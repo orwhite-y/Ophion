@@ -3,6 +3,12 @@
 */
 #pragma once
 
+#include <ntddk.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 //
 // master stealth switch — set to 0 to disable all stealth globally
 //
@@ -36,7 +42,7 @@
 // protects host-mode from guest/anti-cheat page table corruption
 // disabled by default — enable once base hv is verified stable
 //
-#define USE_PRIVATE_HOST_CR3                1
+#define USE_PRIVATE_HOST_CR3                0
 
 //
 // private host IDT for VMCS_HOST_IDTR_BASE
@@ -118,4 +124,8 @@ VOID stealth_init_cpuid_cache(VOID);
 BOOLEAN stealth_is_leaf_invalid(UINT32 leaf);
 
 BOOLEAN stealth_is_xcr0_valid(UINT64 value);
+
+#ifdef __cplusplus
+}
+#endif
 

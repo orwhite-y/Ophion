@@ -6,6 +6,10 @@
 
 #include "ia32.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #ifndef MAXULONG64
 #define MAXULONG64              ((ULONG64)~((ULONG64)0))
 #endif
@@ -70,12 +74,46 @@ typedef struct _VMM_EPT_DYNAMIC_SPLIT {
     LIST_ENTRY SplitList;
 } VMM_EPT_DYNAMIC_SPLIT, *PVMM_EPT_DYNAMIC_SPLIT;
 
+//
+// EPT hook option flags
+//
+#define EPTO_HOOK_FUNCTION       2
+#define EPTO_VIRTUAL_BREAKPOINT  1
+
+//
+// per-function hook tracking — one for each function hooked within a page
+//
+typedef struct _EPT_HOOKED_FUNCTION_INFO {
+    LIST_ENTRY  hooked_function_list;
+    PVOID       virtual_address;          // original function VA
+    PVOID       handler_function;         // proxy/hook function
+    PUINT8      first_trampoline_address; // trampoline for calling original
+    PUINT8      fake_page_contents;       // pointer to parent page's fake page
+    UINT64      hook_size;                // bytes overwritten
+} EPT_HOOKED_FUNCTION_INFO, *PEPT_HOOKED_FUNCTION_INFO;
+
+//
+// per-page hook tracking — one for each 4KB page with hooks
+//
+typedef struct _EPT_HOOKED_PAGE_INFO {
+    LIST_ENTRY       hooked_page_list;
+    LIST_ENTRY       hooked_functions_list;
+    DECLSPEC_ALIGN(PAGE_SIZE) UINT8 fake_page_contents[PAGE_SIZE];
+    UINT64           pfn_of_hooked_page;
+    UINT64           pfn_of_fake_page_contents;
+    PEPT_PML1_ENTRY  entry_address;       // pointer to EPT PTE being manipulated
+    EPT_PML1_ENTRY   original_entry;      // saved original PTE (RW, no X)
+    EPT_PML1_ENTRY   changed_entry;       // fake page PTE (X only, no RW)
+    UINT32           Options;             // EPTO_HOOK_FUNCTION or EPTO_VIRTUAL_BREAKPOINT
+} EPT_HOOKED_PAGE_INFO, *PEPT_HOOKED_PAGE_INFO;
+
 typedef struct _EPT_STATE {
     MTRR_RANGE_DESCRIPTOR mem_ranges[MAX_MTRR_RANGES];
     UINT32                num_ranges;
     UINT8                 default_type;
     BOOLEAN               ad_supported;
-    LIST_ENTRY            hooked_pages;    // reserved for future EPT hooks
+    BOOLEAN               execute_only_supported;  // CPU supports X-only EPT pages (R=0,W=0,X=1)
+    LIST_ENTRY            hooked_pages;    // list of EPT_HOOKED_PAGE_INFO
 
     //
     // INVVPID capability bits (cached from IA32_VMX_EPT_VPID_CAP)
@@ -86,6 +124,19 @@ typedef struct _EPT_STATE {
     BOOLEAN               invvpid_all_contexts;
     BOOLEAN               invvpid_single_retaining_globals;
 } EPT_STATE, *PEPT_STATE;
+
+typedef struct _EPT_DIAGNOSTICS_SNAPSHOT {
+    UINT32  processor_count;
+    UINT32  initialized_processors;
+    UINT32  mtrr_range_count;
+    UINT8   default_memory_type;
+    BOOLEAN ad_supported;
+    BOOLEAN invvpid_supported;
+    BOOLEAN invvpid_individual_addr;
+    BOOLEAN invvpid_single_context;
+    BOOLEAN invvpid_all_contexts;
+    BOOLEAN invvpid_single_retaining_globals;
+} EPT_DIAGNOSTICS_SNAPSHOT, *PEPT_DIAGNOSTICS_SNAPSHOT;
 
 typedef struct _VIRTUAL_MACHINE_STATE {
 
@@ -154,6 +205,11 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     // shadowed guest CR8 (TPR) for interrupt priority checks
     UINT8   guest_cr8;
 
+    //
+    // EPT hook: page to restore after MTF single-step
+    //
+    PEPT_HOOKED_PAGE_INFO mtf_restore_page;
+
     // per-core private host GDT for VMXOFF restore
     PVOID   host_gdt;
     UINT64  original_gdt_base;
@@ -164,6 +220,40 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 
 #define VMCALL_TEST             0x00000001
 #define VMCALL_VMXOFF           0x00000002
+#define VMCALL_EPT_HOOK         0x00000003
+#define VMCALL_EPT_UNHOOK       0x00000004
+#define VMCALL_EPT_UNHOOK_ALL   0x00000005
+
+//
+// VMCALL identifier in rax — like UnrealVTDbg's VMCALL_IDENTIFIER
+// checked BEFORE the r10/r11/r12 signature. if rax matches this,
+// parameters are in rcx/rdx/r8/r9/r10-r15 (no signature registers).
+//
+#define OPHION_VMCALL_ID        0x4F5048494F4E4558ULL   // 'OPHIONEX'
+
+//
+// EPT hook VMCALL request — caller fills at PASSIVE_LEVEL, VMX-root processes.
+// VMX-root temporarily switches to guest CR3 to access guest memory safely.
+// param1 (rdx) = pointer to this struct
+//
+typedef struct _EPT_HOOK_VMCALL_PARAM {
+    UINT64  caller_cr3;           // [in] for guest memory access inside ept_hook_install
+    PVOID   target_function;      // [in] VA of function to hook
+    PVOID   proxy_function;       // [in] VA of hook proxy
+    PVOID * origin_function;      // [in/out] receives trampoline address (or NULL)
+    UINT32  hook_type;            // [in] 0=abs jmp, 1=VMCALL, 2=INT3
+    volatile LONG installed;      // [internal] 0→1 by first CPU, others just split+PTE
+    BOOLEAN result;               // [out]
+    UINT32  error_code;           // [out] debug: 0=ok, 1=no_pa, 2=split_fail, 3=pml1_null,
+                                  //   4=pool_page, 5=pool_func, 6=pool_tramp, 7=pa_fake
+} EPT_HOOK_VMCALL_PARAM, *PEPT_HOOK_VMCALL_PARAM;
+
+typedef struct _EPT_UNHOOK_VMCALL_PARAM {
+    UINT64  caller_cr3;           // [in] caller's CR3
+    PVOID   target_function;      // [in] VA to unhook
+    volatile LONG unhooked;       // [internal] 0→1 by first CPU
+    BOOLEAN result;               // [out]
+} EPT_UNHOOK_VMCALL_PARAM, *PEPT_UNHOOK_VMCALL_PARAM;
 
 // per-cpu NMI pending flag for host IDT NMI handler
 extern volatile LONG g_host_nmi_pending[MAX_PROCESSORS];
@@ -180,3 +270,7 @@ extern UINT32                  g_cpu_count;
 extern UINT64                  g_system_cr3;
 extern UINT64 *                g_msr_bitmap_invalid;
 extern HOST_IDT_STATE          g_host_idt;
+
+#ifdef __cplusplus
+}
+#endif

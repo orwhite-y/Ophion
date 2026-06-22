@@ -11,13 +11,12 @@
     </ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Label="Globals">
-    <ProjectGuid>{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}</ProjectGuid>
-    <RootNamespace>Ophion</RootNamespace>
-    <ProjectName>Ophion</ProjectName>
+    <ProjectGuid>{B2C3D4E5-F6A7-8901-BCDE-F12345678901}</ProjectGuid>
+    <RootNamespace>TestDriver</RootNamespace>
+    <ProjectName>TestDriver</ProjectName>
     <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
-  <!-- Configuration: x64 Release (Kernel Mode) -->
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>Driver</ConfigurationType>
     <DriverType>WDM</DriverType>
@@ -26,7 +25,6 @@
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
-  <!-- Configuration: x64 Debug (Kernel Mode) -->
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>Driver</ConfigurationType>
     <DriverType>WDM</DriverType>
@@ -35,118 +33,65 @@
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
-  <ImportGroup Label="ExtensionSettings">
-  </ImportGroup>
   <ImportGroup Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
-  <!-- Output directories -->
   <PropertyGroup>
-    <OutDir>$(ProjectDir)build\bin\$(Configuration)\</OutDir>
-    <IntDir>$(ProjectDir)build\obj\$(Configuration)\</IntDir>
-    <TargetName>Ophion</TargetName>
+    <OutDir>$(ProjectDir)..\build\bin\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)..\build\obj\TestDriver_$(Configuration)\</IntDir>
+    <TargetName>TestEptHook</TargetName>
     <TargetExt>.sys</TargetExt>
     <SignMode>TestSign</SignMode>
-    <TestCertificate>26F9E348962C59621D11296D690DD6D13E6B93DB</TestCertificate>
   </PropertyGroup>
-  <ItemDefinitionGroup>
-    <DriverSign>
-      <FileDigestAlgorithm>SHA256</FileDigestAlgorithm>
-    </DriverSign>
-  </ItemDefinitionGroup>
-  <!-- Compiler settings: Release -->
+  <!-- Release -->
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
       <PreprocessorDefinitions>_AMD64_;AMD64;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level4</WarningLevel>
       <Optimization>MaxSpeed</Optimization>
-      <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
-      <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
-      <IntrinsicFunctions>true</IntrinsicFunctions>
-      <WholeProgramOptimization>true</WholeProgramOptimization>
       <TreatWarningAsError>false</TreatWarningAsError>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <CompileAs>CompileAsCpp</CompileAs>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <AdditionalOptions>/FS %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <EnableCOMDATFolding>true</EnableCOMDATFolding>
-      <OptimizeReferences>true</OptimizeReferences>
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
-      <ModuleDefinitionFile>$(ProjectDir)Ophion.def</ModuleDefinitionFile>
     </Link>
     <MASM>
       <PreprocessorDefinitions>_AMD64_;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </MASM>
   </ItemDefinitionGroup>
-  <!-- Compiler settings: Debug -->
+  <!-- Debug -->
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <PreprocessorDefinitions>_AMD64_;AMD64;_DEBUG;DBG=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level4</WarningLevel>
       <Optimization>Disabled</Optimization>
       <TreatWarningAsError>false</TreatWarningAsError>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <CompileAs>CompileAsCpp</CompileAs>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <AdditionalOptions>/FS %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EntryPointSymbol>DriverEntry</EntryPointSymbol>
-      <ModuleDefinitionFile>$(ProjectDir)Ophion.def</ModuleDefinitionFile>
     </Link>
     <MASM>
       <PreprocessorDefinitions>_AMD64_;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </MASM>
-    <PostBuildEvent>
-      <Command>vmp_debug1.bat</Command>
-    </PostBuildEvent>
+    <DriverSign>
+      <FileDigestAlgorithm>SHA256</FileDigestAlgorithm>
+    </DriverSign>
   </ItemDefinitionGroup>
-  <!-- Source Files -->
+  <!-- Source -->
   <ItemGroup>
-    <ClCompile Include="src\driver.cpp" />
-    <ClCompile Include="src\vmx.cpp" />
-    <ClCompile Include="src\vmexit.cpp" />
-    <ClCompile Include="src\ept.cpp" />
-    <ClCompile Include="src\events.cpp" />
-    <ClCompile Include="src\broadcast.cpp" />
-    <ClCompile Include="src\globals.cpp" />
-    <ClCompile Include="src\util.cpp" />
-    <ClCompile Include="src\stealth.cpp" />
-    <ClCompile Include="src\hostcr3.cpp" />
-    <ClCompile Include="src\hostidt.cpp" />
-    <ClCompile Include="src\hostgdt.cpp" />
-    <ClCompile Include="src\ept_diag.cpp" />
-    <ClCompile Include="src\ept_hook.cpp" />
-    <ClCompile Include="src\pool_manager.cpp" />
+    <ClCompile Include="test_driver.cpp" />
   </ItemGroup>
-  <!-- Assembly Files (MASM x64) -->
   <ItemGroup>
-    <MASM Include="asm\AsmSegmentRegs.asm" />
-    <MASM Include="asm\AsmCommon.asm" />
-    <MASM Include="asm\AsmVmxOperation.asm" />
-    <MASM Include="asm\AsmVmxContext.asm" />
-    <MASM Include="asm\AsmVmexitHandler.asm" />
-    <MASM Include="asm\AsmVmxIntrinsics.asm" />
-    <MASM Include="asm\AsmHostIdt.asm" />
-    <MASM Include="asm\lde64.asm" />
-  </ItemGroup>
-  <!-- Header Files -->
-  <ItemGroup>
-    <ClInclude Include="include\hv.h" />
-    <ClInclude Include="include\ia32.h" />
-    <ClInclude Include="include\hv_types.h" />
-    <ClInclude Include="include\asm_prototypes.h" />
-    <ClInclude Include="include\stealth.h" />
+    <MASM Include="vmcall.asm" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-  <ImportGroup Label="ExtensionTargets">
-  </ImportGroup>
 </Project>

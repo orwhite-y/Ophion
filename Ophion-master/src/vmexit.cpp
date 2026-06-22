@@ -659,8 +659,19 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
     UINT64 guest_phys = 0;
     __vmx_vmread(VMCS_GUEST_PHYSICAL_ADDRESS, &guest_phys);
 
-    UNREFERENCED_PARAMETER(guest_phys);
+    //
+    // try to handle as an EPT hook violation (split-TLB page swap)
+    //
+    if (ept_handle_violation(vcpu, guest_phys, vcpu->exit_qual))
+    {
+        // handled — don't advance RIP, the guest will re-execute
+        vcpu->advance_rip = FALSE;
+        return;
+    }
 
+    //
+    // unhandled EPT violation — inject #GP to guest
+    //
     vmexit_inject_gp();
     vcpu->advance_rip = FALSE;
 }
@@ -684,10 +695,98 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         }
     }
 
+    //
+    // 1. check rax identifier (like UnrealVTDbg's VMCALL_IDENTIFIER)
+    //    if rax matches, parameters are in rcx/rdx/r8/r9/r10-r15
+    //
+    if (regs->rax == OPHION_VMCALL_ID)
+    {
+        UINT64 vmcall_num = regs->rcx;
+
+        switch (vmcall_num)
+        {
+        case VMCALL_EPT_HOOK:
+        {
+            //
+            // 参数全在寄存器，和 UnrealVTDbg 完全一样:
+            //   rdx = target_function
+            //   r8  = proxy_function
+            //   r9  = &origin_function (guest VA)
+            //   r10 = caller_cr3
+            //   r11 = hook_type
+            //
+            UINT64 target_va  = regs->rdx;
+            UINT64 proxy_va   = regs->r8;
+            UINT64 origin_va  = regs->r9;
+            UINT64 caller_cr3 = regs->r10;
+            UINT32 hook_type  = (UINT32)regs->r11;
+
+            if (!target_va || !caller_cr3)
+            {
+                regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            //
+            // HOST_CR3 = system CR3 (不用 private host CR3)
+            // 所有内核内存直接可访问，和 VT_Driver 一样。
+            //
+            EPT_HOOK_VMCALL_PARAM local_req = {};
+            local_req.target_function = (PVOID)target_va;
+            local_req.proxy_function  = (PVOID)proxy_va;
+            local_req.hook_type       = hook_type;
+            if (origin_va)
+                local_req.origin_function = (PVOID *)origin_va;
+
+            BOOLEAN ok = ept_hook_install(vcpu, &local_req);
+
+            regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
+            break;
+        }
+
+        case VMCALL_EPT_UNHOOK:
+        {
+            UINT64 target_va = regs->rdx;
+            if (!target_va)
+            {
+                regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            EPT_UNHOOK_VMCALL_PARAM local_req = {};
+            local_req.target_function = (PVOID)target_va;
+
+            BOOLEAN ok = ept_unhook_install(vcpu, &local_req);
+            regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
+            break;
+        }
+
+        case VMCALL_EPT_UNHOOK_ALL:
+            ept_unhook_all();
+            regs->rax = (UINT64)STATUS_SUCCESS;
+            break;
+
+        default:
+            regs->rax = 0ULL;
+            break;
+        }
+        return;
+    }
+
+    //
+    // 2. not our identifier — check r10/r11/r12 signature (Ophion's own VMCALLs)
+    //
     if (regs->r10 != 0x48564653ULL ||       // 'HVFS'
         regs->r11 != 0x564d43414c4cULL ||   // 'VMCALL'
         regs->r12 != 0x4e4f485950455256ULL)  // 'NOHYPERV'
     {
+        // signature mismatch — try EPT-hooked fake page VMCALL redirect
+        if (ept_handle_vmcall_hook(vcpu))
+        {
+            vcpu->advance_rip = FALSE;
+            return;
+        }
+
         vmexit_inject_ud();
         vcpu->advance_rip = FALSE;
         return;
@@ -1062,6 +1161,11 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
     case VMX_EXIT_REASON_EPT_VIOLATION:
         vmexit_handle_ept_violation(vcpu);
+        break;
+
+    case VMX_EXIT_REASON_MONITOR_TRAP_FLAG:
+        ept_handle_mtf(vcpu);
+        vcpu->advance_rip = FALSE;
         break;
 
     case VMX_EXIT_REASON_EPT_MISCONFIGURATION:

@@ -529,6 +529,12 @@ vmx_init(VOID)
         return FALSE;
     }
 
+    if (!pool_manager_init())
+    {
+        DbgPrintEx(0, 0, "[hv] Pool manager initialization failed!\n");
+        return FALSE;
+    }
+
     for (UINT32 i = 0; i < g_cpu_count; i++)
     {
         VIRTUAL_MACHINE_STATE * vcpu = &g_vcpu[i];
@@ -678,6 +684,8 @@ vmx_terminate(VOID)
 
     if (g_ept)
     {
+        ept_unhook_all();
+
         for (UINT32 i = 0; i < g_cpu_count; i++)
         {
             if (g_vcpu[i].ept_page_table)
@@ -686,6 +694,8 @@ vmx_terminate(VOID)
         ExFreePoolWithTag(g_ept, HV_POOL_TAG);
         g_ept = NULL;
     }
+
+    pool_manager_destroy();
 
 #if USE_PRIVATE_HOST_CR3
     hostcr3_destroy();

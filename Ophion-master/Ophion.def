@@ -1,0 +1,4 @@
+EXPORTS
+    OphionEptHook = ept_hook_function
+    OphionEptUnhook = ept_unhook_function
+    OphionEptUnhookAll = ept_unhook_all_broadcast

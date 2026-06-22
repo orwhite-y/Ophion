@@ -1,9 +1,9 @@
 set "projectpath=%cd%"
-@REM cd ../../
+@REM cd ../../ 
 set "preProjectpath=%cd%"
 cd /d %projectpath%
 set "SignFullPath=%preProjectpath%/build/bin/Debug/Ophion.sys"
-set "SignFullPath1=%preProjectpath%/x64/Debug/testHookDriver.sys"
+set "SignFullPath1=%preProjectpath%/build/bin/Debug/TestEptHook.sys"
 @REM set "VMPath=%preProjectpath%/x64/Release/YJ.sys.vmp"
 
 set "d=%date:~0,10%"

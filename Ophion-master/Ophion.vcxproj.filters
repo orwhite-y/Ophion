@@ -16,28 +16,49 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ClCompile Include="src\driver.c">
+    <ClCompile Include="src\driver.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\vmx.c">
+    <ClCompile Include="src\vmx.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\vmexit.c">
+    <ClCompile Include="src\vmexit.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\ept.c">
+    <ClCompile Include="src\ept.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\events.c">
+    <ClCompile Include="src\events.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\broadcast.c">
+    <ClCompile Include="src\broadcast.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\globals.c">
+    <ClCompile Include="src\globals.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\util.c">
+    <ClCompile Include="src\util.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\stealth.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hostcr3.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hostidt.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hostgdt.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ept_diag.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ept_hook.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\pool_manager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -53,6 +74,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="include\asm_prototypes.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="include\stealth.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
@@ -74,6 +98,12 @@
       <Filter>Assembly Files</Filter>
     </MASM>
     <MASM Include="asm\AsmVmxIntrinsics.asm">
+      <Filter>Assembly Files</Filter>
+    </MASM>
+    <MASM Include="asm\AsmHostIdt.asm">
+      <Filter>Assembly Files</Filter>
+    </MASM>
+    <MASM Include="asm\lde64.asm">
       <Filter>Assembly Files</Filter>
     </MASM>
   </ItemGroup>

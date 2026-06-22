@@ -21,7 +21,11 @@ ept_check_features(VOID)
         return FALSE;
     }
 
-    g_ept->ad_supported = vpid_reg.EptAccessedAndDirtyFlags ? TRUE : FALSE;
+    g_ept->ad_supported            = vpid_reg.EptAccessedAndDirtyFlags ? TRUE : FALSE;
+    g_ept->execute_only_supported  = vpid_reg.ExecuteOnlyPages ? TRUE : FALSE;
+
+    DbgPrintEx(0, 0, "[hv] EPT execute-only pages: %s\n",
+               g_ept->execute_only_supported ? "supported" : "NOT supported");
 
     g_ept->invvpid_supported              = vpid_reg.Invvpid ? TRUE : FALSE;
     g_ept->invvpid_individual_addr        = vpid_reg.InvvpidIndividualAddress ? TRUE : FALSE;

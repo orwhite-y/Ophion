@@ -5,7 +5,9 @@
 #include "hv.h"
 
 // KeGenericCallDpc, KeSignalCallDpcDone, KeSignalCallDpcSynchronize
-// are not in the standard wdk headers
+// are not in the standard wdk headers — must be extern "C" for C++ linkage
+extern "C" {
+
 NTKERNELAPI
 _IRQL_requires_max_(APC_LEVEL)
 _IRQL_requires_min_(PASSIVE_LEVEL)
@@ -28,6 +30,8 @@ _IRQL_requires_same_
 LOGICAL
 KeSignalCallDpcSynchronize(
     _In_ PVOID SystemArgument2);
+
+} // extern "C"
 
 static VOID
 dpc_init_guest(

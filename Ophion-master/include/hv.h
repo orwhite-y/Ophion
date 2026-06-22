@@ -14,6 +14,10 @@
 #include "asm_prototypes.h"
 #include "stealth.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 UINT64 va_to_pa(PVOID va);
 PVOID  pa_to_va(UINT64 pa);
 UINT64 get_system_cr3(VOID);
@@ -74,9 +78,42 @@ PEPT_PML1_ENTRY ept_get_pml1(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 PEPT_PML2_ENTRY ept_get_pml2(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 BOOLEAN ept_split_large_page(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 
+BOOLEAN ept_diag_query_snapshot(PEPT_DIAGNOSTICS_SNAPSHOT snapshot);
+BOOLEAN ept_diag_query_pml2(UINT32 processor_index, SIZE_T phys_addr, PEPT_PML2_ENTRY entry_out);
+BOOLEAN ept_diag_query_pml1(UINT32 processor_index, SIZE_T phys_addr, PEPT_PML1_ENTRY entry_out);
+
 VOID ept_invept_single(EPT_POINTER ept_ptr);
 VOID ept_invept_all(VOID);
 VOID vpid_invvpid_single(UINT16 vpid);
+
+//
+// EPT hook engine (ept_hook.cpp)
+//   hook_type: 0 = absolute jump (14B), 1 = VMCALL (3B), 2 = INT3 (1B)
+//
+
+// public API — PASSIVE_LEVEL, issues VMCALL to all CPUs via DPC broadcast
+BOOLEAN ept_hook_function(PVOID target, PVOID proxy, PVOID * original, UINT32 hook_type);
+BOOLEAN ept_unhook_function(PVOID target);
+VOID    ept_unhook_all_broadcast(VOID);
+
+// VMX-root internal — called from VMCALL handler (guest CR3 must be active)
+BOOLEAN ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req);
+BOOLEAN ept_unhook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_UNHOOK_VMCALL_PARAM req);
+VOID    ept_unhook_all(VOID);
+
+// VMX-root handlers — called from vmexit dispatch
+BOOLEAN ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exit_qual);
+VOID    ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu);
+BOOLEAN ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu);
+
+//
+// pool manager (pool_manager.cpp)
+//
+BOOLEAN pool_manager_init(VOID);
+PVOID   pool_manager_request(UINT32 type, SIZE_T size);
+UINT64  pool_manager_get_physical(PVOID address);  // safe in VMX-root
+VOID    pool_manager_release(PVOID address);
+VOID    pool_manager_destroy(VOID);
 
 BOOLEAN vmexit_handler(PGUEST_REGS regs, VIRTUAL_MACHINE_STATE * vcpu);
 
@@ -107,3 +144,7 @@ VOID broadcast_terminate_all(VOID);
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT driver_obj, PUNICODE_STRING registry_path);
 VOID     DriverUnload(PDRIVER_OBJECT driver_obj);
+
+#ifdef __cplusplus
+}
+#endif

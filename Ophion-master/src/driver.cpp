@@ -9,7 +9,26 @@
 #define SYMLINK_NAME    L"\\DosDevices\\Ophion"
 
 #define IOCTL_BASE      0x800
-#define IOCTL_HV_STATUS CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_BASE + 0, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_HV_STATUS      CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_BASE + 0, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_EPT_HOOK       CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_BASE + 1, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_EPT_UNHOOK     CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_BASE + 2, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_EPT_UNHOOK_ALL CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_BASE + 3, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+//
+// IOCTL structures (user/kernel → driver interface)
+//
+#pragma pack(push, 8)
+typedef struct _IOCTL_EPT_HOOK_PARAMS {
+    UINT64 target_address;
+    UINT64 proxy_address;
+    UINT32 hook_type;
+    UINT64 original_address;   // [out] trampoline for calling original
+} IOCTL_EPT_HOOK_PARAMS, *PIOCTL_EPT_HOOK_PARAMS;
+
+typedef struct _IOCTL_EPT_UNHOOK_PARAMS {
+    UINT64 target_address;
+} IOCTL_EPT_UNHOOK_PARAMS, *PIOCTL_EPT_UNHOOK_PARAMS;
+#pragma pack(pop)
 
 static NTSTATUS DriverCreateClose(PDEVICE_OBJECT device_obj, PIRP irp);
 static NTSTATUS DriverIoControl(PDEVICE_OBJECT device_obj, PIRP irp);
@@ -139,10 +158,57 @@ DriverIoControl(
         break;
     }
 
+    case IOCTL_EPT_HOOK:
+    {
+        if (io_stack->Parameters.DeviceIoControl.InputBufferLength >= sizeof(IOCTL_EPT_HOOK_PARAMS) &&
+            io_stack->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(IOCTL_EPT_HOOK_PARAMS))
+        {
+            PIOCTL_EPT_HOOK_PARAMS req = (PIOCTL_EPT_HOOK_PARAMS)irp->AssociatedIrp.SystemBuffer;
+            PVOID original = NULL;
+
+            if (ept_hook_function(
+                    (PVOID)req->target_address,
+                    (PVOID)req->proxy_address,
+                    &original,
+                    req->hook_type))
+            {
+                req->original_address = (UINT64)original;
+                irp->IoStatus.Information = sizeof(IOCTL_EPT_HOOK_PARAMS);
+            }
+            else
+            {
+                status = STATUS_UNSUCCESSFUL;
+            }
+        }
+        else
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
+        break;
+    }
+
+    case IOCTL_EPT_UNHOOK:
+    {
+        if (io_stack->Parameters.DeviceIoControl.InputBufferLength >= sizeof(IOCTL_EPT_UNHOOK_PARAMS))
+        {
+            PIOCTL_EPT_UNHOOK_PARAMS req = (PIOCTL_EPT_UNHOOK_PARAMS)irp->AssociatedIrp.SystemBuffer;
+            if (!ept_unhook_function((PVOID)req->target_address))
+                status = STATUS_NOT_FOUND;
+        }
+        else
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
+        break;
+    }
+
+    case IOCTL_EPT_UNHOOK_ALL:
+    {
+        ept_unhook_all_broadcast();
+        break;
+    }
+
     default:
-        //
-        // add more shi here later
-        //
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;
     }

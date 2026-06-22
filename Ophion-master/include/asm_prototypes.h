@@ -5,6 +5,10 @@
 
 #include <ntddk.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 //
 // segment register accessors (AsmSegmentRegs.asm)
 //
@@ -65,3 +69,14 @@ extern VOID asm_host_nmi_handler(VOID);
 extern VOID asm_host_df_handler(VOID);
 extern VOID asm_host_gp_handler(VOID);
 extern VOID asm_host_default_handler(VOID);
+
+//
+// Length Disassembly Engine (lde64.asm)
+// rcx = address to disassemble, edx = mode (0=32-bit, 64=64-bit)
+// returns instruction length in rax
+//
+extern SIZE_T __fastcall LDE(const PVOID address, UINT32 mode);
+
+#ifdef __cplusplus
+}
+#endif

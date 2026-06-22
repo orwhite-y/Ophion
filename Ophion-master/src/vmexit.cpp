@@ -670,9 +670,11 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
     }
 
     //
-    // unhandled EPT violation — inject #GP to guest
+    // unhandled EPT violation — 可能是刚 unhook 但 TLB 还没刷新
+    // 做一次 INVEPT 让 CPU 重试（PTE 已恢复 RWX，重试后不会再 violation）
+    // 如果确实是 EPT 配置错误，重试几次后系统会自然恢复或触发 misconfig
     //
-    vmexit_inject_gp();
+    ept_invept_single(vcpu->ept_pointer);
     vcpu->advance_rip = FALSE;
 }
 

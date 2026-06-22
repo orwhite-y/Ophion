@@ -9,6 +9,7 @@
 
 #define VMCALL_EPT_HOOK       0x00000003
 #define VMCALL_EPT_UNHOOK     0x00000004
+#define VMCALL_EPT_UNHOOK_ALL 0x00000005
 #define OPHION_VMCALL_ID      0x4F5048494F4E4558ULL   // must match Ophion hv_types.h
 
 //
@@ -179,18 +180,47 @@ DpcUnhook(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
 // ---- 驱动 ----
 
 static VOID
+DpcInvept(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
+{
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(Ctx);
+    // 只做 INVEPT，不操作链表
+    hv_vmcall_ex(VMCALL_EPT_UNHOOK_ALL, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    KeSignalCallDpcSynchronize(A2);
+    KeSignalCallDpcDone(A1);
+}
+
+static VOID
 TestUnload(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
 
     if (g_target)
     {
-        UNHOOK_DPC_ARGS args = {};
-        args.target = g_target;
-        args.cr3    = __readcr3();
-        KeGenericCallDpc(DpcUnhook, &args);
-        DbgPrintEx(0, 0, "[EPT-TEST] Unhooked. success=%d\n", args.success_count);
+        //
+        // 1. 先禁用代理函数 — 即使 hook 还在，代理直接返回不会崩
+        //
+        g_orig_NtCreateFile = NULL;
+
+        //
+        // 2. 等待所有 CPU 上正在执行的 hook 完成
+        //
+        KeStallExecutionProcessor(100); // 100us
+
+        //
+        // 3. unhook: 恢复所有 CPU 的 PTE + 移除链表
+        //
+        hv_vmcall_ex(VMCALL_EPT_UNHOOK,
+            (UINT64)g_target, 0, 0, 0, 0, 0, 0, 0, 0);
+
+        //
+        // 4. 广播 INVEPT 刷新所有 CPU 的 TLB
+        //
+        KeGenericCallDpc(DpcInvept, NULL);
+
+        DbgPrintEx(0, 0, "[EPT-TEST] Unhooked NtCreateFile.\n");
     }
+
     DbgPrintEx(0, 0, "[EPT-TEST] Unloaded.\n");
 }
 

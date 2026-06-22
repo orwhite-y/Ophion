@@ -118,30 +118,90 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
 
     UINT64 target_pfn = phys_addr >> 12;
 
-    // 已经 hook 过的页面只做 split + PTE
-    PLIST_ENTRY chk = g_ept->hooked_pages.Flink;
-    while (chk != &g_ept->hooked_pages)
+    // 检查是否已 hook 过这个页面
+    struct _LIST_ENTRY * hcur;
+    for (hcur = g_ept->hooked_pages.Flink; hcur != &g_ept->hooked_pages; hcur = hcur->Flink)
     {
-        PEPT_HOOKED_PAGE_INFO existing = CONTAINING_RECORD(chk, EPT_HOOKED_PAGE_INFO, hooked_page_list);
+        PEPT_HOOKED_PAGE_INFO existing = CONTAINING_RECORD(hcur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
         if (existing->pfn_of_hooked_page == target_pfn)
         {
-            // split this CPU's EPT + set PTE + invept
-            PEPT_PML2_ENTRY p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)phys_addr);
-            if (p2 && p2->LargePage)
-                ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)phys_addr);
-
-            PEPT_PML1_ENTRY p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)phys_addr);
-            if (p1)
+            //
+            // 页面已 hook — 检查这个具体函数是否已经 hook
+            //
+            BOOLEAN func_exists = FALSE;
+            PLIST_ENTRY fc = existing->hooked_functions_list.Flink;
+            while (fc != &existing->hooked_functions_list)
             {
-                p1->ExecuteAccess = 0;
-                p1->ReadAccess    = 1;
-                p1->WriteAccess   = 1;
+                PEPT_HOOKED_FUNCTION_INFO efi = CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
+                if (efi->virtual_address == req->target_function)
+                {
+                    func_exists = TRUE;
+                    break;
+                }
+                fc = fc->Flink;
             }
+
+            if (func_exists)
+            {
+                // 这个函数已经 hook 了 (其他 CPU 的重复调用)
+                // 只做 split + PTE + invept
+                PEPT_PML2_ENTRY p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)phys_addr);
+                if (p2 && p2->LargePage)
+                    ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)phys_addr);
+
+                PEPT_PML1_ENTRY p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)phys_addr);
+                if (p1)
+                {
+                    p1->ExecuteAccess = 0;
+                    p1->ReadAccess    = 1;
+                    p1->WriteAccess   = 1;
+                }
+                _mm_mfence();
+                ept_invept_single(vcpu->ept_pointer);
+                return TRUE;
+            }
+
+            //
+            // 同页面不同函数 — 添加新 hook 到已有的 fake page
+            //
+            PEPT_HOOKED_FUNCTION_INFO fi = (PEPT_HOOKED_FUNCTION_INFO)
+                pool_manager_request(POOL_TAG_HOOKED_FUNC, sizeof(EPT_HOOKED_FUNCTION_INFO));
+            if (!fi) return FALSE;
+            RtlZeroMemory(fi, sizeof(*fi));
+
+            fi->first_trampoline_address = (PUINT8)pool_manager_request(POOL_TAG_TRAMPOLINE, 128);
+            if (!fi->first_trampoline_address) { pool_manager_release(fi); return FALSE; }
+
+            fi->virtual_address    = req->target_function;
+            fi->fake_page_contents = existing->fake_page_contents;
+            fi->handler_function   = req->proxy_function;
+
+            UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
+            PUINT8 fake  = &existing->fake_page_contents[off];
+            SIZE_T min_sz = (req->hook_type == 1) ? 3 : (req->hook_type == 2) ? 1 : 14;
+            SIZE_T ow = 0;
+            while (ow < min_sz) ow += LDE((PUINT8)req->target_function + ow, 64);
+            fi->hook_size = ow;
+
+            RtlCopyMemory(fi->first_trampoline_address, req->target_function, ow);
+            hook_write_absolute_jump(&fi->first_trampoline_address[ow],
+                                     (UINT64)req->target_function + ow);
+
+            if (req->origin_function)
+                *req->origin_function = fi->first_trampoline_address;
+
+            switch (req->hook_type) {
+            case 0: hook_write_absolute_jump(fake, (UINT64)req->proxy_function); break;
+            case 1: fake[0]=0x0F; fake[1]=0x01; fake[2]=0xC1; break;
+            case 2: fake[0]=0xCC; break;
+            }
+
+            InsertHeadList(&existing->hooked_functions_list, &fi->hooked_function_list);
+
             _mm_mfence();
             ept_invept_single(vcpu->ept_pointer);
             return TRUE;
         }
-        chk = chk->Flink;
     }
 
     // split 2MB → 4KB
@@ -284,14 +344,21 @@ ept_unhook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_UNHOOK_VMCALL_PARAM req)
         }
     }
 
-    // every CPU: restore PTE to RWX
-    PEPT_PML1_ENTRY pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)phys_addr);
-    if (pte)
+    //
+    // 恢复所有 CPU 的 PTE 到 RWX
+    // (不能只恢复当前 CPU，其他 CPU 的 EPT PTE 也需要恢复)
+    //
+    for (UINT32 i = 0; i < g_cpu_count; i++)
     {
-        pte->ReadAccess      = 1;
-        pte->WriteAccess     = 1;
-        pte->ExecuteAccess   = 1;
-        pte->PageFrameNumber = target_pfn;
+        if (!g_vcpu[i].ept_page_table) continue;
+        PEPT_PML1_ENTRY p = ept_get_pml1(g_vcpu[i].ept_page_table, (SIZE_T)phys_addr);
+        if (p)
+        {
+            p->ReadAccess      = 1;
+            p->WriteAccess     = 1;
+            p->ExecuteAccess   = 1;
+            p->PageFrameNumber = target_pfn;
+        }
     }
     _mm_mfence();
     ept_invept_single(vcpu->ept_pointer);

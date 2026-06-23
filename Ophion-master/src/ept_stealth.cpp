@@ -21,6 +21,7 @@
 *     all at consecutive physical addresses → looks like one normal allocation.
 */
 #include "hv.h"
+#include "log.h"
 
 #define POOL_TAG_STEALTH_INFO   4
 #define POOL_TAG_STEALTH_FAKEPT 5
@@ -53,7 +54,7 @@ ept_stealth_region_init(VOID)
         region->base_va = MmAllocateContiguousMemory(size, max_phys);
         if (!region->base_va)
         {
-            DbgPrintEx(0, 0, "[hv] stealth region: alloc failed\n");
+            HYPERPLATFORM_LOG_ERROR("[hv] stealth region: alloc failed");
             return FALSE;
         }
     }
@@ -63,9 +64,18 @@ ept_stealth_region_init(VOID)
     region->total_pages = size / PAGE_SIZE;
     region->next_page  = 0;
 
-    DbgPrintEx(0, 0, "[hv] stealth region: %lluMB at VA=%p PA=%llx (%llu pages)\n",
+    HYPERPLATFORM_LOG_INFO("[hv] stealth region: %lluMB at VA=%p PA=%llx (%llu pages)",
                (UINT64)(size / (1024*1024)), region->base_va, region->base_pa,
                (UINT64)region->total_pages);
+
+#if USE_PRIVATE_HOST_CR3
+    //
+    // map the stealth region into private host page tables so VMX-root
+    // can access shadow/fake pages under host CR3 (without CR3 switch)
+    //
+    hostcr3_map_va(region->base_va, size);
+#endif
+
     return TRUE;
 }
 
@@ -159,7 +169,7 @@ stealth_find_pt_page(UINT64 cr3, UINT64 va, PT_PAGE_INFO * out)
 // called from VMX-root (uses pool_manager + contiguous region).
 //
 static PSTEALTH_FAKE_PT
-stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn)
+stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, PVOID pt_page_va_hint)
 {
     // check if already exists
     PLIST_ENTRY cur = g_ept->stealth_fake_pts.Flink;
@@ -187,16 +197,15 @@ stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn)
     fpt->fake_page_va = stealth_region_alloc_page(&fpt->pfn_of_fake);
     if (!fpt->fake_page_va) { pool_manager_release(fpt); return NULL; }
 
-    // copy real PT page content
-    PVOID real_pt_va = pa_to_va(pt_page_pfn << 12);
-    if (real_pt_va)
-        RtlCopyMemory(fpt->fake_page_va, real_pt_va, PAGE_SIZE);
+    // copy real PT page content from caller's NonPaged buffer copy
+    if (!pt_page_va_hint) { pool_manager_release(fpt); return NULL; }
+    RtlCopyMemory(fpt->fake_page_va, pt_page_va_hint, PAGE_SIZE);
 
     // split EPT 2MB → 4KB for the PT page if needed
     UINT64 pt_phys = pt_page_pfn << 12;
     PEPT_PML2_ENTRY pt_pml2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys);
     if (pt_pml2 && pt_pml2->LargePage)
-        ept_split_large_page(vcpu->ept_page_table, (SIZE_T)pt_phys);
+        ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)pt_phys);
 
     PEPT_PML1_ENTRY pt_pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys);
     if (!pt_pte) { pool_manager_release(fpt); return NULL; }
@@ -211,7 +220,7 @@ stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn)
     fpt->pt_fake_entry.WriteAccess     = 0;    // write-protect for sync
     fpt->pt_fake_entry.PageFrameNumber = fpt->pfn_of_fake;
 
-    // activate fake view
+    // activate fake view — EPT now maps PT page to fake page
     pt_pte->AsUInt = fpt->pt_fake_entry.AsUInt;
 
     InsertHeadList(&g_ept->stealth_fake_pts, &fpt->fake_pt_list);
@@ -255,104 +264,29 @@ stealth_fake_pt_resync(PSTEALTH_FAKE_PT fpt)
 // =========================================================================
 
 BOOLEAN
-ept_stealth_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM req)
+ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM req, volatile LONG * interlock)
 {
     if (!vcpu->ept_page_table || !req->target_va)
         return FALSE;
     if (!req->handler_function && !req->shellcode_buffer && !req->resident)
-        return FALSE;   // need handler, shellcode, or resident flag
+        return FALSE;
 
     UINT64 target_phys = req->target_phys & ~0xFFFULL;
-    if (!target_phys) return FALSE;
+    if (!target_phys)
+        return FALSE;
     UINT64 target_pfn = target_phys >> 12;
 
-    // --- check if already installed (DPC duplicate) ---
+    // --- check if already installed ---
     PLIST_ENTRY cur = g_ept->stealth_pages.Flink;
     while (cur != &g_ept->stealth_pages)
     {
         PEPT_STEALTH_PAGE_INFO existing = CONTAINING_RECORD(cur, EPT_STEALTH_PAGE_INFO, stealth_page_list);
         cur = cur->Flink;
         if (existing->pfn_of_target == target_pfn)
-        {
-            // other CPU: just split EPT + set PTE + configure #PF
-            PEPT_PML2_ENTRY p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
-            if (p2 && p2->LargePage)
-                ept_split_large_page(vcpu->ept_page_table, (SIZE_T)target_phys);
-            PEPT_PML1_ENTRY p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
-            if (p1) { p1->ReadAccess = 1; p1->WriteAccess = 1; p1->ExecuteAccess = 0; }
-
-            if (existing->fake_pt)
-            {
-                UINT64 pt_phys = existing->fake_pt->pt_page_pfn << 12;
-                PEPT_PML2_ENTRY pp2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys);
-                if (pp2 && pp2->LargePage)
-                    ept_split_large_page(vcpu->ept_page_table, (SIZE_T)pt_phys);
-                PEPT_PML1_ENTRY pp1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys);
-                if (pp1) pp1->AsUInt = existing->fake_pt->pt_fake_entry.AsUInt;
-            }
-
-            SIZE_T exc = 0;
-            __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc);
-            exc |= (1ULL << EXCEPTION_VECTOR_PAGE_FAULT);
-            __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc);
-            __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x10);
-            __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x10);
-
-            _mm_mfence();
-            ept_invept_single(vcpu->ept_pointer);
-            return TRUE;
-        }
+            return TRUE;  // already installed
     }
 
-    // --- first CPU interlock ---
-    if (_InterlockedCompareExchange(&req->installed, 1, 0) != 0)
-    {
-        // another CPU is doing the full install — spin until it appears in the list
-        for (int retry = 0; retry < 100; retry++)
-        {
-            for (int i = 0; i < 10000; i++) _mm_pause();
-
-            cur = g_ept->stealth_pages.Flink;
-            while (cur != &g_ept->stealth_pages)
-            {
-                PEPT_STEALTH_PAGE_INFO e = CONTAINING_RECORD(cur, EPT_STEALTH_PAGE_INFO, stealth_page_list);
-                cur = cur->Flink;
-                if (e->pfn_of_target == target_pfn)
-                {
-                    // found — do per-CPU EPT setup (same as duplicate path at top)
-                    PEPT_PML2_ENTRY p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
-                    if (p2 && p2->LargePage)
-                        ept_split_large_page(vcpu->ept_page_table, (SIZE_T)target_phys);
-                    PEPT_PML1_ENTRY p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
-                    if (p1) { p1->ReadAccess = 1; p1->WriteAccess = 1; p1->ExecuteAccess = 0; }
-
-                    if (e->fake_pt)
-                    {
-                        UINT64 pt_phys = e->fake_pt->pt_page_pfn << 12;
-                        PEPT_PML2_ENTRY pp2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys);
-                        if (pp2 && pp2->LargePage)
-                            ept_split_large_page(vcpu->ept_page_table, (SIZE_T)pt_phys);
-                        PEPT_PML1_ENTRY pp1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys);
-                        if (pp1) pp1->AsUInt = e->fake_pt->pt_fake_entry.AsUInt;
-                    }
-
-                    SIZE_T exc = 0;
-                    __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc);
-                    exc |= (1ULL << EXCEPTION_VECTOR_PAGE_FAULT);
-                    __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc);
-                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x10);
-                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x10);
-
-                    _mm_mfence();
-                    ept_invept_single(vcpu->ept_pointer);
-                    return TRUE;
-                }
-            }
-        }
-        return FALSE; // first CPU failed or timed out
-    }
-
-    // === FIRST CPU: full install ===
+    // === single-CPU install (no interlock needed) ===
 
     // allocate tracking struct
     PEPT_STEALTH_PAGE_INFO sp = (PEPT_STEALTH_PAGE_INFO)
@@ -365,58 +299,37 @@ ept_stealth_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM req)
     sp->handler_function = req->handler_function;
     sp->guest_cr3        = req->caller_cr3;
 
-    // --- walk guest page table ---
-    UINT64 va = (UINT64)req->target_va;
-    UINT64 pml4_idx = (va >> 39) & 0x1FF;
-    UINT64 pdp_idx  = (va >> 30) & 0x1FF;
-    UINT64 pd_idx   = (va >> 21) & 0x1FF;
-    UINT64 pt_idx   = (va >> 12) & 0x1FF;
+    // --- resolve guest PT page info ---
+    //
+    // prefer pre-computed values (filled at PASSIVE/DISPATCH level by caller).
+    // avoids pa_to_va (MmGetVirtualForPhysical) in VMX-root which can deadlock
+    // when KeGenericCallDpc sends all CPUs into VMX-root simultaneously and
+    // another CPU holds an OS internal lock that pa_to_va needs.
+    //
+    UINT64 pt_page_pfn;
+    UINT64 pt_idx;
 
-    UINT64 pml4e = 0, pdpe = 0, pde = 0;
-    {
-        PVOID pml4_va = pa_to_va(req->caller_cr3 & PFN_MASK);
-        if (!pml4_va) { pool_manager_release(sp); return FALSE; }
-        pml4e = ((PUINT64)pml4_va)[pml4_idx];
-        if (!(pml4e & 1)) { pool_manager_release(sp); return FALSE; }
+    // pt_precomputed MUST be TRUE — callers fill pt_page_pfn/pt_pte_index/pt_page_va
+    // at PASSIVE/DISPATCH level. NEVER walk guest page tables via pa_to_va in VMX-root
+    // (deadlocks when KeGenericCallDpc puts all CPUs into VMX-root simultaneously).
+    if (!req->pt_precomputed) { pool_manager_release(sp); return FALSE; }
 
-        PVOID pdp_va = pa_to_va(pml4e & PFN_MASK);
-        if (!pdp_va) { pool_manager_release(sp); return FALSE; }
-        pdpe = ((PUINT64)pdp_va)[pdp_idx];
-        if (!(pdpe & 1) || (pdpe & (1ULL << 7))) { pool_manager_release(sp); return FALSE; }
+    pt_page_pfn = req->pt_page_pfn;
+    pt_idx      = req->pt_pte_index;
 
-        PVOID pd_va = pa_to_va(pdpe & PFN_MASK);
-        if (!pd_va) { pool_manager_release(sp); return FALSE; }
-        pde = ((PUINT64)pd_va)[pd_idx];
-        if (!(pde & 1) || (pde & (1ULL << 7))) { pool_manager_release(sp); return FALSE; }
-    }
-
-    UINT64 pt_page_pfn = (pde & PFN_MASK) >> 12;
     sp->pt_pte_index = (UINT32)pt_idx;
     sp->resident     = req->resident;
 
     //
-    // clear NX in guest PTE (both modes need this)
-    //
-    PVOID pt_page_va = pa_to_va(pt_page_pfn << 12);
-    if (pt_page_va)
-    {
-        PUINT64 real_pte = &((PUINT64)pt_page_va)[pt_idx];
-        *real_pte &= ~NX_BIT;
-    }
+    // NX clear is done by caller at PASSIVE_LEVEL (TestDriver side).
 
     //
-    // BOTH modes use fake PT page to hide NX=0 from PTE scanners.
+    // EPT-only stealth: no fake PT page manipulation.
+    // execute → EPT violation → swap to shadow page (execute view)
+    // read/write → sees original page (read view)
+    // simpler and doesn't corrupt other PTEs in the same PT page.
     //
-    // the trick for resident mode performance:
-    //   #PF → swap PT to real(NX=0) → VMRESUME → CPU page walk → TLB entry created
-    //   → MTF fires after 1 instruction → swap PT BACK to fake(NX=1)
-    //   → but DON'T flush stealth VA's TLB entry
-    //   → CPU continues executing from TLB cache → zero overhead
-    //   → only on TLB miss (context switch, etc.) does #PF repeat
-    //
-    sp->fake_pt = stealth_get_or_create_fake_pt(vcpu, pt_page_pfn);
-    if (!sp->fake_pt) { pool_manager_release(sp); return FALSE; }
-    stealth_fake_pt_set_nx(sp->fake_pt, sp->pt_pte_index);
+    sp->fake_pt = NULL;  // no fake PT
 
     // --- allocate shadow page from contiguous region ---
     sp->shadow_page = stealth_region_alloc_page(&sp->pfn_of_shadow);
@@ -435,11 +348,9 @@ ept_stealth_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM req)
     }
     else
     {
-        // copy original page content via physical address (safe in VMX-root)
-        // never dereference guest VA directly — host CR3 may not map it
-        PVOID src_va = pa_to_va(target_pfn << 12);
-        if (src_va)
-            RtlCopyMemory(sp->shadow_page, src_va, PAGE_SIZE);
+        // copy original page content — MUST use pre-computed VA, NEVER pa_to_va
+        if (req->target_page_copy)
+            RtlCopyMemory(sp->shadow_page, req->target_page_copy, PAGE_SIZE);
 
         if (!req->resident)
         {
@@ -454,7 +365,7 @@ ept_stealth_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM req)
     // --- set up EPT for TARGET page ---
     PEPT_PML2_ENTRY target_pml2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
     if (target_pml2 && target_pml2->LargePage)
-        ept_split_large_page(vcpu->ept_page_table, (SIZE_T)target_phys);
+        ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
 
     PEPT_PML1_ENTRY target_pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
     if (!target_pte) { goto fail_cleanup_fakept; }
@@ -469,7 +380,19 @@ ept_stealth_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM req)
 
     // execute view: shows shadow page (DLL code / shellcode)
     sp->execute_entry = sp->original_entry;
-    sp->execute_entry.ReadAccess       = g_ept->execute_only_supported ? 0 : 1;
+    //
+    // shellcode inject (non-resident, shellcode_buffer != NULL):
+    //   must keep ReadAccess=1 so shellcode can read its own embedded
+    //   strings/data from the shadow page. with execute-only (R=0),
+    //   reads would EPT-violate → swap to original page (zeros) → crash.
+    //
+    // resident DLL mode: use execute-only if supported — reads are served
+    //   from the original (zeroed) page via EPT violation + MTF.
+    //   DLL code reads its own data sections through separate VA ranges.
+    //
+    BOOLEAN needs_self_read = (req->shellcode_buffer != NULL && req->shellcode_size > 0)
+                           || (!req->resident && req->handler_function != NULL);
+    sp->execute_entry.ReadAccess       = (g_ept->execute_only_supported && !needs_self_read) ? 0 : 1;
     sp->execute_entry.WriteAccess      = 0;
     sp->execute_entry.ExecuteAccess    = 1;
     sp->execute_entry.PageFrameNumber  = sp->pfn_of_shadow;
@@ -495,25 +418,47 @@ ept_stealth_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM req)
         target_pte->ExecuteAccess = 0;
     }
 
-    //
-    // enable #PF interception for NX violations (both modes)
-    // resident needs it for TLB miss recovery
-    // oneshot needs it for initial execution trigger
-    //
-    SIZE_T exc = 0;
-    __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc);
-    exc |= (1ULL << EXCEPTION_VECTOR_PAGE_FAULT);
-    __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc);
-    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x10);
-    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x10);
+    // no #PF interception needed — pure EPT violation driven
 
     InsertHeadList(&g_ept->stealth_pages, &sp->stealth_page_list);
+
+    //
+    //
+    // only modify CURRENT CPU's EPT — never touch other CPUs' EPT directly.
+    // modifying another CPU's EPT while it's walking it → EPT misconfiguration
+    // → VMRESUME failure → CPU dies → 0x101 CLOCK_WATCHDOG.
+    //
+    // other CPUs: lazy setup via ept_stealth_handle_violation on EPT violation,
+    // or via the "already installed" path when this function is called again.
+    //
+    {
+        // split target page 2MB→4KB
+        PEPT_PML2_ENTRY tp2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
+        if (tp2 && tp2->LargePage)
+            ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
+        PEPT_PML1_ENTRY tp1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
+        if (tp1)
+        {
+            if (req->resident)
+                tp1->AsUInt = sp->execute_entry.AsUInt;
+            else
+            {
+                tp1->ReadAccess    = 1;
+                tp1->WriteAccess   = 1;
+                tp1->ExecuteAccess = 0;
+            }
+        }
+
+        // DEBUG: skip PT page fake mapping (pt_fake_entry not initialized in debug mode)
+        // if (sp->fake_pt)
+        // {
+        //     ...
+        // }
+    }
 
     _mm_mfence();
     ept_invept_single(vcpu->ept_pointer);
 
-    DbgPrintEx(0, 0, "[hv] stealth: installed VA=%p pfn=%llx shadow_pfn=%llx fakePT_pfn=%llx\n",
-               req->target_va, target_pfn, sp->pfn_of_shadow, sp->fake_pt->pfn_of_fake);
     return TRUE;
 
 fail_cleanup_fakept:
@@ -911,6 +856,26 @@ ept_stealth_alloc(PVOID target_va, PVOID handler_function)
     req.handler_function = handler_function;
     req.target_phys      = target_phys;
 
+    // pre-compute PT info at PASSIVE level — avoid pa_to_va in VMX-root
+    {
+        PT_PAGE_INFO pti = {};
+        if (stealth_find_pt_page(caller_cr3, (UINT64)target_va & ~0xFFFULL, &pti))
+        {
+            req.pt_page_pfn    = pti.pt_page_phys >> 12;
+            req.pt_pte_index   = pti.pte_index;
+            // copy PT page + target page content into NonPaged buffers for VMX-root
+            { PHYSICAL_ADDRESS _pa; _pa.QuadPart = (LONGLONG)pti.pt_page_phys;
+              PVOID _v = MmGetVirtualForPhysical(_pa);
+              req.pt_page_copy = _v ? ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'htpS') : NULL;
+              if (req.pt_page_copy && _v) RtlCopyMemory(req.pt_page_copy, _v, PAGE_SIZE); }
+            { PHYSICAL_ADDRESS _pa; _pa.QuadPart = (LONGLONG)(req.target_phys & ~0xFFFULL);
+              PVOID _v = MmGetVirtualForPhysical(_pa);
+              req.target_page_copy = _v ? ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'htpS') : NULL;
+              if (req.target_page_copy && _v) RtlCopyMemory(req.target_page_copy, _v, PAGE_SIZE); }
+            req.pt_precomputed = TRUE;
+        }
+    }
+
     KeGenericCallDpc(dpc_stealth_alloc, &req);
     return req.result;
 }
@@ -925,7 +890,7 @@ ept_stealth_inject(PVOID target_va, PVOID shellcode, UINT32 shellcode_size)
     UINT64 base_va    = (UINT64)target_va;
     UINT32 bytes_done = 0, page_count = 0;
 
-    DbgPrintEx(0, 0, "[hv] stealth inject: VA=%p size=%u\n", target_va, shellcode_size);
+    HYPERPLATFORM_LOG_INFO("[hv] stealth inject: VA=%p size=%u", target_va, shellcode_size);
 
     while (bytes_done < shellcode_size)
     {
@@ -947,6 +912,17 @@ ept_stealth_inject(PVOID target_va, PVOID shellcode, UINT32 shellcode_size)
         req.shellcode_buffer = (PUINT8)shellcode + bytes_done;
         req.shellcode_size   = chunk;
 
+        // pre-compute PT info at PASSIVE level — avoid pa_to_va in VMX-root
+        {
+            PT_PAGE_INFO pti = {};
+            if (stealth_find_pt_page(caller_cr3, (UINT64)current_va & ~0xFFFULL, &pti))
+            {
+                req.pt_page_pfn    = pti.pt_page_phys >> 12;
+                req.pt_pte_index   = pti.pte_index;
+                req.pt_precomputed = TRUE;
+            }
+        }
+
         KeGenericCallDpc(dpc_stealth_alloc, &req);
         if (!req.result) goto rollback;
 
@@ -954,7 +930,7 @@ ept_stealth_inject(PVOID target_va, PVOID shellcode, UINT32 shellcode_size)
         page_count++;
     }
 
-    DbgPrintEx(0, 0, "[hv] stealth inject: %u pages set up\n", page_count);
+    HYPERPLATFORM_LOG_INFO("[hv] stealth inject: %u pages set up", page_count);
     return TRUE;
 
 rollback:
@@ -1020,7 +996,7 @@ ept_stealth_map_resident(PVOID target_va, SIZE_T size)
     UINT64 end_va     = ((UINT64)target_va + size + PAGE_SIZE - 1) & ~0xFFFULL;
     UINT32 page_count = 0;
 
-    DbgPrintEx(0, 0, "[hv] stealth map_resident: VA=%p size=0x%llX (%llu pages)\n",
+    HYPERPLATFORM_LOG_INFO("[hv] stealth map_resident: VA=%p size=0x%llX (%llu pages)",
                target_va, (UINT64)size, (end_va - base_va) / PAGE_SIZE);
 
     for (UINT64 va = base_va; va < end_va; va += PAGE_SIZE)
@@ -1045,10 +1021,21 @@ ept_stealth_map_resident(PVOID target_va, SIZE_T size)
         req.shellcode_size   = 0;
         req.resident         = TRUE;    // resident mode
 
+        // pre-compute PT info at PASSIVE level — avoid pa_to_va in VMX-root
+        {
+            PT_PAGE_INFO pti = {};
+            if (stealth_find_pt_page(caller_cr3, va, &pti))
+            {
+                req.pt_page_pfn    = pti.pt_page_phys >> 12;
+                req.pt_pte_index   = pti.pte_index;
+                req.pt_precomputed = TRUE;
+            }
+        }
+
         KeGenericCallDpc(dpc_stealth_alloc, &req);
         if (!req.result)
         {
-            DbgPrintEx(0, 0, "[hv] stealth map_resident: page %u failed (VA=%p)\n", page_count, (PVOID)va);
+            HYPERPLATFORM_LOG_ERROR("[hv] stealth map_resident: page %u failed (VA=%p)", page_count, (PVOID)va);
             goto rollback;
         }
 
@@ -1062,7 +1049,7 @@ ept_stealth_map_resident(PVOID target_va, SIZE_T size)
         page_count++;
     }
 
-    DbgPrintEx(0, 0, "[hv] stealth map_resident: %u pages mapped, DLL running at native speed\n",
+    HYPERPLATFORM_LOG_INFO("[hv] stealth map_resident: %u pages mapped, DLL running at native speed",
                page_count);
     return TRUE;
 

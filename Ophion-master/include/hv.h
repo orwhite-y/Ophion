@@ -25,11 +25,49 @@ PVOID  pa_to_va(UINT64 pa);
 UINT64 get_system_cr3(VOID);
 
 //
+// CR3 switch helpers for private host CR3 compatibility.
+//
+// in VMX-root with USE_PRIVATE_HOST_CR3, the host CR3 is a static snapshot
+// that doesn't map memory allocated after init (DPC stacks, other drivers, etc.)
+//
+// before accessing guest/system memory in VMX-root, switch to system CR3.
+// after done, switch back. the VMM stack is always accessible under both
+// (allocated before hostcr3_build, mapped in both private and system CR3).
+//
+// IMPORTANT: read all values from VMM stack (regs->xxx) BEFORE switching CR3.
+// the compiler may reorder reads across __writecr3 — use _mm_mfence if needed.
+//
+static __forceinline UINT64
+vmx_enter_guest_cr3(VOID)
+{
+#if USE_PRIVATE_HOST_CR3
+    UINT64 saved = __readcr3();
+    __writecr3(g_system_cr3);
+    _mm_mfence();
+    return saved;
+#else
+    return 0;
+#endif
+}
+
+static __forceinline VOID
+vmx_leave_guest_cr3(UINT64 saved)
+{
+#if USE_PRIVATE_HOST_CR3
+    _mm_mfence();
+    __writecr3(saved);
+#else
+    UNREFERENCED_PARAMETER(saved);
+#endif
+}
+
+//
 // private host page tables (hostcr3.c)
 //
 BOOLEAN hostcr3_build(VOID);
 UINT64  hostcr3_get(VOID);
 VOID    hostcr3_destroy(VOID);
+BOOLEAN hostcr3_map_va(PVOID va, SIZE_T size);
 
 //
 // private host IDT (hostidt.c)
@@ -93,15 +131,13 @@ VOID vpid_invvpid_single(UINT16 vpid);
 //   hook_type: 0 = absolute jump (14B), 1 = VMCALL (3B), 2 = INT3 (1B)
 //
 
-// public API — PASSIVE_LEVEL, issues VMCALL to all CPUs via DPC broadcast
-BOOLEAN ept_hook_function(PVOID target, PVOID proxy, PVOID * original, UINT32 hook_type);
-BOOLEAN ept_unhook_function(PVOID target);
-VOID    ept_unhook_all_broadcast(VOID);
-
 // VMX-root internal — called from VMCALL handler (guest CR3 must be active)
 BOOLEAN ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req);
 BOOLEAN ept_unhook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_UNHOOK_VMCALL_PARAM req);
 VOID    ept_unhook_all(VOID);
+
+// VMX-root safe EPT 2MB→4KB split (uses pre-allocated pool, NOT ExAllocatePool2)
+PVMM_EPT_DYNAMIC_SPLIT ept_split_large_page_pool(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 
 // VMX-root handlers — called from vmexit dispatch
 BOOLEAN ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exit_qual);
@@ -127,7 +163,12 @@ BOOLEAN ept_stealth_free_range(PVOID target_va, SIZE_T size);
 VOID    ept_stealth_free_all_broadcast(VOID);
 
 // VMX-root internal
-BOOLEAN ept_stealth_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM req);
+BOOLEAN ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM req, volatile LONG * interlock);
+
+// convenience wrapper: uses &req->installed as interlock (for Ophion internal DPC path)
+static __forceinline BOOLEAN
+ept_stealth_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM req)
+{ return ept_stealth_install_ex(vcpu, req, &req->installed); }
 BOOLEAN ept_stealth_uninstall(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_FREE_PARAM req);
 VOID    ept_stealth_free_all(VOID);
 

@@ -2,6 +2,7 @@
 *   vmexit.c - vm-exit handler dispatches exits to sub-handlers
 */
 #include "hv.h"
+#include "log.h"
 
 static __forceinline VOID
 vmexit_advance_rip(VIRTUAL_MACHINE_STATE * vcpu)
@@ -723,20 +724,24 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         case VMCALL_EPT_HOOK:
         {
             //
-            // 参数全在寄存器，和 UnrealVTDbg 完全一样:
+            // 参数全在寄存器:
             //   rdx = target_function
             //   r8  = proxy_function
             //   r9  = &origin_function (guest VA)
             //   r10 = caller_cr3
             //   r11 = hook_type
+            //   r12 = target_cr3      (0 = R0 hook, non-0 = R3 per-process)
+            //   r13 = user_trampoline (R3 executable buffer, NULL = kernel pool)
+            //   r14 = user_trampoline_pa (pre-computed PA)
             //
-            // PITFALL #2: Read values from regs (VMM stack), never dereference guest pointers directly.
-            // FIX: regs->rdx is a VALUE on VMM stack (host CR3 mapped). Dereference only after __writecr3(guest).
-            UINT64 target_va  = regs->rdx;
-            UINT64 proxy_va   = regs->r8;
-            UINT64 origin_va  = regs->r9;
-            UINT64 caller_cr3 = regs->r10;
-            UINT32 hook_type  = (UINT32)regs->r11;
+            UINT64 target_va       = regs->rdx;
+            UINT64 proxy_va        = regs->r8;
+            UINT64 origin_va       = regs->r9;
+            UINT64 caller_cr3      = regs->r10;
+            UINT32 hook_type       = (UINT32)regs->r11;
+            UINT64 target_cr3      = regs->r12;
+            UINT64 user_tramp_va   = regs->r13;
+            UINT64 user_tramp_pa   = regs->r14;
 
             if (!target_va || !caller_cr3)
             {
@@ -744,62 +749,88 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 break;
             }
 
-            //
-            // HOST_CR3 = system CR3 (不用 private host CR3)
-            // 所有内核内存直接可访问，和 VT_Driver 一样。
-            //
+            UINT64 _saved_cr3 = vmx_enter_guest_cr3();
+
             EPT_HOOK_VMCALL_PARAM local_req = {};
-            local_req.target_function = (PVOID)target_va;
-            local_req.proxy_function  = (PVOID)proxy_va;
-            local_req.hook_type       = hook_type;
+            local_req.caller_cr3         = caller_cr3;
+            local_req.target_function    = (PVOID)target_va;
+            local_req.proxy_function     = (PVOID)proxy_va;
+            local_req.hook_type          = hook_type;
+            local_req.target_cr3         = target_cr3;
+            local_req.user_trampoline    = (PVOID)user_tramp_va;
+            local_req.user_trampoline_pa = user_tramp_pa;
             if (origin_va)
                 local_req.origin_function = (PVOID *)origin_va;
 
             BOOLEAN ok = ept_hook_install(vcpu, &local_req);
 
+            vmx_leave_guest_cr3(_saved_cr3);
             regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
             break;
         }
 
         case VMCALL_EPT_UNHOOK:
         {
-            UINT64 target_va = regs->rdx;
+            UINT64 target_va  = regs->rdx;
+            UINT64 caller_cr3 = regs->r10;
             if (!target_va)
             {
                 regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
                 break;
             }
 
+            UINT64 _saved_cr3 = vmx_enter_guest_cr3();
+
+            //
+            // for R3 unhook: need caller_cr3 to resolve R3 VA → PA
+            // switch from system CR3 to caller_cr3 if provided
+            //
+            UINT64 _pre_unhook_cr3 = 0;
+            if (caller_cr3)
+            {
+                _pre_unhook_cr3 = __readcr3();
+                __writecr3(caller_cr3);
+                _mm_mfence();
+            }
+
             EPT_UNHOOK_VMCALL_PARAM local_req = {};
             local_req.target_function = (PVOID)target_va;
+            local_req.caller_cr3      = caller_cr3;
 
             BOOLEAN ok = ept_unhook_install(vcpu, &local_req);
+
+            if (_pre_unhook_cr3)
+            {
+                _mm_mfence();
+                __writecr3(_pre_unhook_cr3);
+            }
+
+            vmx_leave_guest_cr3(_saved_cr3);
             regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
             break;
         }
 
         case VMCALL_EPT_UNHOOK_ALL:
-            // PITFALL #11: ept_unhook_all must NOT call INVEPT if called after VMXOFF.
-            // FIX: ept_unhook_all() only restores PTEs + frees pool. Caller does INVEPT separately.
             ept_unhook_all();
             regs->rax = (UINT64)STATUS_SUCCESS;
             break;
 
         case VMCALL_STEALTH_ALLOC:
         {
-            //
-            // stealth memory allocation — EPT split page with hidden execute
-            // rdx = pointer to EPT_STEALTH_ALLOC_PARAM (on VMM stack via DPC)
-            //
+            UINT64 _saved_cr3 = vmx_enter_guest_cr3();
+
             PEPT_STEALTH_ALLOC_PARAM stealth_req = (PEPT_STEALTH_ALLOC_PARAM)regs->rdx;
             if (!stealth_req)
             {
+                vmx_leave_guest_cr3(_saved_cr3);
                 regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
                 break;
             }
 
-            BOOLEAN ok = ept_stealth_install(vcpu, stealth_req);
+            BOOLEAN ok = ept_stealth_install_ex(vcpu, stealth_req, &stealth_req->installed);
             stealth_req->result = ok;
+
+            vmx_leave_guest_cr3(_saved_cr3);
             regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
             break;
         }
@@ -813,170 +844,83 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 break;
             }
 
+            UINT64 _saved_cr3 = vmx_enter_guest_cr3();
             BOOLEAN ok = ept_stealth_uninstall(vcpu, free_req);
             free_req->result = ok;
+            vmx_leave_guest_cr3(_saved_cr3);
             regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
             break;
         }
 
+        case VMCALL_TEST:
+            regs->rax = (UINT64)STATUS_SUCCESS;
+            break;
+
+        case VMCALL_VMXOFF:
+        {
+            UINT64 instr_len = 0;
+            __vmx_vmread(VMCS_VMEXIT_INSTRUCTION_LENGTH, &instr_len);
+
+            vcpu->vmxoff.guest_rip = vcpu->vmexit_rip + instr_len;
+            vcpu->vmxoff.guest_rsp = (UINT64)regs->rsp;
+
+            UINT64 guest_cr3 = 0;
+            __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
+            vcpu->vmxoff.guest_cr3 = guest_cr3;
+
+            vcpu->vmxoff.executed = TRUE;
+
+            __vmx_off();
+
+            __writecr3(guest_cr3);
+
+#if USE_PRIVATE_HOST_IDT
+            if (g_host_idt.initialized)
+                asm_reload_idtr((PVOID)g_host_idt.original_idt_base, IDT_NUM_ENTRIES * sizeof(IDT_GATE_DESCRIPTOR_64) - 1);
+#endif
+
+#if USE_PRIVATE_HOST_GDT
+            if (vcpu->host_gdt)
+            {
+                PSEGMENT_DESCRIPTOR_64 tss_desc = (PSEGMENT_DESCRIPTOR_64)(
+                    vcpu->original_gdt_base + (vcpu->original_tr_selector & ~0x7));
+                tss_desc->Type = TSS_TYPE_AVAILABLE_64;
+
+                asm_reload_gdtr((PVOID)vcpu->original_gdt_base, (UINT32)vcpu->original_gdt_limit);
+                asm_reload_tr(vcpu->original_tr_selector);
+            }
+#endif
+
+            __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
+
+            regs->rax = (UINT64)STATUS_SUCCESS;
+            break;
+        }
+
         default:
-            regs->rax = 0ULL;
+            regs->rax = (UINT64)STATUS_UNSUCCESSFUL;
             break;
         }
         return;
     }
 
     //
-    // 2. not our identifier — check r10/r11/r12 signature (Ophion's own VMCALLs)
+    // not our VMCALL — try EPT hook / stealth VMCALL dispatch
     //
-    if (regs->r10 != 0x48564653ULL ||       // 'HVFS'
-        regs->r11 != 0x564d43414c4cULL ||   // 'VMCALL'
-        regs->r12 != 0x4e4f485950455256ULL)  // 'NOHYPERV'
+    if (ept_handle_vmcall_hook(vcpu))
     {
-        // signature mismatch — try EPT-hooked fake page VMCALL redirect
-        if (ept_handle_vmcall_hook(vcpu))
-        {
-            vcpu->advance_rip = FALSE;
-            return;
-        }
-
-        // try stealth page VMCALL dispatch (hidden executable memory)
-        if (ept_handle_stealth_vmcall(vcpu))
-        {
-            vcpu->advance_rip = FALSE;
-            return;
-        }
-
-        vmexit_inject_ud();
         vcpu->advance_rip = FALSE;
         return;
     }
 
-    UINT64 vmcall_num = regs->rcx;
-
-    switch (vmcall_num)
+    if (ept_handle_stealth_vmcall(vcpu))
     {
-    case VMCALL_TEST:
-        regs->rax = (UINT64)STATUS_SUCCESS;
-        break;
-
-    case VMCALL_VMXOFF:
-    {
-        UINT64 instr_len = 0;
-        __vmx_vmread(VMCS_VMEXIT_INSTRUCTION_LENGTH, &instr_len);
-
-        vcpu->vmxoff.guest_rip = vcpu->vmexit_rip + instr_len;
-        vcpu->vmxoff.guest_rsp = (UINT64)regs->rsp;
-
-        //
-        // save guest state before VMXOFF
-        //
-        UINT64 guest_cr3 = 0;
-        __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
-        vcpu->vmxoff.guest_cr3 = guest_cr3;
-
-        vcpu->vmxoff.executed = TRUE;
-
-        __vmx_off();
-
-        __writecr3(guest_cr3);
-
-#if USE_PRIVATE_HOST_IDT
-        if (g_host_idt.initialized)
-            asm_reload_idtr((PVOID)g_host_idt.original_idt_base, IDT_NUM_ENTRIES * sizeof(IDT_GATE_DESCRIPTOR_64) - 1);
-#endif
-
-#if USE_PRIVATE_HOST_GDT
-        if (vcpu->host_gdt)
-        {
-            //
-            // clear TSS busy bit before LTR, LTR on a busy TSS causes #GP
-            //
-            PSEGMENT_DESCRIPTOR_64 tss_desc = (PSEGMENT_DESCRIPTOR_64)(
-                vcpu->original_gdt_base + (vcpu->original_tr_selector & ~0x7));
-            tss_desc->Type = TSS_TYPE_AVAILABLE_64;
-
-            asm_reload_gdtr((PVOID)vcpu->original_gdt_base, (UINT32)vcpu->original_gdt_limit);
-            asm_reload_tr(vcpu->original_tr_selector);
-        }
-#endif
-
-        __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
-
-        regs->rax = (UINT64)STATUS_SUCCESS;
-        break;
+        vcpu->advance_rip = FALSE;
+        return;
     }
 
-    //
-    // EPT hook/stealth VMCALLs — DPC broadcast uses asm_vmx_vmcall which
-    // sets r10/r11/r12 signature (not rax=OPHION_VMCALL_ID). Handle them
-    // in both paths so DPC-based hooks work correctly.
-    //
-    case VMCALL_EPT_HOOK:
-    {
-        PEPT_HOOK_VMCALL_PARAM hook_req = (PEPT_HOOK_VMCALL_PARAM)regs->rdx;
-        if (!hook_req)
-        {
-            regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
-            break;
-        }
-        BOOLEAN ok = ept_hook_install(vcpu, hook_req);
-        hook_req->result = ok;
-        regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
-        break;
-    }
-
-    case VMCALL_EPT_UNHOOK:
-    {
-        PEPT_UNHOOK_VMCALL_PARAM unhook_req = (PEPT_UNHOOK_VMCALL_PARAM)regs->rdx;
-        if (!unhook_req)
-        {
-            regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
-            break;
-        }
-        BOOLEAN ok = ept_unhook_install(vcpu, unhook_req);
-        unhook_req->result = ok;
-        regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
-        break;
-    }
-
-    case VMCALL_EPT_UNHOOK_ALL:
-        ept_unhook_all();
-        regs->rax = (UINT64)STATUS_SUCCESS;
-        break;
-
-    case VMCALL_STEALTH_ALLOC:
-    {
-        PEPT_STEALTH_ALLOC_PARAM stealth_req = (PEPT_STEALTH_ALLOC_PARAM)regs->rdx;
-        if (!stealth_req)
-        {
-            regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
-            break;
-        }
-        BOOLEAN ok = ept_stealth_install(vcpu, stealth_req);
-        stealth_req->result = ok;
-        regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
-        break;
-    }
-
-    case VMCALL_STEALTH_FREE:
-    {
-        PEPT_STEALTH_FREE_PARAM free_req = (PEPT_STEALTH_FREE_PARAM)regs->rdx;
-        if (!free_req)
-        {
-            regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
-            break;
-        }
-        BOOLEAN ok = ept_stealth_uninstall(vcpu, free_req);
-        free_req->result = ok;
-        regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
-        break;
-    }
-
-    default:
-        regs->rax = (UINT64)STATUS_UNSUCCESSFUL;
-        break;
-    }
+    vmexit_inject_ud();
+    vcpu->advance_rip = FALSE;
 }
 
 VOID
@@ -1103,6 +1047,12 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     __vmx_vmread(VMCS_EXIT_REASON, &exit_raw);
     exit_reason = (UINT32)(exit_raw & 0xFFFF);
     vcpu->exit_reason = exit_reason;
+
+    //
+    // lazy per-CPU stealth setup DISABLED for now.
+    // stealth only active on the install CPU. shellcode thread must be
+    // affinity-pinned to that CPU by the caller.
+    //
 
     //
     // TSC compensation: if RDTSC exiting was armed for compensation and this

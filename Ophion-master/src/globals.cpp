@@ -13,3 +13,4 @@ volatile LONG g_host_nmi_pending[MAX_PROCESSORS] = {0};
 
 BOOLEAN g_stealth_enabled                   = STEALTH_ENABLED;
 STEALTH_CPUID_CACHE g_stealth_cpuid_cache   = {0};
+volatile LONG g_stealth_pf_intercept_needed = 0;  // set to 1 when stealth pages are installed

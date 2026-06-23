@@ -43,9 +43,11 @@ extern "C" {
 // protects host-mode from guest/anti-cheat page table corruption
 // disabled by default — enable once base hv is verified stable
 //
-// PITFALL #1: Must be 0 for EPT hooks. Private host CR3 breaks VMX-root memory access (guest VA not mapped).
-// FIX: Set to 0. VT_Driver(UnrealVTDbg) also uses system CR3 as HOST_CR3.
-#define USE_PRIVATE_HOST_CR3                0
+// Private host CR3 now works with EPT hooks:
+//   - All VMM memory (pool, stacks, EPT tables) allocated BEFORE hostcr3_build()
+//   - Guest memory access in VMX-root wrapped by vmx_enter_guest_cr3/vmx_leave_guest_cr3
+//   - Post-init allocations (stealth region) mapped via hostcr3_map_va()
+#define USE_PRIVATE_HOST_CR3                0   // TODO: re-enable after stealth inject fixed
 
 //
 // private host IDT for VMCS_HOST_IDTR_BASE
@@ -123,6 +125,7 @@ typedef struct _STEALTH_CPUID_CACHE {
 
 extern BOOLEAN              g_stealth_enabled;
 extern STEALTH_CPUID_CACHE  g_stealth_cpuid_cache;
+extern volatile LONG        g_stealth_pf_intercept_needed;
 
 VOID stealth_init_cpuid_cache(VOID);
 

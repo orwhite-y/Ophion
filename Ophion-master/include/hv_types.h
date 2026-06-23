@@ -90,6 +90,7 @@ typedef struct _EPT_HOOKED_FUNCTION_INFO {
     PUINT8      first_trampoline_address; // trampoline for calling original
     PUINT8      fake_page_contents;       // pointer to parent page's fake page
     UINT64      hook_size;                // bytes overwritten
+    BOOLEAN     user_trampoline;          // TRUE = trampoline is user-mode (don't pool_release)
 } EPT_HOOKED_FUNCTION_INFO, *PEPT_HOOKED_FUNCTION_INFO;
 
 //
@@ -105,6 +106,13 @@ typedef struct _EPT_HOOKED_PAGE_INFO {
     EPT_PML1_ENTRY   original_entry;      // saved original PTE (RW, no X)
     EPT_PML1_ENTRY   changed_entry;       // fake page PTE (X only, no RW)
     UINT32           Options;             // EPTO_HOOK_FUNCTION or EPTO_VIRTUAL_BREAKPOINT
+    //
+    // R3 hook: per-process filtering via CR3.
+    //   0 = R0 hook (all processes see the hook)
+    //   non-0 = R3 hook (only the process with this CR3 PFN sees the hook,
+    //           other processes execute original code transparently via MTF)
+    //
+    UINT64           target_cr3;
 } EPT_HOOKED_PAGE_INFO, *PEPT_HOOKED_PAGE_INFO;
 
 //
@@ -244,6 +252,7 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     // stealth #PF swap state: target + PT EPTs swapped for execution
     //
     PEPT_STEALTH_PAGE_INFO stealth_pf_swapped;
+    BOOLEAN     stealth_pf_configured;  // TRUE after this CPU's VMCS has #PF interception
 
     // per-core private host GDT for VMXOFF restore
     PVOID   host_gdt;
@@ -283,6 +292,18 @@ typedef struct _EPT_HOOK_VMCALL_PARAM {
     BOOLEAN result;               // [out]
     UINT32  error_code;           // [out] debug: 0=ok, 1=no_pa, 2=split_fail, 3=pml1_null,
                                   //   4=pool_page, 5=pool_func, 6=pool_tramp, 7=pa_fake
+    //
+    // R3 hook extensions — set target_cr3 != 0 to enable per-process EPT hook.
+    //   caller must:
+    //     1. attach to target process (KeStackAttachProcess)
+    //     2. lock target page (MmProbeAndLockPages) to pin physical page
+    //     3. allocate user-mode PAGE_EXECUTE_READWRITE trampoline buffer
+    //     4. pre-compute trampoline PA via MmGetPhysicalAddress
+    //     5. pass caller_cr3 = target process CR3
+    //
+    UINT64  target_cr3;           // [in] 0 = R0 hook, non-0 = R3 per-process (CR3 PFN)
+    PVOID   user_trampoline;      // [in] R3 executable buffer for trampoline (NULL = kernel pool)
+    UINT64  user_trampoline_pa;   // [in] pre-computed PA of user_trampoline
 } EPT_HOOK_VMCALL_PARAM, *PEPT_HOOK_VMCALL_PARAM;
 
 typedef struct _EPT_UNHOOK_VMCALL_PARAM {
@@ -361,6 +382,16 @@ typedef struct _EPT_STEALTH_ALLOC_PARAM {
     PVOID   shellcode_buffer;     // [in] if non-NULL: shellcode for THIS page's execute view
     UINT32  shellcode_size;       // [in] shellcode bytes for this page (max PAGE_SIZE)
     BOOLEAN resident;             // [in] TRUE = DLL mode: default execute view, no #PF overhead
+    //
+    // pre-computed guest PT info (filled by caller at PASSIVE/DISPATCH level).
+    // avoids pa_to_va (MmGetVirtualForPhysical) in VMX-root which can deadlock
+    // when KeGenericCallDpc puts all CPUs into VMX-root simultaneously.
+    //
+    UINT64  pt_page_pfn;          // [in] PFN of the guest PT page containing target PTE
+    UINT32  pt_pte_index;         // [in] index of target PTE within PT page (0-511)
+    PVOID   pt_page_copy;         // [in] NonPaged buffer with PT page content (4KB, caller-allocated)
+    PVOID   target_page_copy;     // [in] NonPaged buffer with target page content (4KB, for shadow copy)
+    BOOLEAN pt_precomputed;       // [in] TRUE = caller filled above fields at PASSIVE_LEVEL
     volatile LONG installed;      // [internal] 0→1 by first CPU
     BOOLEAN result;               // [out]
 } EPT_STEALTH_ALLOC_PARAM, *PEPT_STEALTH_ALLOC_PARAM;

@@ -4,19 +4,21 @@
 *   all communication via VMCALL from other kernel drivers.
 */
 #include "hv.h"
+#include "log.h"
 
 VOID
 DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
 {
     UNREFERENCED_PARAMETER(driver_obj);
-    DbgPrintEx(0, 0, "[hv] Unloading hypervisor driver...\n");
+    HYPERPLATFORM_LOG_INFO("[hv] Unloading hypervisor driver...");
 
     ept_stealth_free_all_broadcast();
     ept_stealth_region_destroy();
     broadcast_terminate_all();
     vmx_terminate();
 
-    DbgPrintEx(0, 0, "[hv] Driver unloaded.\n");
+    LogTermination();
+    HYPERPLATFORM_LOG_INFO("[hv] Driver unloaded.");
 }
 
 NTSTATUS
@@ -25,22 +27,30 @@ DriverEntry(
     _In_ PUNICODE_STRING registry_path)
 {
     UNREFERENCED_PARAMETER(registry_path);
-    DbgPrintEx(0, 0, "[hv] Ophion initializing...\n");
+
+    //
+    // init log system — buffer-based, safe for VMX-root via _SAFE macros
+    //
+    auto log_status = LogInitialization(kLogPutLevelDebug, nullptr);
+    if (log_status == STATUS_REINITIALIZATION_NEEDED)
+        LogRegisterReinitialization(driver_obj);
+
+    HYPERPLATFORM_LOG_INFO("[hv] Ophion initializing...");
 
     driver_obj->DriverUnload = DriverUnload;
 
     if (!vmx_init())
     {
-        DbgPrintEx(0, 0, "[hv] VMX initialization FAILED!\n");
+        HYPERPLATFORM_LOG_ERROR("[hv] VMX initialization FAILED!");
         vmx_terminate();
         return STATUS_HV_OPERATION_FAILED;
     }
 
     if (ept_stealth_region_init())
-        DbgPrintEx(0, 0, "[hv] Stealth region initialized.\n");
+        HYPERPLATFORM_LOG_INFO("[hv] Stealth region initialized.");
     else
-        DbgPrintEx(0, 0, "[hv] Stealth region init failed (stealth features disabled).\n");
+        HYPERPLATFORM_LOG_WARN("[hv] Stealth region init failed (stealth features disabled).");
 
-    DbgPrintEx(0, 0, "[hv] Hypervisor loaded and active on all cores!\n");
+    HYPERPLATFORM_LOG_INFO("[hv] Hypervisor loaded and active on all cores!");
     return STATUS_SUCCESS;
 }

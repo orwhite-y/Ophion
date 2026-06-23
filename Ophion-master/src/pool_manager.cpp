@@ -7,6 +7,7 @@
 *   and trampoline buffers.
 */
 #include "hv.h"
+#include "log.h"
 
 #define POOL_MAX_ENTRIES     256
 #define TRAMPOLINE_BUF_SIZE  128    // enough for overwritten instructions + abs jmp
@@ -123,7 +124,7 @@ pool_manager_init(VOID)
     {
         if (!pool_add_entry(POOL_TAG_SPLIT, sizeof(VMM_EPT_DYNAMIC_SPLIT)))
         {
-            DbgPrintEx(0, 0, "[hv] Pool: split alloc %u/%u failed\n", i, split_count);
+            HYPERPLATFORM_LOG_ERROR("[hv] Pool: split alloc %u/%u failed", i, split_count);
             return FALSE;
         }
     }
@@ -132,7 +133,7 @@ pool_manager_init(VOID)
     {
         if (!pool_add_entry(POOL_TAG_HOOKED_PAGE, sizeof(EPT_HOOKED_PAGE_INFO)))
         {
-            DbgPrintEx(0, 0, "[hv] Pool: hooked_page alloc %u failed\n", i);
+            HYPERPLATFORM_LOG_ERROR("[hv] Pool: hooked_page alloc %u failed", i);
             return FALSE;
         }
     }
@@ -141,7 +142,7 @@ pool_manager_init(VOID)
     {
         if (!pool_add_entry(POOL_TAG_HOOKED_FUNC, sizeof(EPT_HOOKED_FUNCTION_INFO)))
         {
-            DbgPrintEx(0, 0, "[hv] Pool: hooked_func alloc %u failed\n", i);
+            HYPERPLATFORM_LOG_ERROR("[hv] Pool: hooked_func alloc %u failed", i);
             return FALSE;
         }
     }
@@ -150,7 +151,7 @@ pool_manager_init(VOID)
     {
         if (!pool_add_entry(POOL_TAG_TRAMPOLINE, TRAMPOLINE_BUF_SIZE))
         {
-            DbgPrintEx(0, 0, "[hv] Pool: trampoline alloc %u failed\n", i);
+            HYPERPLATFORM_LOG_ERROR("[hv] Pool: trampoline alloc %u failed", i);
             return FALSE;
         }
     }
@@ -168,7 +169,7 @@ pool_manager_init(VOID)
     {
         if (!pool_add_entry(POOL_TAG_STEALTH_INFO, sizeof(EPT_STEALTH_PAGE_INFO)))
         {
-            DbgPrintEx(0, 0, "[hv] Pool: stealth_info alloc %u failed\n", i);
+            HYPERPLATFORM_LOG_ERROR("[hv] Pool: stealth_info alloc %u failed", i);
             return FALSE;
         }
     }
@@ -181,13 +182,13 @@ pool_manager_init(VOID)
     {
         if (!pool_add_entry(POOL_TAG_STEALTH_FAKEPT, sizeof(STEALTH_FAKE_PT)))
         {
-            DbgPrintEx(0, 0, "[hv] Pool: stealth_fakept alloc %u failed\n", i);
+            HYPERPLATFORM_LOG_ERROR("[hv] Pool: stealth_fakept alloc %u failed", i);
             return FALSE;
         }
     }
 
     g_pool_initialized = TRUE;
-    DbgPrintEx(0, 0, "[hv] Pool manager initialized\n");
+    HYPERPLATFORM_LOG_INFO("[hv] Pool manager initialized");
     return TRUE;
 }
 

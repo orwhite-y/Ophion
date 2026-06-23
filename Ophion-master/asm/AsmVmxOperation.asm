@@ -1,6 +1,8 @@
 ; asmVmxOperation.asm
 ; VMX enable, VMCALL interface
 
+OPHION_VMCALL_ID EQU 04F5048494F4E4558h   ; 'OPHIONEX'
+
 PUBLIC asm_enable_vmx
 PUBLIC asm_vmx_vmcall
 
@@ -17,27 +19,14 @@ asm_enable_vmx ENDP
 ; asm_vmx_vmcall(UINT64 vmcallNumber /*rcx*/, UINT64 param1 /*rdx*/,
 ;              UINT64 param2 /*r8*/, UINT64 param3 /*r9*/)
 ;
-; sets signature registers R10/R11/R12 so the VM-exit handler can
-; verify this VMCALL came from our code.
+; uses rax = OPHION_VMCALL_ID so the VM-exit handler dispatches via
+; the unified OPHION_VMCALL_ID path. rcx = vmcall number, rdx/r8/r9 = params.
 ; returns NTSTATUS in RAX (set by the VM-exit handler).
 
 asm_vmx_vmcall PROC
     pushfq
-
-    push    r10
-    push    r11
-    push    r12
-
-    mov     r10, 48564653h          ; 'HVFS'  — signature
-    mov     r11, 564d43414c4ch      ; 'VMCALL' — signature
-    mov     r12, 4e4f485950455256h  ; 'NOHYPERV' — signature
-
+    mov     rax, OPHION_VMCALL_ID
     vmcall
-
-    pop     r12
-    pop     r11
-    pop     r10
-
     popfq
     ret
 asm_vmx_vmcall ENDP

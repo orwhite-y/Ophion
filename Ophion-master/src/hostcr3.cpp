@@ -14,6 +14,7 @@
 *     5. set VMCS_HOST_CR3 to our private pml4 physical address
 */
 #include "hv.h"
+#include "log.h"
 
 #define PTE_PRESENT     (1ULL << 0)
 #define PTE_LARGE_PAGE  (1ULL << 7)
@@ -174,7 +175,7 @@ hostcr3_build(VOID)
     PUINT64 orig_pml4 = host_map_phys(pml4_pa);
     if (!orig_pml4)
     {
-        DbgPrintEx(0, 0, "[hv] hostcr3: failed to map PML4 at PA 0x%llx\n", pml4_pa);
+        HYPERPLATFORM_LOG_ERROR("[hv] hostcr3: failed to map PML4 at PA 0x%llx", pml4_pa);
         return FALSE;
     }
 
@@ -241,7 +242,7 @@ hostcr3_build(VOID)
         }
     }
 
-    DbgPrintEx(0, 0, "[hv] Private host CR3 built: PA=0x%llx (%u pages allocated)\n",
+    HYPERPLATFORM_LOG_INFO("[hv] Private host CR3 built: PA=0x%llx (%u pages allocated)",
                g_host_pml4_pa, g_host_pt_count);
 
     return TRUE;
@@ -251,6 +252,196 @@ UINT64
 hostcr3_get(VOID)
 {
     return g_host_pml4_pa;
+}
+
+/*
+*   map a virtual address range into the private host page tables.
+*   called at PASSIVE_LEVEL for memory allocated after hostcr3_build()
+*   (e.g., stealth contiguous region).
+*
+*   walks system page tables to find current mappings, then ensures our
+*   private page tables have matching entries. creates missing intermediate
+*   page table levels as needed.
+*/
+BOOLEAN
+hostcr3_map_va(PVOID va, SIZE_T size)
+{
+    if (!g_host_pml4_va || !size)
+        return FALSE;
+
+    UINT64 sys_cr3    = get_system_cr3();
+    UINT64 sys_pml4_pa = sys_cr3 & PTE_PFN_MASK;
+    PUINT64 sys_pml4   = host_map_phys(sys_pml4_pa);
+    if (!sys_pml4)
+        return FALSE;
+
+    UINT64 start = (UINT64)va & ~0xFFFULL;
+    UINT64 end   = ((UINT64)va + size + 0xFFF) & ~0xFFFULL;
+    UINT32 pages_mapped = 0;
+
+    for (UINT64 addr = start; addr < end; addr += PAGE_SIZE)
+    {
+        UINT32 pml4_idx = (UINT32)((addr >> 39) & 0x1FF);
+        UINT32 pdpt_idx = (UINT32)((addr >> 30) & 0x1FF);
+        UINT32 pd_idx   = (UINT32)((addr >> 21) & 0x1FF);
+        UINT32 pt_idx   = (UINT32)((addr >> 12) & 0x1FF);
+
+        // only kernel space
+        if (pml4_idx < 256)
+            continue;
+
+        //
+        // walk system page tables to find the leaf
+        //
+        if (!(sys_pml4[pml4_idx] & PTE_PRESENT))
+            continue;
+
+        // skip self-referencing entry
+        if ((sys_pml4[pml4_idx] & PTE_PFN_MASK) == sys_pml4_pa)
+            continue;
+
+        PUINT64 sys_pdpt = host_map_phys(sys_pml4[pml4_idx] & PTE_PFN_MASK);
+        if (!sys_pdpt || !(sys_pdpt[pdpt_idx] & PTE_PRESENT))
+            continue;
+
+        if (sys_pdpt[pdpt_idx] & PTE_LARGE_PAGE)
+        {
+            //
+            // 1GB large page — sync to our PDPT if stale.
+            // MmAllocateContiguousMemory may cause Windows to create new large
+            // pages after hostcr3_build(). Must update our copy to match.
+            //
+            if (!(g_host_pml4_va[pml4_idx] & PTE_PRESENT))
+            {
+                addr += (1ULL << 30) - PAGE_SIZE;
+                continue;
+            }
+            PUINT64 our_pdpt_lp = host_map_phys(g_host_pml4_va[pml4_idx] & PTE_PFN_MASK);
+            if (our_pdpt_lp && our_pdpt_lp[pdpt_idx] != sys_pdpt[pdpt_idx])
+            {
+                our_pdpt_lp[pdpt_idx] = sys_pdpt[pdpt_idx];
+                pages_mapped++;
+            }
+            addr += (1ULL << 30) - PAGE_SIZE;
+            continue;
+        }
+
+        PUINT64 sys_pd = host_map_phys(sys_pdpt[pdpt_idx] & PTE_PFN_MASK);
+        if (!sys_pd || !(sys_pd[pd_idx] & PTE_PRESENT))
+            continue;
+
+        if (sys_pd[pd_idx] & PTE_LARGE_PAGE)
+        {
+            //
+            // 2MB large page — sync to our PD if stale.
+            // common for large contiguous allocations (stealth 64MB region).
+            //
+            if (!(g_host_pml4_va[pml4_idx] & PTE_PRESENT))
+            {
+                addr += (1ULL << 21) - PAGE_SIZE;
+                continue;
+            }
+            PUINT64 _our_pdpt = host_map_phys(g_host_pml4_va[pml4_idx] & PTE_PFN_MASK);
+            if (!_our_pdpt || !(_our_pdpt[pdpt_idx] & PTE_PRESENT) || (_our_pdpt[pdpt_idx] & PTE_LARGE_PAGE))
+            {
+                addr += (1ULL << 21) - PAGE_SIZE;
+                continue;
+            }
+            PUINT64 _our_pd = host_map_phys(_our_pdpt[pdpt_idx] & PTE_PFN_MASK);
+            if (_our_pd && _our_pd[pd_idx] != sys_pd[pd_idx])
+            {
+                _our_pd[pd_idx] = sys_pd[pd_idx];
+                pages_mapped++;
+            }
+            addr += (1ULL << 21) - PAGE_SIZE;
+            continue;
+        }
+
+        PUINT64 sys_pt = host_map_phys(sys_pd[pd_idx] & PTE_PFN_MASK);
+        if (!sys_pt || !(sys_pt[pt_idx] & PTE_PRESENT))
+            continue;
+
+        //
+        // walk our private page tables, creating missing levels
+        //
+
+        // PML4 — kernel entries deep-copied at build time, should exist
+        if (!(g_host_pml4_va[pml4_idx] & PTE_PRESENT))
+        {
+            PUINT64 our_pdpt = (PUINT64)host_alloc_page();
+            if (!our_pdpt)
+                return FALSE;
+            g_host_pml4_va[pml4_idx] = (sys_pml4[pml4_idx] & ~PTE_PFN_MASK) | va_to_pa(our_pdpt);
+        }
+
+        PUINT64 our_pdpt = host_map_phys(g_host_pml4_va[pml4_idx] & PTE_PFN_MASK);
+        if (!our_pdpt)
+            continue;
+
+        // PDPT
+        if (our_pdpt[pdpt_idx] & PTE_LARGE_PAGE)
+        {
+            addr += (1ULL << 30) - PAGE_SIZE;
+            continue;
+        }
+        if (!(our_pdpt[pdpt_idx] & PTE_PRESENT))
+        {
+            //
+            // clone the entire PD from system (gets all sibling 2MB entries + PTs)
+            //
+            PUINT64 cloned_pd = host_clone_pd(sys_pd);
+            if (!cloned_pd)
+                continue;
+            our_pdpt[pdpt_idx] = (sys_pdpt[pdpt_idx] & ~PTE_PFN_MASK) | va_to_pa(cloned_pd);
+            // cloned PD includes all PT entries for this 1GB range — skip ahead
+            addr += (1ULL << 30) - PAGE_SIZE;
+            continue;
+        }
+
+        PUINT64 our_pd = host_map_phys(our_pdpt[pdpt_idx] & PTE_PFN_MASK);
+        if (!our_pd)
+            continue;
+
+        // PD
+        if (our_pd[pd_idx] & PTE_LARGE_PAGE)
+        {
+            addr += (1ULL << 21) - PAGE_SIZE;
+            continue;
+        }
+        if (!(our_pd[pd_idx] & PTE_PRESENT))
+        {
+            //
+            // clone the entire PT from system (gets all sibling 4KB entries)
+            //
+            PUINT64 cloned_pt = host_clone_pt(sys_pt);
+            if (!cloned_pt)
+                continue;
+            our_pd[pd_idx] = (sys_pd[pd_idx] & ~PTE_PFN_MASK) | va_to_pa(cloned_pt);
+            addr += (1ULL << 21) - PAGE_SIZE;
+            continue;
+        }
+
+        PUINT64 our_pt = host_map_phys(our_pd[pd_idx] & PTE_PFN_MASK);
+        if (!our_pt)
+            continue;
+
+        //
+        // leaf PTE — copy from system if ours is stale/missing
+        //
+        if (our_pt[pt_idx] != sys_pt[pt_idx])
+        {
+            our_pt[pt_idx] = sys_pt[pt_idx];
+            pages_mapped++;
+        }
+    }
+
+    if (pages_mapped)
+    {
+        HYPERPLATFORM_LOG_INFO("[hv] hostcr3_map_va: mapped %u pages for VA %p (size 0x%llx)",
+                   pages_mapped, va, (UINT64)size);
+    }
+
+    return TRUE;
 }
 
 VOID

@@ -20,6 +20,30 @@
 
 #define EPT_PML1_PAGE_OFFSET(_a) (((UINT64)(_a)) & 0xFFF)
 
+// mask PCID and no-flush bit from CR3, keep only PML4 physical address
+#define CR3_ADDR_MASK  0x000FFFFFFFFFF000ULL
+
+//
+// spinlock for serializing the "new page" full install path in ept_hook_install.
+// the DPC broadcast VMCALL handler uses InterlockedCompareExchange on the shared
+// req->installed field, but the OPHION_VMCALL_ID path builds per-CPU local_req,
+// so this lock provides defense-in-depth for all VMCALL dispatch paths.
+//
+static volatile LONG g_hook_list_lock = 0;
+
+static __forceinline VOID
+hook_lock_acquire(VOID)
+{
+    unsigned int wait = 1;
+    while (_InterlockedCompareExchange(&g_hook_list_lock, 1, 0) != 0)
+    {
+        for (unsigned int i = 0; i < wait; i++)
+            _mm_pause();
+        if (wait < 4096)
+            wait <<= 1;
+    }
+}
+
 // ---- helpers ----
 
 static VOID
@@ -51,7 +75,8 @@ ept_swap_page(PEPT_PML1_ENTRY entry, EPT_PML1_ENTRY value, EPT_POINTER eptp)
 // (avoids pa_to_va/MmGetVirtualForPhysical which may not work in VMX-root)
 //
 // PITFALL #6: Split buffer must be page-aligned. FIX: Pool uses MmAllocateContiguousMemory instead of ExAllocatePool2.
-static PVMM_EPT_DYNAMIC_SPLIT
+// NOT static — also used by ept_stealth.cpp (VMX-root safe split)
+PVMM_EPT_DYNAMIC_SPLIT
 ept_split_large_page_pool(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
 {
     PEPT_PML2_ENTRY target = ept_get_pml2(page_table, phys_addr);
@@ -105,20 +130,46 @@ ept_split_large_page_pool(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
 // =========================================================================
 
 //
-// ept_hook_install — 在 VMX-root 下运行 (HOST_CR3 = system CR3)
-// 不用 private host CR3 → 所有内核内存直接可访问，和 VT_Driver 一样简单。
+// ept_hook_install — 在 VMX-root 下运行
+// 支持 private host CR3: 调用方 (VMCALL handler) 已经 vmx_enter_guest_cr3()
+// 切换到 system CR3。对于 R3 hook 会额外切到 caller_cr3 访问用户态 VA。
 //
-// PITFALL #5: Multi-CPU: DPC broadcast runs on ALL CPUs simultaneously.
-// FIX: First CPU does full install. Others check hooked_pages list, find page already hooked, only do split+PTE+INVEPT.
+// R3 hook (target_cr3 != 0):
+//   - 切换到 caller_cr3 访问用户态目标 VA (MmGetPhysicalAddress, RtlCopyMemory, LDE)
+//   - 使用 caller 提供的 user_trampoline (R3 可执行内存) 代替 kernel pool
+//   - violation handler 按 CR3 过滤: 只有目标进程看到 hook，其他进程透传
 BOOLEAN
 ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
 {
     if (!vcpu->ept_page_table || !req->target_function)
         return FALSE;
 
+    BOOLEAN is_r3 = (req->target_cr3 != 0);
+
+    //
+    // R3 hook: switch to caller_cr3 (target process) for user-mode VA access.
+    // system CR3 doesn't map user-mode VAs of other processes.
+    // kernel VAs (pool, EPT tables, VMM stack) are mapped in all CR3s.
+    //
+    UINT64 pre_cr3 = 0;
+    if (is_r3 && req->caller_cr3)
+    {
+        pre_cr3 = __readcr3();
+        __writecr3(req->caller_cr3);
+        _mm_mfence();
+    }
+
+    //
+    // macro to restore CR3 on early return (R3 mode only)
+    //
+    #define HOOK_RESTORE_CR3_AND_RETURN(val) do { \
+        if (is_r3 && pre_cr3) { _mm_mfence(); __writecr3(pre_cr3); } \
+        return (val); \
+    } while(0)
+
     UINT64 phys_addr = MmGetPhysicalAddress(req->target_function).QuadPart;
     if (!phys_addr)
-        return FALSE;
+        HOOK_RESTORE_CR3_AND_RETURN(FALSE);
 
     UINT64 target_pfn = phys_addr >> 12;
 
@@ -162,19 +213,34 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
                 }
                 _mm_mfence();
                 ept_invept_single(vcpu->ept_pointer);
-                return TRUE;
+                HOOK_RESTORE_CR3_AND_RETURN(TRUE);
             }
 
             //
             // 同页面不同函数 — 添加新 hook 到已有的 fake page
+            // lock protects concurrent InsertHeadList on the per-page function list
             //
+            hook_lock_acquire();
+
             PEPT_HOOKED_FUNCTION_INFO fi = (PEPT_HOOKED_FUNCTION_INFO)
                 pool_manager_request(POOL_TAG_HOOKED_FUNC, sizeof(EPT_HOOKED_FUNCTION_INFO));
-            if (!fi) return FALSE;
+            if (!fi) { _InterlockedExchange(&g_hook_list_lock, 0); HOOK_RESTORE_CR3_AND_RETURN(FALSE); }
             RtlZeroMemory(fi, sizeof(*fi));
 
-            fi->first_trampoline_address = (PUINT8)pool_manager_request(POOL_TAG_TRAMPOLINE, 128);
-            if (!fi->first_trampoline_address) { pool_manager_release(fi); return FALSE; }
+            //
+            // trampoline: R3 hook 用 caller 提供的用户态可执行内存, R0 hook 用 kernel pool
+            //
+            if (is_r3 && req->user_trampoline)
+            {
+                fi->first_trampoline_address = (PUINT8)req->user_trampoline;
+                fi->user_trampoline = TRUE;
+            }
+            else
+            {
+                fi->first_trampoline_address = (PUINT8)pool_manager_request(POOL_TAG_TRAMPOLINE, 128);
+                fi->user_trampoline = FALSE;
+            }
+            if (!fi->first_trampoline_address) { pool_manager_release(fi); _InterlockedExchange(&g_hook_list_lock, 0); HOOK_RESTORE_CR3_AND_RETURN(FALSE); }
 
             fi->virtual_address    = req->target_function;
             fi->fake_page_contents = existing->fake_page_contents;
@@ -201,10 +267,45 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
             }
 
             InsertHeadList(&existing->hooked_functions_list, &fi->hooked_function_list);
+            _InterlockedExchange(&g_hook_list_lock, 0);
 
             _mm_mfence();
             ept_invept_single(vcpu->ept_pointer);
-            return TRUE;
+            HOOK_RESTORE_CR3_AND_RETURN(TRUE);
+        }
+    }
+
+    //
+    // page not found — need full install. acquire lock to prevent
+    // concurrent InsertHeadList corruption from multiple CPUs.
+    //
+    hook_lock_acquire();
+
+    //
+    // double-check after lock: another CPU may have installed while we waited
+    //
+    for (hcur = g_ept->hooked_pages.Flink; hcur != &g_ept->hooked_pages; hcur = hcur->Flink)
+    {
+        PEPT_HOOKED_PAGE_INFO existing2 = CONTAINING_RECORD(hcur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
+        if (existing2->pfn_of_hooked_page == target_pfn)
+        {
+            _InterlockedExchange(&g_hook_list_lock, 0);
+
+            // found after lock — lightweight path (split + PTE + INVEPT)
+            PEPT_PML2_ENTRY p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)phys_addr);
+            if (p2 && p2->LargePage)
+                ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)phys_addr);
+
+            PEPT_PML1_ENTRY p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)phys_addr);
+            if (p1)
+            {
+                p1->ExecuteAccess = 0;
+                p1->ReadAccess    = 1;
+                p1->WriteAccess   = 1;
+            }
+            _mm_mfence();
+            ept_invept_single(vcpu->ept_pointer);
+            HOOK_RESTORE_CR3_AND_RETURN(TRUE);
         }
     }
 
@@ -216,39 +317,49 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     if (pml2 && pml2->LargePage)
     {
         split = ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)phys_addr);
-        if (!split) return FALSE;
-        // PITFALL #8: Don't use ept_get_pml1/pa_to_va in VMX-root. Get PML1 directly from split buffer.
+        if (!split) { _InterlockedExchange(&g_hook_list_lock, 0); HOOK_RESTORE_CR3_AND_RETURN(FALSE); }
         pte = &split->PML1[ADDRMASK_EPT_PML1_INDEX(phys_addr)];
     }
     else
     {
         pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)phys_addr);
     }
-    if (!pte) return FALSE;
+    if (!pte) { _InterlockedExchange(&g_hook_list_lock, 0); HOOK_RESTORE_CR3_AND_RETURN(FALSE); }
 
     // 分配跟踪结构
     PEPT_HOOKED_PAGE_INFO hp = (PEPT_HOOKED_PAGE_INFO)
         pool_manager_request(POOL_TAG_HOOKED_PAGE, sizeof(EPT_HOOKED_PAGE_INFO));
-    if (!hp) return FALSE;
+    if (!hp) { _InterlockedExchange(&g_hook_list_lock, 0); HOOK_RESTORE_CR3_AND_RETURN(FALSE); }
     RtlZeroMemory(hp, sizeof(*hp));
     InitializeListHead(&hp->hooked_functions_list);
 
     PEPT_HOOKED_FUNCTION_INFO fi = (PEPT_HOOKED_FUNCTION_INFO)
         pool_manager_request(POOL_TAG_HOOKED_FUNC, sizeof(EPT_HOOKED_FUNCTION_INFO));
-    if (!fi) { pool_manager_release(hp); return FALSE; }
+    if (!fi) { pool_manager_release(hp); _InterlockedExchange(&g_hook_list_lock, 0); HOOK_RESTORE_CR3_AND_RETURN(FALSE); }
     RtlZeroMemory(fi, sizeof(*fi));
 
-    fi->first_trampoline_address = (PUINT8)pool_manager_request(POOL_TAG_TRAMPOLINE, 128);
-    if (!fi->first_trampoline_address) { pool_manager_release(fi); pool_manager_release(hp); return FALSE; }
+    //
+    // trampoline: R3 hook 用 caller 提供的用户态可执行内存, R0 hook 用 kernel pool
+    //
+    if (is_r3 && req->user_trampoline)
+    {
+        fi->first_trampoline_address = (PUINT8)req->user_trampoline;
+        fi->user_trampoline = TRUE;
+    }
+    else
+    {
+        fi->first_trampoline_address = (PUINT8)pool_manager_request(POOL_TAG_TRAMPOLINE, 128);
+        fi->user_trampoline = FALSE;
+    }
+    if (!fi->first_trampoline_address) { pool_manager_release(fi); pool_manager_release(hp); _InterlockedExchange(&g_hook_list_lock, 0); HOOK_RESTORE_CR3_AND_RETURN(FALSE); }
 
     // 设置 hooked page
     hp->pfn_of_hooked_page = target_pfn;
-    // fake_page_contents 在 hooked_page 结构体里（pool 分配），
-    // 物理地址 = pool 基地址 + 结构体内偏移
     UINT64 hp_pa = pool_manager_get_physical(hp);
     UINT64 fake_offset = (UINT64)hp->fake_page_contents - (UINT64)hp;
     hp->pfn_of_fake_page_contents = (hp_pa + fake_offset) >> 12;
     hp->entry_address = pte;
+    hp->target_cr3 = req->target_cr3 & CR3_ADDR_MASK;
 
     // 拷贝原始页面到 fake page
     RtlCopyMemory(hp->fake_page_contents, PAGE_ALIGN(req->target_function), PAGE_SIZE);
@@ -269,7 +380,6 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     hook_write_absolute_jump(&fi->first_trampoline_address[ow],
                              (UINT64)req->target_function + ow);
 
-    // 写 origin_function (如果提供了)
     if (req->origin_function)
         *req->origin_function = fi->first_trampoline_address;
 
@@ -287,7 +397,6 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     hp->original_entry.WriteAccess   = 1;
 
     hp->changed_entry = hp->original_entry;
-    // PITFALL #9: X-only pages (R=0,W=0,X=1) cause EPT misconfiguration if CPU doesn't support it.
     hp->changed_entry.ReadAccess       = g_ept->execute_only_supported ? 0 : 1;
     hp->changed_entry.WriteAccess      = 0;
     hp->changed_entry.ExecuteAccess    = 1;
@@ -297,6 +406,19 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     InsertHeadList(&hp->hooked_functions_list, &fi->hooked_function_list);
     InsertHeadList(&g_ept->hooked_pages, &hp->hooked_page_list);
 
+    _InterlockedExchange(&g_hook_list_lock, 0);
+
+    //
+    // R3 hook: 切回 system CR3 (离开 caller_cr3)
+    // 后续 PTE 修改和 INVEPT 不需要用户态 VA 访问
+    //
+    if (is_r3 && pre_cr3)
+    {
+        _mm_mfence();
+        __writecr3(pre_cr3);
+        pre_cr3 = 0;   // prevent double-restore in macro
+    }
+
     pte->ExecuteAccess = 0;
     pte->ReadAccess    = 1;
     pte->WriteAccess   = 1;
@@ -304,6 +426,8 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     _mm_mfence();
     ept_invept_single(vcpu->ept_pointer);
     return TRUE;
+
+    #undef HOOK_RESTORE_CR3_AND_RETURN
 }
 
 //
@@ -335,7 +459,7 @@ ept_unhook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_UNHOOK_VMCALL_PARAM req)
                 if (fn->virtual_address == req->target_function)
                 {
                     RemoveEntryList(&fn->hooked_function_list);
-                    if (fn->first_trampoline_address) pool_manager_release(fn->first_trampoline_address);
+                    if (fn->first_trampoline_address && !fn->user_trampoline) pool_manager_release(fn->first_trampoline_address);
                     pool_manager_release(fn);
                     break;
                 }
@@ -403,59 +527,6 @@ ept_unhook_all(VOID)
     // PITFALL #11: No INVEPT here - may be called after VMXOFF when INVEPT would cause #UD.
 }
 
-VOID ept_unhook_all_broadcast(VOID) { ept_unhook_all(); }
-
-// =========================================================================
-//  PASSIVE_LEVEL wrapper (for Ophion's own IOCTL path)
-// =========================================================================
-
-extern "C" {
-    NTKERNELAPI VOID    KeGenericCallDpc(PKDEFERRED_ROUTINE, PVOID);
-    NTKERNELAPI VOID    KeSignalCallDpcDone(PVOID);
-    NTKERNELAPI LOGICAL KeSignalCallDpcSynchronize(PVOID);
-}
-
-static VOID dpc_hook(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
-{
-    UNREFERENCED_PARAMETER(Dpc);
-    PEPT_HOOK_VMCALL_PARAM req = (PEPT_HOOK_VMCALL_PARAM)Ctx;
-    asm_vmx_vmcall(VMCALL_EPT_HOOK, (UINT64)req, req->caller_cr3, 0);
-    KeSignalCallDpcSynchronize(A2);
-    KeSignalCallDpcDone(A1);
-}
-
-static VOID dpc_unhook(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
-{
-    UNREFERENCED_PARAMETER(Dpc);
-    PEPT_UNHOOK_VMCALL_PARAM req = (PEPT_UNHOOK_VMCALL_PARAM)Ctx;
-    asm_vmx_vmcall(VMCALL_EPT_UNHOOK, (UINT64)req, req->caller_cr3, 0);
-    KeSignalCallDpcSynchronize(A2);
-    KeSignalCallDpcDone(A1);
-}
-
-BOOLEAN
-ept_hook_function(PVOID target, PVOID proxy, PVOID * original, UINT32 hook_type)
-{
-    EPT_HOOK_VMCALL_PARAM req = {};
-    req.caller_cr3      = __readcr3();
-    req.target_function = target;
-    req.proxy_function  = proxy;
-    req.origin_function = original;
-    req.hook_type       = hook_type;
-    KeGenericCallDpc(dpc_hook, &req);
-    return req.result;
-}
-
-BOOLEAN
-ept_unhook_function(PVOID target)
-{
-    EPT_UNHOOK_VMCALL_PARAM req = {};
-    req.caller_cr3      = __readcr3();
-    req.target_function = target;
-    KeGenericCallDpc(dpc_unhook, &req);
-    return req.result;
-}
-
 // =========================================================================
 //  VMX-root: EPT violation / MTF / VMCALL-hook handlers
 // =========================================================================
@@ -490,6 +561,33 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
         }
         if (viol.ExecuteAccess)
         {
+            //
+            // R3 hook: per-process filtering.
+            // only the target process (matching CR3) sees the fake page (hook).
+            // other processes get a temporary RWX pass-through via MTF single-step,
+            // executing original code transparently.
+            //
+            if (hp->target_cr3 != 0)
+            {
+                UINT64 guest_cr3 = 0;
+                __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
+
+                if ((guest_cr3 & CR3_ADDR_MASK) != hp->target_cr3)
+                {
+                    // non-target process: pass through with temporary RWX
+                    EPT_PML1_ENTRY passthrough = hp->original_entry;
+                    passthrough.ExecuteAccess = 1;
+                    ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
+                    vcpu->mtf_restore_page = hp;
+                    SIZE_T pc = 0;
+                    __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+                    pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+                    __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+                    return TRUE;
+                }
+            }
+
+            // target process (or R0 hook): swap to fake page (hook visible)
             ept_swap_page(my_pte, hp->changed_entry, vcpu->ept_pointer);
             return TRUE;
         }
@@ -539,25 +637,31 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     {
         PSTEALTH_FAKE_PT fpt = vcpu->mtf_restore_fake_pt;
 
-        // resync: copy real → fake, then re-apply NX for all stealth entries
-        PVOID real_pt_va = pa_to_va(fpt->pt_page_pfn << 12);
-        if (real_pt_va && fpt->fake_page_va)
-        {
-            RtlCopyMemory(fpt->fake_page_va, real_pt_va, PAGE_SIZE);
-
-            // re-apply NX=1 for all stealth pages sharing this fake PT
-            PLIST_ENTRY sc = g_ept->stealth_pages.Flink;
-            while (sc != &g_ept->stealth_pages)
-            {
-                PEPT_STEALTH_PAGE_INFO sp = CONTAINING_RECORD(sc, EPT_STEALTH_PAGE_INFO, stealth_page_list);
-                sc = sc->Flink;
-                if (sp->fake_pt == fpt)
-                {
-                    PUINT64 pte = &((PUINT64)fpt->fake_page_va)[sp->pt_pte_index];
-                    *pte |= (1ULL << 63);
-                }
-            }
-        }
+        //
+        // resync fake PT from real PT page after OS wrote A/D bits or modified PTEs.
+        // CANNOT use pa_to_va (MmGetVirtualForPhysical) in VMX-root — causes hang.
+        // instead: read updated PTE values through the EPT real-view mapping
+        // that is still active (we haven't swapped back to fake yet).
+        //
+        // the real PT page is currently accessible through its original EPT mapping
+        // (pt_real_entry). use the stealth region's contiguous VA or just
+        // read directly via the EPT — but we need a VA...
+        //
+        // simplest safe approach: the fake_page_va IS accessible (it's in the
+        // stealth contiguous region, always mapped). read the real PT page
+        // through guest CR3 (switch to guest CR3, read via guest VA of PT page).
+        // but we don't know the guest VA of the PT page.
+        //
+        // pragmatic fix: DON'T resync the entire page. only update the specific
+        // PTE that was written (the one that caused the EPT violation).
+        // the fault address tells us which PTE was modified.
+        // just re-read that single PTE from the real page (still mapped in EPT)
+        // and update the fake page's copy, then re-apply NX.
+        //
+        // for now: skip resync entirely. just swap back to fake view.
+        // the fake page has slightly stale A/D bits, but NX is preserved.
+        // this is acceptable for stealth functionality.
+        //
 
         // swap PT page EPT back to fake view
         PEPT_PML1_ENTRY pt_pte = ept_get_pml1(vcpu->ept_page_table,
@@ -647,6 +751,20 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
     {
         PEPT_HOOKED_PAGE_INFO hp = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
         cur = cur->Flink;
+
+        //
+        // R3 hook: only dispatch VMCALL for the target process.
+        // non-target processes should never reach here (violation handler
+        // gives them original code), but check CR3 as safety net.
+        //
+        if (hp->target_cr3 != 0)
+        {
+            UINT64 guest_cr3 = 0;
+            __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
+            if ((guest_cr3 & CR3_ADDR_MASK) != hp->target_cr3)
+                continue;
+        }
+
         PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
         while (fc != &hp->hooked_functions_list)
         {

@@ -54,4 +54,24 @@ hv_vmcall_ex PROC
     ret
 hv_vmcall_ex ENDP
 
+;
+; simple 4-param vmcall (like Ophion's asm_vmx_vmcall).
+; no push/pop of r12-r15, no stack parameter loading.
+; avoids register pressure issues that corrupt DPC A1/A2.
+;
+; bool hv_vmcall_simple(
+;     u64 vmcall_reason,   ; rcx
+;     u64 param1,          ; rdx
+;     u64 param2,          ; r8
+;     u64 param3           ; r9
+; )
+;
+hv_vmcall_simple PROC
+    pushfq
+    mov     rax, OPHION_VMCALL_ID
+    vmcall
+    popfq
+    ret
+hv_vmcall_simple ENDP
+
 END

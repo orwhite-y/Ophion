@@ -19,6 +19,36 @@
 #include <ntifs.h>
 #include <ntddk.h>
 #include <intrin.h>
+#include <ntimage.h>
+
+// ---- undocumented PEB structures for user-mode module walk ----
+
+extern "C" NTKERNELAPI PPEB PsGetProcessPeb(PEPROCESS Process);
+
+typedef struct _TD_UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWCH   Buffer;
+} TD_UNICODE_STRING;
+
+typedef struct _TD_LDR_ENTRY {
+    LIST_ENTRY InLoadOrderLinks;
+    LIST_ENTRY InMemoryOrderLinks;
+    LIST_ENTRY InInitializationOrderLinks;
+    PVOID      DllBase;
+    PVOID      EntryPoint;
+    ULONG      SizeOfImage;
+    TD_UNICODE_STRING FullDllName;
+    TD_UNICODE_STRING BaseDllName;
+} TD_LDR_ENTRY;
+
+typedef struct _TD_PEB_LDR_DATA {
+    ULONG      Length;
+    BOOLEAN    Initialized;
+    PVOID      SsHandle;
+    LIST_ENTRY InLoadOrderModuleList;
+    LIST_ENTRY InMemoryOrderModuleList;
+} TD_PEB_LDR_DATA;
 
 // ---- VMCALL interface (must match Ophion hv_types.h) ----
 
@@ -37,18 +67,78 @@ typedef struct _TD_STEALTH_PARAM {
     PVOID   shellcode_buffer;
     UINT32  shellcode_size;
     BOOLEAN resident;
+    //
+    // pre-computed guest PT info (filled at PASSIVE/DISPATCH level).
+    // avoids MmGetVirtualForPhysical (pa_to_va) in VMX-root which deadlocks
+    // when KeGenericCallDpc puts all CPUs into VMX-root simultaneously.
+    //
+    UINT64  pt_page_pfn;        // PFN of guest PT page containing target PTE
+    UINT32  pt_pte_index;       // index within PT page (0-511)
+    PVOID   pt_page_copy;       // NonPaged buffer with PT page content (4KB)
+    PVOID   target_page_copy;   // NonPaged buffer with target page content (4KB)
+    BOOLEAN pt_precomputed;     // TRUE = caller filled above fields at PASSIVE_LEVEL
     volatile LONG installed;
     BOOLEAN result;
 } TD_STEALTH_PARAM;
 #pragma pack(pop)
 
+#define PFN_MASK_  0x000FFFFFFFFFF000ULL
+
+//
+// walk guest page tables at PASSIVE/DISPATCH level (safe, no VMX-root).
+// returns FALSE if the VA is not mapped or uses large pages.
+//
+static BOOLEAN
+TdResolveGuestPT(UINT64 cr3, UINT64 va, UINT64 * out_pt_pfn, UINT32 * out_pte_idx)
+{
+    PHYSICAL_ADDRESS pa;
+    PUINT64 table;
+
+    // PML4
+    pa.QuadPart = (LONGLONG)(cr3 & PFN_MASK_);
+    table = (PUINT64)MmGetVirtualForPhysical(pa);
+    if (!table) return FALSE;
+    UINT64 pml4e = table[(va >> 39) & 0x1FF];
+    if (!(pml4e & 1)) return FALSE;
+
+    // PDPT
+    pa.QuadPart = (LONGLONG)(pml4e & PFN_MASK_);
+    table = (PUINT64)MmGetVirtualForPhysical(pa);
+    if (!table) return FALSE;
+    UINT64 pdpe = table[(va >> 30) & 0x1FF];
+    if (!(pdpe & 1) || (pdpe & (1ULL << 7))) return FALSE;  // 1GB page
+
+    // PD
+    pa.QuadPart = (LONGLONG)(pdpe & PFN_MASK_);
+    table = (PUINT64)MmGetVirtualForPhysical(pa);
+    if (!table) return FALSE;
+    UINT64 pde = table[(va >> 21) & 0x1FF];
+    if (!(pde & 1) || (pde & (1ULL << 7))) return FALSE;  // 2MB page
+
+    *out_pt_pfn  = (pde & PFN_MASK_) >> 12;
+    *out_pte_idx = (UINT32)((va >> 12) & 0x1FF);
+    return TRUE;
+}
+
 // ---- assembly VMCALL (vmcall.asm) ----
 
 extern "C" {
+    NTSYSCALLAPI NTSTATUS NTAPI RtlCreateUserThread(
+        HANDLE ProcessHandle, PSECURITY_DESCRIPTOR SecurityDescriptor,
+        BOOLEAN CreateSuspended, ULONG StackZeroBits,
+        SIZE_T StackReserve, SIZE_T StackCommit,
+        PVOID StartAddress, PVOID Parameter,
+        PHANDLE ThreadHandle, PCLIENT_ID ClientId);
+
     NTSTATUS hv_vmcall_ex(
         UINT64 vmcall_reason, UINT64 param1, UINT64 param2, UINT64 param3,
         UINT64 param4, UINT64 param5, UINT64 param6,
         UINT64 param7, UINT64 param8, UINT64 param9);
+
+    // simple 4-param vmcall — no r12-r15 push/pop, no stack args.
+    // safe for DPC callbacks (doesn't clobber A1/A2 save slots).
+    NTSTATUS hv_vmcall_simple(
+        UINT64 vmcall_reason, UINT64 param1, UINT64 param2, UINT64 param3);
 
     NTKERNELAPI VOID    KeGenericCallDpc(PKDEFERRED_ROUTINE, PVOID);
     NTKERNELAPI VOID    KeSignalCallDpcDone(PVOID);
@@ -57,11 +147,17 @@ extern "C" {
 
 // ---- undocumented API ----
 
+#define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001
+
 typedef NTSTATUS (NTAPI * fn_ZwCreateThreadEx)(
     PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, HANDLE,
     PVOID, PVOID, ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID);
 
+
+typedef NTSTATUS (NTAPI * fn_ZwResumeThread)(HANDLE, PULONG);
+
 static fn_ZwCreateThreadEx g_pZwCreateThreadEx = NULL;
+static fn_ZwResumeThread   g_pZwResumeThread   = NULL;
 
 // ---- device / IOCTL ----
 
@@ -70,6 +166,10 @@ static fn_ZwCreateThreadEx g_pZwCreateThreadEx = NULL;
 
 #define TD_IOCTL_BASE   0x900
 #define IOCTL_INJECT    CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 0, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_EPT_HOOK    CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 1, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_EPT_UNHOOK  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 2, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_EPT_HOOK_R3 CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 3, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_EPT_UNHOOK_R3 CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 4, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #pragma pack(push, 8)
 typedef struct _TD_INJECT_PARAMS {
@@ -78,6 +178,24 @@ typedef struct _TD_INJECT_PARAMS {
     UINT64 shellcode_va;    // [out]
     UINT64 actual_size;     // [out]
 } TD_INJECT_PARAMS;
+
+//
+// R3 EPT hook params — from user-mode app via DeviceIoControl
+//
+typedef struct _TD_R3_HOOK_PARAMS {
+    UINT64 target_pid;          // [in]  target process PID
+    UINT64 target_function_va;  // [in]  R3 VA to hook (e.g. NtCreateFile in ntdll)
+    UINT64 proxy_function_va;   // [in]  R3 VA of proxy function in target process
+    UINT64 hook_type;           // [in]  0=abs jmp, 1=VMCALL, 2=INT3
+    UINT64 trampoline_va;       // [out] receives trampoline VA (R3, callable)
+    UINT64 status;              // [out] NTSTATUS
+} TD_R3_HOOK_PARAMS;
+
+typedef struct _TD_R3_UNHOOK_PARAMS {
+    UINT64 target_pid;          // [in]
+    UINT64 target_function_va;  // [in]  same VA passed to hook
+    UINT64 status;              // [out]
+} TD_R3_UNHOOK_PARAMS;
 #pragma pack(pop)
 
 // ---- MessageBoxA shellcode (x64 PIC) ----
@@ -111,154 +229,157 @@ typedef struct _TD_INJECT_PARAMS {
 //   (see byte array below — hand-assembled and verified)
 //
 
-static const UINT8 g_msgbox_shellcode[] = {
-    // ===== prologue =====
-    0x48, 0x83, 0xEC, 0x28,                                     // sub rsp, 28h
+// ---- Data-driven shellcode ----
+// The kernel driver resolves all addresses at PASSIVE_LEVEL and writes
+// them into a data block at the start of the page. The shellcode stub
+// just reads from that block and calls the functions. Zero PEB walking.
+//
+// Page layout:
+//   +0x000: shellcode stub (tiny)
+//   +0x100: UINT64  pLoadLibraryA
+//   +0x108: UINT64  pGetProcAddress
+//   +0x110: char    "user32.dll\0"
+//   +0x120: char    "MessageBoxA\0"
+//   +0x130: char    "Ophion Stealth!\0"
+//   +0x140: char    "Ophion\0"
+//
 
-    // ===== PEB → kernel32 base → rbx =====
-    0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00,      // mov rax, gs:[60h]
-    0x48, 0x8B, 0x40, 0x18,                                     // mov rax, [rax+18h]
-    0x48, 0x8B, 0x40, 0x20,                                     // mov rax, [rax+20h]
-    0x48, 0x8B, 0x00,                                           // mov rax, [rax]
-    0x48, 0x8B, 0x00,                                           // mov rax, [rax]
-    0x48, 0x8B, 0x58, 0x20,                                     // mov rbx, [rax+20h]
+// stub: reads function pointers from data area, calls MessageBoxA
+static const UINT8 g_shellcode_stub[] = {
+    0x48, 0x83, 0xEC, 0x28,                         // sub rsp, 28h         ; align stack
+    0x48, 0x8D, 0x2D, 0xF5, 0x00, 0x00, 0x00,      // lea rbp, [rip+0xF5]  ; rbp → data area (+0x100 from here)
 
-    // ===== find_export subroutine (inline) =====
-    // input:  rbx = module base, r12d = target hash
-    // output: rax = function VA
-    // clobbers: rcx, rdx, rsi, r8, r9, r10
-    //
-    // we call this 3 times via jmp-back pattern:
-    //   1. find GetProcAddress (hash 0x7C0DFCAA) in kernel32
-    //   2. find LoadLibraryA  via GetProcAddress
-    //   3. find MessageBoxA   via GetProcAddress
+    // LoadLibraryA("user32.dll")
+    0x48, 0x8B, 0x45, 0x00,                         // mov rax, [rbp+0]     ; pLoadLibraryA
+    0x48, 0x8D, 0x4D, 0x10,                         // lea rcx, [rbp+10h]   ; "user32.dll"
+    0x48, 0x83, 0xEC, 0x20,                         // sub rsp, 20h
+    0xFF, 0xD0,                                     // call rax
+    0x48, 0x83, 0xC4, 0x20,                         // add rsp, 20h
 
-    // --- call 1: find GetProcAddress in kernel32 ---
-    // set r12d = hash of "GetProcAddress" (ROR13+ADD)
-    0x41, 0xBC, 0xAA, 0xFC, 0x0D, 0x7C,                        // mov r12d, 0x7C0DFCAA
+    // GetProcAddress(user32, "MessageBoxA")
+    0x48, 0x89, 0xC1,                               // mov rcx, rax         ; user32 handle
+    0x48, 0x8B, 0x45, 0x08,                         // mov rax, [rbp+8]     ; pGetProcAddress
+    0x48, 0x8D, 0x55, 0x20,                         // lea rdx, [rbp+20h]   ; "MessageBoxA"
+    0x48, 0x83, 0xEC, 0x20,                         // sub rsp, 20h
+    0xFF, 0xD0,                                     // call rax
+    0x48, 0x83, 0xC4, 0x20,                         // add rsp, 20h
 
-    // find_export:
-    // parse export directory
-    0x8B, 0x53, 0x3C,                                           // mov edx, [rbx+3Ch]   ; e_lfanew
-    0x48, 0x01, 0xDA,                                           // add rdx, rbx
-    0x44, 0x8B, 0x82, 0x88, 0x00, 0x00, 0x00,                   // mov r8d, [rdx+88h]   ; export dir RVA
-    0x49, 0x01, 0xD8,                                           // add r8, rbx          ; export dir VA
-    0x41, 0x8B, 0x48, 0x18,                                     // mov ecx, [r8+18h]    ; NumberOfNames
-    0x45, 0x8B, 0x48, 0x20,                                     // mov r9d, [r8+20h]    ; AddressOfNames RVA
-    0x49, 0x01, 0xD9,                                           // add r9, rbx
+    // MessageBoxA(NULL, "Ophion Stealth!", "Ophion", MB_OK)
+    0x48, 0x89, 0xC3,                               // mov rbx, rax         ; MessageBoxA
+    0x48, 0x31, 0xC9,                               // xor rcx, rcx         ; hWnd = NULL
+    0x48, 0x8D, 0x55, 0x30,                         // lea rdx, [rbp+30h]   ; "Ophion Stealth!"
+    0x4C, 0x8D, 0x45, 0x40,                         // lea r8, [rbp+40h]    ; "Ophion"
+    0x45, 0x31, 0xC9,                               // xor r9d, r9d         ; uType = 0
+    0x48, 0x83, 0xEC, 0x20,                         // sub rsp, 20h
+    0xFF, 0xD3,                                     // call rbx
+    0x48, 0x83, 0xC4, 0x20,                         // add rsp, 20h
 
-    // search_loop: hash each export name, compare with r12d
-    0xFF, 0xC9,                                                 // +0:  dec ecx
-    0x41, 0x8B, 0x34, 0x89,                                     // +2:  mov esi, [r9+rcx*4]
-    0x48, 0x01, 0xDE,                                           // +6:  add rsi, rbx
-    0x31, 0xD2,                                                 // +9:  xor edx, edx
-    // hash_name:
-    0xAC,                                                       // +11: lodsb
-    0x01, 0xC2,                                                 // +12: add edx, eax
-    0xC1, 0xCA, 0x0D,                                           // +14: ror edx, 13
-    0x84, 0xC0,                                                 // +17: test al, al
-    0x75, 0xF6,                                                 // +19: jnz hash_name (target=+11, disp=-10)
-    0x44, 0x39, 0xE2,                                           // +21: cmp edx, r12d
-    0x75, 0xE6,                                                 // +24: jne search_loop (target=+0, disp=-26)
-
-    // resolve function address
-    0x45, 0x8B, 0x48, 0x24,                                     // mov r9d, [r8+24h]    ; ordinals RVA
-    0x49, 0x01, 0xD9,                                           // add r9, rbx
-    0x41, 0x0F, 0xB7, 0x0C, 0x49,                               // movzx ecx, word [r9+rcx*2]
-    0x45, 0x8B, 0x48, 0x1C,                                     // mov r9d, [r8+1Ch]    ; functions RVA
-    0x49, 0x01, 0xD9,                                           // add r9, rbx
-    0x41, 0x8B, 0x04, 0x89,                                     // mov eax, [r9+rcx*4]
-    0x48, 0x01, 0xD8,                                           // add rax, rbx         ; GetProcAddress VA
-    0x49, 0x89, 0xC7,                                           // mov r15, rax         ; r15 = GetProcAddress
-
-    // ===== call GetProcAddress(kernel32, "LoadLibraryA") =====
-    0x48, 0x89, 0xD9,                                           // mov rcx, rbx         ; kernel32 base
-    0xEB, 0x0D,                                                 // jmp over_str1 (+13)
-    // "LoadLibraryA\0" (13 bytes)
-    0x4C, 0x6F, 0x61, 0x64, 0x4C, 0x69, 0x62, 0x72,
-    0x61, 0x72, 0x79, 0x41, 0x00,
-    // over_str1:
-    0x48, 0x8D, 0x15, 0xEC, 0xFF, 0xFF, 0xFF,                   // lea rdx, [rip-20]    ; → "LoadLibraryA"
-    0x48, 0x83, 0xEC, 0x20,                                     // sub rsp, 20h
-    0x41, 0xFF, 0xD7,                                           // call r15             ; GetProcAddress
-    0x48, 0x83, 0xC4, 0x20,                                     // add rsp, 20h
-    0x49, 0x89, 0xC6,                                           // mov r14, rax         ; r14 = LoadLibraryA
-
-    // ===== call LoadLibraryA("user32.dll") =====
-    0xEB, 0x0B,                                                 // jmp over_str2 (+11)
-    // "user32.dll\0" (11 bytes)
-    0x75, 0x73, 0x65, 0x72, 0x33, 0x32, 0x2E, 0x64,
-    0x6C, 0x6C, 0x00,
-    // over_str2:
-    0x48, 0x8D, 0x0D, 0xEE, 0xFF, 0xFF, 0xFF,                   // lea rcx, [rip-18]    ; → "user32.dll"
-    0x48, 0x83, 0xEC, 0x20,                                     // sub rsp, 20h
-    0x41, 0xFF, 0xD6,                                           // call r14             ; LoadLibraryA
-    0x48, 0x83, 0xC4, 0x20,                                     // add rsp, 20h
-    0x48, 0x89, 0xC3,                                           // mov rbx, rax         ; rbx = user32 base
-
-    // ===== call GetProcAddress(user32, "MessageBoxA") =====
-    0x48, 0x89, 0xD9,                                           // mov rcx, rbx         ; user32 base
-    0xEB, 0x0C,                                                 // jmp over_str3 (+12)
-    // "MessageBoxA\0" (12 bytes)
-    0x4D, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x42,
-    0x6F, 0x78, 0x41, 0x00,
-    // over_str3:
-    0x48, 0x8D, 0x15, 0xED, 0xFF, 0xFF, 0xFF,                   // lea rdx, [rip-19]    ; → "MessageBoxA"
-    0x48, 0x83, 0xEC, 0x20,                                     // sub rsp, 20h
-    0x41, 0xFF, 0xD7,                                           // call r15             ; GetProcAddress
-    0x48, 0x83, 0xC4, 0x20,                                     // add rsp, 20h
-    0x49, 0x89, 0xC6,                                           // mov r14, rax         ; r14 = MessageBoxA
-
-    // ===== call MessageBoxA(NULL, "Ophion Stealth!", "Ophion", MB_OK) =====
-    0x48, 0x31, 0xC9,                                           // xor rcx, rcx         ; hWnd = NULL
-    0xEB, 0x10,                                                 // jmp over_str4 (+16)
-    // "Ophion Stealth!\0" (16 bytes)
-    0x4F, 0x70, 0x68, 0x69, 0x6F, 0x6E, 0x20, 0x53,
-    0x74, 0x65, 0x61, 0x6C, 0x74, 0x68, 0x21, 0x00,
-    // over_str4:
-    0x48, 0x8D, 0x15, 0xE9, 0xFF, 0xFF, 0xFF,                   // lea rdx, [rip-23]    ; → "Ophion Stealth!"
-    0xEB, 0x07,                                                 // jmp over_str5 (+7)
-    // "Ophion\0" (7 bytes)
-    0x4F, 0x70, 0x68, 0x69, 0x6F, 0x6E, 0x00,
-    // over_str5:
-    0x4C, 0x8D, 0x05, 0xF2, 0xFF, 0xFF, 0xFF,                   // lea r8, [rip-14]     ; → "Ophion"
-    0x45, 0x31, 0xC9,                                           // xor r9d, r9d         ; uType = MB_OK
-    0x48, 0x83, 0xEC, 0x20,                                     // sub rsp, 20h
-    0x41, 0xFF, 0xD6,                                           // call r14             ; MessageBoxA
-    0x48, 0x83, 0xC4, 0x20,                                     // add rsp, 20h
-
-    // ===== epilogue =====
-    0x48, 0x83, 0xC4, 0x28,                                     // add rsp, 28h
-    0xC3,                                                       // ret
+    0x48, 0x83, 0xC4, 0x28,                         // add rsp, 28h
+    0xC3,                                           // ret
 };
+
+//
+// build the full shellcode page: stub + data block with resolved addresses
+// must be called while attached to the target process (or from system context)
+//
+static VOID
+TdBuildShellcodePage(PVOID page_base)
+{
+    RtlZeroMemory(page_base, PAGE_SIZE);
+
+    // copy stub at offset 0
+    RtlCopyMemory(page_base, g_shellcode_stub, sizeof(g_shellcode_stub));
+
+    PUINT8 data = (PUINT8)page_base + 0x100;
+
+    // resolve kernel32 functions
+    UNICODE_STRING name;
+    RtlInitUnicodeString(&name, L"kernel32.dll");
+
+    // get kernel32 base via PEB walk in kernel (safe, documented)
+    // actually easier: just use MmGetSystemRoutineAddress for ntdll funcs
+    // but LoadLibraryA is in kernel32, not exported to kernel.
+    // solution: get the user-mode addresses from the PEB of the target process.
+
+    // simplest: read PEB → Ldr → walk modules → find kernel32 → read GetProcAddress + LoadLibraryA
+
+    // PEB of target process (we're attached via KeStackAttachProcess)
+    PPEB peb = PsGetProcessPeb(PsGetCurrentProcess());
+    if (!peb) return;
+
+    __try {
+        TD_PEB_LDR_DATA * ldr = *(TD_PEB_LDR_DATA **)((PUINT8)peb + 0x18);
+        if (!ldr) return;
+
+        PLIST_ENTRY head = &ldr->InMemoryOrderModuleList;
+        PLIST_ENTRY cur  = head->Flink;
+        PVOID kernel32_base = NULL;
+
+        while (cur != head)
+        {
+            TD_LDR_ENTRY * e = CONTAINING_RECORD(cur, TD_LDR_ENTRY, InMemoryOrderLinks);
+            if (e->BaseDllName.Buffer && e->BaseDllName.Length >= 20)
+            {
+                // case-insensitive check for "kernel32.dll"
+                BOOLEAN match = TRUE;
+                const WCHAR target[] = L"kernel32.dll";
+                for (USHORT i = 0; i < 12; i++)
+                {
+                    WCHAR c = e->BaseDllName.Buffer[i];
+                    if (c >= L'A' && c <= L'Z') c += 32;
+                    if (c != target[i]) { match = FALSE; break; }
+                }
+                if (match) { kernel32_base = e->DllBase; break; }
+            }
+            cur = cur->Flink;
+        }
+
+        if (!kernel32_base) return;
+
+        // parse kernel32 PE exports
+        PIMAGE_DOS_HEADER dos_h = (PIMAGE_DOS_HEADER)kernel32_base;
+        PIMAGE_NT_HEADERS64 nt_h = (PIMAGE_NT_HEADERS64)((PUINT8)kernel32_base + dos_h->e_lfanew);
+        ULONG exp_rva = nt_h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        PIMAGE_EXPORT_DIRECTORY exp_d = (PIMAGE_EXPORT_DIRECTORY)((PUINT8)kernel32_base + exp_rva);
+
+        PULONG  names_arr    = (PULONG)((PUINT8)kernel32_base + exp_d->AddressOfNames);
+        PUSHORT ordinals_arr = (PUSHORT)((PUINT8)kernel32_base + exp_d->AddressOfNameOrdinals);
+        PULONG  funcs_arr    = (PULONG)((PUINT8)kernel32_base + exp_d->AddressOfFunctions);
+
+        UINT64 pLoadLibraryA = 0, pGetProcAddress = 0;
+
+        for (ULONG i = 0; i < exp_d->NumberOfNames; i++)
+        {
+            const char * fn = (const char *)((PUINT8)kernel32_base + names_arr[i]);
+            if (!pLoadLibraryA && strcmp(fn, "LoadLibraryA") == 0)
+                pLoadLibraryA = (UINT64)kernel32_base + funcs_arr[ordinals_arr[i]];
+            if (!pGetProcAddress && strcmp(fn, "GetProcAddress") == 0)
+                pGetProcAddress = (UINT64)kernel32_base + funcs_arr[ordinals_arr[i]];
+            if (pLoadLibraryA && pGetProcAddress) break;
+        }
+
+        // write data block at +0x100
+        *(PUINT64)(data + 0x00) = pLoadLibraryA;
+        *(PUINT64)(data + 0x08) = pGetProcAddress;
+        RtlCopyMemory(data + 0x10, "user32.dll",       11);
+        RtlCopyMemory(data + 0x20, "MessageBoxA",      12);
+        RtlCopyMemory(data + 0x30, "Ophion Stealth!",  16);
+        RtlCopyMemory(data + 0x40, "Ophion",            7);
+
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // PEB walk failed silently
+    }
+}
 
 // =========================================================================
 //  DPC broadcast → VMCALL per CPU
 // =========================================================================
 
-static VOID
-DpcStealthAlloc(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
-{
-    UNREFERENCED_PARAMETER(Dpc);
-    TD_STEALTH_PARAM * req = (TD_STEALTH_PARAM *)Ctx;
-
-    //
-    // hv_vmcall_ex: rax = OPHION_VMCALL_ID (set by asm)
-    //   rcx = VMCALL_STEALTH_ALLOC
-    //   rdx = pointer to param struct
-    //   r8-r15 = unused (0)
-    //
-    hv_vmcall_ex(
-        VMCALL_STEALTH_ALLOC,
-        (UINT64)req,       // rdx = param pointer
-        0, 0, 0, 0, 0, 0, 0, 0);
-
-    KeSignalCallDpcSynchronize(A2);
-    KeSignalCallDpcDone(A1);
-}
-
 //
-// set up EPT stealth for one page via VMCALL to all CPUs
+// set up EPT stealth for one page — single VMCALL from current CPU.
+// HV internally loops all g_vcpu[i].ept_page_table to split + set PTE.
+// NO KeGenericCallDpc — avoids 0x101 CLOCK_WATCHDOG when a CPU is
+// stuck in VMX-root (Ophion HV pre-existing bug).
 //
 static BOOLEAN
 TdStealthAllocPage(
@@ -267,7 +388,9 @@ TdStealthAllocPage(
     UINT64  page_phys,      // physical address of page
     PVOID   sc_buf,         // shellcode chunk for this page (or NULL for resident)
     UINT32  sc_size,        // shellcode size for this page
-    BOOLEAN resident)
+    BOOLEAN resident,
+    UINT64  pt_pfn,         // pre-computed PT page PFN (from TdResolveGuestPT)
+    UINT32  pt_idx)         // pre-computed PTE index within PT page
 {
     TD_STEALTH_PARAM req = {};
     req.caller_cr3       = caller_cr3;
@@ -277,9 +400,50 @@ TdStealthAllocPage(
     req.shellcode_buffer = sc_buf;
     req.shellcode_size   = sc_size;
     req.resident         = resident;
+    req.pt_page_pfn      = pt_pfn;
+    req.pt_pte_index     = pt_idx;
 
-    KeGenericCallDpc(DpcStealthAlloc, &req);
-    return req.result;
+    //
+    // copy PT page and target page content into NonPaged kernel buffers.
+    // VMX-root accesses these buffers (always valid under any CR3).
+    // MmGetVirtualForPhysical returns process-relative VAs that are
+    // invalid under system CR3 in VMX-root — so we copy the content here.
+    //
+    PVOID pt_buf  = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'htpS');
+    PVOID tgt_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'htpS');
+    if (!pt_buf || !tgt_buf)
+    {
+        if (pt_buf)  ExFreePoolWithTag(pt_buf,  'htpS');
+        if (tgt_buf) ExFreePoolWithTag(tgt_buf, 'htpS');
+        return FALSE;
+    }
+
+    {
+        PHYSICAL_ADDRESS pa;
+        pa.QuadPart = (LONGLONG)(pt_pfn << 12);
+        PVOID pt_va = MmGetVirtualForPhysical(pa);
+        if (pt_va)
+            RtlCopyMemory(pt_buf, pt_va, PAGE_SIZE);
+        else
+            RtlZeroMemory(pt_buf, PAGE_SIZE);
+
+        pa.QuadPart = (LONGLONG)(page_phys & ~0xFFFULL);
+        PVOID tgt_va = MmGetVirtualForPhysical(pa);
+        if (tgt_va)
+            RtlCopyMemory(tgt_buf, tgt_va, PAGE_SIZE);
+        else
+            RtlZeroMemory(tgt_buf, PAGE_SIZE);
+    }
+
+    req.pt_page_copy     = pt_buf;
+    req.target_page_copy = tgt_buf;
+    req.pt_precomputed   = TRUE;
+
+    NTSTATUS st = hv_vmcall_simple(VMCALL_STEALTH_ALLOC, (UINT64)&req, 0, 0);
+
+    ExFreePoolWithTag(pt_buf,  'htpS');
+    ExFreePoolWithTag(tgt_buf, 'htpS');
+    return NT_SUCCESS(st) && req.result;
 }
 
 //
@@ -308,15 +472,52 @@ TdStealthInjectPages(
         UINT32 space      = (UINT32)(PAGE_SIZE - off_in_pg);
         UINT32 chunk      = (shellcode_size - done < space) ? (shellcode_size - done) : space;
 
+        //
+        // page already has content from TdBuildShellcodePage — no need to touch.
+        // (touching would overwrite first byte of shellcode with 0)
+        // MmGetPhysicalAddress works because the page was already committed+written.
+        //
+
         UINT64 page_phys = MmGetPhysicalAddress((PVOID)page_va).QuadPart;
-        if (!page_phys) return FALSE;
+        if (!page_phys)
+        {
+            DbgPrintEx(0, 0, "[td] stealth page %u: MmGetPhysicalAddress=0 for VA=%p\n",
+                       page_count, (PVOID)page_va);
+            return FALSE;
+        }
 
         //
-        // write shellcode into the page BEFORE VMCALL
-        // VMX-root's ept_stealth_install will copy page content to shadow page
-        // (for resident mode with shellcode_buffer=NULL, it copies via pa_to_va)
+        // pre-compute guest PT page info at PASSIVE/DISPATCH level (safe).
+        // this avoids calling pa_to_va (MmGetVirtualForPhysical) in VMX-root
+        // which deadlocks when KeGenericCallDpc puts all CPUs into VMX-root
+        // and another CPU holds an OS internal lock.
         //
-        // for shellcode mode: pass the buffer directly so VMX-root copies it
+        UINT64 pt_pfn = 0;
+        UINT32 pt_idx = 0;
+        if (!TdResolveGuestPT(caller_cr3, page_va, &pt_pfn, &pt_idx))
+        {
+            DbgPrintEx(0, 0, "[td] stealth page %u: PT walk failed for VA=%p\n",
+                       page_count, (PVOID)page_va);
+            return FALSE;
+        }
+
+        //
+        // clear NX bit in guest PTE at PASSIVE_LEVEL (safe — we're attached
+        // to the target process). can't do this in VMX-root because the PT
+        // page VA from MmGetVirtualForPhysical is process-relative and invalid
+        // under system CR3.
+        //
+        // DEBUG: NX clear disabled to test if it causes BSOD
+        // {
+        //     PHYSICAL_ADDRESS ptpa;
+        //     ptpa.QuadPart = (LONGLONG)(pt_pfn << 12);
+        //     PUINT64 pt_page = (PUINT64)MmGetVirtualForPhysical(ptpa);
+        //     if (pt_page)
+        //         pt_page[pt_idx] &= ~(1ULL << 63);
+        // }
+
+        //
+        // shellcode mode: pass the buffer directly so VMX-root copies it
         //
         BOOLEAN ok = TdStealthAllocPage(
             caller_cr3,
@@ -324,7 +525,9 @@ TdStealthInjectPages(
             page_phys + off_in_pg,
             (PUINT8)shellcode + done,
             chunk,
-            resident);
+            resident,
+            pt_pfn,
+            pt_idx);
 
         if (!ok)
         {
@@ -341,34 +544,552 @@ TdStealthInjectPages(
 }
 
 // =========================================================================
+//  EPT Hook: NtCreateFile
+// =========================================================================
+
+#define VMCALL_EPT_HOOK     0x00000003
+#define VMCALL_EPT_UNHOOK   0x00000004
+
+//
+// original NtCreateFile pointer (set by hook install, used by proxy)
+//
+typedef NTSTATUS (NTAPI * fn_NtCreateFile)(
+    PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
+    PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+
+static fn_NtCreateFile g_orig_NtCreateFile = NULL;
+static PVOID           g_hooked_target     = NULL;
+static volatile LONG   g_hook_log_count    = 0;
+
+//
+// proxy function — called instead of NtCreateFile when EPT hook is active.
+// logs the file path via DbgPrint, then calls original via trampoline.
+//
+static NTSTATUS NTAPI
+HookedNtCreateFile(
+    PHANDLE FileHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER AllocationSize,
+    ULONG FileAttributes,
+    ULONG ShareAccess,
+    ULONG CreateDisposition,
+    ULONG CreateOptions,
+    PVOID EaBuffer,
+    ULONG EaLength)
+{
+    //
+    // log every 100th call to avoid flooding DbgPrint
+    //
+    LONG count = _InterlockedIncrement(&g_hook_log_count);
+    if ((count % 100) == 1 && ObjectAttributes && ObjectAttributes->ObjectName)
+    {
+        DbgPrintEx(0, 0, "[td-hook] NtCreateFile #%d: %wZ\n",
+                   count, ObjectAttributes->ObjectName);
+    }
+
+    //
+    // call original via trampoline
+    //
+    if (g_orig_NtCreateFile)
+    {
+        return g_orig_NtCreateFile(
+            FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
+            AllocationSize, FileAttributes, ShareAccess,
+            CreateDisposition, CreateOptions, EaBuffer, EaLength);
+    }
+
+    return STATUS_UNSUCCESSFUL;
+}
+
+//
+// DPC callback: each CPU issues VMCALL to install EPT hook
+//
+static VOID
+DpcEptHook(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
+{
+    UNREFERENCED_PARAMETER(Dpc);
+
+    struct _EPT_HOOK_CTX {
+        PVOID   target;
+        PVOID   proxy;
+        PVOID * origin;
+        UINT64  caller_cr3;
+        UINT32  hook_type;
+        NTSTATUS result;
+    } * ctx = (struct _EPT_HOOK_CTX *)Ctx;
+
+    //
+    // hv_vmcall_ex: rax = OPHION_VMCALL_ID
+    //   rcx = VMCALL_EPT_HOOK
+    //   rdx = target_function
+    //   r8  = proxy_function
+    //   r9  = &origin_function
+    //   r10 = caller_cr3
+    //   r11 = hook_type
+    //   r12 = target_cr3 (0 = R0 hook)
+    //   r13 = user_trampoline (NULL = kernel pool)
+    //   r14 = user_trampoline_pa (0)
+    //
+    ctx->result = hv_vmcall_ex(
+        VMCALL_EPT_HOOK,
+        (UINT64)ctx->target,
+        (UINT64)ctx->proxy,
+        (UINT64)ctx->origin,
+        ctx->caller_cr3,
+        (UINT64)ctx->hook_type,
+        0,   // target_cr3 = 0 (R0 hook, all processes)
+        0,   // user_trampoline = NULL (use kernel pool)
+        0,   // user_trampoline_pa = 0
+        0);
+
+    KeSignalCallDpcSynchronize(A2);
+    KeSignalCallDpcDone(A1);
+}
+
+static VOID
+DpcEptUnhook(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
+{
+    UNREFERENCED_PARAMETER(Dpc);
+
+    struct _EPT_UNHOOK_CTX {
+        PVOID    target;
+        UINT64   caller_cr3;
+        NTSTATUS result;
+    } * ctx = (struct _EPT_UNHOOK_CTX *)Ctx;
+
+    ctx->result = hv_vmcall_ex(
+        VMCALL_EPT_UNHOOK,
+        (UINT64)ctx->target,
+        0, 0,
+        ctx->caller_cr3,
+        0, 0, 0, 0, 0);
+
+    KeSignalCallDpcSynchronize(A2);
+    KeSignalCallDpcDone(A1);
+}
+
+static NTSTATUS
+TdEptHookNtCreateFile(VOID)
+{
+    UNICODE_STRING fn_name;
+    RtlInitUnicodeString(&fn_name, L"NtCreateFile");
+    PVOID target = MmGetSystemRoutineAddress(&fn_name);
+    if (!target)
+    {
+        DbgPrintEx(0, 0, "[td] NtCreateFile not found\n");
+        return STATUS_NOT_FOUND;
+    }
+
+    DbgPrintEx(0, 0, "[td] NtCreateFile = %p, proxy = %p\n", target, (PVOID)HookedNtCreateFile);
+
+    struct {
+        PVOID   target;
+        PVOID   proxy;
+        PVOID * origin;
+        UINT64  caller_cr3;
+        UINT32  hook_type;
+        NTSTATUS result;
+    } ctx = {};
+
+    ctx.target     = target;
+    ctx.proxy      = (PVOID)HookedNtCreateFile;
+    ctx.origin     = (PVOID *)&g_orig_NtCreateFile;
+    ctx.caller_cr3 = __readcr3();
+    ctx.hook_type  = 0;   // absolute jump (14 bytes)
+
+    KeGenericCallDpc(DpcEptHook, &ctx);
+
+    if (NT_SUCCESS(ctx.result))
+    {
+        g_hooked_target = target;
+        DbgPrintEx(0, 0, "[td] EPT hook installed! trampoline = %p\n", (PVOID)g_orig_NtCreateFile);
+    }
+    else
+    {
+        DbgPrintEx(0, 0, "[td] EPT hook FAILED: 0x%08X\n", ctx.result);
+    }
+
+    return ctx.result;
+}
+
+static NTSTATUS
+TdEptUnhookNtCreateFile(VOID)
+{
+    if (!g_hooked_target)
+        return STATUS_NOT_FOUND;
+
+    struct {
+        PVOID    target;
+        UINT64   caller_cr3;
+        NTSTATUS result;
+    } ctx = {};
+
+    ctx.target     = g_hooked_target;
+    ctx.caller_cr3 = __readcr3();
+
+    KeGenericCallDpc(DpcEptUnhook, &ctx);
+
+    if (NT_SUCCESS(ctx.result))
+    {
+        DbgPrintEx(0, 0, "[td] EPT hook removed. total calls logged: %d\n", g_hook_log_count);
+        g_hooked_target = NULL;
+        g_orig_NtCreateFile = NULL;
+        g_hook_log_count = 0;
+    }
+    else
+    {
+        DbgPrintEx(0, 0, "[td] EPT unhook FAILED: 0x%08X\n", ctx.result);
+    }
+
+    return ctx.result;
+}
+
+// =========================================================================
+//  R3 EPT Hook — per-process, user-mode trampoline, MDL-locked
+// =========================================================================
+
+//
+// tracking for active R3 hooks (simple array, max 16 concurrent R3 hooks)
+//
+#define MAX_R3_HOOKS 16
+
+typedef struct _R3_HOOK_ENTRY {
+    BOOLEAN     active;
+    UINT64      target_pid;
+    PVOID       target_va;
+    PVOID       trampoline_va;      // R3 VA in target process
+    SIZE_T      trampoline_size;
+    PMDL        target_mdl;         // locks target page in physical memory
+    UINT64      target_cr3;         // target process CR3 (PFN only)
+} R3_HOOK_ENTRY;
+
+static R3_HOOK_ENTRY g_r3_hooks[MAX_R3_HOOKS] = {};
+
+static R3_HOOK_ENTRY *
+R3HookFindFree(VOID)
+{
+    for (int i = 0; i < MAX_R3_HOOKS; i++)
+        if (!g_r3_hooks[i].active) return &g_r3_hooks[i];
+    return NULL;
+}
+
+static R3_HOOK_ENTRY *
+R3HookFind(UINT64 pid, PVOID target_va)
+{
+    for (int i = 0; i < MAX_R3_HOOKS; i++)
+        if (g_r3_hooks[i].active && g_r3_hooks[i].target_pid == pid &&
+            g_r3_hooks[i].target_va == target_va)
+            return &g_r3_hooks[i];
+    return NULL;
+}
+
+//
+// DPC callback for R3 EPT hook install
+//
+typedef struct _R3_HOOK_DPC_CTX {
+    PVOID    target;
+    PVOID    proxy;
+    PVOID *  origin;
+    UINT64   caller_cr3;
+    UINT32   hook_type;
+    UINT64   target_cr3;
+    PVOID    user_trampoline;
+    UINT64   user_trampoline_pa;
+    NTSTATUS result;
+} R3_HOOK_DPC_CTX;
+
+static VOID
+DpcEptHookR3(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
+{
+    UNREFERENCED_PARAMETER(Dpc);
+    R3_HOOK_DPC_CTX * ctx = (R3_HOOK_DPC_CTX *)Ctx;
+
+    ctx->result = hv_vmcall_ex(
+        VMCALL_EPT_HOOK,
+        (UINT64)ctx->target,
+        (UINT64)ctx->proxy,
+        (UINT64)ctx->origin,
+        ctx->caller_cr3,
+        (UINT64)ctx->hook_type,
+        ctx->target_cr3,
+        (UINT64)ctx->user_trampoline,
+        ctx->user_trampoline_pa,
+        0);
+
+    KeSignalCallDpcSynchronize(A2);
+    KeSignalCallDpcDone(A1);
+}
+
+//
+// install R3 EPT hook on a function in a target process.
+// must be called at PASSIVE_LEVEL.
+//
+static NTSTATUS
+TdEptHookR3(
+    UINT64  target_pid,
+    PVOID   target_va,
+    PVOID   proxy_va,
+    UINT32  hook_type,
+    PVOID * out_trampoline)
+{
+    if (!target_va) return STATUS_INVALID_PARAMETER;
+
+    R3_HOOK_ENTRY * entry = R3HookFindFree();
+    if (!entry)
+    {
+        DbgPrintEx(0, 0, "[td-r3] no free R3 hook slots\n");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    // look up target process
+    PEPROCESS proc = NULL;
+    NTSTATUS st = PsLookupProcessByProcessId((HANDLE)target_pid, &proc);
+    if (!NT_SUCCESS(st)) return st;
+
+    KAPC_STATE apc;
+    KeStackAttachProcess(proc, &apc);
+
+    UINT64 target_cr3 = __readcr3();
+    UINT64 caller_cr3 = target_cr3;
+
+    //
+    // 1. lock target page in physical memory via MDL
+    //
+    PVOID page_va = (PVOID)((UINT64)target_va & ~0xFFFULL);
+    PMDL mdl = IoAllocateMdl(page_va, PAGE_SIZE, FALSE, FALSE, NULL);
+    if (!mdl)
+    {
+        KeUnstackDetachProcess(&apc);
+        ObDereferenceObject(proc);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    __try {
+        MmProbeAndLockPages(mdl, UserMode, IoReadAccess);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        IoFreeMdl(mdl);
+        KeUnstackDetachProcess(&apc);
+        ObDereferenceObject(proc);
+        DbgPrintEx(0, 0, "[td-r3] MmProbeAndLockPages failed for %p\n", target_va);
+        return STATUS_ACCESS_VIOLATION;
+    }
+
+    //
+    // 2. allocate R3 executable trampoline in target process
+    //
+    PVOID tramp_va = NULL;
+    SIZE_T tramp_size = PAGE_SIZE;
+    st = ZwAllocateVirtualMemory(
+        ZwCurrentProcess(), &tramp_va, 0, &tramp_size,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+    if (!NT_SUCCESS(st) || !tramp_va)
+    {
+        MmUnlockPages(mdl);
+        IoFreeMdl(mdl);
+        KeUnstackDetachProcess(&apc);
+        ObDereferenceObject(proc);
+        DbgPrintEx(0, 0, "[td-r3] trampoline alloc failed: 0x%08X\n", st);
+        return st;
+    }
+
+    RtlZeroMemory(tramp_va, tramp_size);
+    UINT64 tramp_pa = MmGetPhysicalAddress(tramp_va).QuadPart;
+
+    DbgPrintEx(0, 0, "[td-r3] target=%p proxy=%p tramp=%p(PA=%llx) cr3=%llx pid=%llu type=%u\n",
+               target_va, proxy_va, tramp_va, tramp_pa, target_cr3, target_pid, hook_type);
+
+    //
+    // 3. DPC broadcast VMCALL to install hook on all CPUs
+    //
+    PVOID origin_ptr = NULL;
+
+    R3_HOOK_DPC_CTX ctx = {};
+    ctx.target              = target_va;
+    ctx.proxy               = proxy_va;
+    ctx.origin              = &origin_ptr;
+    ctx.caller_cr3          = caller_cr3;
+    ctx.hook_type           = hook_type;
+    ctx.target_cr3          = target_cr3;
+    ctx.user_trampoline     = tramp_va;
+    ctx.user_trampoline_pa  = tramp_pa;
+
+    KeGenericCallDpc(DpcEptHookR3, &ctx);
+
+    KeUnstackDetachProcess(&apc);
+
+    if (NT_SUCCESS(ctx.result))
+    {
+        entry->active           = TRUE;
+        entry->target_pid       = target_pid;
+        entry->target_va        = target_va;
+        entry->trampoline_va    = tramp_va;
+        entry->trampoline_size  = tramp_size;
+        entry->target_mdl       = mdl;
+        entry->target_cr3       = target_cr3;
+
+        if (out_trampoline)
+            *out_trampoline = origin_ptr;
+
+        DbgPrintEx(0, 0, "[td-r3] R3 EPT hook installed! trampoline=%p\n", origin_ptr);
+    }
+    else
+    {
+        //
+        // failed — clean up: free trampoline, unlock MDL
+        //
+        KeStackAttachProcess(proc, &apc);
+        ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
+        KeUnstackDetachProcess(&apc);
+
+        MmUnlockPages(mdl);
+        IoFreeMdl(mdl);
+
+        DbgPrintEx(0, 0, "[td-r3] R3 EPT hook FAILED: 0x%08X\n", ctx.result);
+    }
+
+    ObDereferenceObject(proc);
+    return ctx.result;
+}
+
+//
+// remove R3 EPT hook and clean up resources
+//
+static NTSTATUS
+TdEptUnhookR3(UINT64 target_pid, PVOID target_va)
+{
+    R3_HOOK_ENTRY * entry = R3HookFind(target_pid, target_va);
+    if (!entry)
+    {
+        DbgPrintEx(0, 0, "[td-r3] hook entry not found for pid=%llu va=%p\n", target_pid, target_va);
+        return STATUS_NOT_FOUND;
+    }
+
+    //
+    // 1. unhook via VMCALL (DPC broadcast)
+    //
+    PEPROCESS proc = NULL;
+    NTSTATUS st = PsLookupProcessByProcessId((HANDLE)target_pid, &proc);
+    if (!NT_SUCCESS(st)) return st;
+
+    KAPC_STATE apc;
+    KeStackAttachProcess(proc, &apc);
+
+    struct {
+        PVOID    target;
+        UINT64   caller_cr3;
+        NTSTATUS result;
+    } unhook_ctx = {};
+    unhook_ctx.target     = target_va;
+    unhook_ctx.caller_cr3 = __readcr3();
+
+    KeGenericCallDpc(DpcEptUnhook, &unhook_ctx);
+
+    //
+    // 2. free trampoline in target process
+    //
+    if (entry->trampoline_va)
+    {
+        SIZE_T sz = entry->trampoline_size;
+        ZwFreeVirtualMemory(ZwCurrentProcess(), &entry->trampoline_va, &sz, MEM_RELEASE);
+    }
+
+    KeUnstackDetachProcess(&apc);
+
+    //
+    // 3. unlock MDL
+    //
+    if (entry->target_mdl)
+    {
+        MmUnlockPages(entry->target_mdl);
+        IoFreeMdl(entry->target_mdl);
+    }
+
+    DbgPrintEx(0, 0, "[td-r3] R3 hook removed: pid=%llu va=%p\n", target_pid, target_va);
+
+    RtlZeroMemory(entry, sizeof(*entry));
+    ObDereferenceObject(proc);
+    return unhook_ctx.result;
+}
+
+//
+// unhook all active R3 hooks (called from unload)
+//
+static VOID
+TdEptUnhookAllR3(VOID)
+{
+    for (int i = 0; i < MAX_R3_HOOKS; i++)
+    {
+        if (g_r3_hooks[i].active)
+            TdEptUnhookR3(g_r3_hooks[i].target_pid, g_r3_hooks[i].target_va);
+    }
+}
+
+// =========================================================================
 //  thread creation
 // =========================================================================
 
 static NTSTATUS
 TdCreateThread(PEPROCESS process, PVOID entry)
 {
-    if (!g_pZwCreateThreadEx) return STATUS_NOT_SUPPORTED;
+    //
+    // try function pointer (resolved at init), fallback to manual syscall stub
+    //
+    if (g_pZwCreateThreadEx)
+    {
+        HANDLE proc_h = NULL;
+        NTSTATUS st = ObOpenObjectByPointer(
+            process, OBJ_KERNEL_HANDLE, NULL,
+            PROCESS_ALL_ACCESS, *PsProcessType, KernelMode, &proc_h);
+        if (!NT_SUCCESS(st)) return st;
 
-    HANDLE proc_h = NULL;
-    NTSTATUS st = ObOpenObjectByPointer(
-        process, OBJ_KERNEL_HANDLE, NULL,
-        PROCESS_ALL_ACCESS, *PsProcessType, KernelMode, &proc_h);
-    if (!NT_SUCCESS(st)) return st;
+        HANDLE thread_h = NULL;
+        st = g_pZwCreateThreadEx(
+            &thread_h, THREAD_ALL_ACCESS, NULL, proc_h,
+            entry, NULL,
+            0, 0, 0, 0, NULL);
+
+        if (NT_SUCCESS(st) && thread_h)
+            ZwClose(thread_h);
+        ZwClose(proc_h);
+        return st;
+    }
+
+    //
+    // fallback: attach to process, use RtlCreateUserThread
+    // create SUSPENDED → pin to install CPU → resume
+    //
+    KAPC_STATE apc;
+    KeStackAttachProcess(process, &apc);
 
     HANDLE thread_h = NULL;
-    st = g_pZwCreateThreadEx(
-        &thread_h, THREAD_ALL_ACCESS, NULL, proc_h,
-        entry, NULL,
-        0,      // not suspended — runs immediately
-        0, 0, 0, NULL);
+    CLIENT_ID cid = {};
+    //
+    // pin CURRENT kernel thread to install CPU first.
+    // then create user thread (not suspended) — it inherits scheduling
+    // affinity from the current processor context.
+    //
+    ULONG cpu = KeGetCurrentProcessorNumberEx(NULL);
+    KAFFINITY old_affinity = KeSetSystemAffinityThreadEx((KAFFINITY)1 << cpu);
+
+    NTSTATUS st = RtlCreateUserThread(
+        ZwCurrentProcess(),
+        NULL, FALSE, 0, 0, 0,
+        entry, NULL, &thread_h, &cid);
+
+    KeRevertToUserAffinityThreadEx(old_affinity);
+    KeUnstackDetachProcess(&apc);
 
     if (NT_SUCCESS(st) && thread_h)
     {
-        DbgPrintEx(0, 0, "[td] thread created at %p\n", entry);
+        // also set the thread's own affinity to install CPU
+        KAFFINITY mask = (KAFFINITY)1 << cpu;
+        ZwSetInformationThread(thread_h, ThreadAffinityMask, &mask, sizeof(mask));
         ZwClose(thread_h);
     }
 
-    ZwClose(proc_h);
     return st;
 }
 
@@ -413,7 +1134,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
         st = ZwAllocateVirtualMemory(
             ZwCurrentProcess(), &base, 0, &size,
-            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 
         if (NT_SUCCESS(st) && base)
         {
@@ -421,11 +1142,22 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                        base, (UINT64)size, p->target_pid);
 
             //
-            // EPT stealth via VMCALL: shellcode in shadow page (execute view)
-            // original page stays clean (anti-cheat read view = zeroed/benign)
+            // build shellcode into a KERNEL buffer (not the target page).
+            // stealth install puts it in shadow page only.
+            // original page stays zeroed = clean for anti-cheat.
             //
-            if (TdStealthInjectPages(base, (PVOID)g_msgbox_shellcode,
-                                     sizeof(g_msgbox_shellcode), FALSE))
+            PVOID sc_kern = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'htpS');
+            if (sc_kern)
+            {
+                // build shellcode in kernel buffer (resolves addresses via PEB walk)
+                // temporarily use the user page as workspace, then copy and zero it
+                TdBuildShellcodePage(base);
+                RtlCopyMemory(sc_kern, base, PAGE_SIZE);
+                RtlZeroMemory(base, PAGE_SIZE);  // clean original page
+            }
+
+            if (sc_kern && TdStealthInjectPages(base, sc_kern,
+                                     PAGE_SIZE, FALSE))
             {
                 p->shellcode_va = (UINT64)base;
                 p->actual_size  = (UINT64)size;
@@ -436,14 +1168,67 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
                 st = STATUS_UNSUCCESSFUL;
             }
+            if (sc_kern) ExFreePoolWithTag(sc_kern, 'htpS');
         }
 
         KeUnstackDetachProcess(&apc_state);
 
         if (NT_SUCCESS(st) && p->shellcode_va)
-            TdCreateThread(proc, (PVOID)p->shellcode_va);
+        {
+            NTSTATUS thr_st = TdCreateThread(proc, (PVOID)p->shellcode_va);
+            // encode thread result in high bits of actual_size for debugging
+            p->actual_size |= ((UINT64)(UINT32)thr_st << 32);
+        }
 
         ObDereferenceObject(proc);
+        break;
+    }
+
+    case IOCTL_EPT_HOOK:
+    {
+        st = TdEptHookNtCreateFile();
+        break;
+    }
+
+    case IOCTL_EPT_UNHOOK:
+    {
+        st = TdEptUnhookNtCreateFile();
+        break;
+    }
+
+    case IOCTL_EPT_HOOK_R3:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_R3_HOOK_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_R3_HOOK_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_R3_HOOK_PARAMS * p = (TD_R3_HOOK_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+
+        PVOID tramp = NULL;
+        st = TdEptHookR3(
+            p->target_pid,
+            (PVOID)p->target_function_va,
+            (PVOID)p->proxy_function_va,
+            (UINT32)p->hook_type,
+            &tramp);
+
+        p->trampoline_va = (UINT64)tramp;
+        p->status        = (UINT64)st;
+        irp->IoStatus.Information = sizeof(TD_R3_HOOK_PARAMS);
+        break;
+    }
+
+    case IOCTL_EPT_UNHOOK_R3:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_R3_UNHOOK_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_R3_UNHOOK_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_R3_UNHOOK_PARAMS * p = (TD_R3_UNHOOK_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+
+        st = TdEptUnhookR3(p->target_pid, (PVOID)p->target_function_va);
+        p->status = (UINT64)st;
+        irp->IoStatus.Information = sizeof(TD_R3_UNHOOK_PARAMS);
         break;
     }
 
@@ -463,6 +1248,14 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
 static VOID TdUnload(PDRIVER_OBJECT drv)
 {
+    if (g_hooked_target)
+    {
+        DbgPrintEx(0, 0, "[td] Unhooking R0 hook before unload...\n");
+        TdEptUnhookNtCreateFile();
+    }
+
+    TdEptUnhookAllR3();
+
     UNICODE_STRING sym;
     RtlInitUnicodeString(&sym, TD_SYMLINK_NAME);
     IoDeleteSymbolicLink(&sym);
@@ -476,9 +1269,21 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     UNREFERENCED_PARAMETER(reg);
 
     UNICODE_STRING fn;
-    RtlInitUnicodeString(&fn, L"ZwCreateThreadEx");
+    // try NtCreateThreadEx first (more likely exported), then ZwCreateThreadEx
+    RtlInitUnicodeString(&fn, L"NtCreateThreadEx");
     g_pZwCreateThreadEx = (fn_ZwCreateThreadEx)MmGetSystemRoutineAddress(&fn);
-    DbgPrintEx(0, 0, "[td] ZwCreateThreadEx = %p\n", (PVOID)g_pZwCreateThreadEx);
+    if (!g_pZwCreateThreadEx)
+    {
+        RtlInitUnicodeString(&fn, L"ZwCreateThreadEx");
+        g_pZwCreateThreadEx = (fn_ZwCreateThreadEx)MmGetSystemRoutineAddress(&fn);
+    }
+    RtlInitUnicodeString(&fn, L"NtResumeThread");
+    g_pZwResumeThread = (fn_ZwResumeThread)MmGetSystemRoutineAddress(&fn);
+    if (!g_pZwResumeThread)
+    {
+        RtlInitUnicodeString(&fn, L"ZwResumeThread");
+        g_pZwResumeThread = (fn_ZwResumeThread)MmGetSystemRoutineAddress(&fn);
+    }
 
     UNICODE_STRING dev_name, sym_name;
     RtlInitUnicodeString(&dev_name, TD_DEVICE_NAME);

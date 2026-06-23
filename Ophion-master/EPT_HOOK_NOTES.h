@@ -8,25 +8,43 @@
  * Keep this file as reference for anyone modifying the EPT hook code.
  *
  * ============================================================================
- *  1. PRIVATE HOST CR3 AND VMX-ROOT MEMORY ACCESS
+ *  1. PRIVATE HOST CR3 AND VMX-ROOT MEMORY ACCESS (RESOLVED)
  * ============================================================================
  *
  *  Ophion's USE_PRIVATE_HOST_CR3 creates a deep-copy of kernel page tables
  *  at init time. In VMX-root mode, HOST_CR3 = private copy.
  *
- *  PROBLEM: Any memory allocated AFTER hostcr3_build() is NOT mapped in
- *  the private page tables. This includes:
+ *  ORIGINAL PROBLEM: Any memory allocated AFTER hostcr3_build() is NOT
+ *  mapped in the private page tables. This includes:
  *    - Test driver's stack variables (DPC callback stack)
- *    - Test driver's global variables
+ *    - Other driver's global variables
  *    - NonPaged pool allocated after init
+ *    - Stealth contiguous region (64MB, allocated in DriverEntry)
  *
  *  SYMPTOM: Accessing these addresses in VMX-root → #PF → private IDT
  *  halt handler → system freeze (no BSOD, just hangs).
  *
- *  SOLUTION: Disabled USE_PRIVATE_HOST_CR3 for EPT hook compatibility.
- *  VT_Driver (UnrealVTDbg) never uses private host CR3.
- *  If stealth is needed, private host CR3 must be rebuilt after all
- *  allocations, or VMX-root must switch CR3 before accessing guest memory.
+ *  SOLUTION (now implemented — USE_PRIVATE_HOST_CR3 = 1):
+ *
+ *    1. All VMM-critical allocations (pool manager, VMM stacks, MSR/IO
+ *       bitmaps, VMXON/VMCS, EPT tables) happen BEFORE hostcr3_build()
+ *       in vmx_init(). These are mapped in the private CR3 snapshot.
+ *
+ *    2. Guest memory access in VMX-root is wrapped by
+ *       vmx_enter_guest_cr3() / vmx_leave_guest_cr3() which switch
+ *       to system CR3. All VMCALL handlers (EPT hook, unhook, stealth)
+ *       already do this. Register values are read from VMM stack
+ *       (always mapped) BEFORE the CR3 switch.
+ *
+ *    3. Post-init allocations (stealth contiguous region) are dynamically
+ *       mapped into private page tables via hostcr3_map_va().
+ *
+ *    4. Pool manager buffers (splits, hooked pages, trampolines) are
+ *       pre-allocated at PASSIVE_LEVEL during pool_manager_init() and
+ *       their physical addresses are cached. Safe under both CR3s.
+ *
+ *  This provides anti-cheat stealth (guest can't corrupt host page tables
+ *  to redirect VMX-root execution) while maintaining full EPT hook support.
  *
  * ============================================================================
  *  2. VMCALL PARAMETER PASSING - DO NOT PASS POINTERS

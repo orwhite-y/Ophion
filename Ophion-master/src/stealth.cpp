@@ -3,6 +3,7 @@
 *   implements cpuid bare-metal caching and xcr0 validation
 */
 #include "hv.h"
+#include "log.h"
 
 /*
 *   initialize the bare-metal cpuid cache
@@ -94,8 +95,8 @@ stealth_init_cpuid_cache(VOID)
     }
 #endif
 
-    DbgPrintEx(0, 0, "[hv] Stealth CPUID cache: MaxStd=0x%X, MaxExt=0x%X, XCR0=0x%llX, "
-             "InvalidLeaf={0x%X, 0x%X, 0x%X, 0x%X}\n",
+    HYPERPLATFORM_LOG_INFO("[hv] Stealth CPUID cache: MaxStd=0x%X, MaxExt=0x%X, XCR0=0x%llX, "
+             "InvalidLeaf={0x%X, 0x%X, 0x%X, 0x%X}",
              g_stealth_cpuid_cache.max_std_leaf,
              g_stealth_cpuid_cache.max_ext_leaf,
              g_stealth_cpuid_cache.valid_xcr0_mask,
@@ -105,7 +106,7 @@ stealth_init_cpuid_cache(VOID)
              (UINT32)g_stealth_cpuid_cache.invalid_leaf[3]);
 
 #if STEALTH_COMPENSATE_TIMING
-    DbgPrintEx(0, 0, "[hv] TSC compensation: bare_metal_cpuid=%llu cycles, rdtsc_exiting_forced=%d\n",
+    HYPERPLATFORM_LOG_INFO("[hv] TSC compensation: bare_metal_cpuid=%llu cycles, rdtsc_exiting_forced=%d",
              g_stealth_cpuid_cache.bare_metal_cpuid_cost,
              g_stealth_cpuid_cache.rdtsc_exiting_forced);
 #endif

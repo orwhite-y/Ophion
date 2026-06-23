@@ -269,6 +269,7 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_EPT_UNHOOK_ALL   0x00000005
 #define VMCALL_STEALTH_ALLOC    0x00000006
 #define VMCALL_STEALTH_FREE     0x00000007
+#define VMCALL_EPT_HOOK_INJECT  0x00000008
 
 //
 // VMCALL identifier in rax — like UnrealVTDbg's VMCALL_IDENTIFIER
@@ -304,7 +305,29 @@ typedef struct _EPT_HOOK_VMCALL_PARAM {
     UINT64  target_cr3;           // [in] 0 = R0 hook, non-0 = R3 per-process (CR3 PFN)
     PVOID   user_trampoline;      // [in] R3 executable buffer for trampoline (NULL = kernel pool)
     UINT64  user_trampoline_pa;   // [in] pre-computed PA of user_trampoline
+    //
+    // force changed_entry ReadAccess=1 even when execute-only EPT is supported.
+    // needed for shellcode inject: code reads its own embedded data from the
+    // fake page. without R=1, reads EPT-violate → original page (zeros) → crash.
+    //
+    BOOLEAN force_read_access;    // [in] TRUE = changed_entry R=1 (shellcode self-read)
 } EPT_HOOK_VMCALL_PARAM, *PEPT_HOOK_VMCALL_PARAM;
+
+//
+// EPT hook inject — pre-built at PASSIVE_LEVEL, no user VA access in VMX-root.
+// all data passed via kernel NonPaged buffers. safe from SMAP / page faults.
+// param passed as pointer via rdx (like VMCALL_STEALTH_ALLOC).
+//
+typedef struct _EPT_HOOK_INJECT_PARAM {
+    UINT64  target_va;              // [in] user VA of shellcode entry (for tracking)
+    UINT64  target_phys;            // [in] pre-computed PA of target page
+    UINT64  handler_va;             // [in] trampoline VA (VMCALL redirects here)
+    PVOID   fake_page_buffer;       // [in] kernel buffer: pre-built fake page (shellcode + VMCALL)
+    UINT32  hook_size;              // [in] bytes overwritten by VMCALL (LDE result)
+    BOOLEAN force_read_access;      // [in] changed_entry R=1 for shellcode self-read
+    volatile LONG installed;        // [internal] first CPU → 1
+    BOOLEAN result;                 // [out]
+} EPT_HOOK_INJECT_PARAM, *PEPT_HOOK_INJECT_PARAM;
 
 typedef struct _EPT_UNHOOK_VMCALL_PARAM {
     UINT64  caller_cr3;           // [in] caller's CR3

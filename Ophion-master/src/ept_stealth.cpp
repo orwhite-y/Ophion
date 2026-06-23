@@ -276,17 +276,90 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
         return FALSE;
     UINT64 target_pfn = target_phys >> 12;
 
-    // --- check if already installed ---
+    // --- check if already installed (by another CPU in DPC broadcast) ---
     PLIST_ENTRY cur = g_ept->stealth_pages.Flink;
     while (cur != &g_ept->stealth_pages)
     {
         PEPT_STEALTH_PAGE_INFO existing = CONTAINING_RECORD(cur, EPT_STEALTH_PAGE_INFO, stealth_page_list);
         cur = cur->Flink;
         if (existing->pfn_of_target == target_pfn)
-            return TRUE;  // already installed
+        {
+            //
+            // tracking struct exists (another CPU did full install).
+            // still need to split THIS CPU's EPT and set the PTE,
+            // otherwise this CPU's 2MB page stays RWX and the thread
+            // can execute from the original page without shadow redirection.
+            //
+            PEPT_PML2_ENTRY tp2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
+            if (tp2 && tp2->LargePage)
+                ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
+
+            PEPT_PML1_ENTRY tp1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
+            if (tp1)
+            {
+                if (existing->resident)
+                    tp1->AsUInt = existing->execute_entry.AsUInt;
+                else
+                {
+                    tp1->ReadAccess    = 1;
+                    tp1->WriteAccess   = 1;
+                    tp1->ExecuteAccess = 0;
+                }
+            }
+            _mm_mfence();
+            ept_invept_single(vcpu->ept_pointer);
+            return TRUE;
+        }
     }
 
-    // === single-CPU install (no interlock needed) ===
+    // === first CPU: full install (use interlock to prevent duplicate) ===
+    //
+    // multiple CPUs enter VMX-root via KeGenericCallDpc simultaneously.
+    // the "already installed" check above is not atomic with InsertHeadList.
+    // use the interlock to ensure only one CPU does the full install.
+    // other CPUs that lose the race will re-check the list and take the
+    // "already installed" path on next iteration (after winner inserts).
+    //
+    if (interlock && _InterlockedCompareExchange(interlock, 1, 0) != 0)
+    {
+        //
+        // another CPU is doing or has done the full install.
+        // spin briefly then re-check the list — winner should have inserted by now.
+        //
+        for (int i = 0; i < 1000; i++) _mm_pause();
+
+        cur = g_ept->stealth_pages.Flink;
+        while (cur != &g_ept->stealth_pages)
+        {
+            PEPT_STEALTH_PAGE_INFO existing = CONTAINING_RECORD(cur, EPT_STEALTH_PAGE_INFO, stealth_page_list);
+            cur = cur->Flink;
+            if (existing->pfn_of_target == target_pfn)
+            {
+                // winner installed — split this CPU's EPT
+                PEPT_PML2_ENTRY tp2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
+                if (tp2 && tp2->LargePage)
+                    ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
+                PEPT_PML1_ENTRY tp1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
+                if (tp1)
+                {
+                    if (existing->resident)
+                        tp1->AsUInt = existing->execute_entry.AsUInt;
+                    else
+                    {
+                        tp1->ReadAccess    = 1;
+                        tp1->WriteAccess   = 1;
+                        tp1->ExecuteAccess = 0;
+                    }
+                }
+                _mm_mfence();
+                ept_invept_single(vcpu->ept_pointer);
+                return TRUE;
+            }
+        }
+
+        // winner failed or hasn't inserted yet — fall through to try full install
+        // (interlock is already 1, but that's fine — only one CPU reaches here)
+    }
 
     // allocate tracking struct
     PEPT_STEALTH_PAGE_INFO sp = (PEPT_STEALTH_PAGE_INFO)
@@ -569,6 +642,25 @@ ept_handle_stealth_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         cur = cur->Flink;
 
         if (sp->guest_va != rip_page) continue;
+
+        //
+        // shellcode mode: handler_function is NULL — VMCALL should not
+        // redirect anywhere. skip this entry so it falls through to #UD.
+        //
+        if (!sp->handler_function) continue;
+
+        //
+        // per-process filtering: only dispatch VMCALL for the target process.
+        // without this, a different process with the same VA executing VMCALL
+        // would be incorrectly redirected.
+        //
+        if (sp->guest_cr3 != 0)
+        {
+            UINT64 guest_cr3 = 0;
+            __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
+            if ((guest_cr3 & 0x000FFFFFFFFFF000ULL) != (sp->guest_cr3 & 0x000FFFFFFFFFF000ULL))
+                continue;
+        }
 
         // restore target page EPT → read view
         PEPT_PML1_ENTRY target_pte = ept_get_pml1(vcpu->ept_page_table,

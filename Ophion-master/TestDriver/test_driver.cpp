@@ -53,6 +53,24 @@ typedef struct _TD_PEB_LDR_DATA {
 // ---- VMCALL interface (must match Ophion hv_types.h) ----
 
 #define VMCALL_STEALTH_ALLOC    0x00000006
+#define VMCALL_EPT_HOOK_INJECT  0x00000008
+
+//
+// EPT hook inject param — pre-built at PASSIVE_LEVEL, passed to VMX-root.
+// must match Ophion's EPT_HOOK_INJECT_PARAM.
+//
+#pragma pack(push, 8)
+typedef struct _TD_HOOK_INJECT_PARAM {
+    UINT64  target_va;              // user VA of shellcode entry
+    UINT64  target_phys;            // pre-computed PA of target page
+    UINT64  handler_va;             // trampoline VA (VMCALL redirects here)
+    PVOID   fake_page_buffer;       // kernel buffer: pre-built fake page
+    UINT32  hook_size;              // bytes overwritten by VMCALL (from LDE)
+    BOOLEAN force_read_access;
+    volatile LONG installed;
+    BOOLEAN result;
+} TD_HOOK_INJECT_PARAM;
+#pragma pack(pop)
 
 //
 // param struct passed via VMCALL rdx pointer
@@ -439,11 +457,17 @@ TdStealthAllocPage(
     req.target_page_copy = tgt_buf;
     req.pt_precomputed   = TRUE;
 
-    NTSTATUS st = hv_vmcall_simple(VMCALL_STEALTH_ALLOC, (UINT64)&req, 0, 0);
+    // DPC broadcast — every CPU does VMCALL, each splits its own EPT.
+    // same pattern as EPT hook's KeGenericCallDpc.
+    KeGenericCallDpc([](PKDPC, PVOID Ctx, PVOID A1, PVOID A2) {
+        hv_vmcall_simple(VMCALL_STEALTH_ALLOC, (UINT64)Ctx, 0, 0);
+        KeSignalCallDpcSynchronize(A2);
+        KeSignalCallDpcDone(A1);
+    }, &req);
 
     ExFreePoolWithTag(pt_buf,  'htpS');
     ExFreePoolWithTag(tgt_buf, 'htpS');
-    return NT_SUCCESS(st) && req.result;
+    return req.result;
 }
 
 //
@@ -507,14 +531,13 @@ TdStealthInjectPages(
         // page VA from MmGetVirtualForPhysical is process-relative and invalid
         // under system CR3.
         //
-        // DEBUG: NX clear disabled to test if it causes BSOD
-        // {
-        //     PHYSICAL_ADDRESS ptpa;
-        //     ptpa.QuadPart = (LONGLONG)(pt_pfn << 12);
-        //     PUINT64 pt_page = (PUINT64)MmGetVirtualForPhysical(ptpa);
-        //     if (pt_page)
-        //         pt_page[pt_idx] &= ~(1ULL << 63);
-        // }
+        {
+            PHYSICAL_ADDRESS ptpa;
+            ptpa.QuadPart = (LONGLONG)(pt_pfn << 12);
+            PUINT64 pt_page = (PUINT64)MmGetVirtualForPhysical(ptpa);
+            if (pt_page)
+                pt_page[pt_idx] &= ~(1ULL << 63);
+        }
 
         //
         // shellcode mode: pass the buffer directly so VMX-root copies it
@@ -797,6 +820,7 @@ typedef struct _R3_HOOK_DPC_CTX {
     UINT64   target_cr3;
     PVOID    user_trampoline;
     UINT64   user_trampoline_pa;
+    UINT64   flags;             // bit 0 = force_read_access (shellcode self-read)
     NTSTATUS result;
 } R3_HOOK_DPC_CTX;
 
@@ -816,7 +840,7 @@ DpcEptHookR3(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
         ctx->target_cr3,
         (UINT64)ctx->user_trampoline,
         ctx->user_trampoline_pa,
-        0);
+        ctx->flags);
 
     KeSignalCallDpcSynchronize(A2);
     KeSignalCallDpcDone(A1);
@@ -1022,8 +1046,48 @@ TdEptUnhookAllR3(VOID)
 {
     for (int i = 0; i < MAX_R3_HOOKS; i++)
     {
-        if (g_r3_hooks[i].active)
+        if (!g_r3_hooks[i].active) continue;
+
+        //
+        // for inject hooks (target_mdl == NULL): the target process may have
+        // already exited. don't attach — just VMCALL unhook by VA + clear entry.
+        // EPT unhook only needs the VA to find the PFN in the hooked_pages list.
+        // the VMCALL runs under system CR3, which is fine for EPT-only operations.
+        //
+        // for real R3 hooks (target_mdl != NULL): use the full unhook path.
+        //
+        if (g_r3_hooks[i].target_mdl == NULL)
+        {
+            // inject hook — lightweight unhook (no attach needed)
+            PEPROCESS proc = NULL;
+            NTSTATUS st = PsLookupProcessByProcessId(
+                (HANDLE)g_r3_hooks[i].target_pid, &proc);
+
+            if (NT_SUCCESS(st))
+            {
+                // process still alive — attach to resolve VA → PA for unhook
+                KAPC_STATE apc;
+                KeStackAttachProcess(proc, &apc);
+
+                struct { PVOID target; UINT64 caller_cr3; NTSTATUS result; } ctx = {};
+                ctx.target     = g_r3_hooks[i].target_va;
+                ctx.caller_cr3 = __readcr3();
+                KeGenericCallDpc(DpcEptUnhook, &ctx);
+
+                KeUnstackDetachProcess(&apc);
+                ObDereferenceObject(proc);
+            }
+            // else: process dead — EPT pages are orphaned but harmless.
+            // the PFN won't be reused for anything meaningful until
+            // ept_unhook_all() on HV unload restores all PTEs to RWX.
+
+            RtlZeroMemory(&g_r3_hooks[i], sizeof(g_r3_hooks[i]));
+        }
+        else
+        {
+            // real R3 hook — full cleanup
             TdEptUnhookR3(g_r3_hooks[i].target_pid, g_r3_hooks[i].target_va);
+        }
     }
 }
 
@@ -1045,11 +1109,18 @@ TdCreateThread(PEPROCESS process, PVOID entry)
             PROCESS_ALL_ACCESS, *PsProcessType, KernelMode, &proc_h);
         if (!NT_SUCCESS(st)) return st;
 
+        //
+        // create thread NOT suspended — runs immediately.
+        // all CPUs have EPT split (DPC broadcast), no affinity pinning needed.
+        // NtResumeThread/ZwResumeThread may not be exported by ntoskrnl,
+        // so avoid suspend+resume pattern entirely.
+        //
         HANDLE thread_h = NULL;
         st = g_pZwCreateThreadEx(
             &thread_h, THREAD_ALL_ACCESS, NULL, proc_h,
             entry, NULL,
-            0, 0, 0, 0, NULL);
+            0,      // flags = 0: not suspended
+            0, 0, 0, NULL);
 
         if (NT_SUCCESS(st) && thread_h)
             ZwClose(thread_h);
@@ -1115,6 +1186,18 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
     {
     case IOCTL_INJECT:
     {
+        //
+        // EPT hook-based shellcode injection — ALL pre-built at PASSIVE_LEVEL.
+        // VMX-root only does EPT manipulation, NEVER touches user VA (SMAP safe).
+        //
+        // flow:
+        //   1. alloc PAGE_READWRITE in target, build shellcode, clear NX
+        //   2. copy page to kernel buffer, patch VMCALL at entry
+        //   3. build trampoline at PASSIVE_LEVEL: [saved bytes] + [abs jmp back]
+        //   4. VMCALL_EPT_HOOK_INJECT: EPT split + PTE(X=0) + fake page from kernel buf
+        //   5. zero original page, create thread
+        //   6. execute → EPT violation → fake page → VMCALL → trampoline → shellcode
+        //
         if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_INJECT_PARAMS) ||
             io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_INJECT_PARAMS))
         { st = STATUS_BUFFER_TOO_SMALL; break; }
@@ -1132,52 +1215,169 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         SIZE_T size = p->alloc_size ? (SIZE_T)p->alloc_size : PAGE_SIZE;
         size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
+        //
+        // allocate PAGE_EXECUTE_READWRITE — ensures NX=0 in guest PTE.
+        // manual NX clear is fragile: Windows memory manager can restore NX
+        // at any time (working set trim, A/D bit updates, etc.), causing
+        // guest #PF before EPT violation has a chance to fire.
+        //
+        // stealth: EPT hides the page content (reads → original page = zeros).
+        // VAD shows executable, but that can be changed later if needed.
+        //
         st = ZwAllocateVirtualMemory(
             ZwCurrentProcess(), &base, 0, &size,
             MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 
-        if (NT_SUCCESS(st) && base)
+        if (!NT_SUCCESS(st) || !base)
         {
-            DbgPrintEx(0, 0, "[td] alloc VA=%p size=0x%llX pid=%llu\n",
-                       base, (UINT64)size, p->target_pid);
+            KeUnstackDetachProcess(&apc_state);
+            ObDereferenceObject(proc);
+            break;
+        }
 
-            //
-            // build shellcode into a KERNEL buffer (not the target page).
-            // stealth install puts it in shadow page only.
-            // original page stays zeroed = clean for anti-cheat.
-            //
-            PVOID sc_kern = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'htpS');
-            if (sc_kern)
+        DbgPrintEx(0, 0, "[td] inject: VA=%p size=0x%llX pid=%llu\n",
+                   base, (UINT64)size, p->target_pid);
+
+        // --- step 1: build shellcode (needs PEB walk in target context) ---
+        TdBuildShellcodePage(base);
+
+        UINT64 caller_cr3 = __readcr3();
+
+        // --- step 2: copy shellcode → kernel buffer, then zero original page ---
+        //
+        // order matters: copy FIRST, zero SECOND, get PA THIRD.
+        // zeroing may trigger COW (Windows assigns a new physical page).
+        // MmGetPhysicalAddress AFTER zero gets the correct (new) PA.
+        // EPT hook binds to this PA → matches the zeroed page.
+        //
+        PVOID fake_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'kjnI');
+        if (!fake_buf)
+        {
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
+            KeUnstackDetachProcess(&apc_state);
+            ObDereferenceObject(proc);
+            st = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+        RtlCopyMemory(fake_buf, base, PAGE_SIZE);   // save shellcode to kernel buffer
+
+        //
+        // get PA immediately — do NOT zero yet.
+        // zeroing can trigger COW or working-set changes that invalidate PA.
+        // EPT hook binds to THIS PA. zero later would need PA re-check.
+        //
+        // touch the page (read+write) to ensure it's faulted in and stable.
+        //
+        *(volatile UINT8 *)base;  // force read fault-in
+        UINT64 base_phys = MmGetPhysicalAddress(base).QuadPart;
+        DbgPrintEx(0, 0, "[td] inject: PA=%llx\n", base_phys);
+
+        // --- step 4: allocate trampoline (R3 executable) ---
+        PVOID tramp_va = NULL;
+        SIZE_T tramp_size = PAGE_SIZE;
+        NTSTATUS tramp_st = ZwAllocateVirtualMemory(
+            ZwCurrentProcess(), &tramp_va, 0, &tramp_size,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+        if (!NT_SUCCESS(tramp_st) || !tramp_va || !base_phys)
+        {
+            if (tramp_va) ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
+            ExFreePoolWithTag(fake_buf, 'kjnI');
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
+            KeUnstackDetachProcess(&apc_state);
+            ObDereferenceObject(proc);
+            st = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+
+        // --- step 4: pre-build trampoline + patch VMCALL on fake page ---
+        //
+        // fake_buf already has shellcode (copied above before zeroing).
+        // trampoline = [saved first N bytes] + [abs jmp base+N]
+        // shellcode first instruction: sub rsp, 28h = 48 83 EC 28 (4 bytes)
+        //
+        UINT32 hook_size = 4;  // sub rsp, 28h = 48 83 EC 28
+
+        // build trampoline — read saved bytes from fake_buf (NOT base, which is zeroed!)
+        RtlZeroMemory(tramp_va, tramp_size);
+        RtlCopyMemory(tramp_va, fake_buf, hook_size);  // save original bytes from kernel copy
+        {
+            // abs jump to base + hook_size
+            PUINT8 t = (PUINT8)tramp_va + hook_size;
+            UINT64 dst = (UINT64)base + hook_size;
+            t[0] = 0x68;
+            *(PUINT32)(t + 1) = (UINT32)dst;
+            t[5] = 0xC7; t[6] = 0x44; t[7] = 0x24; t[8] = 0x04;
+            *(PUINT32)(t + 9) = (UINT32)(dst >> 32);
+            t[13] = 0xC3;
+        }
+
+        // patch VMCALL at entry of fake page (overwrite first 3 bytes)
+        ((PUINT8)fake_buf)[0] = 0x0F;
+        ((PUINT8)fake_buf)[1] = 0x01;
+        ((PUINT8)fake_buf)[2] = 0xC1;
+
+        DbgPrintEx(0, 0, "[td] inject: fake page + trampoline built, tramp=%p\n", tramp_va);
+
+        // --- step 6: VMCALL to set up EPT (kernel buffers only, no user VA in VMX-root) ---
+        TD_HOOK_INJECT_PARAM inj_req = {};
+        inj_req.target_va        = (UINT64)base;
+        inj_req.target_phys      = base_phys;
+        inj_req.handler_va       = (UINT64)tramp_va;
+        inj_req.fake_page_buffer = fake_buf;
+        inj_req.hook_size        = hook_size;
+        inj_req.force_read_access = TRUE;
+
+        KeGenericCallDpc([](PKDPC, PVOID Ctx, PVOID A1, PVOID A2) {
+            hv_vmcall_simple(VMCALL_EPT_HOOK_INJECT, (UINT64)Ctx, 0, 0);
+            KeSignalCallDpcSynchronize(A2);
+            KeSignalCallDpcDone(A1);
+        }, &inj_req);
+
+        ExFreePoolWithTag(fake_buf, 'kjnI');
+
+        if (inj_req.result)
+        {
+            // verify PA hasn't changed (detect COW / page replacement)
+            UINT64 pa_check = MmGetPhysicalAddress(base).QuadPart;
+            DbgPrintEx(0, 0, "[td] inject: PA check: before=%llx after=%llx %s\n",
+                       base_phys, pa_check,
+                       (pa_check == base_phys) ? "MATCH" : "MISMATCH!");
+
+            // track for cleanup (no MDL — page is one-shot inject, not persistent)
+            R3_HOOK_ENTRY * he = R3HookFindFree();
+            if (he)
             {
-                // build shellcode in kernel buffer (resolves addresses via PEB walk)
-                // temporarily use the user page as workspace, then copy and zero it
-                TdBuildShellcodePage(base);
-                RtlCopyMemory(sc_kern, base, PAGE_SIZE);
-                RtlZeroMemory(base, PAGE_SIZE);  // clean original page
+                he->active          = TRUE;
+                he->target_pid      = p->target_pid;
+                he->target_va       = base;
+                he->trampoline_va   = tramp_va;
+                he->trampoline_size = tramp_size;
+                he->target_mdl      = NULL;
+                he->target_cr3      = caller_cr3;
             }
 
-            if (sc_kern && TdStealthInjectPages(base, sc_kern,
-                                     PAGE_SIZE, FALSE))
-            {
-                p->shellcode_va = (UINT64)base;
-                p->actual_size  = (UINT64)size;
-                irp->IoStatus.Information = sizeof(TD_INJECT_PARAMS);
-            }
-            else
-            {
-                ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
-                st = STATUS_UNSUCCESSFUL;
-            }
-            if (sc_kern) ExFreePoolWithTag(sc_kern, 'htpS');
+            p->shellcode_va = (UINT64)base;
+            p->actual_size  = (UINT64)size;
+            irp->IoStatus.Information = sizeof(TD_INJECT_PARAMS);
+            DbgPrintEx(0, 0, "[td] inject: EPT hook OK\n");
+        }
+        else
+        {
+            DbgPrintEx(0, 0, "[td] inject: EPT hook FAILED\n");
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
+            st = STATUS_UNSUCCESSFUL;
         }
 
         KeUnstackDetachProcess(&apc_state);
 
+        // --- step 7: create thread ---
         if (NT_SUCCESS(st) && p->shellcode_va)
         {
             NTSTATUS thr_st = TdCreateThread(proc, (PVOID)p->shellcode_va);
-            // encode thread result in high bits of actual_size for debugging
             p->actual_size |= ((UINT64)(UINT32)thr_st << 32);
+            DbgPrintEx(0, 0, "[td] inject: thread=0x%08X\n", thr_st);
         }
 
         ObDereferenceObject(proc);

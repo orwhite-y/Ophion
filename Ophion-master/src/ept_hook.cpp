@@ -144,26 +144,46 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     if (!vcpu->ept_page_table || !req->target_function)
         return FALSE;
 
-    BOOLEAN is_r3 = (req->target_cr3 != 0);
+    //
+    // is_r3: need CR3 switch to access user-mode target VA.
+    // triggered when target_cr3 is set (per-process hook) OR when
+    // user_trampoline is provided (shellcode inject with target_cr3=0).
+    //
+    // target_cr3 controls EPT violation per-process CR3 filtering (separate).
+    //
+    BOOLEAN is_r3 = (req->target_cr3 != 0 || req->user_trampoline != NULL);
 
     //
-    // R3 hook: switch to caller_cr3 (target process) for user-mode VA access.
+    // R3 hook / inject: switch to caller_cr3 (target process) for user-mode VA access.
     // system CR3 doesn't map user-mode VAs of other processes.
     // kernel VAs (pool, EPT tables, VMM stack) are mapped in all CR3s.
     //
     UINT64 pre_cr3 = 0;
+    UINT64 pre_rflags = 0;
     if (is_r3 && req->caller_cr3)
     {
         pre_cr3 = __readcr3();
         __writecr3(req->caller_cr3);
+        //
+        // SMAP: VM exit sets RFLAGS to 0x2 (AC=0). with CR4.SMAP=1,
+        // supervisor access to user pages (U/S=1) causes #PF.
+        // set AC=1 to allow user page access in VMX-root.
+        // (STAC/CLAC may #UD on older CPUs, so use direct RFLAGS write)
+        //
+        pre_rflags = __readeflags();
+        __writeeflags(pre_rflags | (1ULL << 18));  // set AC flag
         _mm_mfence();
     }
 
     //
-    // macro to restore CR3 on early return (R3 mode only)
+    // macro to restore CR3 + RFLAGS on early return (R3 mode only)
     //
     #define HOOK_RESTORE_CR3_AND_RETURN(val) do { \
-        if (is_r3 && pre_cr3) { _mm_mfence(); __writecr3(pre_cr3); } \
+        if (is_r3 && pre_cr3) { \
+            _mm_mfence(); \
+            __writeeflags(pre_rflags); \
+            __writecr3(pre_cr3); \
+        } \
         return (val); \
     } while(0)
 
@@ -397,7 +417,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     hp->original_entry.WriteAccess   = 1;
 
     hp->changed_entry = hp->original_entry;
-    hp->changed_entry.ReadAccess       = g_ept->execute_only_supported ? 0 : 1;
+    hp->changed_entry.ReadAccess       = (g_ept->execute_only_supported && !req->force_read_access) ? 0 : 1;
     hp->changed_entry.WriteAccess      = 0;
     hp->changed_entry.ExecuteAccess    = 1;
     hp->changed_entry.PageFrameNumber  = hp->pfn_of_fake_page_contents;
@@ -415,6 +435,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     if (is_r3 && pre_cr3)
     {
         _mm_mfence();
+        __writeeflags(pre_rflags);  // restore RFLAGS (clear AC / SMAP)
         __writecr3(pre_cr3);
         pre_cr3 = 0;   // prevent double-restore in macro
     }
@@ -724,8 +745,8 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
             }
         }
 
-        // for oneshot (non-resident): also restore target page to read view
-        if (!sp->resident)
+        // keep execute view — shellcode reads its own data from the same page
+        if (0 && !sp->resident)
         {
             PEPT_PML1_ENTRY target_pte = ept_get_pml1(vcpu->ept_page_table,
                 (SIZE_T)(sp->pfn_of_target << 12));

@@ -696,7 +696,31 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
     PGUEST_REGS regs = vcpu->regs;
 
     //
-    // reject VMCALL from ring 3 — only kernel callers allowed
+    // EPT hook / stealth VMCALL dispatch — MUST run before CPL check.
+    //
+    // Ring 3 EPT hooks (type 1) and stealth oneshot pages embed VMCALL (0F 01 C1)
+    // in user-mode execute pages. the CPU executes vmcall from CPL=3 which causes
+    // a VM exit. these handlers check RIP against known hooked/stealth pages and
+    // redirect execution to the handler function. safe: only matches our own pages.
+    //
+    // if we checked CPL first, all R3 vmcall would be rejected with #UD before
+    // the EPT hook/stealth dispatch could handle them.
+    //
+    if (ept_handle_vmcall_hook(vcpu))
+    {
+        vcpu->advance_rip = FALSE;
+        return;
+    }
+
+    if (ept_handle_stealth_vmcall(vcpu))
+    {
+        vcpu->advance_rip = FALSE;
+        return;
+    }
+
+    //
+    // reject VMCALL from ring 3 — only kernel callers allowed for OPHION_VMCALL_ID.
+    // EPT hook / stealth vmcall was already handled above.
     //
     {
         size_t guest_cs_ar = 0;
@@ -733,6 +757,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             //   r12 = target_cr3      (0 = R0 hook, non-0 = R3 per-process)
             //   r13 = user_trampoline (R3 executable buffer, NULL = kernel pool)
             //   r14 = user_trampoline_pa (pre-computed PA)
+            //   r15 = flags (bit 0 = force_read_access for shellcode self-read)
             //
             UINT64 target_va       = regs->rdx;
             UINT64 proxy_va        = regs->r8;
@@ -742,6 +767,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             UINT64 target_cr3      = regs->r12;
             UINT64 user_tramp_va   = regs->r13;
             UINT64 user_tramp_pa   = regs->r14;
+            UINT64 flags           = regs->r15;
 
             if (!target_va || !caller_cr3)
             {
@@ -759,6 +785,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             local_req.target_cr3         = target_cr3;
             local_req.user_trampoline    = (PVOID)user_tramp_va;
             local_req.user_trampoline_pa = user_tramp_pa;
+            local_req.force_read_access  = (flags & 1) ? TRUE : FALSE;
             if (origin_va)
                 local_req.origin_function = (PVOID *)origin_va;
 
@@ -852,6 +879,150 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             break;
         }
 
+        case VMCALL_EPT_HOOK_INJECT:
+        {
+            //
+            // shellcode inject via EPT hook — all data pre-built at PASSIVE_LEVEL.
+            // NO user VA access in VMX-root (SMAP safe).
+            // rdx = pointer to EPT_HOOK_INJECT_PARAM (kernel NonPaged memory)
+            //
+            #define _POOL_TAG_HOOKED_PAGE 1
+            #define _POOL_TAG_HOOKED_FUNC 2
+            PEPT_HOOK_INJECT_PARAM inj = (PEPT_HOOK_INJECT_PARAM)regs->rdx;
+            if (!inj || !inj->fake_page_buffer || !inj->target_phys)
+            {
+                regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            UINT64 target_phys = inj->target_phys & ~0xFFFULL;
+            UINT64 target_pfn  = target_phys >> 12;
+
+            // --- already installed (other CPU in DPC broadcast) ---
+            BOOLEAN already = FALSE;
+            PLIST_ENTRY hcur = g_ept->hooked_pages.Flink;
+            while (hcur != &g_ept->hooked_pages)
+            {
+                PEPT_HOOKED_PAGE_INFO ex = CONTAINING_RECORD(hcur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
+                hcur = hcur->Flink;
+                if (ex->pfn_of_hooked_page == target_pfn)
+                {
+                    // just split this CPU's EPT + set PTE
+                    PEPT_PML2_ENTRY p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
+                    if (p2 && p2->LargePage)
+                        ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
+                    PEPT_PML1_ENTRY p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
+                    if (p1) { p1->ReadAccess = 1; p1->WriteAccess = 1; p1->ExecuteAccess = 0; }
+                    _mm_mfence();
+                    ept_invept_single(vcpu->ept_pointer);
+                    inj->result = TRUE;
+                    already = TRUE;
+                    break;
+                }
+            }
+            if (already) { regs->rax = (UINT64)STATUS_SUCCESS; break; }
+
+            // --- first CPU: full install ---
+            if (_InterlockedCompareExchange(&inj->installed, 1, 0) != 0)
+            {
+                //
+                // lost interlock — another CPU is doing the full install.
+                // don't wait for the list entry (spin may not be enough on 20 CPUs).
+                // just split THIS CPU's EPT and set X=0. the global list entry
+                // (for violation/VMCALL dispatch) will be available once the winner
+                // CPU completes InsertHeadList — the list is shared across all CPUs.
+                //
+                PEPT_PML2_ENTRY p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
+                if (p2 && p2->LargePage)
+                    ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
+                PEPT_PML1_ENTRY p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
+                if (p1) { p1->ReadAccess = 1; p1->WriteAccess = 1; p1->ExecuteAccess = 0; }
+                _mm_mfence();
+                ept_invept_single(vcpu->ept_pointer);
+                inj->result = TRUE;
+                regs->rax = (UINT64)STATUS_SUCCESS;
+                break;
+            }
+
+            // allocate tracking structs from pool (kernel memory, no SMAP issue)
+            PEPT_HOOKED_PAGE_INFO hp = (PEPT_HOOKED_PAGE_INFO)
+                pool_manager_request(_POOL_TAG_HOOKED_PAGE, sizeof(EPT_HOOKED_PAGE_INFO));
+            PEPT_HOOKED_FUNCTION_INFO fi = hp ? (PEPT_HOOKED_FUNCTION_INFO)
+                pool_manager_request(_POOL_TAG_HOOKED_FUNC, sizeof(EPT_HOOKED_FUNCTION_INFO)) : NULL;
+            if (!hp || !fi)
+            {
+                if (hp) pool_manager_release(hp);
+                inj->result = FALSE;
+                regs->rax = (UINT64)STATUS_INSUFFICIENT_RESOURCES;
+                break;
+            }
+            RtlZeroMemory(hp, sizeof(*hp));
+            RtlZeroMemory(fi, sizeof(*fi));
+            InitializeListHead(&hp->hooked_functions_list);
+
+            // split 2MB → 4KB
+            PEPT_PML2_ENTRY pml2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
+            PEPT_PML1_ENTRY pte = NULL;
+            if (pml2 && pml2->LargePage)
+            {
+                PVMM_EPT_DYNAMIC_SPLIT sp = ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
+                if (!sp) { pool_manager_release(fi); pool_manager_release(hp);
+                           inj->result = FALSE; regs->rax = (UINT64)STATUS_UNSUCCESSFUL; break; }
+                pte = &sp->PML1[ADDRMASK_EPT_PML1_INDEX(target_phys)];
+            }
+            else
+                pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
+
+            if (!pte) { pool_manager_release(fi); pool_manager_release(hp);
+                        inj->result = FALSE; regs->rax = (UINT64)STATUS_UNSUCCESSFUL; break; }
+
+            // fill hooked page — copy pre-built fake page from KERNEL buffer (safe!)
+            hp->pfn_of_hooked_page = target_pfn;
+            UINT64 hp_pa = pool_manager_get_physical(hp);
+            UINT64 fake_off = (UINT64)hp->fake_page_contents - (UINT64)hp;
+            hp->pfn_of_fake_page_contents = (hp_pa + fake_off) >> 12;
+            hp->entry_address = pte;
+            hp->target_cr3 = 0;  // global (no CR3 filtering — private page, safe)
+
+            RtlCopyMemory(hp->fake_page_contents, inj->fake_page_buffer, PAGE_SIZE);
+
+            // fill function info
+            fi->virtual_address    = (PVOID)inj->target_va;
+            fi->handler_function   = (PVOID)inj->handler_va;
+            fi->fake_page_contents = hp->fake_page_contents;
+            fi->hook_size          = inj->hook_size;
+            fi->first_trampoline_address = NULL;  // built at PASSIVE_LEVEL
+            fi->user_trampoline    = TRUE;         // don't pool_release
+
+            // EPT PTE permissions
+            hp->original_entry = *pte;
+            hp->original_entry.ReadAccess    = 1;
+            hp->original_entry.WriteAccess   = 1;
+            hp->original_entry.ExecuteAccess = 0;
+
+            hp->changed_entry = hp->original_entry;
+            hp->changed_entry.ReadAccess      = inj->force_read_access ? 1
+                                               : (g_ept->execute_only_supported ? 0 : 1);
+            hp->changed_entry.WriteAccess     = 0;
+            hp->changed_entry.ExecuteAccess   = 1;
+            hp->changed_entry.PageFrameNumber = hp->pfn_of_fake_page_contents;
+
+            hp->Options = EPTO_HOOK_FUNCTION;
+            InsertHeadList(&hp->hooked_functions_list, &fi->hooked_function_list);
+            InsertHeadList(&g_ept->hooked_pages, &hp->hooked_page_list);
+
+            // activate: set PTE to read view (X=0)
+            pte->ReadAccess    = 1;
+            pte->WriteAccess   = 1;
+            pte->ExecuteAccess = 0;
+            _mm_mfence();
+            ept_invept_single(vcpu->ept_pointer);
+
+            inj->result = TRUE;
+            regs->rax = (UINT64)STATUS_SUCCESS;
+            break;
+        }
+
         case VMCALL_TEST:
             regs->rax = (UINT64)STATUS_SUCCESS;
             break;
@@ -905,20 +1076,8 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
     }
 
     //
-    // not our VMCALL — try EPT hook / stealth VMCALL dispatch
+    // not our VMCALL and not an EPT hook/stealth page (already checked above)
     //
-    if (ept_handle_vmcall_hook(vcpu))
-    {
-        vcpu->advance_rip = FALSE;
-        return;
-    }
-
-    if (ept_handle_stealth_vmcall(vcpu))
-    {
-        vcpu->advance_rip = FALSE;
-        return;
-    }
-
     vmexit_inject_ud();
     vcpu->advance_rip = FALSE;
 }

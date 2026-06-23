@@ -670,10 +670,21 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
     }
 
     //
+    // try stealth page EPT violation (hidden executable memory split-TLB)
+    //
+    if (ept_stealth_handle_violation(vcpu, guest_phys, vcpu->exit_qual))
+    {
+        vcpu->advance_rip = FALSE;
+        return;
+    }
+
+    //
     // unhandled EPT violation — 可能是刚 unhook 但 TLB 还没刷新
     // 做一次 INVEPT 让 CPU 重试（PTE 已恢复 RWX，重试后不会再 violation）
     // 如果确实是 EPT 配置错误，重试几次后系统会自然恢复或触发 misconfig
     //
+    // PITFALL #13: Don't inject #GP - page may have been unhooked but TLB stale.
+    // FIX: INVEPT flushes stale TLB, CPU retries with updated PTE (now RWX), no more violation.
     ept_invept_single(vcpu->ept_pointer);
     vcpu->advance_rip = FALSE;
 }
@@ -701,6 +712,8 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
     // 1. check rax identifier (like UnrealVTDbg's VMCALL_IDENTIFIER)
     //    if rax matches, parameters are in rcx/rdx/r8/r9/r10-r15
     //
+    // PITFALL #3: EPT VMCALLs use rax identifier, not r10/r11/r12 signature (need r10-r15 for params).
+    // FIX: Check rax first. If matches, r10-r15 carry target/proxy/cr3/hook_type. Like UnrealVTDbg.
     if (regs->rax == OPHION_VMCALL_ID)
     {
         UINT64 vmcall_num = regs->rcx;
@@ -717,6 +730,8 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             //   r10 = caller_cr3
             //   r11 = hook_type
             //
+            // PITFALL #2: Read values from regs (VMM stack), never dereference guest pointers directly.
+            // FIX: regs->rdx is a VALUE on VMM stack (host CR3 mapped). Dereference only after __writecr3(guest).
             UINT64 target_va  = regs->rdx;
             UINT64 proxy_va   = regs->r8;
             UINT64 origin_va  = regs->r9;
@@ -764,9 +779,45 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         }
 
         case VMCALL_EPT_UNHOOK_ALL:
+            // PITFALL #11: ept_unhook_all must NOT call INVEPT if called after VMXOFF.
+            // FIX: ept_unhook_all() only restores PTEs + frees pool. Caller does INVEPT separately.
             ept_unhook_all();
             regs->rax = (UINT64)STATUS_SUCCESS;
             break;
+
+        case VMCALL_STEALTH_ALLOC:
+        {
+            //
+            // stealth memory allocation — EPT split page with hidden execute
+            // rdx = pointer to EPT_STEALTH_ALLOC_PARAM (on VMM stack via DPC)
+            //
+            PEPT_STEALTH_ALLOC_PARAM stealth_req = (PEPT_STEALTH_ALLOC_PARAM)regs->rdx;
+            if (!stealth_req)
+            {
+                regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            BOOLEAN ok = ept_stealth_install(vcpu, stealth_req);
+            stealth_req->result = ok;
+            regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
+            break;
+        }
+
+        case VMCALL_STEALTH_FREE:
+        {
+            PEPT_STEALTH_FREE_PARAM free_req = (PEPT_STEALTH_FREE_PARAM)regs->rdx;
+            if (!free_req)
+            {
+                regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            BOOLEAN ok = ept_stealth_uninstall(vcpu, free_req);
+            free_req->result = ok;
+            regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
+            break;
+        }
 
         default:
             regs->rax = 0ULL;
@@ -784,6 +835,13 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
     {
         // signature mismatch — try EPT-hooked fake page VMCALL redirect
         if (ept_handle_vmcall_hook(vcpu))
+        {
+            vcpu->advance_rip = FALSE;
+            return;
+        }
+
+        // try stealth page VMCALL dispatch (hidden executable memory)
+        if (ept_handle_stealth_vmcall(vcpu))
         {
             vcpu->advance_rip = FALSE;
             return;
@@ -846,6 +904,72 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
 
         regs->rax = (UINT64)STATUS_SUCCESS;
+        break;
+    }
+
+    //
+    // EPT hook/stealth VMCALLs — DPC broadcast uses asm_vmx_vmcall which
+    // sets r10/r11/r12 signature (not rax=OPHION_VMCALL_ID). Handle them
+    // in both paths so DPC-based hooks work correctly.
+    //
+    case VMCALL_EPT_HOOK:
+    {
+        PEPT_HOOK_VMCALL_PARAM hook_req = (PEPT_HOOK_VMCALL_PARAM)regs->rdx;
+        if (!hook_req)
+        {
+            regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
+            break;
+        }
+        BOOLEAN ok = ept_hook_install(vcpu, hook_req);
+        hook_req->result = ok;
+        regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
+        break;
+    }
+
+    case VMCALL_EPT_UNHOOK:
+    {
+        PEPT_UNHOOK_VMCALL_PARAM unhook_req = (PEPT_UNHOOK_VMCALL_PARAM)regs->rdx;
+        if (!unhook_req)
+        {
+            regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
+            break;
+        }
+        BOOLEAN ok = ept_unhook_install(vcpu, unhook_req);
+        unhook_req->result = ok;
+        regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
+        break;
+    }
+
+    case VMCALL_EPT_UNHOOK_ALL:
+        ept_unhook_all();
+        regs->rax = (UINT64)STATUS_SUCCESS;
+        break;
+
+    case VMCALL_STEALTH_ALLOC:
+    {
+        PEPT_STEALTH_ALLOC_PARAM stealth_req = (PEPT_STEALTH_ALLOC_PARAM)regs->rdx;
+        if (!stealth_req)
+        {
+            regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
+            break;
+        }
+        BOOLEAN ok = ept_stealth_install(vcpu, stealth_req);
+        stealth_req->result = ok;
+        regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
+        break;
+    }
+
+    case VMCALL_STEALTH_FREE:
+    {
+        PEPT_STEALTH_FREE_PARAM free_req = (PEPT_STEALTH_FREE_PARAM)regs->rdx;
+        if (!free_req)
+        {
+            regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
+            break;
+        }
+        BOOLEAN ok = ept_stealth_uninstall(vcpu, free_req);
+        free_req->result = ok;
+        regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
         break;
     }
 
@@ -1301,6 +1425,44 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
         if (int_info.Valid)
         {
+            //
+            // stealth: intercept instruction-fetch #PF (NX violation)
+            //
+            // when a stealth page is executed, the CPU page walker reads the
+            // fake PT page (NX=1) and generates #PF with error code bit 4 set.
+            // we handle this by temporarily swapping EPTs so the CPU can execute.
+            //
+            if (int_info.Vector == EXCEPTION_VECTOR_PAGE_FAULT &&
+                int_info.InterruptionType == INTERRUPT_TYPE_HARDWARE_EXCEPTION)
+            {
+                size_t pf_error_code = 0;
+                __vmx_vmread(VMCS_VMEXIT_INTERRUPTION_ERROR_CODE, &pf_error_code);
+
+                // bit 4 = instruction fetch (I/D flag)
+                if (pf_error_code & 0x10)
+                {
+                    // fault address is in exit qualification for #PF
+                    UINT64 fault_addr = vcpu->exit_qual;
+
+                    if (ept_stealth_handle_pf(vcpu, fault_addr, (UINT32)pf_error_code))
+                    {
+                        //
+                        // handled — don't inject #PF, don't advance RIP.
+                        // CPU will retry the instruction after VMRESUME.
+                        // page walk will now read real PT page (NX=0) → execute succeeds.
+                        //
+                        vcpu->advance_rip = FALSE;
+                        break;
+                    }
+                }
+
+                //
+                // not our stealth page — fall through to re-inject #PF normally.
+                // must set CR2 to the fault address before re-injection.
+                //
+                asm_write_cr2(vcpu->exit_qual);
+            }
+
             if (int_info.InterruptionType == INTERRUPT_TYPE_NMI)
             {
                 //

@@ -5,7 +5,9 @@
 
 //
 // windows kernel headers (used only at PASSIVE/DPC level in non-root)
+// ntifs.h includes ntddk.h + wdm.h + APC types + ObOpenObjectByPointer
 //
+#include <ntifs.h>
 #include <ntddk.h>
 #include <intrin.h>
 
@@ -105,6 +107,39 @@ VOID    ept_unhook_all(VOID);
 BOOLEAN ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exit_qual);
 VOID    ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu);
 BOOLEAN ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu);
+
+//
+// stealth memory allocation (ept_stealth.cpp)
+//   allocates PAGE_READWRITE memory with hidden execute capability via EPT split
+//   read → clean data (no exec attr), execute → VMCALL → handler dispatch
+//
+
+// stealth region — contiguous physical memory for shadow/fake pages
+BOOLEAN ept_stealth_region_init(VOID);
+VOID    ept_stealth_region_destroy(VOID);
+
+// public API — PASSIVE_LEVEL
+BOOLEAN ept_stealth_alloc(PVOID target_va, PVOID handler_function);
+BOOLEAN ept_stealth_inject(PVOID target_va, PVOID shellcode, UINT32 shellcode_size);
+BOOLEAN ept_stealth_map_resident(PVOID target_va, SIZE_T size);
+BOOLEAN ept_stealth_free(PVOID target_va);
+BOOLEAN ept_stealth_free_range(PVOID target_va, SIZE_T size);
+VOID    ept_stealth_free_all_broadcast(VOID);
+
+// VMX-root internal
+BOOLEAN ept_stealth_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM req);
+BOOLEAN ept_stealth_uninstall(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_FREE_PARAM req);
+VOID    ept_stealth_free_all(VOID);
+
+// VMX-root handler — check if VMCALL came from a stealth page
+BOOLEAN ept_handle_stealth_vmcall(VIRTUAL_MACHINE_STATE * vcpu);
+
+// EPT violation handler for stealth pages (target page + PT page writes)
+BOOLEAN ept_stealth_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exit_qual);
+
+// #PF handler — intercepts instruction-fetch page faults (NX violations)
+// temporarily swaps PT page EPT to real view so CPU page walk sees NX=0
+BOOLEAN ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error_code);
 
 //
 // pool manager (pool_manager.cpp)

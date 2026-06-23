@@ -18,6 +18,7 @@ extern "C" {
 // hide CR4.VMXE (bit 13) from guest reads
 // defeats: hvdetecc vm.vmxe
 //
+// PITFALL #14: CR4.VMXE hiding breaks VMware nested VMX. FIX: Set to 0 for VMware.
 #define STEALTH_HIDE_CR4_VMXE               1
 
 //
@@ -42,6 +43,8 @@ extern "C" {
 // protects host-mode from guest/anti-cheat page table corruption
 // disabled by default — enable once base hv is verified stable
 //
+// PITFALL #1: Must be 0 for EPT hooks. Private host CR3 breaks VMX-root memory access (guest VA not mapped).
+// FIX: Set to 0. VT_Driver(UnrealVTDbg) also uses system CR3 as HOST_CR3.
 #define USE_PRIVATE_HOST_CR3                0
 
 //
@@ -56,8 +59,10 @@ extern "C" {
 // (#GP, #PF, etc), our IDT handlers halt the cpu rather than corrupt state.
 // on VMXOFF we restore the OS IDT so normal exception handling resumes.
 //
+// PITFALL #14: Private host IDT/GDT causes triple-fault in VMware. FIX: Set to 0 for VMware testing.
 #define USE_PRIVATE_HOST_IDT                1
 
+// PITFALL #14: Same VMware issue. FIX: Set to 0 for VMware.
 #define USE_PRIVATE_HOST_GDT                1
 
 //

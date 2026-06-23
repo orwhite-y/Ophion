@@ -1,55 +1,20 @@
 /*
-*   driver.c - windows kernel driver entry point for the hypervisor
-*   creates a device object, symbolic link, and initializes vmx
-*   provides ioctl interface for usermode loader communication
+*   driver.c - Ophion hypervisor kernel driver
+*   pure hypervisor — no IOCTL, no device object.
+*   all communication via VMCALL from other kernel drivers.
 */
 #include "hv.h"
-
-#define DEVICE_NAME     L"\\Device\\Ophion"
-#define SYMLINK_NAME    L"\\DosDevices\\Ophion"
-
-#define IOCTL_BASE      0x800
-#define IOCTL_HV_STATUS      CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_BASE + 0, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_EPT_HOOK       CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_BASE + 1, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_EPT_UNHOOK     CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_BASE + 2, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_EPT_UNHOOK_ALL CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_BASE + 3, METHOD_BUFFERED, FILE_ANY_ACCESS)
-
-//
-// IOCTL structures (user/kernel → driver interface)
-//
-#pragma pack(push, 8)
-typedef struct _IOCTL_EPT_HOOK_PARAMS {
-    UINT64 target_address;
-    UINT64 proxy_address;
-    UINT32 hook_type;
-    UINT64 original_address;   // [out] trampoline for calling original
-} IOCTL_EPT_HOOK_PARAMS, *PIOCTL_EPT_HOOK_PARAMS;
-
-typedef struct _IOCTL_EPT_UNHOOK_PARAMS {
-    UINT64 target_address;
-} IOCTL_EPT_UNHOOK_PARAMS, *PIOCTL_EPT_UNHOOK_PARAMS;
-#pragma pack(pop)
-
-static NTSTATUS DriverCreateClose(PDEVICE_OBJECT device_obj, PIRP irp);
-static NTSTATUS DriverIoControl(PDEVICE_OBJECT device_obj, PIRP irp);
 
 VOID
 DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
 {
-    UNICODE_STRING symlink;
-
+    UNREFERENCED_PARAMETER(driver_obj);
     DbgPrintEx(0, 0, "[hv] Unloading hypervisor driver...\n");
 
+    ept_stealth_free_all_broadcast();
+    ept_stealth_region_destroy();
     broadcast_terminate_all();
     vmx_terminate();
-
-    RtlInitUnicodeString(&symlink, SYMLINK_NAME);
-    IoDeleteSymbolicLink(&symlink);
-
-    if (driver_obj->DeviceObject)
-    {
-        IoDeleteDevice(driver_obj->DeviceObject);
-    }
 
     DbgPrintEx(0, 0, "[hv] Driver unloaded.\n");
 }
@@ -59,161 +24,23 @@ DriverEntry(
     _In_ PDRIVER_OBJECT  driver_obj,
     _In_ PUNICODE_STRING registry_path)
 {
-    NTSTATUS       status;
-    PDEVICE_OBJECT device_obj = NULL;
-    UNICODE_STRING device_name;
-    UNICODE_STRING symlink;
-
     UNREFERENCED_PARAMETER(registry_path);
-
     DbgPrintEx(0, 0, "[hv] Ophion initializing...\n");
 
-    RtlInitUnicodeString(&device_name, DEVICE_NAME);
-    status = IoCreateDevice(
-        driver_obj,
-        0,
-        &device_name,
-        FILE_DEVICE_UNKNOWN,
-        FILE_DEVICE_SECURE_OPEN,
-        FALSE,
-        &device_obj);
-
-    if (!NT_SUCCESS(status))
-    {
-        DbgPrintEx(0, 0, "[hv] IoCreateDevice failed: 0x%X\n", status);
-        return status;
-    }
-
-    RtlInitUnicodeString(&symlink, SYMLINK_NAME);
-    status = IoCreateSymbolicLink(&symlink, &device_name);
-
-    if (!NT_SUCCESS(status))
-    {
-        DbgPrintEx(0, 0, "[hv] IoCreateSymbolicLink failed: 0x%X\n", status);
-        IoDeleteDevice(device_obj);
-        return status;
-    }
-
-    driver_obj->DriverUnload                         = DriverUnload;
-    driver_obj->MajorFunction[IRP_MJ_CREATE]         = DriverCreateClose;
-    driver_obj->MajorFunction[IRP_MJ_CLOSE]          = DriverCreateClose;
-    driver_obj->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DriverIoControl;
+    driver_obj->DriverUnload = DriverUnload;
 
     if (!vmx_init())
     {
         DbgPrintEx(0, 0, "[hv] VMX initialization FAILED!\n");
-        vmx_terminate();  // clean up any partially-allocated resources
-        IoDeleteSymbolicLink(&symlink);
-        IoDeleteDevice(device_obj);
+        vmx_terminate();
         return STATUS_HV_OPERATION_FAILED;
     }
 
+    if (ept_stealth_region_init())
+        DbgPrintEx(0, 0, "[hv] Stealth region initialized.\n");
+    else
+        DbgPrintEx(0, 0, "[hv] Stealth region init failed (stealth features disabled).\n");
+
     DbgPrintEx(0, 0, "[hv] Hypervisor loaded and active on all cores!\n");
     return STATUS_SUCCESS;
-}
-
-static NTSTATUS
-DriverCreateClose(
-    _In_ PDEVICE_OBJECT device_obj,
-    _In_ PIRP           irp)
-{
-    UNREFERENCED_PARAMETER(device_obj);
-
-    irp->IoStatus.Status      = STATUS_SUCCESS;
-    irp->IoStatus.Information = 0;
-    IoCompleteRequest(irp, IO_NO_INCREMENT);
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS
-DriverIoControl(
-    _In_ PDEVICE_OBJECT device_obj,
-    _In_ PIRP           irp)
-{
-    NTSTATUS           status = STATUS_SUCCESS;
-    PIO_STACK_LOCATION io_stack;
-    ULONG              ioctl_code;
-
-    UNREFERENCED_PARAMETER(device_obj);
-
-    io_stack       = IoGetCurrentIrpStackLocation(irp);
-    ioctl_code = io_stack->Parameters.DeviceIoControl.IoControlCode;
-
-    switch (ioctl_code)
-    {
-    case IOCTL_HV_STATUS:
-    {
-        //
-        // return basic status: number of virtualized cores
-        //
-        if (io_stack->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(UINT32))
-        {
-            *(UINT32 *)irp->AssociatedIrp.SystemBuffer = g_cpu_count;
-            irp->IoStatus.Information = sizeof(UINT32);
-        }
-        else
-        {
-            status = STATUS_BUFFER_TOO_SMALL;
-        }
-        break;
-    }
-
-    case IOCTL_EPT_HOOK:
-    {
-        if (io_stack->Parameters.DeviceIoControl.InputBufferLength >= sizeof(IOCTL_EPT_HOOK_PARAMS) &&
-            io_stack->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(IOCTL_EPT_HOOK_PARAMS))
-        {
-            PIOCTL_EPT_HOOK_PARAMS req = (PIOCTL_EPT_HOOK_PARAMS)irp->AssociatedIrp.SystemBuffer;
-            PVOID original = NULL;
-
-            if (ept_hook_function(
-                    (PVOID)req->target_address,
-                    (PVOID)req->proxy_address,
-                    &original,
-                    req->hook_type))
-            {
-                req->original_address = (UINT64)original;
-                irp->IoStatus.Information = sizeof(IOCTL_EPT_HOOK_PARAMS);
-            }
-            else
-            {
-                status = STATUS_UNSUCCESSFUL;
-            }
-        }
-        else
-        {
-            status = STATUS_BUFFER_TOO_SMALL;
-        }
-        break;
-    }
-
-    case IOCTL_EPT_UNHOOK:
-    {
-        if (io_stack->Parameters.DeviceIoControl.InputBufferLength >= sizeof(IOCTL_EPT_UNHOOK_PARAMS))
-        {
-            PIOCTL_EPT_UNHOOK_PARAMS req = (PIOCTL_EPT_UNHOOK_PARAMS)irp->AssociatedIrp.SystemBuffer;
-            if (!ept_unhook_function((PVOID)req->target_address))
-                status = STATUS_NOT_FOUND;
-        }
-        else
-        {
-            status = STATUS_BUFFER_TOO_SMALL;
-        }
-        break;
-    }
-
-    case IOCTL_EPT_UNHOOK_ALL:
-    {
-        ept_unhook_all_broadcast();
-        break;
-    }
-
-    default:
-        status = STATUS_INVALID_DEVICE_REQUEST;
-        break;
-    }
-
-    irp->IoStatus.Status = status;
-    IoCompleteRequest(irp, IO_NO_INCREMENT);
-    return status;
 }

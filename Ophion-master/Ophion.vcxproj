@@ -126,6 +126,7 @@
     <ClCompile Include="src\ept_diag.cpp" />
     <ClCompile Include="src\ept_hook.cpp" />
     <ClCompile Include="src\pool_manager.cpp" />
+    <ClCompile Include="src\ept_stealth.cpp" />
   </ItemGroup>
   <!-- Assembly Files (MASM x64) -->
   <ItemGroup>

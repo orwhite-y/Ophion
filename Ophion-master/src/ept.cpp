@@ -304,6 +304,9 @@ ept_init(VOID)
     RtlZeroMemory(g_ept, sizeof(EPT_STATE));
 
     InitializeListHead(&g_ept->hooked_pages);
+    InitializeListHead(&g_ept->stealth_pages);
+    InitializeListHead(&g_ept->stealth_fake_pts);
+    RtlZeroMemory(&g_ept->stealth_region, sizeof(g_ept->stealth_region));
 
     if (!ept_check_features())
         return FALSE;

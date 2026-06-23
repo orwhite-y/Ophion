@@ -22,12 +22,14 @@ OPHION_VMCALL_ID EQU 04F5048494F4E4558h   ; 'OPHIONEX'
 ; )
 ;
 hv_vmcall_ex PROC
+    ; PITFALL #4: r12-r15 are callee-saved. MUST push/pop or caller crashes after vmcall returns.
     ; 保存非易失性寄存器 (r12-r15)
     push    r12
     push    r13
     push    r14
     push    r15
 
+    ; PITFALL #3: Use rax as identifier (not r10/r11/r12) so r10-r15 are free for parameters.
     ; rax = Ophion identifier
     mov     rax, OPHION_VMCALL_ID
 

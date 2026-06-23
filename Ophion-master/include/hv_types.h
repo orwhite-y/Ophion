@@ -107,13 +107,33 @@ typedef struct _EPT_HOOKED_PAGE_INFO {
     UINT32           Options;             // EPTO_HOOK_FUNCTION or EPTO_VIRTUAL_BREAKPOINT
 } EPT_HOOKED_PAGE_INFO, *PEPT_HOOKED_PAGE_INFO;
 
+//
+// contiguous shadow region — must be defined before EPT_STATE (embedded, not pointer)
+//
+#define STEALTH_REGION_DEFAULT_MB   64
+#define STEALTH_REGION_DEFAULT_SIZE ((SIZE_T)STEALTH_REGION_DEFAULT_MB * 1024 * 1024)
+
+typedef struct _STEALTH_REGION {
+    PVOID           base_va;
+    UINT64          base_pa;
+    SIZE_T          total_pages;
+    volatile LONG   next_page;
+} STEALTH_REGION;
+
+// forward declarations for pointer types used in VIRTUAL_MACHINE_STATE
+typedef struct _EPT_STEALTH_PAGE_INFO *PEPT_STEALTH_PAGE_INFO;
+typedef struct _STEALTH_FAKE_PT *PSTEALTH_FAKE_PT;
+
 typedef struct _EPT_STATE {
     MTRR_RANGE_DESCRIPTOR mem_ranges[MAX_MTRR_RANGES];
     UINT32                num_ranges;
     UINT8                 default_type;
     BOOLEAN               ad_supported;
-    BOOLEAN               execute_only_supported;  // CPU supports X-only EPT pages (R=0,W=0,X=1)
-    LIST_ENTRY            hooked_pages;    // list of EPT_HOOKED_PAGE_INFO
+    BOOLEAN               execute_only_supported;
+    LIST_ENTRY            hooked_pages;
+    LIST_ENTRY            stealth_pages;
+    LIST_ENTRY            stealth_fake_pts;
+    STEALTH_REGION        stealth_region;
 
     //
     // INVVPID capability bits (cached from IA32_VMX_EPT_VPID_CAP)
@@ -210,6 +230,21 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     //
     PEPT_HOOKED_PAGE_INFO mtf_restore_page;
 
+    //
+    // stealth page: page to restore after MTF single-step
+    //
+    PEPT_STEALTH_PAGE_INFO mtf_restore_stealth;
+
+    //
+    // stealth PT page: restore fake PT after MTF (PTE write passthrough)
+    //
+    PSTEALTH_FAKE_PT mtf_restore_fake_pt;
+
+    //
+    // stealth #PF swap state: target + PT EPTs swapped for execution
+    //
+    PEPT_STEALTH_PAGE_INFO stealth_pf_swapped;
+
     // per-core private host GDT for VMXOFF restore
     PVOID   host_gdt;
     UINT64  original_gdt_base;
@@ -223,6 +258,8 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_EPT_HOOK         0x00000003
 #define VMCALL_EPT_UNHOOK       0x00000004
 #define VMCALL_EPT_UNHOOK_ALL   0x00000005
+#define VMCALL_STEALTH_ALLOC    0x00000006
+#define VMCALL_STEALTH_FREE     0x00000007
 
 //
 // VMCALL identifier in rax — like UnrealVTDbg's VMCALL_IDENTIFIER
@@ -254,6 +291,87 @@ typedef struct _EPT_UNHOOK_VMCALL_PARAM {
     volatile LONG unhooked;       // [internal] 0→1 by first CPU
     BOOLEAN result;               // [out]
 } EPT_UNHOOK_VMCALL_PARAM, *PEPT_UNHOOK_VMCALL_PARAM;
+
+//
+// stealth memory allocation — EPT split page with hidden execute capability
+//
+// allocates memory as PAGE_READWRITE (non-executable in VAD/NtQueryVirtualMemory)
+// hypervisor clears NX in guest PTE and sets up EPT split:
+//   read  → original page (clean data, no suspicious code)
+//   exec  → shadow page with VMCALL at entry → dispatch to handler
+//
+// anti-cheat sees: PAGE_READWRITE, no executable attribute, no PE/MZ headers
+// CPU executes: VMCALL → VM exit → handler function
+//
+
+#define EPTO_STEALTH_PAGE       4
+
+//
+// shared fake PT page — one per physical PT page, ref-counted
+// multiple stealth pages in the same 2MB VA range share this
+//
+typedef struct _STEALTH_FAKE_PT {
+    LIST_ENTRY      fake_pt_list;
+    UINT64          pt_page_pfn;        // PFN of the real guest PT page
+    PUINT8          fake_page_va;       // VA of fake page in contiguous region
+    UINT64          pfn_of_fake;        // PFN of fake page
+    EPT_PML1_ENTRY  pt_fake_entry;      // EPT PTE: read → fake (NX=1)
+    EPT_PML1_ENTRY  pt_real_entry;      // EPT PTE: real PT (for temp swap)
+    UINT32          ref_count;          // number of stealth pages using this
+} STEALTH_FAKE_PT, *PSTEALTH_FAKE_PT;
+
+//
+// per-page stealth allocation tracking (~200 bytes, no embedded PAGE_SIZE arrays)
+//
+// shadow page and fake PT page are in the contiguous region (not embedded).
+// fake PT page is shared among stealth pages in the same physical PT page.
+//
+typedef struct _EPT_STEALTH_PAGE_INFO {
+    LIST_ENTRY      stealth_page_list;
+
+    // --- target page ---
+    UINT64          guest_va;           // guest VA of stealth page (page-aligned)
+    UINT64          pfn_of_target;      // original physical page PFN
+    PUINT8          shadow_page;        // ptr into contiguous region (execute view)
+    UINT64          pfn_of_shadow;      // PFN of shadow page
+    PVOID           handler_function;   // VMCALL dispatch target (NULL for shellcode/resident)
+    PEPT_PML1_ENTRY entry_address;      // EPT PTE for target page
+    EPT_PML1_ENTRY  original_entry;     // read view PTE: R+W, no X
+    EPT_PML1_ENTRY  execute_entry;      // execute view PTE: X only (or R+X for resident)
+    UINT64          guest_cr3;
+    BOOLEAN         resident;           // TRUE = DLL mode (default exec view, reads swap)
+
+    // --- PT page (shared via STEALTH_FAKE_PT) ---
+    PSTEALTH_FAKE_PT fake_pt;           // shared fake PT page info (NULL for resident mode)
+    UINT32          pt_pte_index;       // index (0-511) of our PTE in the PT page
+
+} EPT_STEALTH_PAGE_INFO, *PEPT_STEALTH_PAGE_INFO;
+
+//
+// VMCALL parameter for stealth allocation (register-based, like EPT hook)
+//   rdx = target_va (already allocated as PAGE_READWRITE by caller)
+//   r8  = handler_function (proxy to redirect VMCALL to)
+//   r10 = caller_cr3
+//
+typedef struct _EPT_STEALTH_ALLOC_PARAM {
+    UINT64  caller_cr3;           // [in] guest CR3
+    PVOID   target_va;            // [in] PAGE_READWRITE memory in guest
+    PVOID   handler_function;     // [in] function to dispatch VMCALL to (NULL for shellcode mode)
+    UINT64  target_phys;          // [in] pre-computed physical address of target_va
+    PVOID   shellcode_buffer;     // [in] if non-NULL: shellcode for THIS page's execute view
+    UINT32  shellcode_size;       // [in] shellcode bytes for this page (max PAGE_SIZE)
+    BOOLEAN resident;             // [in] TRUE = DLL mode: default execute view, no #PF overhead
+    volatile LONG installed;      // [internal] 0→1 by first CPU
+    BOOLEAN result;               // [out]
+} EPT_STEALTH_ALLOC_PARAM, *PEPT_STEALTH_ALLOC_PARAM;
+
+typedef struct _EPT_STEALTH_FREE_PARAM {
+    UINT64  caller_cr3;
+    PVOID   target_va;
+    UINT64  target_phys;          // [in] pre-computed physical address of target_va
+    volatile LONG freed;
+    BOOLEAN result;
+} EPT_STEALTH_FREE_PARAM, *PEPT_STEALTH_FREE_PARAM;
 
 // per-cpu NMI pending flag for host IDT NMI handler
 extern volatile LONG g_host_nmi_pending[MAX_PROCESSORS];

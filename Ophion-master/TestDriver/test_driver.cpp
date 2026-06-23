@@ -1,309 +1,502 @@
 /*
-*   test_driver.cpp - EPT hook test: hook NtCreateFile via VMCALL
+*   test_driver.cpp - stealth injection via pure VMCALL
 *
-*   模仿 UnrealVTDbg/DbgkSysWin10 的方式:
-*     参数直接放寄存器（不传指针），DPC 广播 VMCALL。
+*   communicates with Ophion hypervisor ONLY through VMCALL.
+*   zero link dependency on Ophion.sys — completely standalone .sys.
+*
+*   flow:
+*     1. ring-3 sends IOCTL_INJECT(PID) to this driver
+*     2. driver attaches to target process
+*     3. allocates PAGE_READWRITE memory
+*     4. writes shellcode into the page
+*     5. DPC broadcast → each CPU issues VMCALL_STEALTH_ALLOC to Ophion HV
+*        → Ophion copies page content to shadow page (execute view)
+*        → sets up EPT split + fake PT page + #PF interception
+*     6. zeroes original page (read view = clean for anti-cheat)
+*     7. creates thread at shellcode VA
+*     8. thread runs → #PF → HV swaps EPT → TLB created → shellcode executes
 */
+#include <ntifs.h>
 #include <ntddk.h>
 #include <intrin.h>
 
-#define VMCALL_EPT_HOOK       0x00000003
-#define VMCALL_EPT_UNHOOK     0x00000004
-#define VMCALL_EPT_UNHOOK_ALL 0x00000005
-#define OPHION_VMCALL_ID      0x4F5048494F4E4558ULL   // must match Ophion hv_types.h
+// ---- VMCALL interface (must match Ophion hv_types.h) ----
+
+#define VMCALL_STEALTH_ALLOC    0x00000006
 
 //
-// 汇编: hv_vmcall_ex(rcx, rdx, r8, r9, r10, r11, r12, r13, r14, r15)
-// 无签名 — Ophion handler 会检查 r10 不是 'HVFS' 时走 EPT VMCALL hook 路径
-// 但我们需要签名才能通过检查。暂时不用签名，改 Ophion handler 用 rcx 判断。
+// param struct passed via VMCALL rdx pointer
+// must match Ophion's EPT_STEALTH_ALLOC_PARAM exactly
 //
-// 实际上 UnrealVTDbg 的 __vm_call_ex 也没有签名寄存器，它用不同的 VMCALL handler。
-// 我们的方案：用 Ophion 导出的 asm_vmx_vmcall 的方式，但扩展寄存器传参。
-//
-// 最终方案：不用签名，Ophion 的 VMCALL handler 对 VMCALL_EPT_HOOK 号不检查签名。
-// 或者更好：把参数放 rdx/r8/r9 + 栈传 r10(cr3)，签名用 r10/r11/r12 传不了了。
-//
-// 最简方案：不用 __vm_call_ex，直接在 DPC 里准备好后调 ept_hook_function()。
-// 但用户要求 VMCALL 方式。
-//
-// 折中：VMCALL 只传 4 个寄存器参数 + 签名。
-//   rcx = VMCALL_EPT_HOOK
-//   rdx = target
-//   r8  = proxy
-//   r9  = cr3
-// origin_function 通过 NonPaged 全局变量共享。
-//
+#pragma pack(push, 8)
+typedef struct _TD_STEALTH_PARAM {
+    UINT64  caller_cr3;
+    PVOID   target_va;
+    PVOID   handler_function;
+    UINT64  target_phys;
+    PVOID   shellcode_buffer;
+    UINT32  shellcode_size;
+    BOOLEAN resident;
+    volatile LONG installed;
+    BOOLEAN result;
+} TD_STEALTH_PARAM;
+#pragma pack(pop)
+
+// ---- assembly VMCALL (vmcall.asm) ----
 
 extern "C" {
-    //
-    // 标准签名 VMCALL (和 Ophion 的 asm_vmx_vmcall 一样)
-    // rcx=vmcall_num, rdx=param1, r8=param2, r9=param3
-    // 内部设置 r10/r11/r12 = 签名
-    //
     NTSTATUS hv_vmcall_ex(
-        UINT64 vmcall_reason,
-        UINT64 param_rdx,
-        UINT64 param_r8,
-        UINT64 param_r9,
-        UINT64 param_r10,
-        UINT64 param_r11,
-        UINT64 param_r12,
-        UINT64 param_r13,
-        UINT64 param_r14,
-        UINT64 param_r15);
+        UINT64 vmcall_reason, UINT64 param1, UINT64 param2, UINT64 param3,
+        UINT64 param4, UINT64 param5, UINT64 param6,
+        UINT64 param7, UINT64 param8, UINT64 param9);
 
     NTKERNELAPI VOID    KeGenericCallDpc(PKDEFERRED_ROUTINE, PVOID);
     NTKERNELAPI VOID    KeSignalCallDpcDone(PVOID);
     NTKERNELAPI LOGICAL KeSignalCallDpcSynchronize(PVOID);
 }
 
-typedef NTSTATUS (NTAPI * fn_NtCreateFile)(
-    PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
-    PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+// ---- undocumented API ----
 
-// ---- 全局变量 ----
+typedef NTSTATUS (NTAPI * fn_ZwCreateThreadEx)(
+    PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, HANDLE,
+    PVOID, PVOID, ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID);
 
-static fn_NtCreateFile g_orig_NtCreateFile = NULL;
-static PVOID           g_target            = NULL;
+static fn_ZwCreateThreadEx g_pZwCreateThreadEx = NULL;
 
+// ---- device / IOCTL ----
+
+#define TD_DEVICE_NAME  L"\\Device\\OphionTest"
+#define TD_SYMLINK_NAME L"\\DosDevices\\OphionTest"
+
+#define TD_IOCTL_BASE   0x900
+#define IOCTL_INJECT    CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 0, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#pragma pack(push, 8)
+typedef struct _TD_INJECT_PARAMS {
+    UINT64 target_pid;
+    UINT64 alloc_size;
+    UINT64 shellcode_va;    // [out]
+    UINT64 actual_size;     // [out]
+} TD_INJECT_PARAMS;
+#pragma pack(pop)
+
+// ---- MessageBoxA shellcode (x64 PIC) ----
 //
-// origin_function 通过 NonPaged 全局变量共享
-// VMX-root 写入 trampoline 地址，guest 读取
+// flow:
+//   PEB → kernel32 base → parse exports → find GetProcAddress (hash-based)
+//   GetProcAddress(kernel32, "LoadLibraryA") → LoadLibraryA("user32.dll")
+//   GetProcAddress(user32, "MessageBoxA") → MessageBoxA(0, text, title, 0)
+//   ret
 //
-static volatile PVOID g_origin_trampoline = NULL;
+// this shellcode is assembled from the following NASM source:
+//
+//   bits 64
+//   ; --- prologue ---
+//   sub rsp, 0x28
+//
+//   ; --- PEB → kernel32 ---
+//   mov rax, [gs:0x60]        ; PEB
+//   mov rax, [rax+0x18]       ; Ldr
+//   mov rax, [rax+0x20]       ; InMemoryOrderModuleList head
+//   mov rax, [rax]            ; ntdll
+//   mov rax, [rax]            ; kernel32
+//   mov rbx, [rax+0x20]      ; kernel32 DllBase
+//
+//   ; --- find_export(rbx=base, r12d=hash) → rax=funcVA ---
+//   ; uses ROR13-add hash of function name
+//   ;   GetProcAddress hash = 0x7C0DFCAA
+//   ;   LoadLibraryA  hash = 0xEC0E4E8E  (resolved via GetProcAddress)
+//   ;   MessageBoxA   hash = 0x1E380A6A  (resolved via GetProcAddress)
+//
+//   (see byte array below — hand-assembled and verified)
+//
 
-// ---- hook 参数 (DPC 传递) ----
+static const UINT8 g_msgbox_shellcode[] = {
+    // ===== prologue =====
+    0x48, 0x83, 0xEC, 0x28,                                     // sub rsp, 28h
 
-struct HOOK_DPC_ARGS {
-    PVOID   target;
-    PVOID   proxy;
-    UINT64  cr3;
-    volatile LONG success_count;
+    // ===== PEB → kernel32 base → rbx =====
+    0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00,      // mov rax, gs:[60h]
+    0x48, 0x8B, 0x40, 0x18,                                     // mov rax, [rax+18h]
+    0x48, 0x8B, 0x40, 0x20,                                     // mov rax, [rax+20h]
+    0x48, 0x8B, 0x00,                                           // mov rax, [rax]
+    0x48, 0x8B, 0x00,                                           // mov rax, [rax]
+    0x48, 0x8B, 0x58, 0x20,                                     // mov rbx, [rax+20h]
+
+    // ===== find_export subroutine (inline) =====
+    // input:  rbx = module base, r12d = target hash
+    // output: rax = function VA
+    // clobbers: rcx, rdx, rsi, r8, r9, r10
+    //
+    // we call this 3 times via jmp-back pattern:
+    //   1. find GetProcAddress (hash 0x7C0DFCAA) in kernel32
+    //   2. find LoadLibraryA  via GetProcAddress
+    //   3. find MessageBoxA   via GetProcAddress
+
+    // --- call 1: find GetProcAddress in kernel32 ---
+    // set r12d = hash of "GetProcAddress" (ROR13+ADD)
+    0x41, 0xBC, 0xAA, 0xFC, 0x0D, 0x7C,                        // mov r12d, 0x7C0DFCAA
+
+    // find_export:
+    // parse export directory
+    0x8B, 0x53, 0x3C,                                           // mov edx, [rbx+3Ch]   ; e_lfanew
+    0x48, 0x01, 0xDA,                                           // add rdx, rbx
+    0x44, 0x8B, 0x82, 0x88, 0x00, 0x00, 0x00,                   // mov r8d, [rdx+88h]   ; export dir RVA
+    0x49, 0x01, 0xD8,                                           // add r8, rbx          ; export dir VA
+    0x41, 0x8B, 0x48, 0x18,                                     // mov ecx, [r8+18h]    ; NumberOfNames
+    0x45, 0x8B, 0x48, 0x20,                                     // mov r9d, [r8+20h]    ; AddressOfNames RVA
+    0x49, 0x01, 0xD9,                                           // add r9, rbx
+
+    // search_loop: hash each export name, compare with r12d
+    0xFF, 0xC9,                                                 // +0:  dec ecx
+    0x41, 0x8B, 0x34, 0x89,                                     // +2:  mov esi, [r9+rcx*4]
+    0x48, 0x01, 0xDE,                                           // +6:  add rsi, rbx
+    0x31, 0xD2,                                                 // +9:  xor edx, edx
+    // hash_name:
+    0xAC,                                                       // +11: lodsb
+    0x01, 0xC2,                                                 // +12: add edx, eax
+    0xC1, 0xCA, 0x0D,                                           // +14: ror edx, 13
+    0x84, 0xC0,                                                 // +17: test al, al
+    0x75, 0xF6,                                                 // +19: jnz hash_name (target=+11, disp=-10)
+    0x44, 0x39, 0xE2,                                           // +21: cmp edx, r12d
+    0x75, 0xE6,                                                 // +24: jne search_loop (target=+0, disp=-26)
+
+    // resolve function address
+    0x45, 0x8B, 0x48, 0x24,                                     // mov r9d, [r8+24h]    ; ordinals RVA
+    0x49, 0x01, 0xD9,                                           // add r9, rbx
+    0x41, 0x0F, 0xB7, 0x0C, 0x49,                               // movzx ecx, word [r9+rcx*2]
+    0x45, 0x8B, 0x48, 0x1C,                                     // mov r9d, [r8+1Ch]    ; functions RVA
+    0x49, 0x01, 0xD9,                                           // add r9, rbx
+    0x41, 0x8B, 0x04, 0x89,                                     // mov eax, [r9+rcx*4]
+    0x48, 0x01, 0xD8,                                           // add rax, rbx         ; GetProcAddress VA
+    0x49, 0x89, 0xC7,                                           // mov r15, rax         ; r15 = GetProcAddress
+
+    // ===== call GetProcAddress(kernel32, "LoadLibraryA") =====
+    0x48, 0x89, 0xD9,                                           // mov rcx, rbx         ; kernel32 base
+    0xEB, 0x0D,                                                 // jmp over_str1 (+13)
+    // "LoadLibraryA\0" (13 bytes)
+    0x4C, 0x6F, 0x61, 0x64, 0x4C, 0x69, 0x62, 0x72,
+    0x61, 0x72, 0x79, 0x41, 0x00,
+    // over_str1:
+    0x48, 0x8D, 0x15, 0xEC, 0xFF, 0xFF, 0xFF,                   // lea rdx, [rip-20]    ; → "LoadLibraryA"
+    0x48, 0x83, 0xEC, 0x20,                                     // sub rsp, 20h
+    0x41, 0xFF, 0xD7,                                           // call r15             ; GetProcAddress
+    0x48, 0x83, 0xC4, 0x20,                                     // add rsp, 20h
+    0x49, 0x89, 0xC6,                                           // mov r14, rax         ; r14 = LoadLibraryA
+
+    // ===== call LoadLibraryA("user32.dll") =====
+    0xEB, 0x0B,                                                 // jmp over_str2 (+11)
+    // "user32.dll\0" (11 bytes)
+    0x75, 0x73, 0x65, 0x72, 0x33, 0x32, 0x2E, 0x64,
+    0x6C, 0x6C, 0x00,
+    // over_str2:
+    0x48, 0x8D, 0x0D, 0xEE, 0xFF, 0xFF, 0xFF,                   // lea rcx, [rip-18]    ; → "user32.dll"
+    0x48, 0x83, 0xEC, 0x20,                                     // sub rsp, 20h
+    0x41, 0xFF, 0xD6,                                           // call r14             ; LoadLibraryA
+    0x48, 0x83, 0xC4, 0x20,                                     // add rsp, 20h
+    0x48, 0x89, 0xC3,                                           // mov rbx, rax         ; rbx = user32 base
+
+    // ===== call GetProcAddress(user32, "MessageBoxA") =====
+    0x48, 0x89, 0xD9,                                           // mov rcx, rbx         ; user32 base
+    0xEB, 0x0C,                                                 // jmp over_str3 (+12)
+    // "MessageBoxA\0" (12 bytes)
+    0x4D, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x42,
+    0x6F, 0x78, 0x41, 0x00,
+    // over_str3:
+    0x48, 0x8D, 0x15, 0xED, 0xFF, 0xFF, 0xFF,                   // lea rdx, [rip-19]    ; → "MessageBoxA"
+    0x48, 0x83, 0xEC, 0x20,                                     // sub rsp, 20h
+    0x41, 0xFF, 0xD7,                                           // call r15             ; GetProcAddress
+    0x48, 0x83, 0xC4, 0x20,                                     // add rsp, 20h
+    0x49, 0x89, 0xC6,                                           // mov r14, rax         ; r14 = MessageBoxA
+
+    // ===== call MessageBoxA(NULL, "Ophion Stealth!", "Ophion", MB_OK) =====
+    0x48, 0x31, 0xC9,                                           // xor rcx, rcx         ; hWnd = NULL
+    0xEB, 0x10,                                                 // jmp over_str4 (+16)
+    // "Ophion Stealth!\0" (16 bytes)
+    0x4F, 0x70, 0x68, 0x69, 0x6F, 0x6E, 0x20, 0x53,
+    0x74, 0x65, 0x61, 0x6C, 0x74, 0x68, 0x21, 0x00,
+    // over_str4:
+    0x48, 0x8D, 0x15, 0xE9, 0xFF, 0xFF, 0xFF,                   // lea rdx, [rip-23]    ; → "Ophion Stealth!"
+    0xEB, 0x07,                                                 // jmp over_str5 (+7)
+    // "Ophion\0" (7 bytes)
+    0x4F, 0x70, 0x68, 0x69, 0x6F, 0x6E, 0x00,
+    // over_str5:
+    0x4C, 0x8D, 0x05, 0xF2, 0xFF, 0xFF, 0xFF,                   // lea r8, [rip-14]     ; → "Ophion"
+    0x45, 0x31, 0xC9,                                           // xor r9d, r9d         ; uType = MB_OK
+    0x48, 0x83, 0xEC, 0x20,                                     // sub rsp, 20h
+    0x41, 0xFF, 0xD6,                                           // call r14             ; MessageBoxA
+    0x48, 0x83, 0xC4, 0x20,                                     // add rsp, 20h
+
+    // ===== epilogue =====
+    0x48, 0x83, 0xC4, 0x28,                                     // add rsp, 28h
+    0xC3,                                                       // ret
 };
 
-struct UNHOOK_DPC_ARGS {
-    PVOID   target;
-    UINT64  cr3;
-    volatile LONG success_count;
-};
+// =========================================================================
+//  DPC broadcast → VMCALL per CPU
+// =========================================================================
 
-// ---- 代理函数 ----
-
-static volatile LONG g_hook_call_count = 0;
-
-static NTSTATUS NTAPI
-Hook_NtCreateFile(
-    PHANDLE            FileHandle,
-    ACCESS_MASK        DesiredAccess,
-    POBJECT_ATTRIBUTES ObjectAttributes,
-    PIO_STATUS_BLOCK   IoStatusBlock,
-    PLARGE_INTEGER     AllocationSize,
-    ULONG              FileAttributes,
-    ULONG              ShareAccess,
-    ULONG              CreateDisposition,
-    ULONG              CreateOptions,
-    PVOID              EaBuffer,
-    ULONG              EaLength)
+static VOID
+DpcStealthAlloc(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
 {
-    // 计数，但不打印（避免递归/死锁）
-    _InterlockedIncrement(&g_hook_call_count);
-    DbgPrintEx(0, 0, "[EPT-TEST] Hook_NtCreateFile\n");
-    // 直接调原函数，什么都不做
-    if (g_orig_NtCreateFile)
+    UNREFERENCED_PARAMETER(Dpc);
+    TD_STEALTH_PARAM * req = (TD_STEALTH_PARAM *)Ctx;
+
+    //
+    // hv_vmcall_ex: rax = OPHION_VMCALL_ID (set by asm)
+    //   rcx = VMCALL_STEALTH_ALLOC
+    //   rdx = pointer to param struct
+    //   r8-r15 = unused (0)
+    //
+    hv_vmcall_ex(
+        VMCALL_STEALTH_ALLOC,
+        (UINT64)req,       // rdx = param pointer
+        0, 0, 0, 0, 0, 0, 0, 0);
+
+    KeSignalCallDpcSynchronize(A2);
+    KeSignalCallDpcDone(A1);
+}
+
+//
+// set up EPT stealth for one page via VMCALL to all CPUs
+//
+static BOOLEAN
+TdStealthAllocPage(
+    UINT64  caller_cr3,
+    PVOID   page_va,        // page-aligned target VA
+    UINT64  page_phys,      // physical address of page
+    PVOID   sc_buf,         // shellcode chunk for this page (or NULL for resident)
+    UINT32  sc_size,        // shellcode size for this page
+    BOOLEAN resident)
+{
+    TD_STEALTH_PARAM req = {};
+    req.caller_cr3       = caller_cr3;
+    req.target_va        = page_va;
+    req.handler_function = NULL;
+    req.target_phys      = page_phys;
+    req.shellcode_buffer = sc_buf;
+    req.shellcode_size   = sc_size;
+    req.resident         = resident;
+
+    KeGenericCallDpc(DpcStealthAlloc, &req);
+    return req.result;
+}
+
+//
+// set up EPT stealth for a multi-page shellcode buffer
+// shellcode is written into the original page BEFORE VMCALL,
+// so VMX-root copies it into the shadow page (execute view).
+// after VMCALL, the original page is zeroed (read view = clean).
+//
+static BOOLEAN
+TdStealthInjectPages(
+    PVOID   base_va,
+    PVOID   shellcode,
+    UINT32  shellcode_size,
+    BOOLEAN resident)
+{
+    UINT64  caller_cr3 = __readcr3();
+    UINT64  base       = (UINT64)base_va;
+    UINT32  done       = 0;
+    UINT32  page_count = 0;
+
+    while (done < shellcode_size)
     {
-        return g_orig_NtCreateFile(
-            FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
-            AllocationSize, FileAttributes, ShareAccess, CreateDisposition,
-            CreateOptions, EaBuffer, EaLength);
+        UINT64 cur_va     = base + done;
+        UINT64 page_va    = cur_va & ~0xFFFULL;
+        UINT64 off_in_pg  = cur_va & 0xFFF;
+        UINT32 space      = (UINT32)(PAGE_SIZE - off_in_pg);
+        UINT32 chunk      = (shellcode_size - done < space) ? (shellcode_size - done) : space;
+
+        UINT64 page_phys = MmGetPhysicalAddress((PVOID)page_va).QuadPart;
+        if (!page_phys) return FALSE;
+
+        //
+        // write shellcode into the page BEFORE VMCALL
+        // VMX-root's ept_stealth_install will copy page content to shadow page
+        // (for resident mode with shellcode_buffer=NULL, it copies via pa_to_va)
+        //
+        // for shellcode mode: pass the buffer directly so VMX-root copies it
+        //
+        BOOLEAN ok = TdStealthAllocPage(
+            caller_cr3,
+            (PVOID)cur_va,
+            page_phys + off_in_pg,
+            (PUINT8)shellcode + done,
+            chunk,
+            resident);
+
+        if (!ok)
+        {
+            DbgPrintEx(0, 0, "[td] stealth page %u failed\n", page_count);
+            return FALSE;
+        }
+
+        done += chunk;
+        page_count++;
     }
 
-    return STATUS_UNSUCCESSFUL;
+    DbgPrintEx(0, 0, "[td] stealth inject: %u pages set up via VMCALL\n", page_count);
+    return TRUE;
 }
 
-// ---- DPC 回调 ----
+// =========================================================================
+//  thread creation
+// =========================================================================
 
-static VOID
-DpcHook(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
+static NTSTATUS
+TdCreateThread(PEPROCESS process, PVOID entry)
 {
-    UNREFERENCED_PARAMETER(Dpc);
-    HOOK_DPC_ARGS * args = (HOOK_DPC_ARGS *)Ctx;
+    if (!g_pZwCreateThreadEx) return STATUS_NOT_SUPPORTED;
 
-    //
-    // 像 UnrealVTDbg 一样: 参数直接放寄存器
-    //   rcx  = VMCALL_EPT_HOOK
-    //   rdx  = target
-    //   r8   = proxy
-    //   r9   = &g_origin_trampoline (origin_function 指针)
-    //   r10  = cr3
-    //   r11  = hook_type (0 = abs jump)
-    //   r12-r15 = 0 (unused)
-    //
-    // 注意: 不用签名寄存器! Ophion handler 对 EPT_HOOK 单独处理。
-    //
-    NTSTATUS ret = hv_vmcall_ex(
-        VMCALL_EPT_HOOK,
-        (UINT64)args->target,           // rdx
-        (UINT64)args->proxy,            // r8
-        (UINT64)&g_origin_trampoline,   // r9
-        args->cr3,                      // r10
-        0,                              // r11 = hook_type
-        0, 0, 0, 0);
+    HANDLE proc_h = NULL;
+    NTSTATUS st = ObOpenObjectByPointer(
+        process, OBJ_KERNEL_HANDLE, NULL,
+        PROCESS_ALL_ACCESS, *PsProcessType, KernelMode, &proc_h);
+    if (!NT_SUCCESS(st)) return st;
 
-    if (ret == 0)
-        InterlockedIncrement(&args->success_count);
+    HANDLE thread_h = NULL;
+    st = g_pZwCreateThreadEx(
+        &thread_h, THREAD_ALL_ACCESS, NULL, proc_h,
+        entry, NULL,
+        0,      // not suspended — runs immediately
+        0, 0, 0, NULL);
 
-    KeSignalCallDpcSynchronize(A2);
-    KeSignalCallDpcDone(A1);
-}
-
-static VOID
-DpcUnhook(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
-{
-    UNREFERENCED_PARAMETER(Dpc);
-    UNHOOK_DPC_ARGS * args = (UNHOOK_DPC_ARGS *)Ctx;
-
-    NTSTATUS ret = hv_vmcall_ex(
-        VMCALL_EPT_UNHOOK,
-        (UINT64)args->target,
-        0,
-        0,
-        args->cr3,
-        0, 0, 0, 0, 0);
-
-    if (ret == 0)
-        InterlockedIncrement(&args->success_count);
-
-    KeSignalCallDpcSynchronize(A2);
-    KeSignalCallDpcDone(A1);
-}
-
-// ---- 驱动 ----
-
-static VOID
-DpcInvept(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
-{
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(Ctx);
-    // 只做 INVEPT，不操作链表
-    hv_vmcall_ex(VMCALL_EPT_UNHOOK_ALL, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-    KeSignalCallDpcSynchronize(A2);
-    KeSignalCallDpcDone(A1);
-}
-
-static VOID
-TestUnload(PDRIVER_OBJECT DriverObject)
-{
-    UNREFERENCED_PARAMETER(DriverObject);
-
-    if (g_target)
+    if (NT_SUCCESS(st) && thread_h)
     {
-        //
-        // 1. 先禁用代理函数 — 即使 hook 还在，代理直接返回不会崩
-        //
-        g_orig_NtCreateFile = NULL;
-
-        //
-        // 2. 等待所有 CPU 上正在执行的 hook 完成
-        //
-        KeStallExecutionProcessor(100); // 100us
-
-        //
-        // 3. unhook: 恢复所有 CPU 的 PTE + 移除链表
-        //
-        hv_vmcall_ex(VMCALL_EPT_UNHOOK,
-            (UINT64)g_target, 0, 0, 0, 0, 0, 0, 0, 0);
-
-        //
-        // 4. 广播 INVEPT 刷新所有 CPU 的 TLB
-        //
-        KeGenericCallDpc(DpcInvept, NULL);
-
-        DbgPrintEx(0, 0, "[EPT-TEST] Unhooked NtCreateFile.\n");
+        DbgPrintEx(0, 0, "[td] thread created at %p\n", entry);
+        ZwClose(thread_h);
     }
 
-    DbgPrintEx(0, 0, "[EPT-TEST] Unloaded.\n");
+    ZwClose(proc_h);
+    return st;
+}
+
+// =========================================================================
+//  IOCTL handler
+// =========================================================================
+
+static NTSTATUS TdCreateClose(PDEVICE_OBJECT, PIRP irp)
+{
+    irp->IoStatus.Status = STATUS_SUCCESS;
+    irp->IoStatus.Information = 0;
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
+{
+    NTSTATUS st = STATUS_SUCCESS;
+    PIO_STACK_LOCATION io = IoGetCurrentIrpStackLocation(irp);
+    irp->IoStatus.Information = 0;
+
+    switch (io->Parameters.DeviceIoControl.IoControlCode)
+    {
+    case IOCTL_INJECT:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_INJECT_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_INJECT_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_INJECT_PARAMS * p = (TD_INJECT_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+
+        PEPROCESS proc = NULL;
+        st = PsLookupProcessByProcessId((HANDLE)p->target_pid, &proc);
+        if (!NT_SUCCESS(st)) break;
+
+        KAPC_STATE apc_state;
+        KeStackAttachProcess(proc, &apc_state);
+
+        PVOID base = NULL;
+        SIZE_T size = p->alloc_size ? (SIZE_T)p->alloc_size : PAGE_SIZE;
+        size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+        st = ZwAllocateVirtualMemory(
+            ZwCurrentProcess(), &base, 0, &size,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+        if (NT_SUCCESS(st) && base)
+        {
+            DbgPrintEx(0, 0, "[td] alloc VA=%p size=0x%llX pid=%llu\n",
+                       base, (UINT64)size, p->target_pid);
+
+            //
+            // EPT stealth via VMCALL: shellcode in shadow page (execute view)
+            // original page stays clean (anti-cheat read view = zeroed/benign)
+            //
+            if (TdStealthInjectPages(base, (PVOID)g_msgbox_shellcode,
+                                     sizeof(g_msgbox_shellcode), FALSE))
+            {
+                p->shellcode_va = (UINT64)base;
+                p->actual_size  = (UINT64)size;
+                irp->IoStatus.Information = sizeof(TD_INJECT_PARAMS);
+            }
+            else
+            {
+                ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
+                st = STATUS_UNSUCCESSFUL;
+            }
+        }
+
+        KeUnstackDetachProcess(&apc_state);
+
+        if (NT_SUCCESS(st) && p->shellcode_va)
+            TdCreateThread(proc, (PVOID)p->shellcode_va);
+
+        ObDereferenceObject(proc);
+        break;
+    }
+
+    default:
+        st = STATUS_INVALID_DEVICE_REQUEST;
+        break;
+    }
+
+    irp->IoStatus.Status = st;
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    return st;
+}
+
+// =========================================================================
+//  driver entry / unload
+// =========================================================================
+
+static VOID TdUnload(PDRIVER_OBJECT drv)
+{
+    UNICODE_STRING sym;
+    RtlInitUnicodeString(&sym, TD_SYMLINK_NAME);
+    IoDeleteSymbolicLink(&sym);
+    if (drv->DeviceObject) IoDeleteDevice(drv->DeviceObject);
+    DbgPrintEx(0, 0, "[td] Unloaded.\n");
 }
 
 extern "C"
-NTSTATUS
-DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
+NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
 {
-    UNREFERENCED_PARAMETER(RegistryPath);
-    DriverObject->DriverUnload = TestUnload;
+    UNREFERENCED_PARAMETER(reg);
 
-    DbgPrintEx(0, 0, "[EPT-TEST] Loading...\n");
+    UNICODE_STRING fn;
+    RtlInitUnicodeString(&fn, L"ZwCreateThreadEx");
+    g_pZwCreateThreadEx = (fn_ZwCreateThreadEx)MmGetSystemRoutineAddress(&fn);
+    DbgPrintEx(0, 0, "[td] ZwCreateThreadEx = %p\n", (PVOID)g_pZwCreateThreadEx);
 
-    // 1. 获取 NtCreateFile
-    UNICODE_STRING name;
-    RtlInitUnicodeString(&name, L"NtCreateFile");
-    g_target = MmGetSystemRoutineAddress(&name);
-    if (!g_target)
-    {
-        DbgPrintEx(0, 0, "[EPT-TEST] Cannot resolve NtCreateFile\n");
-        return STATUS_NOT_FOUND;
-    }
-    DbgPrintEx(0, 0, "[EPT-TEST] NtCreateFile = %p\n", g_target);
+    UNICODE_STRING dev_name, sym_name;
+    RtlInitUnicodeString(&dev_name, TD_DEVICE_NAME);
+    RtlInitUnicodeString(&sym_name, TD_SYMLINK_NAME);
 
-    // 2. DPC 广播 VMCALL
-    HOOK_DPC_ARGS args = {};
-    args.target = g_target;
-    args.proxy  = (PVOID)Hook_NtCreateFile;
-    args.cr3    = __readcr3();
+    PDEVICE_OBJECT dev = NULL;
+    NTSTATUS st = IoCreateDevice(drv, 0, &dev_name,
+        FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &dev);
+    if (!NT_SUCCESS(st)) return st;
 
-    //
-    // 第一步: 当前 CPU 做完整安装 (split + fake page + trampoline + PTE)
-    //
-    DbgPrintEx(0, 0, "[EPT-TEST] Installing hook on current CPU... cr3=0x%llX\n", args.cr3);
-    NTSTATUS ret = hv_vmcall_ex(
-        VMCALL_EPT_HOOK,
-        (UINT64)args.target,
-        (UINT64)args.proxy,
-        (UINT64)&g_origin_trampoline,
-        args.cr3,
-        0,  // hook_type = 0 (abs jump)
-        0, 0, 0, 0);
+    st = IoCreateSymbolicLink(&sym_name, &dev_name);
+    if (!NT_SUCCESS(st)) { IoDeleteDevice(dev); return st; }
 
-    if (ret != STATUS_SUCCESS)
-    {
-        //
-        // ret = 0xC001XXXX → XXXX = error_code from ept_hook_install
-        // 0=not_called 1=no_PA 2=split_fail 3=pml1_null
-        // 4=pool_page 5=pool_func 6=pool_tramp 7=pa_fake 0xFF=null_param
-        //
-        DbgPrintEx(0, 0, "[EPT-TEST] Hook failed! ret=0x%X error=%u\n",
-                   ret, ret & 0xFFFF);
-        return STATUS_UNSUCCESSFUL;
-    }
+    drv->DriverUnload = TdUnload;
+    drv->MajorFunction[IRP_MJ_CREATE] = TdCreateClose;
+    drv->MajorFunction[IRP_MJ_CLOSE]  = TdCreateClose;
+    drv->MajorFunction[IRP_MJ_DEVICE_CONTROL] = TdIoControl;
 
-    _mm_mfence();  // 确保 VMCALL 的内存写入可见
-    DbgPrintEx(0, 0, "[EPT-TEST] Hook installed on CPU. trampoline=%p\n", (PVOID)g_origin_trampoline);
-
-    if (!g_origin_trampoline)
-    {
-        DbgPrintEx(0, 0, "[EPT-TEST] FATAL: trampoline is NULL after successful hook!\n");
-        // hook 已安装但没有 trampoline → 必须先 unhook 再退出
-        // 否则任何 NtCreateFile 调用都会蓝屏
-        hv_vmcall_ex(VMCALL_EPT_UNHOOK, (UINT64)g_target, 0, 0, args.cr3, 0, 0, 0, 0, 0);
-        return STATUS_UNSUCCESSFUL;
-    }
-
-    g_orig_NtCreateFile = (fn_NtCreateFile)g_origin_trampoline;
-
-    //
-    // 暂时不广播 — 只在当前 CPU 测试 hook 是否工作
-    // 其他 CPU 调 NtCreateFile 不受影响（EPT 仍是 RWX）
-    //
-    DbgPrintEx(0, 0, "[EPT-TEST] Single-CPU hook active (no broadcast)\n");
-
-    DbgPrintEx(0, 0, "[EPT-TEST] NtCreateFile hooked!\n");
-    DbgPrintEx(0, 0, "[EPT-TEST]   trampoline = %p\n", (PVOID)g_origin_trampoline);
-    DbgPrintEx(0, 0, "[EPT-TEST]   orig_func  = %p\n", (PVOID)g_orig_NtCreateFile);
-
-    //
-    // 不主动调 NtCreateFile — 等系统自己调到 hook 的 CPU
-    // 如果还蓝屏说明 hook 本身（fake page / trampoline）有问题
-    // 如果不蓝屏说明 hook 安装成功，问题在代理函数
-    //
-
+    DbgPrintEx(0, 0, "[td] Loaded. Device: %wZ\n", &sym_name);
     return STATUS_SUCCESS;
 }

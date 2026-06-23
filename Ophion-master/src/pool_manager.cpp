@@ -12,10 +12,12 @@
 #define TRAMPOLINE_BUF_SIZE  128    // enough for overwritten instructions + abs jmp
 
 typedef enum _POOL_TYPE_TAG {
-    POOL_TAG_SPLIT       = 0,    // VMM_EPT_DYNAMIC_SPLIT
-    POOL_TAG_HOOKED_PAGE = 1,    // EPT_HOOKED_PAGE_INFO
-    POOL_TAG_HOOKED_FUNC = 2,    // EPT_HOOKED_FUNCTION_INFO
-    POOL_TAG_TRAMPOLINE  = 3,    // executable trampoline buffer
+    POOL_TAG_SPLIT        = 0,    // VMM_EPT_DYNAMIC_SPLIT
+    POOL_TAG_HOOKED_PAGE  = 1,    // EPT_HOOKED_PAGE_INFO
+    POOL_TAG_HOOKED_FUNC  = 2,    // EPT_HOOKED_FUNCTION_INFO
+    POOL_TAG_TRAMPOLINE   = 3,    // executable trampoline buffer
+    POOL_TAG_STEALTH_INFO = 4,    // EPT_STEALTH_PAGE_INFO (small tracking struct, ~200 bytes)
+    POOL_TAG_STEALTH_FAKEPT = 5,  // STEALTH_FAKE_PT (shared fake PT page info, ~100 bytes)
     POOL_TAG_MAX
 } POOL_TYPE_TAG;
 
@@ -68,10 +70,12 @@ pool_add_entry(POOL_TYPE_TAG type, SIZE_T size)
         //
         PHYSICAL_ADDRESS max_phys;
         max_phys.QuadPart = MAXULONG64;
+        // PITFALL #6: Must be page-aligned for EPT PML1 table. ExAllocatePool2 doesn't guarantee alignment.
         entry->address = MmAllocateContiguousMemory(size, max_phys);
     }
     else if (type == POOL_TAG_TRAMPOLINE)
     {
+        // PITFALL #10: Trampolines contain executable code. ExAllocatePool2 has no execute flag.
 #pragma warning(suppress: 4996)
         entry->address = ExAllocatePoolWithTag(NonPagedPoolExecute, size, HV_POOL_TAG);
     }
@@ -88,7 +92,7 @@ pool_add_entry(POOL_TYPE_TAG type, SIZE_T size)
 
     RtlZeroMemory(entry->address, size);
 
-    // 在 PASSIVE_LEVEL 预计算物理地址 — VMX-root 不再需要调 MmGetPhysicalAddress
+    // PITFALL #7: Pre-compute at PASSIVE_LEVEL. MmGetPhysicalAddress unsafe in VMX-root.
     entry->physical_address = MmGetPhysicalAddress(entry->address).QuadPart;
 
     entry->size   = size;
@@ -147,6 +151,37 @@ pool_manager_init(VOID)
         if (!pool_add_entry(POOL_TAG_TRAMPOLINE, TRAMPOLINE_BUF_SIZE))
         {
             DbgPrintEx(0, 0, "[hv] Pool: trampoline alloc %u failed\n", i);
+            return FALSE;
+        }
+    }
+
+    //
+    // stealth pages: page-aligned (shadow_page[4096] needs alignment)
+    // pre-allocate 16 stealth page info structures
+    //
+    //
+    // stealth tracking structs: ~200 bytes each (no embedded PAGE_SIZE arrays)
+    // shadow/fake pages come from contiguous region instead.
+    // 4096 entries → supports up to 16MB of stealth memory.
+    //
+    for (UINT32 i = 0; i < 4096; i++)
+    {
+        if (!pool_add_entry(POOL_TAG_STEALTH_INFO, sizeof(EPT_STEALTH_PAGE_INFO)))
+        {
+            DbgPrintEx(0, 0, "[hv] Pool: stealth_info alloc %u failed\n", i);
+            return FALSE;
+        }
+    }
+
+    //
+    // shared fake PT page tracking: one per unique physical PT page (~100 bytes)
+    // 256 entries covers 256 × 2MB = 512MB of VA space.
+    //
+    for (UINT32 i = 0; i < 256; i++)
+    {
+        if (!pool_add_entry(POOL_TAG_STEALTH_FAKEPT, sizeof(STEALTH_FAKE_PT)))
+        {
+            DbgPrintEx(0, 0, "[hv] Pool: stealth_fakept alloc %u failed\n", i);
             return FALSE;
         }
     }

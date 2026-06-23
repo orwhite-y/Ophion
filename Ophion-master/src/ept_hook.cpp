@@ -50,6 +50,7 @@ ept_swap_page(PEPT_PML1_ENTRY entry, EPT_PML1_ENTRY value, EPT_POINTER eptp)
 // returns the split buffer so caller can access PML1 entries directly
 // (avoids pa_to_va/MmGetVirtualForPhysical which may not work in VMX-root)
 //
+// PITFALL #6: Split buffer must be page-aligned. FIX: Pool uses MmAllocateContiguousMemory instead of ExAllocatePool2.
 static PVMM_EPT_DYNAMIC_SPLIT
 ept_split_large_page_pool(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
 {
@@ -85,7 +86,8 @@ ept_split_large_page_pool(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
     new_ptr.ReadAccess      = 1;
     new_ptr.WriteAccess     = 1;
     new_ptr.ExecuteAccess   = 1;
-    // 用预计算的物理地址，不在 VMX-root 调 MmGetPhysicalAddress
+    // PITFALL #7: Don't call MmGetPhysicalAddress in VMX-root.
+    // FIX: pool_manager_get_physical() returns PA pre-computed at PASSIVE_LEVEL during init.
     new_ptr.PageFrameNumber = pool_manager_get_physical(new_split) / PAGE_SIZE;
 
     RtlCopyMemory(target, &new_ptr, sizeof(new_ptr));
@@ -106,6 +108,8 @@ ept_split_large_page_pool(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
 // ept_hook_install — 在 VMX-root 下运行 (HOST_CR3 = system CR3)
 // 不用 private host CR3 → 所有内核内存直接可访问，和 VT_Driver 一样简单。
 //
+// PITFALL #5: Multi-CPU: DPC broadcast runs on ALL CPUs simultaneously.
+// FIX: First CPU does full install. Others check hooked_pages list, find page already hooked, only do split+PTE+INVEPT.
 BOOLEAN
 ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
 {
@@ -213,6 +217,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     {
         split = ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)phys_addr);
         if (!split) return FALSE;
+        // PITFALL #8: Don't use ept_get_pml1/pa_to_va in VMX-root. Get PML1 directly from split buffer.
         pte = &split->PML1[ADDRMASK_EPT_PML1_INDEX(phys_addr)];
     }
     else
@@ -282,6 +287,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     hp->original_entry.WriteAccess   = 1;
 
     hp->changed_entry = hp->original_entry;
+    // PITFALL #9: X-only pages (R=0,W=0,X=1) cause EPT misconfiguration if CPU doesn't support it.
     hp->changed_entry.ReadAccess       = g_ept->execute_only_supported ? 0 : 1;
     hp->changed_entry.WriteAccess      = 0;
     hp->changed_entry.ExecuteAccess    = 1;
@@ -394,7 +400,7 @@ ept_unhook_all(VOID)
         }
         pool_manager_release(hp);
     }
-    // no INVEPT here — VMX may already be off (VMXOFF done before this call)
+    // PITFALL #11: No INVEPT here - may be called after VMXOFF when INVEPT would cause #UD.
 }
 
 VOID ept_unhook_all_broadcast(VOID) { ept_unhook_all(); }
@@ -506,6 +512,129 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
             (SIZE_T)(hp->pfn_of_hooked_page << 12));
         if (my_pte) ept_swap_page(my_pte, hp->original_entry, vcpu->ept_pointer);
         vcpu->mtf_restore_page = NULL;
+    }
+
+    //
+    // stealth target page MTF: swap back to read-only view (no execute)
+    //
+    else if (vcpu->mtf_restore_stealth)
+    {
+        PEPT_STEALTH_PAGE_INFO sp = vcpu->mtf_restore_stealth;
+        PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,
+            (SIZE_T)(sp->pfn_of_target << 12));
+        if (my_pte)
+        {
+            my_pte->AsUInt = sp->original_entry.AsUInt;
+            _mm_mfence();
+            ept_invept_single(vcpu->ept_pointer);
+        }
+        vcpu->mtf_restore_stealth = NULL;
+    }
+
+    //
+    // stealth shared fake PT page MTF: resync from real PT page, swap back
+    // fires after OS writes a PTE in the same PT page (page in/out, A/D bits)
+    //
+    else if (vcpu->mtf_restore_fake_pt)
+    {
+        PSTEALTH_FAKE_PT fpt = vcpu->mtf_restore_fake_pt;
+
+        // resync: copy real → fake, then re-apply NX for all stealth entries
+        PVOID real_pt_va = pa_to_va(fpt->pt_page_pfn << 12);
+        if (real_pt_va && fpt->fake_page_va)
+        {
+            RtlCopyMemory(fpt->fake_page_va, real_pt_va, PAGE_SIZE);
+
+            // re-apply NX=1 for all stealth pages sharing this fake PT
+            PLIST_ENTRY sc = g_ept->stealth_pages.Flink;
+            while (sc != &g_ept->stealth_pages)
+            {
+                PEPT_STEALTH_PAGE_INFO sp = CONTAINING_RECORD(sc, EPT_STEALTH_PAGE_INFO, stealth_page_list);
+                sc = sc->Flink;
+                if (sp->fake_pt == fpt)
+                {
+                    PUINT64 pte = &((PUINT64)fpt->fake_page_va)[sp->pt_pte_index];
+                    *pte |= (1ULL << 63);
+                }
+            }
+        }
+
+        // swap PT page EPT back to fake view
+        PEPT_PML1_ENTRY pt_pte = ept_get_pml1(vcpu->ept_page_table,
+            (SIZE_T)(fpt->pt_page_pfn << 12));
+        if (pt_pte)
+        {
+            pt_pte->AsUInt = fpt->pt_fake_entry.AsUInt;
+            _mm_mfence();
+            ept_invept_single(vcpu->ept_pointer);
+        }
+
+        vcpu->mtf_restore_fake_pt = NULL;
+    }
+
+    //
+    // stealth #PF recovery: PT page was swapped to real view (NX=0) so CPU
+    // could build a TLB entry. now swap it BACK to fake view (NX=1).
+    //
+    // CRITICAL: do NOT flush the stealth VA's TLB entry!
+    // the TLB has NX=0 cached → CPU continues executing from TLB → native speed.
+    // anti-cheat reading the PTE → fake PT → sees NX=1 → clean.
+    //
+    // for resident mode: leave target page in execute view (DLL keeps running)
+    // for oneshot mode: VMCALL handler already restored everything before MTF
+    //   (VMCALL exit clears MTF pending, but if it doesn't, this is harmless)
+    //
+    else if (vcpu->stealth_pf_swapped)
+    {
+        PEPT_STEALTH_PAGE_INFO sp = vcpu->stealth_pf_swapped;
+
+        //
+        // swap PT page EPT back to fake view (NX=1 visible to PTE scanners)
+        //
+        // CRITICAL: do NOT call INVEPT or INVVPID here!
+        //
+        // INVEPT (even single-context) flushes ALL combined mappings
+        // (guest-linear → host-physical) for this EPTP. this would destroy
+        // the stealth VA's TLB entry, forcing a page walk on the next
+        // instruction fetch → fake PT → NX=1 → #PF again → infinite loop.
+        //
+        // instead: just write the EPT PTE directly. the old EPT entry
+        // (pointing to real PT page) may be cached in EPT TLB, but that's
+        // actually beneficial — if the CPU uses the cached EPT entry for
+        // a guest page walk, it sees the real PT (NX=0), which is what we
+        // want. the fake PT is only for anti-cheat reads, which go through
+        // a different EPT violation path (write-protected PT page).
+        //
+        // the stale EPT TLB entry will eventually be evicted naturally,
+        // at which point the new PTE (fake view) takes effect.
+        //
+        if (sp->fake_pt)
+        {
+            PEPT_PML1_ENTRY pt_pte = ept_get_pml1(vcpu->ept_page_table,
+                (SIZE_T)(sp->fake_pt->pt_page_pfn << 12));
+            if (pt_pte)
+            {
+                pt_pte->AsUInt = sp->fake_pt->pt_fake_entry.AsUInt;
+                _mm_mfence();
+                // NO INVEPT — preserve stealth VA's TLB entry!
+            }
+        }
+
+        // for oneshot (non-resident): also restore target page to read view
+        if (!sp->resident)
+        {
+            PEPT_PML1_ENTRY target_pte = ept_get_pml1(vcpu->ept_page_table,
+                (SIZE_T)(sp->pfn_of_target << 12));
+            if (target_pte)
+            {
+                target_pte->AsUInt = sp->original_entry.AsUInt;
+                _mm_mfence();
+                // NO INVEPT here either for oneshot — let stale TLB be
+            }
+        }
+        // for resident: target page stays in execute view → code continues from TLB
+
+        vcpu->stealth_pf_swapped = NULL;
     }
 }
 

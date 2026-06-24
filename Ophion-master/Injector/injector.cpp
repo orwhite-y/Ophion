@@ -29,6 +29,7 @@
 typedef struct _TD_INJECT_PARAMS {
     UINT64 target_pid;
     UINT64 alloc_size;
+    UINT64 trigger_va;      // [in]  0 = auto (NtTestAlert)
     UINT64 shellcode_va;    // [out]
     UINT64 actual_size;     // [out]
 } TD_INJECT_PARAMS;

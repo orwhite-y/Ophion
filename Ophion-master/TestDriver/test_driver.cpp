@@ -1229,14 +1229,14 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
         //
-        // PAGE_READWRITE — clean VAD (non-executable), NX=1 in guest PTE.
-        // fake PT (NX=1) hides PTE from scanners.
-        // #PF interception + exec PT (NX=0) handles execution.
+        // PAGE_EXECUTE_READWRITE — needed for CFG bitmap + thread creation.
+        // fake PT (NX=1) hides PTE execute from scanners.
         // EPT execute-only (R=0, X=1) hides page content.
+        // fake page in stealth region with EPT X-only hides physical page.
         //
         st = ZwAllocateVirtualMemory(
             ZwCurrentProcess(), &base, 0, &size,
-            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 
         if (!NT_SUCCESS(st) || !base)
         {

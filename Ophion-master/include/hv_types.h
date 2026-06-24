@@ -80,6 +80,9 @@ typedef struct _VMM_EPT_DYNAMIC_SPLIT {
 #define EPTO_HOOK_FUNCTION       2
 #define EPTO_VIRTUAL_BREAKPOINT  1
 
+// forward declaration — needed by EPT_HOOKED_PAGE_INFO before full definition
+typedef struct _STEALTH_FAKE_PT *PSTEALTH_FAKE_PT;
+
 //
 // per-function hook tracking — one for each function hooked within a page
 //
@@ -113,6 +116,20 @@ typedef struct _EPT_HOOKED_PAGE_INFO {
     //           other processes execute original code transparently via MTF)
     //
     UINT64           target_cr3;
+    //
+    // fake PT page association (for inject hooks with NX hiding)
+    //
+    PSTEALTH_FAKE_PT fake_pt;           // shared fake PT page (NULL if not using fake PT)
+    UINT32           pt_pte_index;      // our PTE index in the PT page
+    //
+    // exec PT page — separate page with NX=0 for #PF recovery.
+    // used by ept_hook_handle_pf to swap EPT PFN (no content modification).
+    //   fake PT page: NX=1 (anti-cheat reads)   ← default EPT view
+    //   exec PT page: NX=0 (CPU page walk)      ← swapped in during #PF recovery
+    //
+    PUINT8           exec_pt_page;      // contiguous region page with NX=0
+    UINT64           exec_pt_pfn;       // PFN of exec_pt_page
+    EPT_PML1_ENTRY   pt_exec_entry;     // EPT entry pointing to exec_pt_page
 } EPT_HOOKED_PAGE_INFO, *PEPT_HOOKED_PAGE_INFO;
 
 //
@@ -130,7 +147,7 @@ typedef struct _STEALTH_REGION {
 
 // forward declarations for pointer types used in VIRTUAL_MACHINE_STATE
 typedef struct _EPT_STEALTH_PAGE_INFO *PEPT_STEALTH_PAGE_INFO;
-typedef struct _STEALTH_FAKE_PT *PSTEALTH_FAKE_PT;
+// PSTEALTH_FAKE_PT already forward-declared above (before EPT_HOOKED_PAGE_INFO)
 
 typedef struct _EPT_STATE {
     MTRR_RANGE_DESCRIPTOR mem_ranges[MAX_MTRR_RANGES];
@@ -254,6 +271,11 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     PEPT_STEALTH_PAGE_INFO stealth_pf_swapped;
     BOOLEAN     stealth_pf_configured;  // TRUE after this CPU's VMCS has #PF interception
 
+    //
+    // inject hook #PF recovery: EPT hook page with fake PT that was swapped for execution
+    //
+    PEPT_HOOKED_PAGE_INFO stealth_pf_swapped_hook;
+
     // per-core private host GDT for VMXOFF restore
     PVOID   host_gdt;
     UINT64  original_gdt_base;
@@ -325,8 +347,16 @@ typedef struct _EPT_HOOK_INJECT_PARAM {
     PVOID   fake_page_buffer;       // [in] kernel buffer: pre-built fake page (shellcode + VMCALL)
     UINT32  hook_size;              // [in] bytes overwritten by VMCALL (LDE result)
     BOOLEAN force_read_access;      // [in] changed_entry R=1 for shellcode self-read
+    //
+    // pre-computed guest PT page info (filled at PASSIVE_LEVEL by caller).
+    // used to create fake PT page in VMX-root for NX hiding.
+    //
+    UINT64  pt_page_pfn;            // [in] PFN of guest PT page containing target PTE
+    UINT32  pt_pte_index;           // [in] index within PT page (0-511)
+    PVOID   pt_page_copy;           // [in] kernel buffer with PT page content (for fake PT init)
     volatile LONG installed;        // [internal] first CPU → 1
     BOOLEAN result;                 // [out]
+    BOOLEAN fake_pt_ok;             // [out] TRUE if fake PT was created successfully
 } EPT_HOOK_INJECT_PARAM, *PEPT_HOOK_INJECT_PARAM;
 
 typedef struct _EPT_UNHOOK_VMCALL_PARAM {

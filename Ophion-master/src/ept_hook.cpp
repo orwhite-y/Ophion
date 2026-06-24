@@ -12,6 +12,7 @@
 *       5. restores host CR3, INVEPT
 */
 #include "hv.h"
+#include "log.h"
 
 #define POOL_TAG_SPLIT       0
 #define POOL_TAG_HOOKED_PAGE 1
@@ -698,16 +699,42 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     }
 
     //
+    // inject hook #PF recovery: fake PT had NX temporarily cleared (NX=0)
+    // so CPU could build a TLB entry. now RESTORE NX=1 in the fake PT.
+    //
+    // CRITICAL: do NOT call INVEPT — preserve the target VA's TLB entry!
+    // the TLB has NX=0 cached → CPU continues executing → native speed.
+    // anti-cheat reading the PTE → fake PT → sees NX=1 → clean.
+    //
+    else if (vcpu->stealth_pf_swapped_hook)
+    {
+        PEPT_HOOKED_PAGE_INFO hp = vcpu->stealth_pf_swapped_hook;
+
+        // swap PT page EPT from exec PT (NX=0) back to fake PT (NX=1)
+        // just a PFN swap — no page content modification needed
+        if (hp->fake_pt)
+        {
+            PEPT_PML1_ENTRY pt_pte = ept_get_pml1(vcpu->ept_page_table,
+                (SIZE_T)(hp->fake_pt->pt_page_pfn << 12));
+            if (pt_pte)
+            {
+                pt_pte->AsUInt = hp->fake_pt->pt_fake_entry.AsUInt;
+                _mm_mfence();
+                // NO INVEPT — preserve target VA's TLB entry (NX=0 cached)!
+            }
+        }
+
+        // keep target page in changed_entry (execute view) permanently
+        vcpu->stealth_pf_swapped_hook = NULL;
+    }
+
+    //
     // stealth #PF recovery: PT page was swapped to real view (NX=0) so CPU
     // could build a TLB entry. now swap it BACK to fake view (NX=1).
     //
     // CRITICAL: do NOT flush the stealth VA's TLB entry!
     // the TLB has NX=0 cached → CPU continues executing from TLB → native speed.
     // anti-cheat reading the PTE → fake PT → sees NX=1 → clean.
-    //
-    // for resident mode: leave target page in execute view (DLL keeps running)
-    // for oneshot mode: VMCALL handler already restored everything before MTF
-    //   (VMCALL exit clears MTF pending, but if it doesn't, this is harmless)
     //
     else if (vcpu->stealth_pf_swapped)
     {
@@ -761,6 +788,95 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
 
         vcpu->stealth_pf_swapped = NULL;
     }
+}
+
+// =========================================================================
+//  VMX-root: #PF handler for inject hooks with fake PT (NX hiding)
+//
+//  when an inject hook page is executed, the CPU page walker reads the
+//  fake PT page (NX=1) and generates #PF with error code bit 4 set.
+//
+//  approach: temporarily clear NX in the fake PT page itself, let CPU
+//  re-walk and build a TLB entry (NX=0), then restore NX=1 via MTF.
+//
+//  this avoids swapping to real PT (Windows can restore NX=1 in real PTE
+//  at any time, making the real PT unreliable).
+// =========================================================================
+
+BOOLEAN
+ept_hook_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr)
+{
+    if (!g_ept || IsListEmpty(&g_ept->hooked_pages)) return FALSE;
+
+    UINT64 fault_page = fault_addr & ~0xFFFULL;
+
+    PLIST_ENTRY cur = g_ept->hooked_pages.Flink;
+    while (cur != &g_ept->hooked_pages)
+    {
+        PEPT_HOOKED_PAGE_INFO hp = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
+        cur = cur->Flink;
+
+        if (!hp->fake_pt || !hp->exec_pt_page) continue;
+
+        PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
+        while (fc != &hp->hooked_functions_list)
+        {
+            PEPT_HOOKED_FUNCTION_INFO fi = CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
+            fc = fc->Flink;
+
+            if (((UINT64)fi->virtual_address & ~0xFFFULL) == fault_page)
+            {
+                //
+                // two-page swap: switch PT page EPT from fake PT (NX=1)
+                // to exec PT (NX=0). NO content modification — just PFN swap.
+                //
+
+                // 1. ensure PT page is split on this CPU, then swap to exec PT
+                {
+                    UINT64 pt_phys = hp->fake_pt->pt_page_pfn << 12;
+                    PEPT_PML2_ENTRY pt_p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys);
+                    if (pt_p2 && pt_p2->LargePage)
+                        ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)pt_phys);
+                    PEPT_PML1_ENTRY pt_pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys);
+                    if (pt_pte)
+                        pt_pte->AsUInt = hp->pt_exec_entry.AsUInt;  // exec PT (NX=0)
+                }
+
+                // 2. swap target page EPT → execute view (fake page with shellcode)
+                PEPT_PML1_ENTRY target_pte = ept_get_pml1(vcpu->ept_page_table,
+                    (SIZE_T)(hp->pfn_of_hooked_page << 12));
+                if (target_pte) target_pte->AsUInt = hp->changed_entry.AsUInt;
+
+                // 3. record for MTF restore
+                vcpu->stealth_pf_swapped_hook = hp;
+
+                // 4. arm MTF
+                {
+                    SIZE_T pc = 0;
+                    __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+                    pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+                    __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+                }
+
+                _mm_mfence();
+                ept_invept_single(vcpu->ept_pointer);
+
+                // flush guest TLB so CPU re-walks with exec PT (NX=0)
+                INVVPID_DESCRIPTOR desc = {0};
+                desc.Vpid = VPID_TAG;
+                if (g_ept->invvpid_individual_addr)
+                {
+                    desc.LinearAddress = fault_addr;
+                    asm_invvpid(InvvpidIndividualAddress, &desc);
+                }
+                else
+                    asm_invvpid(InvvpidSingleContext, &desc);
+
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
 }
 
 BOOLEAN

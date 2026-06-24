@@ -67,8 +67,15 @@ typedef struct _TD_HOOK_INJECT_PARAM {
     PVOID   fake_page_buffer;       // kernel buffer: pre-built fake page
     UINT32  hook_size;              // bytes overwritten by VMCALL (from LDE)
     BOOLEAN force_read_access;
+    //
+    // pre-computed guest PT page info (for fake PT / NX hiding)
+    //
+    UINT64  pt_page_pfn;            // PFN of guest PT page containing target PTE
+    UINT32  pt_pte_index;           // index within PT page (0-511)
+    PVOID   pt_page_copy;           // kernel buffer with PT page content (4KB)
     volatile LONG installed;
     BOOLEAN result;
+    BOOLEAN fake_pt_ok;
 } TD_HOOK_INJECT_PARAM;
 #pragma pack(pop)
 
@@ -247,13 +254,17 @@ typedef struct _TD_R3_UNHOOK_PARAMS {
 //   (see byte array below — hand-assembled and verified)
 //
 
-// ---- Data-driven shellcode ----
-// The kernel driver resolves all addresses at PASSIVE_LEVEL and writes
-// them into a data block at the start of the page. The shellcode stub
-// just reads from that block and calls the functions. Zero PEB walking.
+// ---- Data-driven shellcode (split code/data) ----
 //
-// Page layout:
-//   +0x000: shellcode stub (tiny)
+// Code page (EPT execute-only, R=0): only instructions, no embedded data.
+// Data lives in the trampoline page (separate VA, normal RWX, not EPT hooked).
+// This allows changed_entry R=0 → memory scanners read zeros from code page.
+//
+// Code page layout:
+//   +0x000: shellcode stub (code only)
+//
+// Trampoline page layout:
+//   +0x000: [saved bytes] + [abs jmp back]   (trampoline code, 18 bytes)
 //   +0x100: UINT64  pLoadLibraryA
 //   +0x108: UINT64  pGetProcAddress
 //   +0x110: char    "user32.dll\0"
@@ -261,11 +272,15 @@ typedef struct _TD_R3_UNHOOK_PARAMS {
 //   +0x130: char    "Ophion Stealth!\0"
 //   +0x140: char    "Ophion\0"
 //
+// shellcode uses: mov rbp, <absolute tramp_va + 0x100>  (patched at runtime)
+//
 
-// stub: reads function pointers from data area, calls MessageBoxA
+// stub: rbp loaded with absolute data pointer (patched at build time)
+// offset 7-14: 8 bytes to be patched with tramp_va + 0x100
 static const UINT8 g_shellcode_stub[] = {
     0x48, 0x83, 0xEC, 0x28,                         // sub rsp, 28h         ; align stack
-    0x48, 0x8D, 0x2D, 0xF5, 0x00, 0x00, 0x00,      // lea rbp, [rip+0xF5]  ; rbp → data area (+0x100 from here)
+    0x48, 0xBD,                                     // mov rbp, imm64       ; (6 bytes opcode+prefix)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // imm64 placeholder   ; patched to tramp_va+0x100
 
     // LoadLibraryA("user32.dll")
     0x48, 0x8B, 0x45, 0x00,                         // mov rax, [rbp+0]     ; pLoadLibraryA
@@ -297,31 +312,32 @@ static const UINT8 g_shellcode_stub[] = {
 };
 
 //
-// build the full shellcode page: stub + data block with resolved addresses
-// must be called while attached to the target process (or from system context)
+// build shellcode code page: stub only, NO data.
+// data_va = absolute address of data area (on trampoline page).
+// must be called while attached to the target process.
 //
 static VOID
-TdBuildShellcodePage(PVOID page_base)
+TdBuildShellcodePage(PVOID page_base, UINT64 data_va)
 {
     RtlZeroMemory(page_base, PAGE_SIZE);
 
     // copy stub at offset 0
     RtlCopyMemory(page_base, g_shellcode_stub, sizeof(g_shellcode_stub));
 
-    PUINT8 data = (PUINT8)page_base + 0x100;
+    // patch mov rbp, imm64 — write absolute data_va at offset 6
+    // g_shellcode_stub[4] = 0x48, [5] = 0xBD, [6..13] = imm64 placeholder
+    *(PUINT64)((PUINT8)page_base + 6) = data_va;
+}
 
-    // resolve kernel32 functions
-    UNICODE_STRING name;
-    RtlInitUnicodeString(&name, L"kernel32.dll");
+//
+// build data block on the trampoline page at +0x100.
+// must be called while attached to the target process (PEB walk).
+//
+static VOID
+TdBuildDataBlock(PVOID tramp_base)
+{
+    PUINT8 data = (PUINT8)tramp_base + 0x100;
 
-    // get kernel32 base via PEB walk in kernel (safe, documented)
-    // actually easier: just use MmGetSystemRoutineAddress for ntdll funcs
-    // but LoadLibraryA is in kernel32, not exported to kernel.
-    // solution: get the user-mode addresses from the PEB of the target process.
-
-    // simplest: read PEB → Ldr → walk modules → find kernel32 → read GetProcAddress + LoadLibraryA
-
-    // PEB of target process (we're attached via KeStackAttachProcess)
     PPEB peb = PsGetProcessPeb(PsGetCurrentProcess());
     if (!peb) return;
 
@@ -338,7 +354,6 @@ TdBuildShellcodePage(PVOID page_base)
             TD_LDR_ENTRY * e = CONTAINING_RECORD(cur, TD_LDR_ENTRY, InMemoryOrderLinks);
             if (e->BaseDllName.Buffer && e->BaseDllName.Length >= 20)
             {
-                // case-insensitive check for "kernel32.dll"
                 BOOLEAN match = TRUE;
                 const WCHAR target[] = L"kernel32.dll";
                 for (USHORT i = 0; i < 12; i++)
@@ -354,7 +369,6 @@ TdBuildShellcodePage(PVOID page_base)
 
         if (!kernel32_base) return;
 
-        // parse kernel32 PE exports
         PIMAGE_DOS_HEADER dos_h = (PIMAGE_DOS_HEADER)kernel32_base;
         PIMAGE_NT_HEADERS64 nt_h = (PIMAGE_NT_HEADERS64)((PUINT8)kernel32_base + dos_h->e_lfanew);
         ULONG exp_rva = nt_h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
@@ -376,7 +390,6 @@ TdBuildShellcodePage(PVOID page_base)
             if (pLoadLibraryA && pGetProcAddress) break;
         }
 
-        // write data block at +0x100
         *(PUINT64)(data + 0x00) = pLoadLibraryA;
         *(PUINT64)(data + 0x08) = pGetProcAddress;
         RtlCopyMemory(data + 0x10, "user32.dll",       11);
@@ -1216,13 +1229,9 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
         //
-        // allocate PAGE_EXECUTE_READWRITE — ensures NX=0 in guest PTE.
-        // manual NX clear is fragile: Windows memory manager can restore NX
-        // at any time (working set trim, A/D bit updates, etc.), causing
-        // guest #PF before EPT violation has a chance to fire.
-        //
-        // stealth: EPT hides the page content (reads → original page = zeros).
-        // VAD shows executable, but that can be changed later if needed.
+        // PAGE_EXECUTE_READWRITE for now — NX=0, no #PF needed.
+        // execute-only EPT (R=0, X=1) hides content: reads → zeros.
+        // data is on trampoline page (not EPT hooked).
         //
         st = ZwAllocateVirtualMemory(
             ZwCurrentProcess(), &base, 0, &size,
@@ -1238,20 +1247,14 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         DbgPrintEx(0, 0, "[td] inject: VA=%p size=0x%llX pid=%llu\n",
                    base, (UINT64)size, p->target_pid);
 
-        // --- step 1: build shellcode (needs PEB walk in target context) ---
-        TdBuildShellcodePage(base);
+        // --- step 1: allocate trampoline FIRST (need its VA for shellcode patch) ---
+        PVOID tramp_va = NULL;
+        SIZE_T tramp_size = PAGE_SIZE;
+        NTSTATUS tramp_st = ZwAllocateVirtualMemory(
+            ZwCurrentProcess(), &tramp_va, 0, &tramp_size,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 
-        UINT64 caller_cr3 = __readcr3();
-
-        // --- step 2: copy shellcode → kernel buffer, then zero original page ---
-        //
-        // order matters: copy FIRST, zero SECOND, get PA THIRD.
-        // zeroing may trigger COW (Windows assigns a new physical page).
-        // MmGetPhysicalAddress AFTER zero gets the correct (new) PA.
-        // EPT hook binds to this PA → matches the zeroed page.
-        //
-        PVOID fake_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'kjnI');
-        if (!fake_buf)
+        if (!NT_SUCCESS(tramp_st) || !tramp_va)
         {
             ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
             KeUnstackDetachProcess(&apc_state);
@@ -1259,29 +1262,42 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             st = STATUS_INSUFFICIENT_RESOURCES;
             break;
         }
-        RtlCopyMemory(fake_buf, base, PAGE_SIZE);   // save shellcode to kernel buffer
+        RtlZeroMemory(tramp_va, tramp_size);
 
+        // --- step 2: build data block on trampoline page (+0x100), then shellcode ---
         //
-        // get PA immediately — do NOT zero yet.
-        // zeroing can trigger COW or working-set changes that invalidate PA.
-        // EPT hook binds to THIS PA. zero later would need PA re-check.
+        // data on trampoline page (separate VA, normal RWX, NOT EPT hooked).
+        // shellcode code page will be execute-only (R=0) → reads see zeros.
         //
-        // touch the page (read+write) to ensure it's faulted in and stable.
+        TdBuildDataBlock(tramp_va);
+        TdBuildShellcodePage(base, (UINT64)tramp_va + 0x100);
+
+        UINT64 caller_cr3 = __readcr3();
+
+        // --- step 3: copy code page → kernel buffer, zero original, get PA ---
         //
-        *(volatile UINT8 *)base;  // force read fault-in
-        UINT64 base_phys = MmGetPhysicalAddress(base).QuadPart;
+        // order: copy FIRST → zero SECOND → get PA THIRD.
+        // zeroing may trigger COW (new physical page). PA must be read AFTER zero
+        // so EPT hook binds to the correct (post-COW) physical page.
+        //
+        PVOID fake_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'kjnI');
+        if (!fake_buf)
+        {
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
+            KeUnstackDetachProcess(&apc_state);
+            ObDereferenceObject(proc);
+            st = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+        RtlCopyMemory(fake_buf, base, PAGE_SIZE);   // save code to kernel buffer
+        RtlZeroMemory(base, PAGE_SIZE);              // zero original page (COW may change PA)
+        UINT64 base_phys = MmGetPhysicalAddress(base).QuadPart;  // PA of zeroed page
         DbgPrintEx(0, 0, "[td] inject: PA=%llx\n", base_phys);
 
-        // --- step 4: allocate trampoline (R3 executable) ---
-        PVOID tramp_va = NULL;
-        SIZE_T tramp_size = PAGE_SIZE;
-        NTSTATUS tramp_st = ZwAllocateVirtualMemory(
-            ZwCurrentProcess(), &tramp_va, 0, &tramp_size,
-            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-
-        if (!NT_SUCCESS(tramp_st) || !tramp_va || !base_phys)
+        if (!base_phys)
         {
-            if (tramp_va) ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
             ExFreePoolWithTag(fake_buf, 'kjnI');
             ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
             KeUnstackDetachProcess(&apc_state);
@@ -1290,19 +1306,12 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             break;
         }
 
-        // --- step 4: pre-build trampoline + patch VMCALL on fake page ---
-        //
-        // fake_buf already has shellcode (copied above before zeroing).
-        // trampoline = [saved first N bytes] + [abs jmp base+N]
-        // shellcode first instruction: sub rsp, 28h = 48 83 EC 28 (4 bytes)
-        //
+        // --- step 4: build trampoline code + patch VMCALL on fake page ---
         UINT32 hook_size = 4;  // sub rsp, 28h = 48 83 EC 28
 
-        // build trampoline — read saved bytes from fake_buf (NOT base, which is zeroed!)
-        RtlZeroMemory(tramp_va, tramp_size);
-        RtlCopyMemory(tramp_va, fake_buf, hook_size);  // save original bytes from kernel copy
+        // trampoline code at +0x000: [saved bytes] + [abs jmp back]
+        RtlCopyMemory(tramp_va, fake_buf, hook_size);
         {
-            // abs jump to base + hook_size
             PUINT8 t = (PUINT8)tramp_va + hook_size;
             UINT64 dst = (UINT64)base + hook_size;
             t[0] = 0x68;
@@ -1312,12 +1321,60 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             t[13] = 0xC3;
         }
 
-        // patch VMCALL at entry of fake page (overwrite first 3 bytes)
+        // patch VMCALL at entry of fake page
         ((PUINT8)fake_buf)[0] = 0x0F;
         ((PUINT8)fake_buf)[1] = 0x01;
         ((PUINT8)fake_buf)[2] = 0xC1;
 
         DbgPrintEx(0, 0, "[td] inject: fake page + trampoline built, tramp=%p\n", tramp_va);
+
+        // --- step 5b: pre-compute PT page info for fake PT / NX hiding ---
+        //
+        // walk guest page tables at PASSIVE_LEVEL to find the PT page
+        // containing our target PTE. this is used by VMX-root to create
+        // a fake PT page that shows NX=1 to scanners.
+        //
+        UINT64 pt_pfn = 0;
+        UINT32 pt_idx = 0;
+        PVOID  pt_page_buf = NULL;
+
+        if (TdResolveGuestPT(caller_cr3, (UINT64)base & ~0xFFFULL, &pt_pfn, &pt_idx))
+        {
+            //
+            // clear NX in real guest PTE at PASSIVE_LEVEL (safe — we're attached).
+            // the CPU page walker reads the real PT page and needs NX=0 to execute.
+            // the fake PT page (created by VMX-root) will show NX=1 to scanners.
+            //
+            {
+                PHYSICAL_ADDRESS ptpa;
+                ptpa.QuadPart = (LONGLONG)(pt_pfn << 12);
+                PUINT64 pt_page = (PUINT64)MmGetVirtualForPhysical(ptpa);
+                if (pt_page)
+                    pt_page[pt_idx] &= ~(1ULL << 63);  // clear NX bit
+            }
+
+            //
+            // copy PT page content to kernel NonPaged buffer for VMX-root.
+            // VMX-root uses this to initialize the fake PT page content.
+            //
+            pt_page_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'kjnI');
+            if (pt_page_buf)
+            {
+                PHYSICAL_ADDRESS ptpa;
+                ptpa.QuadPart = (LONGLONG)(pt_pfn << 12);
+                PVOID pt_va = MmGetVirtualForPhysical(ptpa);
+                if (pt_va)
+                    RtlCopyMemory(pt_page_buf, pt_va, PAGE_SIZE);
+                else
+                    RtlZeroMemory(pt_page_buf, PAGE_SIZE);
+            }
+
+            DbgPrintEx(0, 0, "[td] inject: PT PFN=%llx idx=%u NX cleared\n", pt_pfn, pt_idx);
+        }
+        else
+        {
+            DbgPrintEx(0, 0, "[td] inject: WARNING — PT walk failed, no fake PT support\n");
+        }
 
         // --- step 6: VMCALL to set up EPT (kernel buffers only, no user VA in VMX-root) ---
         TD_HOOK_INJECT_PARAM inj_req = {};
@@ -1326,7 +1383,10 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         inj_req.handler_va       = (UINT64)tramp_va;
         inj_req.fake_page_buffer = fake_buf;
         inj_req.hook_size        = hook_size;
-        inj_req.force_read_access = TRUE;
+        inj_req.force_read_access = FALSE;  // execute-only: reads → original page (zeros)
+        inj_req.pt_page_pfn      = pt_pfn;
+        inj_req.pt_pte_index     = pt_idx;
+        inj_req.pt_page_copy     = pt_page_buf;
 
         KeGenericCallDpc([](PKDPC, PVOID Ctx, PVOID A1, PVOID A2) {
             hv_vmcall_simple(VMCALL_EPT_HOOK_INJECT, (UINT64)Ctx, 0, 0);
@@ -1335,14 +1395,15 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }, &inj_req);
 
         ExFreePoolWithTag(fake_buf, 'kjnI');
+        if (pt_page_buf) ExFreePoolWithTag(pt_page_buf, 'kjnI');
 
         if (inj_req.result)
         {
-            // verify PA hasn't changed (detect COW / page replacement)
-            UINT64 pa_check = MmGetPhysicalAddress(base).QuadPart;
-            DbgPrintEx(0, 0, "[td] inject: PA check: before=%llx after=%llx %s\n",
-                       base_phys, pa_check,
-                       (pa_check == base_phys) ? "MATCH" : "MISMATCH!");
+            // original page already zeroed (step 3, before PA read + EPT install).
+            // EPT binds to the zeroed page's PA. reads → zeros. execute → fake page.
+
+            DbgPrintEx(0, 0, "[td] inject: EPT hook OK, fake_pt=%s\n",
+                       inj_req.fake_pt_ok ? "YES" : "NO");
 
             // track for cleanup (no MDL — page is one-shot inject, not persistent)
             R3_HOOK_ENTRY * he = R3HookFindFree();

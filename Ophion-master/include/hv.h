@@ -182,6 +182,14 @@ BOOLEAN ept_stealth_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_
 // temporarily swaps PT page EPT to real view so CPU page walk sees NX=0
 BOOLEAN ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error_code);
 
+// shared fake PT page management (VMX-root safe)
+PSTEALTH_FAKE_PT stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, PVOID pt_page_va_hint);
+VOID stealth_fake_pt_set_nx(PSTEALTH_FAKE_PT fpt, UINT32 pte_index);
+PUINT8 stealth_region_alloc_page(UINT64 * out_pfn);
+
+// #PF handler for inject hooks with fake PT (ept_hook.cpp)
+BOOLEAN ept_hook_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr);
+
 //
 // pool manager (pool_manager.cpp)
 //

@@ -94,7 +94,7 @@ ept_stealth_region_destroy(VOID)
 // allocate a 4KB page from the contiguous region (lock-free bump allocator)
 // returns VA and PFN. safe to call from VMX-root (no OS API calls).
 //
-static PUINT8
+PUINT8
 stealth_region_alloc_page(UINT64 * out_pfn)
 {
     STEALTH_REGION * region = &g_ept->stealth_region;
@@ -168,7 +168,7 @@ stealth_find_pt_page(UINT64 cr3, UINT64 va, PT_PAGE_INFO * out)
 // find or create a shared fake PT page for a given physical PT page.
 // called from VMX-root (uses pool_manager + contiguous region).
 //
-static PSTEALTH_FAKE_PT
+PSTEALTH_FAKE_PT
 stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, PVOID pt_page_va_hint)
 {
     // check if already exists
@@ -230,7 +230,7 @@ stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, 
 //
 // add NX=1 for a specific PTE index in the shared fake PT page
 //
-static VOID
+VOID
 stealth_fake_pt_set_nx(PSTEALTH_FAKE_PT fpt, UINT32 pte_index)
 {
     PUINT64 pte = &((PUINT64)fpt->fake_page_va)[pte_index];

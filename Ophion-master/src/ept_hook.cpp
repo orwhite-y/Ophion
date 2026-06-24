@@ -803,10 +803,23 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
 //  at any time, making the real PT unreliable).
 // =========================================================================
 
+// debug counters — safe in VMX-root (no OS API calls, just atomic increment)
+volatile LONG g_dbg_pf_called = 0;    // ept_hook_handle_pf was called
+volatile LONG g_dbg_pf_matched = 0;   // fault VA matched a hooked page
+volatile LONG g_dbg_pf_skipped = 0;   // skipped (no fake_pt/exec_pt)
+
 BOOLEAN
-ept_hook_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr)
+ept_hook_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error_code)
 {
     if (!g_ept || IsListEmpty(&g_ept->hooked_pages)) return FALSE;
+
+    //
+    // ONLY handle NX violations: P=1 (page present) + I/D=1 (instruction fetch).
+    // P=0 means demand paging — must re-inject to guest so Windows pages it in.
+    // error_code bit 0 = P (present), bit 4 = I/D (instruction fetch).
+    //
+    if (!(error_code & 0x01))
+        return FALSE;  // page not present → demand paging, let guest handle
 
     UINT64 fault_page = fault_addr & ~0xFFFULL;
 
@@ -816,7 +829,11 @@ ept_hook_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr)
         PEPT_HOOKED_PAGE_INFO hp = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
         cur = cur->Flink;
 
-        if (!hp->fake_pt || !hp->exec_pt_page) continue;
+        if (!hp->fake_pt || !hp->exec_pt_page)
+        {
+            _InterlockedIncrement(&g_dbg_pf_skipped);
+            continue;
+        }
 
         PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
         while (fc != &hp->hooked_functions_list)
@@ -826,31 +843,17 @@ ept_hook_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr)
 
             if (((UINT64)fi->virtual_address & ~0xFFFULL) == fault_page)
             {
-                //
-                // two-page swap: switch PT page EPT from fake PT (NX=1)
-                // to exec PT (NX=0). NO content modification — just PFN swap.
-                //
+                _InterlockedIncrement(&g_dbg_pf_matched);
 
-                // 1. ensure PT page is split on this CPU, then swap to exec PT
-                {
-                    UINT64 pt_phys = hp->fake_pt->pt_page_pfn << 12;
-                    PEPT_PML2_ENTRY pt_p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys);
-                    if (pt_p2 && pt_p2->LargePage)
-                        ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)pt_phys);
-                    PEPT_PML1_ENTRY pt_pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys);
-                    if (pt_pte)
-                        pt_pte->AsUInt = hp->pt_exec_entry.AsUInt;  // exec PT (NX=0)
-                }
+                // 1. swap PT page EPT → exec view (NX=0 visible to page walker)
+                PEPT_PML1_ENTRY pt_pte = ept_get_pml1(vcpu->ept_page_table,
+                    (SIZE_T)(hp->fake_pt->pt_page_pfn << 12));
+                if (pt_pte) pt_pte->AsUInt = hp->pt_exec_entry.AsUInt;
 
-                // 2. swap target page EPT → execute view (fake page with shellcode)
-                PEPT_PML1_ENTRY target_pte = ept_get_pml1(vcpu->ept_page_table,
-                    (SIZE_T)(hp->pfn_of_hooked_page << 12));
-                if (target_pte) target_pte->AsUInt = hp->changed_entry.AsUInt;
-
-                // 3. record for MTF restore
+                // 2. record for MTF restore (swap back to fake PT after one instruction)
                 vcpu->stealth_pf_swapped_hook = hp;
 
-                // 4. arm MTF
+                // 3. arm MTF — after one instruction, MTF handler restores fake PT (NX=1)
                 {
                     SIZE_T pc = 0;
                     __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
@@ -861,7 +864,7 @@ ept_hook_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr)
                 _mm_mfence();
                 ept_invept_single(vcpu->ept_pointer);
 
-                // flush guest TLB so CPU re-walks with exec PT (NX=0)
+                // flush guest TLB for fault VA so CPU re-walks with NX=0
                 INVVPID_DESCRIPTOR desc = {0};
                 desc.Vpid = VPID_TAG;
                 if (g_ept->invvpid_individual_addr)

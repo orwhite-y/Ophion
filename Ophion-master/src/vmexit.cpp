@@ -915,6 +915,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                     if (p1) { p1->ReadAccess = 1; p1->WriteAccess = 1; p1->ExecuteAccess = 0; }
 
                     // split + set PT page EPT to fake view on this CPU
+                    // (fake_pt may be NULL due to race — winner hasn't set it yet)
                     if (ex->fake_pt)
                     {
                         UINT64 pt_phys = ex->fake_pt->pt_page_pfn << 12;
@@ -923,8 +924,13 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                             ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)pt_phys);
                         PEPT_PML1_ENTRY pp1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys);
                         if (pp1) pp1->AsUInt = ex->fake_pt->pt_fake_entry.AsUInt;
+                    }
 
-                        // enable #PF interception
+                    // enable #PF interception UNCONDITIONALLY on this CPU.
+                    // even if fake_pt is NULL (race), the #PF handler will do
+                    // lazy split/setup when the first #PF fires.
+                    if (inj->pt_page_pfn && inj->pt_page_copy)
+                    {
                         size_t exc_bitmap = 0;
                         __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
                         exc_bitmap |= (1ULL << 14);
@@ -957,6 +963,22 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                     ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
                 PEPT_PML1_ENTRY p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
                 if (p1) { p1->ReadAccess = 1; p1->WriteAccess = 1; p1->ExecuteAccess = 0; }
+
+                //
+                // enable #PF interception on this CPU (lazy — the #PF handler
+                // will split the PT page when the first instruction-fetch #PF fires).
+                // we can't read hp->fake_pt yet because the winner CPU may still be
+                // building the list entry. the #PF handler will find it via the list.
+                //
+                if (inj->pt_page_pfn && inj->pt_page_copy)
+                {
+                    size_t exc_bitmap = 0;
+                    __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
+                    exc_bitmap |= (1ULL << 14);
+                    __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
+                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x10);
+                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x10);
+                }
 
                 _mm_mfence();
                 ept_invept_single(vcpu->ept_pointer);
@@ -1070,9 +1092,14 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                         hp->exec_pt_page = exec_page;
                         hp->exec_pt_pfn  = exec_pfn;
 
-                        // build EPT entry for exec PT page (same as fake but different PFN)
+                        // build EPT entry for exec PT page
+                        // CRITICAL: must have W=1! CPU sets Accessed bit in PTE during
+                        // page walk by WRITING to the PT page. if W=0, the write causes
+                        // an EPT violation that no handler recognizes → infinite loop → BSOD.
+                        // (pt_fake_entry has W=0 for write-sync, but exec PT needs W=1)
                         hp->pt_exec_entry = fpt->pt_fake_entry;
                         hp->pt_exec_entry.PageFrameNumber = exec_pfn;
+                        hp->pt_exec_entry.WriteAccess = 1;
                     }
                 }
             }
@@ -1626,9 +1653,6 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                     // fault address is in exit qualification for #PF
                     UINT64 fault_addr = vcpu->exit_qual;
 
-                    HYPERPLATFORM_LOG_INFO("[hv] #PF instruction-fetch: addr=%llx err=%llx",
-                        fault_addr, (UINT64)pf_error_code);
-
                     if (ept_stealth_handle_pf(vcpu, fault_addr, (UINT32)pf_error_code))
                     {
                         //
@@ -1641,7 +1665,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                     }
 
                     // check inject hooks with fake PT (EPT hook pages with NX hiding)
-                    if (ept_hook_handle_pf(vcpu, fault_addr))
+                    if (ept_hook_handle_pf(vcpu, fault_addr, (UINT32)pf_error_code))
                     {
                         vcpu->advance_rip = FALSE;
                         break;

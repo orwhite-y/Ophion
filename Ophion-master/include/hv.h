@@ -188,7 +188,11 @@ VOID stealth_fake_pt_set_nx(PSTEALTH_FAKE_PT fpt, UINT32 pte_index);
 PUINT8 stealth_region_alloc_page(UINT64 * out_pfn);
 
 // #PF handler for inject hooks with fake PT (ept_hook.cpp)
-BOOLEAN ept_hook_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr);
+BOOLEAN ept_hook_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error_code);
+// debug counters (safe in VMX-root, no OS API)
+extern volatile LONG g_dbg_pf_called;
+extern volatile LONG g_dbg_pf_matched;
+extern volatile LONG g_dbg_pf_skipped;
 
 //
 // pool manager (pool_manager.cpp)

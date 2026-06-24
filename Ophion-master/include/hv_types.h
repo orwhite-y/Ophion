@@ -130,6 +130,7 @@ typedef struct _EPT_HOOKED_PAGE_INFO {
     PUINT8           exec_pt_page;      // contiguous region page with NX=0
     UINT64           exec_pt_pfn;       // PFN of exec_pt_page
     EPT_PML1_ENTRY   pt_exec_entry;     // EPT entry pointing to exec_pt_page
+    volatile LONG *  dbg_pf_counter;    // debug: #PF handler writes here (kernel NonPaged)
 } EPT_HOOKED_PAGE_INFO, *PEPT_HOOKED_PAGE_INFO;
 
 //
@@ -357,6 +358,7 @@ typedef struct _EPT_HOOK_INJECT_PARAM {
     volatile LONG installed;        // [internal] first CPU → 1
     BOOLEAN result;                 // [out]
     BOOLEAN fake_pt_ok;             // [out] TRUE if fake PT was created successfully
+    volatile LONG * dbg_pf_counter; // [in] pointer to counter (kernel NonPaged), handler increments
 } EPT_HOOK_INJECT_PARAM, *PEPT_HOOK_INJECT_PARAM;
 
 typedef struct _EPT_UNHOOK_VMCALL_PARAM {

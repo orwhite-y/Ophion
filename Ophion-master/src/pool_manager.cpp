@@ -117,8 +117,8 @@ pool_manager_init(VOID)
     // split buffers: need cpu_count per hooked page (each CPU has its own EPT)
     // hooked_page/func/trampoline: shared, only 1 per hook
     //
-    UINT32 split_count = g_cpu_count * 8;    // 8 hooks × cpu_count splits
-    if (split_count < 64) split_count = 64;
+    UINT32 split_count = g_cpu_count * 64;   // 64 hooks × cpu_count splits (~2MB NPP)
+    if (split_count < 256) split_count = 256;
 
     for (UINT32 i = 0; i < split_count; i++)
     {
@@ -129,7 +129,7 @@ pool_manager_init(VOID)
         }
     }
 
-    for (UINT32 i = 0; i < 32; i++)
+    for (UINT32 i = 0; i < 64; i++)
     {
         if (!pool_add_entry(POOL_TAG_HOOKED_PAGE, sizeof(EPT_HOOKED_PAGE_INFO)))
         {
@@ -138,7 +138,7 @@ pool_manager_init(VOID)
         }
     }
 
-    for (UINT32 i = 0; i < 64; i++)
+    for (UINT32 i = 0; i < 128; i++)
     {
         if (!pool_add_entry(POOL_TAG_HOOKED_FUNC, sizeof(EPT_HOOKED_FUNCTION_INFO)))
         {
@@ -147,7 +147,7 @@ pool_manager_init(VOID)
         }
     }
 
-    for (UINT32 i = 0; i < 32; i++)
+    for (UINT32 i = 0; i < 64; i++)
     {
         if (!pool_add_entry(POOL_TAG_TRAMPOLINE, TRAMPOLINE_BUF_SIZE))
         {

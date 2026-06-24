@@ -21,12 +21,39 @@
 #include <intrin.h>
 #include <ntimage.h>
 
-// ---- undocumented PEB structures for user-mode module walk ----
+// ---- undocumented kernel APIs ----
 
 extern "C" NTKERNELAPI PPEB PsGetProcessPeb(PEPROCESS Process);
+
+typedef enum _KAPC_ENVIRONMENT {
+    OriginalApcEnvironment,
+    AttachedApcEnvironment,
+    CurrentApcEnvironment,
+    InsertApcEnvironment
+} KAPC_ENVIRONMENT;
+
+typedef VOID (NTAPI *PKNORMAL_ROUTINE)(PVOID, PVOID, PVOID);
+typedef VOID (NTAPI *PKKERNEL_ROUTINE)(PKAPC, PKNORMAL_ROUTINE *, PVOID *, PVOID *, PVOID *);
+typedef VOID (NTAPI *PKRUNDOWN_ROUTINE)(PKAPC);
+
+extern "C" {
+    NTKERNELAPI VOID KeInitializeApc(
+        PKAPC Apc, PETHREAD Thread, KAPC_ENVIRONMENT Environment,
+        PKKERNEL_ROUTINE KernelRoutine, PKRUNDOWN_ROUTINE RundownRoutine,
+        PKNORMAL_ROUTINE NormalRoutine, KPROCESSOR_MODE ApcMode, PVOID NormalContext);
+    NTKERNELAPI BOOLEAN KeInsertQueueApc(
+        PKAPC Apc, PVOID SystemArgument1, PVOID SystemArgument2, KPRIORITY Increment);
+    NTKERNELAPI BOOLEAN PsIsThreadTerminating(PETHREAD Thread);
+}
 extern "C" NTSYSAPI NTSTATUS NTAPI ZwProtectVirtualMemory(
     HANDLE ProcessHandle, PVOID * BaseAddress, PSIZE_T RegionSize,
     ULONG NewProtect, PULONG OldProtect);
+
+typedef NTSTATUS (NTAPI * fn_NtAlertResumeThread)(HANDLE, PULONG);
+
+// undocumented VAD / AVL types — used as opaque pointers for raw offset access
+typedef struct _RTL_AVL_TREE { PVOID Root; } RTL_AVL_TREE, *PRTL_AVL_TREE;
+typedef PVOID PMMVAD_SHORT;  // cast to PUINT8 for field access
 
 typedef struct _TD_UNICODE_STRING {
     USHORT Length;
@@ -55,6 +82,8 @@ typedef struct _TD_PEB_LDR_DATA {
 
 // ---- VMCALL interface (must match Ophion hv_types.h) ----
 
+#define VMCALL_EPT_HOOK         0x00000003
+#define VMCALL_EPT_UNHOOK       0x00000004
 #define VMCALL_STEALTH_ALLOC    0x00000006
 #define VMCALL_EPT_HOOK_INJECT  0x00000008
 
@@ -187,8 +216,9 @@ typedef NTSTATUS (NTAPI * fn_ZwCreateThreadEx)(
 
 typedef NTSTATUS (NTAPI * fn_ZwResumeThread)(HANDLE, PULONG);
 
-static fn_ZwCreateThreadEx g_pZwCreateThreadEx = NULL;
-static fn_ZwResumeThread   g_pZwResumeThread   = NULL;
+static fn_ZwCreateThreadEx      g_pZwCreateThreadEx      = NULL;
+static fn_ZwResumeThread        g_pZwResumeThread        = NULL;
+static fn_NtAlertResumeThread   g_pNtAlertResumeThread   = NULL;
 
 // ---- device / IOCTL ----
 
@@ -201,6 +231,7 @@ static fn_ZwResumeThread   g_pZwResumeThread   = NULL;
 #define IOCTL_EPT_UNHOOK  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 2, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_EPT_HOOK_R3 CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 3, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_EPT_UNHOOK_R3 CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 4, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_INJECT_V2     CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 5, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #pragma pack(push, 8)
 typedef struct _TD_INJECT_PARAMS {
@@ -227,6 +258,20 @@ typedef struct _TD_R3_UNHOOK_PARAMS {
     UINT64 target_function_va;  // [in]  same VA passed to hook
     UINT64 status;              // [out]
 } TD_R3_UNHOOK_PARAMS;
+
+//
+// V2 inject: single-CPU EPT hook, no DPC broadcast.
+// trigger_va = rarely-used R3 function (e.g. NtTestAlert).
+// thread starts at trigger_va → EPT hook → redirect → shellcode.
+//
+typedef struct _TD_INJECT_V2_PARAMS {
+    UINT64 target_pid;      // [in]
+    UINT64 trigger_va;      // [in]  R3 function to hook as execution trigger
+    UINT64 alloc_size;      // [in]  0 = PAGE_SIZE
+    // output
+    UINT64 shellcode_va;    // [out]
+    UINT64 actual_size;     // [out]
+} TD_INJECT_V2_PARAMS;
 #pragma pack(pop)
 
 // ---- MessageBoxA shellcode (x64 PIC) ----
@@ -581,9 +626,6 @@ TdStealthInjectPages(
 // =========================================================================
 //  EPT Hook: NtCreateFile
 // =========================================================================
-
-#define VMCALL_EPT_HOOK     0x00000003
-#define VMCALL_EPT_UNHOOK   0x00000004
 
 //
 // original NtCreateFile pointer (set by hook install, used by proxy)
@@ -1188,6 +1230,13 @@ static NTSTATUS TdCreateClose(PDEVICE_OBJECT, PIRP irp)
     return STATUS_SUCCESS;
 }
 
+// APC kernel routine — called in kernel mode when APC fires, frees the APC object
+static VOID NTAPI TdApcKernelRoutine(
+    PKAPC Apc, PKNORMAL_ROUTINE *, PVOID *, PVOID *, PVOID *)
+{
+    ExFreePoolWithTag(Apc, 'cpAT');
+}
+
 static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 {
     NTSTATUS st = STATUS_SUCCESS;
@@ -1229,10 +1278,10 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
         //
-        // PAGE_EXECUTE_READWRITE — needed for CFG bitmap + thread creation.
+        // PAGE_EXECUTE_READWRITE for CFG bitmap registration.
+        // VAD protection is patched to PAGE_READWRITE after thread creation.
         // fake PT (NX=1) hides PTE execute from scanners.
         // EPT execute-only (R=0, X=1) hides page content.
-        // fake page in stealth region with EPT X-only hides physical page.
         //
         st = ZwAllocateVirtualMemory(
             ZwCurrentProcess(), &base, 0, &size,
@@ -1438,13 +1487,438 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
         KeUnstackDetachProcess(&apc_state);
 
-        // --- step 7: create thread ---
+        // --- step 7: create thread + patch VAD ---
         if (NT_SUCCESS(st) && p->shellcode_va)
         {
             NTSTATUS thr_st = TdCreateThread(proc, (PVOID)p->shellcode_va);
             p->actual_size |= ((UINT64)(UINT32)thr_st << 32);
             DbgPrintEx(0, 0, "[td] inject: thread=0x%08X\n", thr_st);
+
+            //
+            // step 8: patch VAD protection from PAGE_EXECUTE_READWRITE to PAGE_READWRITE.
+            // direct MMVAD memory write — no syscall, no PTE change, no EPT conflict.
+            // anti-cheat scanning VADs sees PAGE_READWRITE (non-executable).
+            //
+            // MMVAD_SHORT layout (Windows 10 19041):
+            //   +0x30: ULONG VadFlags (bitfield)
+            //   VadFlags.Protection is bits 3-7 (5 bits)
+            //   MM_EXECUTE_READWRITE = 6, MM_READWRITE = 4
+            //
+            if (NT_SUCCESS(thr_st))
+            {
+                KAPC_STATE apc2;
+                KeStackAttachProcess(proc, &apc2);
+
+                // walk VAD tree to find our allocation
+                // EPROCESS.VadRoot is at offset 0x7D8 on Win10 19041
+                PUINT8 eproc = (PUINT8)proc;
+                PRTL_AVL_TREE vad_root = (PRTL_AVL_TREE)(eproc + 0x7D8);
+                PMMVAD_SHORT vad = (PMMVAD_SHORT)vad_root->Root;
+
+                UINT64 target_vpn = (UINT64)base >> 12;  // page number
+
+                while (vad)
+                {
+                    UINT64 start_vpn = *(UINT64 *)((PUINT8)vad + 0x18);  // StartingVpn + StartingVpnHigh
+                    UINT64 end_vpn   = *(UINT64 *)((PUINT8)vad + 0x20);  // EndingVpn + EndingVpnHigh
+
+                    // Win10 19041: StartingVpn at +0x18 (ULONG), StartingVpnHigh at +0x20 (UCHAR)
+                    // Actually: +0x18 = StartingVpn (ULONG), +0x1C = EndingVpn (ULONG)
+                    //           +0x20 = StartingVpnHigh (UCHAR), +0x21 = EndingVpnHigh (UCHAR)
+                    ULONG s_lo = *(PULONG)((PUINT8)vad + 0x18);
+                    ULONG e_lo = *(PULONG)((PUINT8)vad + 0x1C);
+                    UCHAR s_hi = *(PUINT8)((PUINT8)vad + 0x20);
+                    UCHAR e_hi = *(PUINT8)((PUINT8)vad + 0x21);
+                    UINT64 svpn = ((UINT64)s_hi << 32) | s_lo;
+                    UINT64 evpn = ((UINT64)e_hi << 32) | e_lo;
+
+                    if (target_vpn >= svpn && target_vpn <= evpn)
+                    {
+                        // found our VAD — patch VadFlags.Protection
+                        // +0x30 = VadFlags (ULONG), Protection is bits [7:3]
+                        PULONG pflags = (PULONG)((PUINT8)vad + 0x30);
+                        ULONG flags = *pflags;
+                        ULONG prot = (flags >> 3) & 0x1F;
+                        DbgPrintEx(0, 0, "[td] inject: VAD found, prot=%u → 4 (RW)\n", prot);
+                        // clear bits [7:3], set to 4 (MM_READWRITE)
+                        flags = (flags & ~(0x1F << 3)) | (4 << 3);
+                        *pflags = flags;
+                        break;
+                    }
+
+                    // AVL tree walk
+                    if (target_vpn < svpn)
+                        vad = (PMMVAD_SHORT)(*(PVOID *)((PUINT8)vad + 0x8));   // Left
+                    else
+                        vad = (PMMVAD_SHORT)(*(PVOID *)((PUINT8)vad + 0x10));  // Right
+                }
+
+                KeUnstackDetachProcess(&apc2);
+            }
         }
+
+        ObDereferenceObject(proc);
+        break;
+    }
+
+    // =====================================================================
+    //  IOCTL_INJECT_V2 — single-CPU EPT inject (no DPC broadcast)
+    //
+    //  flow:
+    //    1. alloc shellcode page + build fake page + PT page copy (same as V1)
+    //    2. pin to CPU 0
+    //    3. single VMCALL: VMCALL_EPT_HOOK_INJECT (shellcode page EPT, CPU 0 only)
+    //    4. single VMCALL: VMCALL_EPT_HOOK (hook trigger_va → shellcode, CPU 0 only)
+    //    5. revert affinity, detach
+    //    6. ZwCreateThreadEx(SUSPENDED) at trigger_va, affinity CPU 0, resume
+    //    7. thread runs trigger → EPT hook → redirect → shellcode → fake PT
+    //
+    //  benefits: no DPC, 1 CPU split only, trigger entry = legit function
+    // =====================================================================
+    case IOCTL_INJECT_V2:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_INJECT_V2_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_INJECT_V2_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_INJECT_V2_PARAMS * p = (TD_INJECT_V2_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+
+        if (!p->trigger_va)
+        { st = STATUS_INVALID_PARAMETER; break; }
+
+        // V2 uses RtlCreateUserThread (always exported) as primary path.
+        // ZwCreateThreadEx is optional — used if available.
+
+        PEPROCESS proc = NULL;
+        st = PsLookupProcessByProcessId((HANDLE)p->target_pid, &proc);
+        if (!NT_SUCCESS(st)) break;
+
+        KAPC_STATE apc_state;
+        KeStackAttachProcess(proc, &apc_state);
+
+        // --- step 1: alloc shellcode page (PAGE_EXECUTE_READWRITE for CFG) ---
+        PVOID base = NULL;
+        SIZE_T size = p->alloc_size ? (SIZE_T)p->alloc_size : PAGE_SIZE;
+        size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+        st = ZwAllocateVirtualMemory(
+            ZwCurrentProcess(), &base, 0, &size,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+        if (!NT_SUCCESS(st) || !base)
+        {
+            KeUnstackDetachProcess(&apc_state);
+            ObDereferenceObject(proc);
+            break;
+        }
+
+        DbgPrintEx(0, 0, "[td-v2] inject: VA=%p size=0x%llX pid=%llu trigger=%p\n",
+                   base, (UINT64)size, p->target_pid, (PVOID)p->trigger_va);
+
+        // --- step 1b: alloc trampoline (for shellcode entry redirect) ---
+        PVOID tramp_va = NULL;
+        SIZE_T tramp_size = PAGE_SIZE;
+        NTSTATUS tramp_st = ZwAllocateVirtualMemory(
+            ZwCurrentProcess(), &tramp_va, 0, &tramp_size,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+        if (!NT_SUCCESS(tramp_st) || !tramp_va)
+        {
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
+            KeUnstackDetachProcess(&apc_state);
+            ObDereferenceObject(proc);
+            st = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+        RtlZeroMemory(tramp_va, tramp_size);
+
+        // --- step 2: build data + shellcode (same as V1) ---
+        TdBuildDataBlock(tramp_va);
+        TdBuildShellcodePage(base, (UINT64)tramp_va + 0x100);
+
+        UINT64 caller_cr3 = __readcr3();
+
+        // --- step 3: copy code → zero original → get PA (post-COW) ---
+        PVOID fake_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'kjnI');
+        if (!fake_buf)
+        {
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
+            KeUnstackDetachProcess(&apc_state);
+            ObDereferenceObject(proc);
+            st = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+        RtlCopyMemory(fake_buf, base, PAGE_SIZE);
+        RtlZeroMemory(base, PAGE_SIZE);
+        UINT64 base_phys = MmGetPhysicalAddress(base).QuadPart;
+
+        if (!base_phys)
+        {
+            ExFreePoolWithTag(fake_buf, 'kjnI');
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
+            KeUnstackDetachProcess(&apc_state);
+            ObDereferenceObject(proc);
+            st = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+
+        // --- step 4: build trampoline + patch VMCALL at fake page entry ---
+        UINT32 hook_size = 4;  // sub rsp, 28h = 48 83 EC 28
+        RtlCopyMemory(tramp_va, fake_buf, hook_size);
+        {
+            PUINT8 t = (PUINT8)tramp_va + hook_size;
+            UINT64 dst = (UINT64)base + hook_size;
+            t[0] = 0x68;
+            *(PUINT32)(t + 1) = (UINT32)dst;
+            t[5] = 0xC7; t[6] = 0x44; t[7] = 0x24; t[8] = 0x04;
+            *(PUINT32)(t + 9) = (UINT32)(dst >> 32);
+            t[13] = 0xC3;
+        }
+        ((PUINT8)fake_buf)[0] = 0x0F;  // VMCALL
+        ((PUINT8)fake_buf)[1] = 0x01;
+        ((PUINT8)fake_buf)[2] = 0xC1;
+
+        // --- step 5: PT page info for fake PT ---
+        UINT64 pt_pfn = 0;
+        UINT32 pt_idx = 0;
+        PVOID  pt_page_buf = NULL;
+        PVOID  pt_real_va  = NULL;
+
+        if (TdResolveGuestPT(caller_cr3, (UINT64)base & ~0xFFFULL, &pt_pfn, &pt_idx))
+        {
+            PHYSICAL_ADDRESS ptpa;
+            ptpa.QuadPart = (LONGLONG)(pt_pfn << 12);
+            pt_real_va = MmGetVirtualForPhysical(ptpa);
+
+            pt_page_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'kjnI');
+            if (pt_page_buf)
+            {
+                if (pt_real_va)
+                    RtlCopyMemory(pt_page_buf, pt_real_va, PAGE_SIZE);
+                else
+                    RtlZeroMemory(pt_page_buf, PAGE_SIZE);
+                ((PUINT64)pt_page_buf)[pt_idx] &= ~(1ULL << 63);  // NX=0 in copy
+            }
+            DbgPrintEx(0, 0, "[td-v2] PT PFN=%llx idx=%u va=%p\n", pt_pfn, pt_idx, pt_real_va);
+        }
+
+        // ==============================================================
+        //  step 6: PIN TO CPU 0 — single VMCALL, no DPC
+        // ==============================================================
+        KAFFINITY old_affinity = KeSetSystemAffinityThreadEx((KAFFINITY)1);  // CPU 0
+
+        // 6a: VMCALL_EPT_HOOK_INJECT — shellcode page EPT + fake PT (CPU 0 only)
+        TD_HOOK_INJECT_PARAM inj_req = {};
+        inj_req.target_va        = (UINT64)base;
+        inj_req.target_phys      = base_phys;
+        inj_req.handler_va       = (UINT64)tramp_va;
+        inj_req.fake_page_buffer = fake_buf;
+        inj_req.hook_size        = hook_size;
+        inj_req.force_read_access = FALSE;
+        inj_req.pt_page_pfn      = pt_pfn;
+        inj_req.pt_pte_index     = pt_idx;
+        inj_req.pt_page_copy     = pt_page_buf;
+        inj_req.pt_page_va       = pt_real_va;
+
+        hv_vmcall_simple(VMCALL_EPT_HOOK_INJECT, (UINT64)&inj_req, 0, 0);
+
+        DbgPrintEx(0, 0, "[td-v2] EPT_HOOK_INJECT on CPU 0: result=%d fake_pt=%d\n",
+                   inj_req.result, inj_req.fake_pt_ok);
+
+        // 6b: VMCALL_EPT_HOOK — hook trigger_va → shellcode_va (CPU 0 only)
+        //     type 1 = VMCALL hook, target_cr3 filtered (only target process)
+        //     proxy = shellcode VA (HV sets RIP to this on VMCALL intercept)
+        NTSTATUS hook_st = STATUS_UNSUCCESSFUL;
+        if (inj_req.result)
+        {
+            PVOID dummy_origin = NULL;
+            hook_st = hv_vmcall_ex(
+                VMCALL_EPT_HOOK,
+                (UINT64)p->trigger_va,      // target function
+                (UINT64)base,               // proxy = shellcode VA
+                (UINT64)&dummy_origin,      // origin (trampoline, unused)
+                caller_cr3,                 // caller CR3
+                1,                          // hook_type = VMCALL (0F 01 C1)
+                caller_cr3,                 // target_cr3 (per-process filter)
+                0,                          // user_trampoline = NULL (pool alloc)
+                0,                          // user_trampoline_pa = 0
+                0);                         // flags = 0
+
+            DbgPrintEx(0, 0, "[td-v2] EPT_HOOK trigger on CPU 0: st=0x%08X\n", hook_st);
+        }
+
+        KeRevertToUserAffinityThreadEx(old_affinity);
+
+        // free kernel buffers (VMX-root already copied what it needs)
+        ExFreePoolWithTag(fake_buf, 'kjnI');
+        if (pt_page_buf) ExFreePoolWithTag(pt_page_buf, 'kjnI');
+
+        if (!inj_req.result || !NT_SUCCESS(hook_st))
+        {
+            DbgPrintEx(0, 0, "[td-v2] EPT setup failed, cleaning up\n");
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
+            KeUnstackDetachProcess(&apc_state);
+            ObDereferenceObject(proc);
+            st = STATUS_UNSUCCESSFUL;
+            break;
+        }
+
+        // track for cleanup
+        R3_HOOK_ENTRY * he = R3HookFindFree();
+        if (he)
+        {
+            he->active          = TRUE;
+            he->target_pid      = p->target_pid;
+            he->target_va       = base;
+            he->trampoline_va   = tramp_va;
+            he->trampoline_size = tramp_size;
+            he->target_mdl      = NULL;
+            he->target_cr3      = caller_cr3;
+        }
+
+        p->shellcode_va = (UINT64)base;
+        p->actual_size  = (UINT64)size;
+        irp->IoStatus.Information = sizeof(TD_INJECT_V2_PARAMS);
+
+        KeUnstackDetachProcess(&apc_state);
+
+        // ==============================================================
+        //  step 7: create thread SUSPENDED at trigger_va, pin CPU 0, resume
+        // ==============================================================
+        {
+            //
+            // pin CURRENT kernel thread to CPU 0 first.
+            // RtlCreateUserThread(CreateSuspended=FALSE) inherits scheduling
+            // from current processor context. thread starts on CPU 0.
+            //
+            // then set the NEW thread's own affinity mask to CPU 0 so it
+            // stays there even after we revert our own affinity.
+            //
+            KAFFINITY old_aff2 = KeSetSystemAffinityThreadEx((KAFFINITY)1);  // CPU 0
+
+            KAPC_STATE apc_thr;
+            KeStackAttachProcess(proc, &apc_thr);
+
+            HANDLE thread_h = NULL;
+            CLIENT_ID cid = {};
+            NTSTATUS thr_st;
+
+            if (g_pZwCreateThreadEx)
+            {
+                // prefer ZwCreateThreadEx (SUSPENDED supported)
+                HANDLE proc_h = NULL;
+                NTSTATUS oh_st = ObOpenObjectByPointer(
+                    proc, OBJ_KERNEL_HANDLE, NULL,
+                    PROCESS_ALL_ACCESS, *PsProcessType, KernelMode, &proc_h);
+
+                if (NT_SUCCESS(oh_st))
+                {
+                    thr_st = g_pZwCreateThreadEx(
+                        &thread_h, THREAD_ALL_ACCESS, NULL, proc_h,
+                        (PVOID)p->trigger_va, NULL,
+                        THREAD_CREATE_FLAGS_CREATE_SUSPENDED,
+                        0, 0, 0, NULL);
+                    ZwClose(proc_h);
+
+                    if (NT_SUCCESS(thr_st) && thread_h)
+                    {
+                        KAFFINITY cpu0 = (KAFFINITY)1;
+                        ZwSetInformationThread(thread_h, ThreadAffinityMask,
+                                               &cpu0, sizeof(cpu0));
+                        if (g_pZwResumeThread)
+                        {
+                            ULONG prev = 0;
+                            g_pZwResumeThread(thread_h, &prev);
+                        }
+                        else
+                        {
+                            ULONG prev = 0;
+                            if (g_pNtAlertResumeThread)
+                                g_pNtAlertResumeThread(thread_h, &prev);
+                        }
+                    }
+                }
+                else
+                    thr_st = oh_st;
+            }
+            else
+            {
+                // fallback: RtlCreateUserThread (always exported, no SUSPENDED flag)
+                // kernel thread is pinned to CPU 0 → new thread starts on CPU 0
+                thr_st = RtlCreateUserThread(
+                    ZwCurrentProcess(), NULL,
+                    FALSE,    // not suspended (no resume API needed)
+                    0, 0, 0,
+                    (PVOID)p->trigger_va, NULL,
+                    &thread_h, &cid);
+            }
+
+            KeUnstackDetachProcess(&apc_thr);
+            KeRevertToUserAffinityThreadEx(old_aff2);
+
+            if (NT_SUCCESS(thr_st) && thread_h)
+            {
+                // set thread affinity to CPU 0 (in case it migrates)
+                KAFFINITY cpu0 = (KAFFINITY)1;
+                ZwSetInformationThread(thread_h, ThreadAffinityMask,
+                                       &cpu0, sizeof(cpu0));
+                DbgPrintEx(0, 0, "[td-v2] thread created on CPU 0, handle=%p\n", thread_h);
+                ZwClose(thread_h);
+            }
+            else
+            {
+                DbgPrintEx(0, 0, "[td-v2] thread creation failed: 0x%08X\n", thr_st);
+                st = thr_st;
+            }
+
+            // --- step 8: patch VAD to PAGE_READWRITE ---
+            if (NT_SUCCESS(st))
+            {
+                KAPC_STATE apc2;
+                KeStackAttachProcess(proc, &apc2);
+
+                PUINT8 eproc = (PUINT8)proc;
+                PRTL_AVL_TREE vad_root = (PRTL_AVL_TREE)(eproc + 0x7D8);
+                PMMVAD_SHORT vad = (PMMVAD_SHORT)vad_root->Root;
+                UINT64 target_vpn = (UINT64)base >> 12;
+
+                while (vad)
+                {
+                    ULONG s_lo = *(PULONG)((PUINT8)vad + 0x18);
+                    ULONG e_lo = *(PULONG)((PUINT8)vad + 0x1C);
+                    UCHAR s_hi = *(PUINT8)((PUINT8)vad + 0x20);
+                    UCHAR e_hi = *(PUINT8)((PUINT8)vad + 0x21);
+                    UINT64 svpn = ((UINT64)s_hi << 32) | s_lo;
+                    UINT64 evpn = ((UINT64)e_hi << 32) | e_lo;
+
+                    if (target_vpn >= svpn && target_vpn <= evpn)
+                    {
+                        PULONG pflags = (PULONG)((PUINT8)vad + 0x30);
+                        ULONG flags = *pflags;
+                        flags = (flags & ~(0x1F << 3)) | (4 << 3);  // MM_READWRITE
+                        *pflags = flags;
+                        DbgPrintEx(0, 0, "[td-v2] VAD patched to RW\n");
+                        break;
+                    }
+
+                    if (target_vpn < svpn)
+                        vad = (PMMVAD_SHORT)(*(PVOID *)((PUINT8)vad + 0x8));
+                    else
+                        vad = (PMMVAD_SHORT)(*(PVOID *)((PUINT8)vad + 0x10));
+                }
+
+                KeUnstackDetachProcess(&apc2);
+            }
+        }
+
+        // --- step 9: unhook trigger after execution (one-shot) ---
+        //
+        // trigger hook stays active until explicit IOCTL_EPT_UNHOOK_R3
+        // or driver unload. single-CPU split means negligible overhead.
+        //
 
         ObDereferenceObject(proc);
         break;
@@ -1550,6 +2024,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
         RtlInitUnicodeString(&fn, L"ZwResumeThread");
         g_pZwResumeThread = (fn_ZwResumeThread)MmGetSystemRoutineAddress(&fn);
     }
+    RtlInitUnicodeString(&fn, L"NtAlertResumeThread");
+    g_pNtAlertResumeThread = (fn_NtAlertResumeThread)MmGetSystemRoutineAddress(&fn);
 
     UNICODE_STRING dev_name, sym_name;
     RtlInitUnicodeString(&dev_name, TD_DEVICE_NAME);

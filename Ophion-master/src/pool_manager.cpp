@@ -66,7 +66,7 @@ pool_add_entry(POOL_TYPE_TAG type, SIZE_T size)
     {
         //
         // split buffer: PML1 数组必须页对齐
-        // hooked_page: fake_page_contents (DECLSPEC_ALIGN(PAGE_SIZE)) 必须页对齐
+        // hooked_page: needs physical address for PFN calculation
         // 用 MmAllocateContiguousMemory 保证物理连续 + 页对齐
         //
         PHYSICAL_ADDRESS max_phys;

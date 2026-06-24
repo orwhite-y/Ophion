@@ -1229,14 +1229,14 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
         //
-        // PAGE_EXECUTE_READWRITE at alloc time — thread creation checks VAD
-        // and rejects non-executable start address. after thread is created,
-        // ZwProtectVirtualMemory downgrades to PAGE_READWRITE (NX=1, clean VAD).
-        // fake PT (NX=1) + exec PT (NX=0) + #PF interception handle execution.
+        // PAGE_READWRITE — clean VAD (non-executable), NX=1 in guest PTE.
+        // fake PT (NX=1) hides PTE from scanners.
+        // #PF interception + exec PT (NX=0) handles execution.
+        // EPT execute-only (R=0, X=1) hides page content.
         //
         st = ZwAllocateVirtualMemory(
             ZwCurrentProcess(), &base, 0, &size,
-            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
         if (!NT_SUCCESS(st) || !base)
         {

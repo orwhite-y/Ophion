@@ -102,7 +102,7 @@ typedef struct _EPT_HOOKED_FUNCTION_INFO {
 typedef struct _EPT_HOOKED_PAGE_INFO {
     LIST_ENTRY       hooked_page_list;
     LIST_ENTRY       hooked_functions_list;
-    DECLSPEC_ALIGN(PAGE_SIZE) UINT8 fake_page_contents[PAGE_SIZE];
+    PUINT8           fake_page_va;            // shellcode page in stealth region (EPT X-only)
     UINT64           pfn_of_hooked_page;
     UINT64           pfn_of_fake_page_contents;
     PEPT_PML1_ENTRY  entry_address;       // pointer to EPT PTE being manipulated

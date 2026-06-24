@@ -264,11 +264,11 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
             if (!fi->first_trampoline_address) { pool_manager_release(fi); _InterlockedExchange(&g_hook_list_lock, 0); HOOK_RESTORE_CR3_AND_RETURN(FALSE); }
 
             fi->virtual_address    = req->target_function;
-            fi->fake_page_contents = existing->fake_page_contents;
+            fi->fake_page_contents = existing->fake_page_va;
             fi->handler_function   = req->proxy_function;
 
             UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
-            PUINT8 fake  = &existing->fake_page_contents[off];
+            PUINT8 fake  = &existing->fake_page_va[off];
             SIZE_T min_sz = (req->hook_type == 1) ? 3 : (req->hook_type == 2) ? 1 : 14;
             SIZE_T ow = 0;
             while (ow < min_sz) ow += LDE((PUINT8)req->target_function + ow, 64);
@@ -374,24 +374,27 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     }
     if (!fi->first_trampoline_address) { pool_manager_release(fi); pool_manager_release(hp); _InterlockedExchange(&g_hook_list_lock, 0); HOOK_RESTORE_CR3_AND_RETURN(FALSE); }
 
-    // 设置 hooked page
+    // 设置 hooked page — fake page in stealth region (EPT X-only)
     hp->pfn_of_hooked_page = target_pfn;
-    UINT64 hp_pa = pool_manager_get_physical(hp);
-    UINT64 fake_offset = (UINT64)hp->fake_page_contents - (UINT64)hp;
-    hp->pfn_of_fake_page_contents = (hp_pa + fake_offset) >> 12;
+    {
+        UINT64 fake_pfn = 0;
+        hp->fake_page_va = stealth_region_alloc_page(&fake_pfn);
+        if (!hp->fake_page_va) { pool_manager_release(fi); pool_manager_release(hp); _InterlockedExchange(&g_hook_list_lock, 0); HOOK_RESTORE_CR3_AND_RETURN(FALSE); }
+        hp->pfn_of_fake_page_contents = fake_pfn;
+    }
     hp->entry_address = pte;
     hp->target_cr3 = req->target_cr3 & CR3_ADDR_MASK;
 
-    // 拷贝原始页面到 fake page
-    RtlCopyMemory(hp->fake_page_contents, PAGE_ALIGN(req->target_function), PAGE_SIZE);
+    // 拷贝原始页面到 fake page (stealth region)
+    RtlCopyMemory(hp->fake_page_va, PAGE_ALIGN(req->target_function), PAGE_SIZE);
 
     // LDE + 构建 trampoline
     fi->virtual_address    = req->target_function;
-    fi->fake_page_contents = hp->fake_page_contents;
+    fi->fake_page_contents = hp->fake_page_va;
     fi->handler_function   = req->proxy_function;
 
     UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
-    PUINT8 fake  = &hp->fake_page_contents[off];
+    PUINT8 fake  = &hp->fake_page_va[off];
     SIZE_T min_sz = (req->hook_type == 1) ? 3 : (req->hook_type == 2) ? 1 : 14;
     SIZE_T ow = 0;
     while (ow < min_sz) ow += LDE((PUINT8)req->target_function + ow, 64);
@@ -444,6 +447,16 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     pte->ExecuteAccess = 0;
     pte->ReadAccess    = 1;
     pte->WriteAccess   = 1;
+
+    // EPT X-only on fake page physical page (stealth region)
+    {
+        SIZE_T fake_phys = (SIZE_T)(hp->pfn_of_fake_page_contents << 12);
+        PEPT_PML2_ENTRY fp2 = ept_get_pml2(vcpu->ept_page_table, fake_phys);
+        if (fp2 && fp2->LargePage)
+            ept_split_large_page_pool(vcpu->ept_page_table, fake_phys);
+        PEPT_PML1_ENTRY fp1 = ept_get_pml1(vcpu->ept_page_table, fake_phys);
+        if (fp1) { fp1->ReadAccess = 0; fp1->WriteAccess = 0; fp1->ExecuteAccess = 1; }
+    }
 
     _mm_mfence();
     ept_invept_single(vcpu->ept_pointer);
@@ -567,6 +580,39 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
         cur = cur->Flink;
         if (hp->pfn_of_hooked_page != pfn && hp->pfn_of_fake_page_contents != pfn) continue;
 
+        //
+        // fake page physical page scan protection:
+        // if anti-cheat maps pfn_of_fake_page_contents directly (MmMapIoSpace etc.),
+        // EPT X-only → violation here. swap to hooked page PFN (zeroed) temporarily
+        // so the read sees zeros, then MTF swaps back to X-only.
+        //
+        if (pfn == hp->pfn_of_fake_page_contents && pfn != hp->pfn_of_hooked_page)
+        {
+            if (viol.ReadAccess || viol.WriteAccess)
+            {
+                PEPT_PML1_ENTRY fake_pte = ept_get_pml1(vcpu->ept_page_table,
+                    (SIZE_T)(hp->pfn_of_fake_page_contents << 12));
+                if (fake_pte)
+                {
+                    // temporarily point to the hooked page (zeroed) for reads
+                    EPT_PML1_ENTRY tmp = *fake_pte;
+                    tmp.ReadAccess = 1; tmp.WriteAccess = 0; tmp.ExecuteAccess = 0;
+                    tmp.PageFrameNumber = hp->pfn_of_hooked_page;  // zeroed page
+                    fake_pte->AsUInt = tmp.AsUInt;
+                    _mm_mfence();
+                    ept_invept_single(vcpu->ept_pointer);
+
+                    vcpu->mtf_restore_page = hp;
+                    SIZE_T pc = 0;
+                    __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+                    pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+                    __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+                }
+                return TRUE;
+            }
+            continue;
+        }
+
         PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)(hp->pfn_of_hooked_page << 12));
         if (!my_pte) continue;
 
@@ -628,18 +674,32 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     if (vcpu->mtf_restore_page)
     {
         PEPT_HOOKED_PAGE_INFO hp = vcpu->mtf_restore_page;
+
+        // restore target page EPT
         PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,
             (SIZE_T)(hp->pfn_of_hooked_page << 12));
         if (my_pte)
         {
-            // fake PT hooks: restore to changed_entry (X=1, R=0) — execution
-            // is controlled by guest PTE NX via #PF, not by EPT X bit.
-            // non-fake-PT hooks: restore to original_entry (X=0).
             if (hp->fake_pt)
                 ept_swap_page(my_pte, hp->changed_entry, vcpu->ept_pointer);
             else
                 ept_swap_page(my_pte, hp->original_entry, vcpu->ept_pointer);
         }
+
+        // restore fake page EPT to X-only (in case it was opened for phys scan read)
+        if (hp->fake_page_va)
+        {
+            PEPT_PML1_ENTRY fake_pte = ept_get_pml1(vcpu->ept_page_table,
+                (SIZE_T)(hp->pfn_of_fake_page_contents << 12));
+            if (fake_pte && fake_pte->ReadAccess)
+            {
+                fake_pte->ReadAccess = 0; fake_pte->WriteAccess = 0; fake_pte->ExecuteAccess = 1;
+                fake_pte->PageFrameNumber = hp->pfn_of_fake_page_contents;
+                _mm_mfence();
+                ept_invept_single(vcpu->ept_pointer);
+            }
+        }
+
         vcpu->mtf_restore_page = NULL;
     }
 

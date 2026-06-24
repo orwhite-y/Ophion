@@ -919,12 +919,19 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                         ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
                     PEPT_PML1_ENTRY p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
 
+                    // EPT X-only on fake page physical page (this CPU)
+                    {
+                        SIZE_T fake_phys = (SIZE_T)(ex->pfn_of_fake_page_contents << 12);
+                        PEPT_PML2_ENTRY fp2 = ept_get_pml2(vcpu->ept_page_table, fake_phys);
+                        if (fp2 && fp2->LargePage)
+                            ept_split_large_page_pool(vcpu->ept_page_table, fake_phys);
+                        PEPT_PML1_ENTRY fp1 = ept_get_pml1(vcpu->ept_page_table, fake_phys);
+                        if (fp1) { fp1->ReadAccess = 0; fp1->WriteAccess = 0; fp1->ExecuteAccess = 1; }
+                    }
+
                     // split + set PT page EPT to fake view on this CPU
-                    // (fake_pt may be NULL due to race — winner hasn't set it yet)
                     if (ex->fake_pt)
                     {
-                        // fake PT active: EPT X=1 (execute via fake page),
-                        // execution controlled by guest PTE NX via #PF
                         if (p1) p1->AsUInt = ex->changed_entry.AsUInt;
 
                         UINT64 pt_phys = ex->fake_pt->pt_page_pfn << 12;
@@ -943,7 +950,6 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                     }
                     else
                     {
-                        // no fake PT: EPT X=0, execute triggers EPT violation
                         if (p1) { p1->ReadAccess = 1; p1->WriteAccess = 1; p1->ExecuteAccess = 0; }
                     }
 
@@ -1029,20 +1035,37 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             if (!pte) { pool_manager_release(fi); pool_manager_release(hp);
                         inj->result = FALSE; vmx_leave_guest_cr3(_saved_cr3_inj); regs->rax = (UINT64)STATUS_UNSUCCESSFUL; break; }
 
-            // fill hooked page — copy pre-built fake page from KERNEL buffer (safe!)
+            // allocate fake page from stealth region (EPT X-only, immune to phys scan)
             hp->pfn_of_hooked_page = target_pfn;
-            UINT64 hp_pa = pool_manager_get_physical(hp);
-            UINT64 fake_off = (UINT64)hp->fake_page_contents - (UINT64)hp;
-            hp->pfn_of_fake_page_contents = (hp_pa + fake_off) >> 12;
+            {
+                UINT64 fake_pfn = 0;
+                hp->fake_page_va = stealth_region_alloc_page(&fake_pfn);
+                if (!hp->fake_page_va) {
+                    pool_manager_release(fi); pool_manager_release(hp);
+                    inj->result = FALSE; vmx_leave_guest_cr3(_saved_cr3_inj);
+                    regs->rax = (UINT64)STATUS_INSUFFICIENT_RESOURCES; break;
+                }
+                hp->pfn_of_fake_page_contents = fake_pfn;
+            }
             hp->entry_address = pte;
             hp->target_cr3 = 0;  // global (no CR3 filtering — private page, safe)
 
-            RtlCopyMemory(hp->fake_page_contents, inj->fake_page_buffer, PAGE_SIZE);
+            RtlCopyMemory(hp->fake_page_va, inj->fake_page_buffer, PAGE_SIZE);
+
+            // EPT X-only on fake page physical page (anti-cheat phys scan → EPT violation)
+            {
+                SIZE_T fake_phys = (SIZE_T)(hp->pfn_of_fake_page_contents << 12);
+                PEPT_PML2_ENTRY fp2 = ept_get_pml2(vcpu->ept_page_table, fake_phys);
+                if (fp2 && fp2->LargePage)
+                    ept_split_large_page_pool(vcpu->ept_page_table, fake_phys);
+                PEPT_PML1_ENTRY fp1 = ept_get_pml1(vcpu->ept_page_table, fake_phys);
+                if (fp1) { fp1->ReadAccess = 0; fp1->WriteAccess = 0; fp1->ExecuteAccess = 1; }
+            }
 
             // fill function info
             fi->virtual_address    = (PVOID)inj->target_va;
             fi->handler_function   = (PVOID)inj->handler_va;
-            fi->fake_page_contents = hp->fake_page_contents;
+            fi->fake_page_contents = hp->fake_page_va;
             fi->hook_size          = inj->hook_size;
             fi->first_trampoline_address = NULL;  // built at PASSIVE_LEVEL
             fi->user_trampoline    = TRUE;         // don't pool_release

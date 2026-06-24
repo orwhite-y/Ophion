@@ -886,11 +886,17 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             // NO user VA access in VMX-root (SMAP safe).
             // rdx = pointer to EPT_HOOK_INJECT_PARAM (kernel NonPaged memory)
             //
+            // CRITICAL: must switch to system CR3 for private host CR3 mode.
+            // inj pointer and its buffers (fake_page_buffer, pt_page_copy) are
+            // post-init NonPaged pool allocations — not mapped in private CR3.
+            //
             #define _POOL_TAG_HOOKED_PAGE 1
             #define _POOL_TAG_HOOKED_FUNC 2
+            UINT64 _saved_cr3_inj = vmx_enter_guest_cr3();
             PEPT_HOOK_INJECT_PARAM inj = (PEPT_HOOK_INJECT_PARAM)regs->rdx;
             if (!inj || !inj->fake_page_buffer || !inj->target_phys)
             {
+                vmx_leave_guest_cr3(_saved_cr3_inj);
                 regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
                 break;
             }
@@ -912,31 +918,33 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                     if (p2 && p2->LargePage)
                         ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
                     PEPT_PML1_ENTRY p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
-                    if (p1) { p1->ReadAccess = 1; p1->WriteAccess = 1; p1->ExecuteAccess = 0; }
 
                     // split + set PT page EPT to fake view on this CPU
                     // (fake_pt may be NULL due to race — winner hasn't set it yet)
                     if (ex->fake_pt)
                     {
+                        // fake PT active: EPT X=1 (execute via fake page),
+                        // execution controlled by guest PTE NX via #PF
+                        if (p1) p1->AsUInt = ex->changed_entry.AsUInt;
+
                         UINT64 pt_phys = ex->fake_pt->pt_page_pfn << 12;
                         PEPT_PML2_ENTRY pp2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys);
                         if (pp2 && pp2->LargePage)
                             ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)pt_phys);
                         PEPT_PML1_ENTRY pp1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys);
                         if (pp1) pp1->AsUInt = ex->fake_pt->pt_fake_entry.AsUInt;
-                    }
 
-                    // enable #PF interception UNCONDITIONALLY on this CPU.
-                    // even if fake_pt is NULL (race), the #PF handler will do
-                    // lazy split/setup when the first #PF fires.
-                    if (inj->pt_page_pfn && inj->pt_page_copy)
-                    {
                         size_t exc_bitmap = 0;
                         __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
                         exc_bitmap |= (1ULL << 14);
                         __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
                         __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x10);
                         __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x10);
+                    }
+                    else
+                    {
+                        // no fake PT: EPT X=0, execute triggers EPT violation
+                        if (p1) { p1->ReadAccess = 1; p1->WriteAccess = 1; p1->ExecuteAccess = 0; }
                     }
 
                     _mm_mfence();
@@ -946,7 +954,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                     break;
                 }
             }
-            if (already) { regs->rax = (UINT64)STATUS_SUCCESS; break; }
+            if (already) { vmx_leave_guest_cr3(_saved_cr3_inj); regs->rax = (UINT64)STATUS_SUCCESS; break; }
 
             // --- first CPU: full install ---
             if (_InterlockedCompareExchange(&inj->installed, 1, 0) != 0)
@@ -983,6 +991,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 _mm_mfence();
                 ept_invept_single(vcpu->ept_pointer);
                 inj->result = TRUE;
+                vmx_leave_guest_cr3(_saved_cr3_inj);
                 regs->rax = (UINT64)STATUS_SUCCESS;
                 break;
             }
@@ -996,6 +1005,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             {
                 if (hp) pool_manager_release(hp);
                 inj->result = FALSE;
+                vmx_leave_guest_cr3(_saved_cr3_inj);
                 regs->rax = (UINT64)STATUS_INSUFFICIENT_RESOURCES;
                 break;
             }
@@ -1010,14 +1020,14 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             {
                 PVMM_EPT_DYNAMIC_SPLIT sp = ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
                 if (!sp) { pool_manager_release(fi); pool_manager_release(hp);
-                           inj->result = FALSE; regs->rax = (UINT64)STATUS_UNSUCCESSFUL; break; }
+                           inj->result = FALSE; vmx_leave_guest_cr3(_saved_cr3_inj); regs->rax = (UINT64)STATUS_UNSUCCESSFUL; break; }
                 pte = &sp->PML1[ADDRMASK_EPT_PML1_INDEX(target_phys)];
             }
             else
                 pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
 
             if (!pte) { pool_manager_release(fi); pool_manager_release(hp);
-                        inj->result = FALSE; regs->rax = (UINT64)STATUS_UNSUCCESSFUL; break; }
+                        inj->result = FALSE; vmx_leave_guest_cr3(_saved_cr3_inj); regs->rax = (UINT64)STATUS_UNSUCCESSFUL; break; }
 
             // fill hooked page — copy pre-built fake page from KERNEL buffer (safe!)
             hp->pfn_of_hooked_page = target_pfn;
@@ -1072,7 +1082,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             {
                 // create fake PT page (NX=1) via stealth infrastructure
                 PSTEALTH_FAKE_PT fpt = stealth_get_or_create_fake_pt(
-                    vcpu, inj->pt_page_pfn, inj->pt_page_copy);
+                    vcpu, inj->pt_page_pfn, inj->pt_page_copy, inj->pt_page_va);
                 if (fpt)
                 {
                     stealth_fake_pt_set_nx(fpt, inj->pt_pte_index);
@@ -1104,9 +1114,17 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 }
             }
 
-            // enable #PF interception for instruction-fetch faults on this CPU
+            // when fake PT is active, set initial EPT to execute view (changed_entry).
+            // execution is controlled by fake PT (NX=1 → #PF), NOT by EPT X bit.
+            // if we leave EPT X=0, we get double VMEXIT (first #PF, then EPT violation)
+            // and the MTF handler can only restore one per trap → infinite loop.
+            //
+            // with EPT X=1 (changed_entry): read → R=0 → EPT violation → zeros.
+            //                               exec → EPT ok → fake PT NX=1 → #PF → exec PT → run.
             if (hp->fake_pt && hp->exec_pt_page)
             {
+                pte->AsUInt = hp->changed_entry.AsUInt;
+
                 size_t exc_bitmap = 0;
                 __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
                 exc_bitmap |= (1ULL << 14);
@@ -1119,6 +1137,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             ept_invept_single(vcpu->ept_pointer);
 
             inj->result = TRUE;
+            vmx_leave_guest_cr3(_saved_cr3_inj);
             regs->rax = (UINT64)STATUS_SUCCESS;
             break;
         }

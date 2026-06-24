@@ -167,9 +167,11 @@ stealth_find_pt_page(UINT64 cr3, UINT64 va, PT_PAGE_INFO * out)
 //
 // find or create a shared fake PT page for a given physical PT page.
 // called from VMX-root (uses pool_manager + contiguous region).
+// real_page_va: system VA of real PT page, hostcr3-mapped by caller at PASSIVE_LEVEL.
+//              used by MTF handler for resync (NULL = no resync, stale fake PT).
 //
 PSTEALTH_FAKE_PT
-stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, PVOID pt_page_va_hint)
+stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, PVOID pt_page_va_hint, PVOID real_page_va)
 {
     // check if already exists
     PLIST_ENTRY cur = g_ept->stealth_fake_pts.Flink;
@@ -190,8 +192,9 @@ stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, 
     if (!fpt) return NULL;
     RtlZeroMemory(fpt, sizeof(*fpt));
 
-    fpt->pt_page_pfn = pt_page_pfn;
-    fpt->ref_count   = 1;
+    fpt->pt_page_pfn   = pt_page_pfn;
+    fpt->ref_count     = 1;
+    fpt->real_page_va  = real_page_va;
 
     // allocate fake page from contiguous region
     fpt->fake_page_va = stealth_region_alloc_page(&fpt->pfn_of_fake);
@@ -217,7 +220,7 @@ stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, 
     fpt->pt_real_entry.ExecuteAccess = 0;
 
     fpt->pt_fake_entry = fpt->pt_real_entry;
-    fpt->pt_fake_entry.WriteAccess     = 0;    // write-protect for sync
+    fpt->pt_fake_entry.WriteAccess     = 1;    // allow A/D bit writes (no EPT violation on page walk)
     fpt->pt_fake_entry.PageFrameNumber = fpt->pfn_of_fake;
 
     // activate fake view — EPT now maps PT page to fake page
@@ -238,15 +241,16 @@ stealth_fake_pt_set_nx(PSTEALTH_FAKE_PT fpt, UINT32 pte_index)
 }
 
 //
-// resync fake PT page from real PT page, then re-apply NX for all stealth entries
+// resync fake PT page from real PT page, then re-apply NX for all entries.
+// uses fpt->real_page_va (hostcr3-mapped) — safe in VMX-root without pa_to_va.
+// walks BOTH stealth_pages and hooked_pages to re-apply NX for all consumers.
 //
-static VOID
+VOID
 stealth_fake_pt_resync(PSTEALTH_FAKE_PT fpt)
 {
-    PVOID real_pt_va = pa_to_va(fpt->pt_page_pfn << 12);
-    if (!real_pt_va) return;
+    if (!fpt->real_page_va) return;
 
-    RtlCopyMemory(fpt->fake_page_va, real_pt_va, PAGE_SIZE);
+    RtlCopyMemory(fpt->fake_page_va, fpt->real_page_va, PAGE_SIZE);
 
     // re-apply NX=1 for all stealth pages using this fake PT
     PLIST_ENTRY cur = g_ept->stealth_pages.Flink;
@@ -256,6 +260,27 @@ stealth_fake_pt_resync(PSTEALTH_FAKE_PT fpt)
         cur = cur->Flink;
         if (sp->fake_pt && sp->fake_pt->pt_page_pfn == fpt->pt_page_pfn)
             stealth_fake_pt_set_nx(fpt, sp->pt_pte_index);
+    }
+
+    // re-apply NX=1 for all inject-hooked pages using this fake PT,
+    // and resync their exec PT pages (NX=0 for our entry, rest matches real PT)
+    cur = g_ept->hooked_pages.Flink;
+    while (cur != &g_ept->hooked_pages)
+    {
+        PEPT_HOOKED_PAGE_INFO hp = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
+        cur = cur->Flink;
+        if (hp->fake_pt && hp->fake_pt->pt_page_pfn == fpt->pt_page_pfn)
+        {
+            stealth_fake_pt_set_nx(fpt, hp->pt_pte_index);
+
+            // resync exec PT page: copy real PT content, keep NX=0 for our entry
+            if (hp->exec_pt_page)
+            {
+                RtlCopyMemory(hp->exec_pt_page, fpt->real_page_va, PAGE_SIZE);
+                PUINT64 exec_pte = (PUINT64)hp->exec_pt_page;
+                exec_pte[hp->pt_pte_index] &= ~(1ULL << 63);  // NX=0
+            }
+        }
     }
 }
 

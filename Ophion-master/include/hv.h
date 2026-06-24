@@ -183,8 +183,9 @@ BOOLEAN ept_stealth_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_
 BOOLEAN ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error_code);
 
 // shared fake PT page management (VMX-root safe)
-PSTEALTH_FAKE_PT stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, PVOID pt_page_va_hint);
+PSTEALTH_FAKE_PT stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, PVOID pt_page_va_hint, PVOID real_page_va);
 VOID stealth_fake_pt_set_nx(PSTEALTH_FAKE_PT fpt, UINT32 pte_index);
+VOID stealth_fake_pt_resync(PSTEALTH_FAKE_PT fpt);
 PUINT8 stealth_region_alloc_page(UINT64 * out_pfn);
 
 // #PF handler for inject hooks with fake PT (ept_hook.cpp)

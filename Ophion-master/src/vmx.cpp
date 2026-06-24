@@ -618,6 +618,10 @@ vmx_init(VOID)
     // other structures accessed in host mode. Building before allocations
     // would leave those VAs unmapped in host CR3 -> #PF -> double fault.
     //
+    // cache system CR3 for vmx_enter_guest_cr3() — MUST be before hostcr3_build
+    g_system_cr3 = get_system_cr3();
+    HYPERPLATFORM_LOG_INFO("[hv] system CR3 = %llx", g_system_cr3);
+
 #if USE_PRIVATE_HOST_CR3
     if (!hostcr3_build())
     {

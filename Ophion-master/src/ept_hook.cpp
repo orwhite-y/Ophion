@@ -630,7 +630,16 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
         PEPT_HOOKED_PAGE_INFO hp = vcpu->mtf_restore_page;
         PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,
             (SIZE_T)(hp->pfn_of_hooked_page << 12));
-        if (my_pte) ept_swap_page(my_pte, hp->original_entry, vcpu->ept_pointer);
+        if (my_pte)
+        {
+            // fake PT hooks: restore to changed_entry (X=1, R=0) — execution
+            // is controlled by guest PTE NX via #PF, not by EPT X bit.
+            // non-fake-PT hooks: restore to original_entry (X=0).
+            if (hp->fake_pt)
+                ept_swap_page(my_pte, hp->changed_entry, vcpu->ept_pointer);
+            else
+                ept_swap_page(my_pte, hp->original_entry, vcpu->ept_pointer);
+        }
         vcpu->mtf_restore_page = NULL;
     }
 
@@ -660,30 +669,22 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
         PSTEALTH_FAKE_PT fpt = vcpu->mtf_restore_fake_pt;
 
         //
-        // resync fake PT from real PT page after OS wrote A/D bits or modified PTEs.
-        // CANNOT use pa_to_va (MmGetVirtualForPhysical) in VMX-root — causes hang.
-        // instead: read updated PTE values through the EPT real-view mapping
-        // that is still active (we haven't swapped back to fake yet).
+        // resync fake PT page from real PT page BEFORE swapping back.
+        // fpt->real_page_va is a system VA from MmGetVirtualForPhysical.
+        // it's valid under system CR3, NOT under private host CR3.
+        // switch to system CR3 to read, then switch back.
         //
-        // the real PT page is currently accessible through its original EPT mapping
-        // (pt_real_entry). use the stealth region's contiguous VA or just
-        // read directly via the EPT — but we need a VA...
+        // copies all 512 PTEs from real → fake, then re-applies NX=1
+        // for every stealth/hooked entry that uses this fake PT.
+        // this prevents stale A/D bits and stale PFN mappings from causing
+        // MEMORY_MANAGEMENT BSOD when the CPU walks the fake PT page for
+        // non-hooked PTEs in the same page.
         //
-        // simplest safe approach: the fake_page_va IS accessible (it's in the
-        // stealth contiguous region, always mapped). read the real PT page
-        // through guest CR3 (switch to guest CR3, read via guest VA of PT page).
-        // but we don't know the guest VA of the PT page.
-        //
-        // pragmatic fix: DON'T resync the entire page. only update the specific
-        // PTE that was written (the one that caused the EPT violation).
-        // the fault address tells us which PTE was modified.
-        // just re-read that single PTE from the real page (still mapped in EPT)
-        // and update the fake page's copy, then re-apply NX.
-        //
-        // for now: skip resync entirely. just swap back to fake view.
-        // the fake page has slightly stale A/D bits, but NX is preserved.
-        // this is acceptable for stealth functionality.
-        //
+        {
+            UINT64 saved_cr3 = vmx_enter_guest_cr3();
+            stealth_fake_pt_resync(fpt);
+            vmx_leave_guest_cr3(saved_cr3);
+        }
 
         // swap PT page EPT back to fake view
         PEPT_PML1_ENTRY pt_pte = ept_get_pml1(vcpu->ept_page_table,
@@ -711,9 +712,11 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
         PEPT_HOOKED_PAGE_INFO hp = vcpu->stealth_pf_swapped_hook;
 
         // swap PT page EPT from exec PT (NX=0) back to fake PT (NX=1)
-        // just a PFN swap — no page content modification needed
         if (hp->fake_pt)
         {
+            // re-apply NX=1 in fake page (Windows may have cleared it via A/D management)
+            stealth_fake_pt_set_nx(hp->fake_pt, hp->pt_pte_index);
+
             PEPT_PML1_ENTRY pt_pte = ept_get_pml1(vcpu->ept_page_table,
                 (SIZE_T)(hp->fake_pt->pt_page_pfn << 12));
             if (pt_pte)
@@ -724,7 +727,6 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
             }
         }
 
-        // keep target page in changed_entry (execute view) permanently
         vcpu->stealth_pf_swapped_hook = NULL;
     }
 
@@ -818,6 +820,8 @@ ept_hook_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error
     // P=0 means demand paging — must re-inject to guest so Windows pages it in.
     // error_code bit 0 = P (present), bit 4 = I/D (instruction fetch).
     //
+    _InterlockedIncrement(&g_dbg_pf_called);
+
     if (!(error_code & 0x01))
         return FALSE;  // page not present → demand paging, let guest handle
 
@@ -845,7 +849,22 @@ ept_hook_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error
             {
                 _InterlockedIncrement(&g_dbg_pf_matched);
 
-                // 1. swap PT page EPT → exec view (NX=0 visible to page walker)
+                // 1. resync exec PT from fake PT (fake page is "live" — gets all writes)
+                //    then force NX=0 for our entry so CPU page walk succeeds
+                if (hp->exec_pt_page)
+                {
+                    RtlCopyMemory(hp->exec_pt_page, hp->fake_pt->fake_page_va, PAGE_SIZE);
+                    PUINT64 exec_pte = (PUINT64)hp->exec_pt_page;
+                    exec_pte[hp->pt_pte_index] &= ~(1ULL << 63);  // NX=0
+                }
+
+                // 2. lazy split PT page EPT (2MB → 4KB) if needed, then swap to exec view
+                {
+                    UINT64 pt_phys = hp->fake_pt->pt_page_pfn << 12;
+                    PEPT_PML2_ENTRY pt_p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys);
+                    if (pt_p2 && pt_p2->LargePage)
+                        ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)pt_phys);
+                }
                 PEPT_PML1_ENTRY pt_pte = ept_get_pml1(vcpu->ept_page_table,
                     (SIZE_T)(hp->fake_pt->pt_page_pfn << 12));
                 if (pt_pte) pt_pte->AsUInt = hp->pt_exec_entry.AsUInt;

@@ -47,7 +47,7 @@ extern "C" {
 //   - All VMM memory (pool, stacks, EPT tables) allocated BEFORE hostcr3_build()
 //   - Guest memory access in VMX-root wrapped by vmx_enter_guest_cr3/vmx_leave_guest_cr3
 //   - Post-init allocations (stealth region) mapped via hostcr3_map_va()
-#define USE_PRIVATE_HOST_CR3                0   // TODO: re-enable after stealth inject fixed
+#define USE_PRIVATE_HOST_CR3                1   // TODO: re-enable after stealth inject fixed
 
 //
 // private host IDT for VMCS_HOST_IDTR_BASE

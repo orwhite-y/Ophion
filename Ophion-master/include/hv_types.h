@@ -355,6 +355,7 @@ typedef struct _EPT_HOOK_INJECT_PARAM {
     UINT64  pt_page_pfn;            // [in] PFN of guest PT page containing target PTE
     UINT32  pt_pte_index;           // [in] index within PT page (0-511)
     PVOID   pt_page_copy;           // [in] kernel buffer with PT page content (for fake PT init)
+    PVOID   pt_page_va;             // [in] system VA of real PT page (hostcr3-mapped, for resync)
     volatile LONG installed;        // [internal] first CPU → 1
     BOOLEAN result;                 // [out]
     BOOLEAN fake_pt_ok;             // [out] TRUE if fake PT was created successfully
@@ -393,6 +394,7 @@ typedef struct _STEALTH_FAKE_PT {
     UINT64          pfn_of_fake;        // PFN of fake page
     EPT_PML1_ENTRY  pt_fake_entry;      // EPT PTE: read → fake (NX=1)
     EPT_PML1_ENTRY  pt_real_entry;      // EPT PTE: real PT (for temp swap)
+    PVOID           real_page_va;       // system VA of real PT page (hostcr3-mapped, for resync)
     UINT32          ref_count;          // number of stealth pages using this
 } STEALTH_FAKE_PT, *PSTEALTH_FAKE_PT;
 
@@ -445,6 +447,7 @@ typedef struct _EPT_STEALTH_ALLOC_PARAM {
     UINT64  pt_page_pfn;          // [in] PFN of the guest PT page containing target PTE
     UINT32  pt_pte_index;         // [in] index of target PTE within PT page (0-511)
     PVOID   pt_page_copy;         // [in] NonPaged buffer with PT page content (4KB, caller-allocated)
+    PVOID   pt_page_va;           // [in] system VA of real PT page (hostcr3-mapped, for MTF resync)
     PVOID   target_page_copy;     // [in] NonPaged buffer with target page content (4KB, for shadow copy)
     BOOLEAN pt_precomputed;       // [in] TRUE = caller filled above fields at PASSIVE_LEVEL
     volatile LONG installed;      // [internal] 0→1 by first CPU

@@ -786,6 +786,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             local_req.user_trampoline    = (PVOID)user_tramp_va;
             local_req.user_trampoline_pa = user_tramp_pa;
             local_req.force_read_access  = (flags & 1) ? TRUE : FALSE;
+            local_req.oneshot            = (flags & 2) ? TRUE : FALSE;
             if (origin_va)
                 local_req.origin_function = (PVOID *)origin_va;
 

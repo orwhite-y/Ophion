@@ -266,6 +266,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
             fi->virtual_address    = req->target_function;
             fi->fake_page_contents = existing->fake_page_va;
             fi->handler_function   = req->proxy_function;
+            fi->oneshot            = req->oneshot;
 
             UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
             PUINT8 fake  = &existing->fake_page_va[off];
@@ -392,6 +393,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     fi->virtual_address    = req->target_function;
     fi->fake_page_contents = hp->fake_page_va;
     fi->handler_function   = req->proxy_function;
+    fi->oneshot            = req->oneshot;
 
     UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
     PUINT8 fake  = &hp->fake_page_va[off];
@@ -991,6 +993,16 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
             fc = fc->Flink;
             if ((UINT64)fi->virtual_address == rip)
             {
+                // oneshot: first trigger → redirect to shellcode.
+                // subsequent triggers → redirect to trampoline (original function).
+                if (fi->oneshot && fi->oneshot_fired)
+                {
+                    __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->first_trampoline_address);
+                    return TRUE;
+                }
+                if (fi->oneshot)
+                    fi->oneshot_fired = TRUE;
+
                 __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
                 return TRUE;
             }

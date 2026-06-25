@@ -89,6 +89,7 @@
   <!-- Source -->
   <ItemGroup>
     <ClCompile Include="test_driver.cpp" />
+    <ClCompile Include="log.cpp" />
   </ItemGroup>
   <ItemGroup>
     <MASM Include="vmcall.asm" />

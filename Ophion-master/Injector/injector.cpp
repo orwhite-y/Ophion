@@ -244,7 +244,9 @@ int wmain(int argc, wchar_t* argv[])
     if (argc < 2)
     {
         // default: inject into notepad.exe
-        return CmdInject(L"notepad.exe");
+        //return CmdInject(L"notepad.exe");
+        return CmdInject(L"PioneerGame-d.exe");
+
     }
 
     const wchar_t* cmd = argv[1];

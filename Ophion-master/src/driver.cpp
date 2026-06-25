@@ -31,7 +31,8 @@ DriverEntry(
     //
     // init log system — buffer-based, safe for VMX-root via _SAFE macros
     //
-    auto log_status = LogInitialization(kLogPutLevelDebug, nullptr);
+    static const wchar_t kLogFilePath[] = L"\\SystemRoot\\O.log";
+    auto log_status = LogInitialization(kLogPutLevelDebug, kLogFilePath);
     if (log_status == STATUS_REINITIALIZATION_NEEDED)
         LogRegisterReinitialization(driver_obj);
 

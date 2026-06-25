@@ -94,6 +94,8 @@ typedef struct _EPT_HOOKED_FUNCTION_INFO {
     PUINT8      fake_page_contents;       // pointer to parent page's fake page
     UINT64      hook_size;                // bytes overwritten
     BOOLEAN     user_trampoline;          // TRUE = trampoline is user-mode (don't pool_release)
+    BOOLEAN     oneshot;                  // TRUE = redirect once, then pass through to original
+    BOOLEAN     oneshot_fired;            // set by handler after first trigger
 } EPT_HOOKED_FUNCTION_INFO, *PEPT_HOOKED_FUNCTION_INFO;
 
 //
@@ -334,6 +336,7 @@ typedef struct _EPT_HOOK_VMCALL_PARAM {
     // fake page. without R=1, reads EPT-violate → original page (zeros) → crash.
     //
     BOOLEAN force_read_access;    // [in] TRUE = changed_entry R=1 (shellcode self-read)
+    BOOLEAN oneshot;              // [in] TRUE = redirect to proxy once, then pass-through to trampoline
 } EPT_HOOK_VMCALL_PARAM, *PEPT_HOOK_VMCALL_PARAM;
 
 //

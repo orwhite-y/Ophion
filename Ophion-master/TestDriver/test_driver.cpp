@@ -20,6 +20,7 @@
 #include <ntddk.h>
 #include <intrin.h>
 #include <ntimage.h>
+#include "log.h"
 
 // ---- undocumented PEB structures for user-mode module walk ----
 
@@ -439,7 +440,7 @@ TdBuildShellcodePIC(PVOID buf, SIZE_T buf_size)
     *(PUINT64)((PUINT8)buf + PIC_PATCH_LOADLIBRARY) = pLoadLib;
     *(PUINT64)((PUINT8)buf + PIC_PATCH_GETPROCADDR) = pGetProc;
 
-    DbgPrintEx(0, 0, "[td] PIC: LoadLibraryA=%llx GetProcAddress=%llx size=%u\n",
+    HYPERPLATFORM_LOG_INFO("[td] PIC: LoadLibraryA=%llx GetProcAddress=%llx size=%u",
                pLoadLib, pGetProc, (UINT32)sizeof(g_shellcode_pic));
     return TRUE;
 }
@@ -562,7 +563,7 @@ TdStealthInjectPages(
         UINT64 page_phys = MmGetPhysicalAddress((PVOID)page_va).QuadPart;
         if (!page_phys)
         {
-            DbgPrintEx(0, 0, "[td] stealth page %u: MmGetPhysicalAddress=0 for VA=%p\n",
+            HYPERPLATFORM_LOG_ERROR("[td] stealth page %u: MmGetPhysicalAddress=0 for VA=%p",
                        page_count, (PVOID)page_va);
             return FALSE;
         }
@@ -577,7 +578,7 @@ TdStealthInjectPages(
         UINT32 pt_idx = 0;
         if (!TdResolveGuestPT(caller_cr3, page_va, &pt_pfn, &pt_idx))
         {
-            DbgPrintEx(0, 0, "[td] stealth page %u: PT walk failed for VA=%p\n",
+            HYPERPLATFORM_LOG_ERROR("[td] stealth page %u: PT walk failed for VA=%p",
                        page_count, (PVOID)page_va);
             return FALSE;
         }
@@ -602,7 +603,7 @@ TdStealthInjectPages(
 
         if (!ok)
         {
-            DbgPrintEx(0, 0, "[td] stealth page %u failed\n", page_count);
+            HYPERPLATFORM_LOG_ERROR("[td] stealth page %u failed", page_count);
             return FALSE;
         }
 
@@ -610,7 +611,7 @@ TdStealthInjectPages(
         page_count++;
     }
 
-    DbgPrintEx(0, 0, "[td] stealth inject: %u pages set up via VMCALL\n", page_count);
+    HYPERPLATFORM_LOG_INFO("[td] stealth inject: %u pages set up via VMCALL", page_count);
     return TRUE;
 }
 
@@ -656,7 +657,7 @@ HookedNtCreateFile(
     LONG count = _InterlockedIncrement(&g_hook_log_count);
     if ((count % 100) == 1 && ObjectAttributes && ObjectAttributes->ObjectName)
     {
-        DbgPrintEx(0, 0, "[td-hook] NtCreateFile #%d: %wZ\n",
+        HYPERPLATFORM_LOG_INFO_SAFE("[td-hook] NtCreateFile #%d: %wZ",
                    count, ObjectAttributes->ObjectName);
     }
 
@@ -749,11 +750,11 @@ TdEptHookNtCreateFile(VOID)
     PVOID target = MmGetSystemRoutineAddress(&fn_name);
     if (!target)
     {
-        DbgPrintEx(0, 0, "[td] NtCreateFile not found\n");
+        HYPERPLATFORM_LOG_ERROR("[td] NtCreateFile not found");
         return STATUS_NOT_FOUND;
     }
 
-    DbgPrintEx(0, 0, "[td] NtCreateFile = %p, proxy = %p\n", target, (PVOID)HookedNtCreateFile);
+    HYPERPLATFORM_LOG_INFO("[td] NtCreateFile = %p, proxy = %p", target, (PVOID)HookedNtCreateFile);
 
     struct {
         PVOID   target;
@@ -775,11 +776,11 @@ TdEptHookNtCreateFile(VOID)
     if (NT_SUCCESS(ctx.result))
     {
         g_hooked_target = target;
-        DbgPrintEx(0, 0, "[td] EPT hook installed! trampoline = %p\n", (PVOID)g_orig_NtCreateFile);
+        HYPERPLATFORM_LOG_INFO("[td] EPT hook installed! trampoline = %p", (PVOID)g_orig_NtCreateFile);
     }
     else
     {
-        DbgPrintEx(0, 0, "[td] EPT hook FAILED: 0x%08X\n", ctx.result);
+        HYPERPLATFORM_LOG_ERROR("[td] EPT hook FAILED: 0x%08X", ctx.result);
     }
 
     return ctx.result;
@@ -804,14 +805,14 @@ TdEptUnhookNtCreateFile(VOID)
 
     if (NT_SUCCESS(ctx.result))
     {
-        DbgPrintEx(0, 0, "[td] EPT hook removed. total calls logged: %d\n", g_hook_log_count);
+        HYPERPLATFORM_LOG_INFO("[td] EPT hook removed. total calls logged: %d", g_hook_log_count);
         g_hooked_target = NULL;
         g_orig_NtCreateFile = NULL;
         g_hook_log_count = 0;
     }
     else
     {
-        DbgPrintEx(0, 0, "[td] EPT unhook FAILED: 0x%08X\n", ctx.result);
+        HYPERPLATFORM_LOG_ERROR("[td] EPT unhook FAILED: 0x%08X", ctx.result);
     }
 
     return ctx.result;
@@ -911,7 +912,7 @@ TdEptHookR3(
     R3_HOOK_ENTRY * entry = R3HookFindFree();
     if (!entry)
     {
-        DbgPrintEx(0, 0, "[td-r3] no free R3 hook slots\n");
+        HYPERPLATFORM_LOG_ERROR("[td-r3] no free R3 hook slots");
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -944,7 +945,7 @@ TdEptHookR3(
         IoFreeMdl(mdl);
         KeUnstackDetachProcess(&apc);
         ObDereferenceObject(proc);
-        DbgPrintEx(0, 0, "[td-r3] MmProbeAndLockPages failed for %p\n", target_va);
+        HYPERPLATFORM_LOG_ERROR("[td-r3] MmProbeAndLockPages failed for %p", target_va);
         return STATUS_ACCESS_VIOLATION;
     }
 
@@ -963,14 +964,14 @@ TdEptHookR3(
         IoFreeMdl(mdl);
         KeUnstackDetachProcess(&apc);
         ObDereferenceObject(proc);
-        DbgPrintEx(0, 0, "[td-r3] trampoline alloc failed: 0x%08X\n", st);
+        HYPERPLATFORM_LOG_ERROR("[td-r3] trampoline alloc failed: 0x%08X", st);
         return st;
     }
 
     RtlZeroMemory(tramp_va, tramp_size);
     UINT64 tramp_pa = MmGetPhysicalAddress(tramp_va).QuadPart;
 
-    DbgPrintEx(0, 0, "[td-r3] target=%p proxy=%p tramp=%p(PA=%llx) cr3=%llx pid=%llu type=%u\n",
+    HYPERPLATFORM_LOG_INFO("[td-r3] target=%p proxy=%p tramp=%p(PA=%llx) cr3=%llx pid=%llu type=%u",
                target_va, proxy_va, tramp_va, tramp_pa, target_cr3, target_pid, hook_type);
 
     //
@@ -1005,7 +1006,7 @@ TdEptHookR3(
         if (out_trampoline)
             *out_trampoline = origin_ptr;
 
-        DbgPrintEx(0, 0, "[td-r3] R3 EPT hook installed! trampoline=%p\n", origin_ptr);
+        HYPERPLATFORM_LOG_INFO("[td-r3] R3 EPT hook installed! trampoline=%p", origin_ptr);
     }
     else
     {
@@ -1019,7 +1020,7 @@ TdEptHookR3(
         MmUnlockPages(mdl);
         IoFreeMdl(mdl);
 
-        DbgPrintEx(0, 0, "[td-r3] R3 EPT hook FAILED: 0x%08X\n", ctx.result);
+        HYPERPLATFORM_LOG_ERROR("[td-r3] R3 EPT hook FAILED: 0x%08X", ctx.result);
     }
 
     ObDereferenceObject(proc);
@@ -1035,7 +1036,7 @@ TdEptUnhookR3(UINT64 target_pid, PVOID target_va)
     R3_HOOK_ENTRY * entry = R3HookFind(target_pid, target_va);
     if (!entry)
     {
-        DbgPrintEx(0, 0, "[td-r3] hook entry not found for pid=%llu va=%p\n", target_pid, target_va);
+        HYPERPLATFORM_LOG_WARN("[td-r3] hook entry not found for pid=%llu va=%p", target_pid, target_va);
         return STATUS_NOT_FOUND;
     }
 
@@ -1079,7 +1080,7 @@ TdEptUnhookR3(UINT64 target_pid, PVOID target_va)
         IoFreeMdl(entry->target_mdl);
     }
 
-    DbgPrintEx(0, 0, "[td-r3] R3 hook removed: pid=%llu va=%p\n", target_pid, target_va);
+    HYPERPLATFORM_LOG_INFO("[td-r3] R3 hook removed: pid=%llu va=%p", target_pid, target_va);
 
     RtlZeroMemory(entry, sizeof(*entry));
     ObDereferenceObject(proc);
@@ -1308,13 +1309,13 @@ TdFindSectionPadding(PVOID image_base, SIZE_T min_size, ULONG * out_offset, ULON
             *out_offset = page_offset;
             *out_avail  = PAGE_SIZE - page_offset;
 
-            DbgPrintEx(0, 0, "[td-gap] section padding: page=%p offset=0x%X avail=0x%X (section %.8s)\n",
+            HYPERPLATFORM_LOG_INFO("[td-gap] section padding: page=%p offset=0x%X avail=0x%X (section %.8s)",
                        page_va, page_offset, *out_avail, best_sec->Name);
             return page_va;
         }
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        DbgPrintEx(0, 0, "[td-gap] exception walking PE headers\n");
+        HYPERPLATFORM_LOG_WARN("[td-gap] exception walking PE headers");
     }
 
     return NULL;
@@ -1386,7 +1387,7 @@ TdFindGapInProcess(SIZE_T min_size, ULONG * out_offset, ULONG * out_avail)
         }
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        DbgPrintEx(0, 0, "[td-gap] exception walking PEB\n");
+        HYPERPLATFORM_LOG_WARN("[td-gap] exception walking PEB");
     }
 
     return NULL;
@@ -1441,7 +1442,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         if (base)
         {
             used_gap = TRUE;
-            DbgPrintEx(0, 0, "[td] inject: section padding VA=%p+0x%X avail=0x%X pid=%llu\n",
+            HYPERPLATFORM_LOG_INFO("[td] inject: section padding VA=%p+0x%X avail=0x%X pid=%llu",
                        base, gap_offset, gap_avail, p->target_pid);
         }
 
@@ -1463,7 +1464,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             gap_offset = 0;  // shellcode at page start
         }
 
-        DbgPrintEx(0, 0, "[td] inject: VA=%p offset=0x%X pid=%llu gap=%d\n",
+        HYPERPLATFORM_LOG_INFO("[td] inject: VA=%p offset=0x%X pid=%llu gap=%d",
                    base, gap_offset, p->target_pid, used_gap);
 
         UINT64 caller_cr3 = __readcr3();
@@ -1496,34 +1497,70 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         // the shared DLL page PA is used by ALL processes — EPT hooking
         // the shared PA would affect every process.
         //
-        // .text is PAGE_EXECUTE_READ → change to RW → write padding byte → COW
-        // → restore to original protection. the write is in padding (zeros),
-        // restored immediately, so page content is unchanged.
+        // direct PTE manipulation: set Write bit in PTE → write byte → COW.
+        // no ZwProtectVirtualMemory call (AC can monitor that API).
+        // user-visible page protection stays unchanged.
         //
         if (used_gap)
         {
             UINT64 pa_before = MmGetPhysicalAddress(base).QuadPart;
-            ULONG _old_p = 0, _tmp_p = 0;
-            PVOID _pb = base;
-            SIZE_T _ps = PAGE_SIZE;
 
-            NTSTATUS vp_st = ZwProtectVirtualMemory(
-                ZwCurrentProcess(), &_pb, &_ps, PAGE_EXECUTE_READWRITE, &_old_p);
+            //
+            // walk guest page table to find PTE, set Write bit directly.
+            // caller_cr3 is the target process CR3 (we're attached).
+            //
+            UINT64 cow_cr3 = __readcr3();
+            UINT64 cow_va  = (UINT64)base;
+            PHYSICAL_ADDRESS cow_pa;
+            BOOLEAN cow_done = FALSE;
 
-            if (NT_SUCCESS(vp_st))
+            // PML4
+            cow_pa.QuadPart = (LONGLONG)((cow_cr3 & ~0xFFFULL) + ((cow_va >> 39) & 0x1FF) * 8);
+            PUINT64 pml4e = (PUINT64)MmGetVirtualForPhysical(cow_pa);
+            if (pml4e && (*pml4e & 1))
             {
-                // write to padding area triggers COW → private physical page
-                ((volatile UINT8 *)base)[gap_offset] = 0x01;
-                ((volatile UINT8 *)base)[gap_offset] = 0x00;  // restore
+                // PDPT
+                cow_pa.QuadPart = (LONGLONG)((*pml4e & 0x000FFFFFFFFFF000ULL) + ((cow_va >> 30) & 0x1FF) * 8);
+                PUINT64 pdpe = (PUINT64)MmGetVirtualForPhysical(cow_pa);
+                if (pdpe && (*pdpe & 1) && !(*pdpe & (1ULL << 7)))
+                {
+                    // PD
+                    cow_pa.QuadPart = (LONGLONG)((*pdpe & 0x000FFFFFFFFFF000ULL) + ((cow_va >> 21) & 0x1FF) * 8);
+                    PUINT64 pde = (PUINT64)MmGetVirtualForPhysical(cow_pa);
+                    if (pde && (*pde & 1) && !(*pde & (1ULL << 7)))
+                    {
+                        // PT → PTE
+                        cow_pa.QuadPart = (LONGLONG)((*pde & 0x000FFFFFFFFFF000ULL) + ((cow_va >> 12) & 0x1FF) * 8);
+                        PUINT64 pte = (PUINT64)MmGetVirtualForPhysical(cow_pa);
+                        if (pte && (*pte & 1))
+                        {
+                            // set Write bit, write, restore
+                            UINT64 orig_pte = *pte;
+                            *pte = orig_pte | (1ULL << 1);  // set W bit
+                            __invlpg((PVOID)cow_va);         // flush TLB for this VA
 
-                // restore original protection
-                _pb = base; _ps = PAGE_SIZE;
-                ZwProtectVirtualMemory(ZwCurrentProcess(), &_pb, &_ps, _old_p, &_tmp_p);
+                            // write to padding → triggers COW
+                            ((volatile UINT8 *)base)[gap_offset] = 0x01;
+                            ((volatile UINT8 *)base)[gap_offset] = 0x00;
+
+                            // restore PTE (COW already happened, PTE now points to private page)
+                            // re-read PTE since COW may have changed it
+                            // just clear W bit if it was originally clear
+                            if (!(orig_pte & (1ULL << 1)))
+                            {
+                                UINT64 new_pte = *pte;
+                                *pte = new_pte & ~(1ULL << 1);
+                                __invlpg((PVOID)cow_va);
+                            }
+                            cow_done = TRUE;
+                        }
+                    }
+                }
             }
 
             UINT64 pa_after = MmGetPhysicalAddress(base).QuadPart;
-            DbgPrintEx(0, 0, "[td] inject: COW %s (PA %llx → %llx)\n",
-                       (pa_before != pa_after) ? "OK" : "SAME", pa_before, pa_after);
+            HYPERPLATFORM_LOG_INFO("[td] inject: COW %s (PA %llx -> %llx) pte_method=%d",
+                       (pa_before != pa_after) ? "OK" : "SAME", pa_before, pa_after, cow_done);
         }
 
         // copy original page content (DLL code in front, zeros in padding)
@@ -1538,7 +1575,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             KeUnstackDetachProcess(&apc_state);
             ObDereferenceObject(proc);
             st = STATUS_UNSUCCESSFUL;
-            DbgPrintEx(0, 0, "[td] inject: PIC shellcode build failed\n");
+            HYPERPLATFORM_LOG_ERROR("[td] inject: PIC shellcode build failed");
             break;
         }
 
@@ -1550,7 +1587,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         // gap mode: original page untouched — DLL code + zero padding stays
 
         UINT64 base_phys = MmGetPhysicalAddress(base).QuadPart;
-        DbgPrintEx(0, 0, "[td] inject: PA=%llx entry=%p\n", base_phys, entry_va);
+        HYPERPLATFORM_LOG_INFO("[td] inject: PA=%llx entry=%p", base_phys, entry_va);
 
         if (!base_phys)
         {
@@ -1588,7 +1625,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         ((PUINT8)fake_buf)[gap_offset + 1] = 0x01;
         ((PUINT8)fake_buf)[gap_offset + 2] = 0xC1;
 
-        DbgPrintEx(0, 0, "[td] inject: trampoline at shadow+0xF00, entry at +0x%X\n", gap_offset);
+        HYPERPLATFORM_LOG_INFO("[td] inject: trampoline at shadow+0xF00, entry at +0x%X", gap_offset);
 
         // --- step 5b: pre-compute PT page info for fake PT / NX hiding ---
         //
@@ -1629,11 +1666,11 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 ((PUINT64)pt_page_buf)[pt_idx] &= ~(1ULL << 63);
             }
 
-            DbgPrintEx(0, 0, "[td] inject: PT PFN=%llx idx=%u va=%p\n", pt_pfn, pt_idx, pt_real_va);
+            HYPERPLATFORM_LOG_INFO("[td] inject: PT PFN=%llx idx=%u va=%p", pt_pfn, pt_idx, pt_real_va);
         }
         else if (!used_gap)
         {
-            DbgPrintEx(0, 0, "[td] inject: WARNING — PT walk failed, no fake PT support\n");
+            HYPERPLATFORM_LOG_WARN("[td] inject: WARNING -- PT walk failed, no fake PT support");
         }
 
         // --- step 6: VMCALL to set up EPT (kernel buffers only, no user VA in VMX-root) ---
@@ -1664,7 +1701,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             // original page already zeroed (step 3, before PA read + EPT install).
             // EPT binds to the zeroed page's PA. reads → zeros. execute → fake page.
 
-            DbgPrintEx(0, 0, "[td] inject: EPT hook OK, fake_pt=%s\n",
+            HYPERPLATFORM_LOG_INFO("[td] inject: EPT hook OK, fake_pt=%s",
                        inj_req.fake_pt_ok ? "YES" : "NO");
 
             // track for cleanup (no MDL — page is one-shot inject, not persistent)
@@ -1683,11 +1720,11 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             p->shellcode_va = (UINT64)entry_va;
             p->actual_size  = (UINT64)size;
             irp->IoStatus.Information = sizeof(TD_INJECT_PARAMS);
-            DbgPrintEx(0, 0, "[td] inject: EPT hook OK\n");
+            HYPERPLATFORM_LOG_INFO("[td] inject: EPT hook OK");
         }
         else
         {
-            DbgPrintEx(0, 0, "[td] inject: EPT hook FAILED\n");
+            HYPERPLATFORM_LOG_ERROR("[td] inject: EPT hook FAILED");
             if (!used_gap) ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
             st = STATUS_UNSUCCESSFUL;
         }
@@ -1759,14 +1796,14 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                         }
                     }
                 } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    DbgPrintEx(0, 0, "[td] inject: trigger resolve exception\n");
+                    HYPERPLATFORM_LOG_WARN("[td] inject: trigger resolve exception");
                 }
             }
         }
 
         if (!trigger_fn && NT_SUCCESS(st))
         {
-            DbgPrintEx(0, 0, "[td] inject: cannot resolve trigger function\n");
+            HYPERPLATFORM_LOG_ERROR("[td] inject: cannot resolve trigger function");
             st = STATUS_NOT_FOUND;
         }
 
@@ -1787,11 +1824,11 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 caller_cr3,                 // caller CR3
                 1,                          // hook_type = VMCALL (0F 01 C1)
                 caller_cr3,                 // target_cr3 (per-process filter)
-                0, 0, 0);                   // no user trampoline
+                0, 0, 2);                   // no user trampoline, flags bit1 = oneshot
 
             KeRevertToUserAffinityThreadEx(old_aff);
 
-            DbgPrintEx(0, 0, "[td] inject: trigger hook %s (trigger=%p → entry=%p st=0x%08X)\n",
+            HYPERPLATFORM_LOG_INFO("[td] inject: trigger hook %s (trigger=%p -> entry=%p st=0x%08X)",
                        NT_SUCCESS(hook_st) ? "OK" : "FAILED", trigger_fn, entry_va, hook_st);
         }
 
@@ -1845,11 +1882,11 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                                 ObDereferenceObject(thr_obj);
                             }
                         }
-                        DbgPrintEx(0, 0, "[td] inject: thread SUSPENDED+CPU0+RESUMED trigger=%p\n", trigger_fn);
+                        HYPERPLATFORM_LOG_INFO("[td] inject: thread SUSPENDED+CPU0+RESUMED trigger=%p", trigger_fn);
                         ZwClose(thr_h);
                     }
                     else
-                        DbgPrintEx(0, 0, "[td] inject: ZwCreateThreadEx failed: 0x%08X\n", thr_st);
+                        HYPERPLATFORM_LOG_ERROR("[td] inject: ZwCreateThreadEx failed: 0x%08X", thr_st);
                     ZwClose(thr_proc_h);
                 }
             }
@@ -1875,7 +1912,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
                 KeUnstackDetachProcess(&thr_apc);
                 KeRevertToUserAffinityThreadEx(old_aff);
-                DbgPrintEx(0, 0, "[td] inject: fallback RtlCreateUserThread trigger=%p st=0x%08X\n", trigger_fn, thr_st);
+                HYPERPLATFORM_LOG_INFO("[td] inject: fallback RtlCreateUserThread trigger=%p st=0x%08X", trigger_fn, thr_st);
             }
         }
 
@@ -1949,7 +1986,7 @@ static VOID TdUnload(PDRIVER_OBJECT drv)
 {
     if (g_hooked_target)
     {
-        DbgPrintEx(0, 0, "[td] Unhooking R0 hook before unload...\n");
+        HYPERPLATFORM_LOG_INFO("[td] Unhooking R0 hook before unload...");
         TdEptUnhookNtCreateFile();
     }
 
@@ -1959,13 +1996,22 @@ static VOID TdUnload(PDRIVER_OBJECT drv)
     RtlInitUnicodeString(&sym, TD_SYMLINK_NAME);
     IoDeleteSymbolicLink(&sym);
     if (drv->DeviceObject) IoDeleteDevice(drv->DeviceObject);
-    DbgPrintEx(0, 0, "[td] Unloaded.\n");
+    HYPERPLATFORM_LOG_INFO("[td] Unloaded.");
+    LogTermination();
 }
 
 extern "C"
 NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
 {
     UNREFERENCED_PARAMETER(reg);
+
+    //
+    // init log system — file output, truncate on load
+    //
+    static const wchar_t kLogFilePath[] = L"\\SystemRoot\\T.log";
+    auto log_status = LogInitialization(kLogPutLevelDebug, kLogFilePath);
+    if (log_status == STATUS_REINITIALIZATION_NEEDED)
+        LogRegisterReinitialization(drv);
 
     UNICODE_STRING fn;
     // try NtCreateThreadEx first (more likely exported), then ZwCreateThreadEx
@@ -2004,6 +2050,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     drv->MajorFunction[IRP_MJ_CLOSE]  = TdCreateClose;
     drv->MajorFunction[IRP_MJ_DEVICE_CONTROL] = TdIoControl;
 
-    DbgPrintEx(0, 0, "[td] Loaded. Device: %wZ\n", &sym_name);
+    HYPERPLATFORM_LOG_INFO("[td] Loaded. Device: %wZ", &sym_name);
     return STATUS_SUCCESS;
 }

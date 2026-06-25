@@ -261,6 +261,25 @@ typedef struct _TD_R3_UNHOOK_PARAMS {
 //   (see byte array below — hand-assembled and verified)
 //
 
+// ---- DLL name matching helpers (used by PIC shellcode + gap finder) ----
+
+static const WCHAR g_ntdll_name[] = L"ntdll.dll";
+static const WCHAR g_k32_name[]  = L"kernel32.dll";
+
+static BOOLEAN TdMatchDllName(const WCHAR * buf, USHORT buf_len, const WCHAR * target, USHORT target_len)
+{
+    USHORT i;
+    WCHAR c;
+    if (buf_len < target_len * sizeof(WCHAR)) return FALSE;
+    for (i = 0; i < target_len; i++)
+    {
+        c = buf[i];
+        if (c >= L'A' && c <= L'Z') c += 32;
+        if (c != target[i]) return FALSE;
+    }
+    return TRUE;
+}
+
 // ---- PIC shellcode (fully self-contained) ----
 //
 // all data encoded as instructions — strings built on stack, function
@@ -1302,23 +1321,6 @@ TdFindSectionPadding(PVOID image_base, SIZE_T min_size, ULONG * out_offset, ULON
 // find a DLL gap in the target process. tries ntdll first (always loaded,
 // large image), then kernel32. must be called while attached.
 //
-static const WCHAR g_ntdll_name[] = L"ntdll.dll";
-static const WCHAR g_k32_name[]  = L"kernel32.dll";
-
-static BOOLEAN TdMatchDllName(const WCHAR * buf, USHORT buf_len, const WCHAR * target, USHORT target_len)
-{
-    USHORT i;
-    WCHAR c;
-    if (buf_len < target_len * sizeof(WCHAR)) return FALSE;
-    for (i = 0; i < target_len; i++)
-    {
-        c = buf[i];
-        if (c >= L'A' && c <= L'Z') c += 32;
-        if (c != target[i]) return FALSE;
-    }
-    return TRUE;
-}
-
 static PVOID
 TdFindGapInProcess(SIZE_T min_size, ULONG * out_offset, ULONG * out_avail)
 {

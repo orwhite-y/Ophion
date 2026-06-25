@@ -117,8 +117,16 @@ pool_manager_init(VOID)
     // split buffers: need cpu_count per hooked page (each CPU has its own EPT)
     // hooked_page/func/trampoline: shared, only 1 per hook
     //
-    UINT32 split_count = g_cpu_count * 8;    // 8 hooks × cpu_count splits
-    if (split_count < 64) split_count = 64;
+    //
+    // large DLL support: 5MB DLL = 1280 pages × cpu_count splits.
+    // but full per-page split is too expensive. use single-CPU mode
+    // (pin thread to CPU 0, only split on CPU 0) to keep it manageable.
+    //
+    // single-CPU mode: 1280 pages × 1 CPU = 1280 splits (~5MB)
+    // fallback multi-CPU: smaller DLLs still work with per-CPU split.
+    //
+    UINT32 split_count = 2048;   // enough for ~2000 pages on 1 CPU, or ~250 pages on 8 CPUs
+    if (split_count < g_cpu_count * 64) split_count = g_cpu_count * 64;
 
     for (UINT32 i = 0; i < split_count; i++)
     {
@@ -129,7 +137,7 @@ pool_manager_init(VOID)
         }
     }
 
-    for (UINT32 i = 0; i < 32; i++)
+    for (UINT32 i = 0; i < 2048; i++)
     {
         if (!pool_add_entry(POOL_TAG_HOOKED_PAGE, sizeof(EPT_HOOKED_PAGE_INFO)))
         {
@@ -138,7 +146,7 @@ pool_manager_init(VOID)
         }
     }
 
-    for (UINT32 i = 0; i < 64; i++)
+    for (UINT32 i = 0; i < 2048; i++)
     {
         if (!pool_add_entry(POOL_TAG_HOOKED_FUNC, sizeof(EPT_HOOKED_FUNCTION_INFO)))
         {
@@ -147,7 +155,7 @@ pool_manager_init(VOID)
         }
     }
 
-    for (UINT32 i = 0; i < 32; i++)
+    for (UINT32 i = 0; i < 64; i++)
     {
         if (!pool_add_entry(POOL_TAG_TRAMPOLINE, TRAMPOLINE_BUF_SIZE))
         {

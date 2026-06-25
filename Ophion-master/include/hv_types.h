@@ -94,6 +94,12 @@ typedef struct _EPT_HOOKED_FUNCTION_INFO {
     PUINT8      fake_page_contents;       // pointer to parent page's fake page
     UINT64      hook_size;                // bytes overwritten
     BOOLEAN     user_trampoline;          // TRUE = trampoline is user-mode (don't pool_release)
+    //
+    // DLL protection filter: if non-zero, VMCALL hook acts as LdrUnloadDll guard.
+    // when guest RCX == protect_dll_base → return STATUS_SUCCESS, skip unload.
+    // when guest RCX != protect_dll_base → redirect to handler_function (original).
+    //
+    UINT64      protect_dll_base;         // 0 = normal hook, non-0 = DLL unload filter
 } EPT_HOOKED_FUNCTION_INFO, *PEPT_HOOKED_FUNCTION_INFO;
 
 //
@@ -136,7 +142,7 @@ typedef struct _EPT_HOOKED_PAGE_INFO {
 //
 // contiguous shadow region — must be defined before EPT_STATE (embedded, not pointer)
 //
-#define STEALTH_REGION_DEFAULT_MB   64
+#define STEALTH_REGION_DEFAULT_MB   128
 #define STEALTH_REGION_DEFAULT_SIZE ((SIZE_T)STEALTH_REGION_DEFAULT_MB * 1024 * 1024)
 
 typedef struct _STEALTH_REGION {
@@ -293,6 +299,9 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_STEALTH_ALLOC    0x00000006
 #define VMCALL_STEALTH_FREE     0x00000007
 #define VMCALL_EPT_HOOK_INJECT  0x00000008
+#define VMCALL_READ_R3          0x00000009
+#define VMCALL_WRITE_R3         0x0000000A
+#define VMCALL_EPT_SHADOW_PAGE  0x0000000B  // dual-view: read→original, exec→shadow
 
 //
 // VMCALL identifier in rax — like UnrealVTDbg's VMCALL_IDENTIFIER
@@ -334,6 +343,13 @@ typedef struct _EPT_HOOK_VMCALL_PARAM {
     // fake page. without R=1, reads EPT-violate → original page (zeros) → crash.
     //
     BOOLEAN force_read_access;    // [in] TRUE = changed_entry R=1 (shellcode self-read)
+    //
+    // DLL protection: if non-zero, this hook acts as LdrUnloadDll guard.
+    // VMCALL handler checks guest RCX vs this value:
+    //   match → return STATUS_SUCCESS (block unload)
+    //   no match → redirect to handler_function (call original)
+    //
+    UINT64  protect_dll_base;     // [in] 0 = normal hook, non-0 = DLL base to protect
 } EPT_HOOK_VMCALL_PARAM, *PEPT_HOOK_VMCALL_PARAM;
 
 //

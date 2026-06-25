@@ -57,6 +57,9 @@ typedef struct _TD_PEB_LDR_DATA {
 
 #define VMCALL_STEALTH_ALLOC    0x00000006
 #define VMCALL_EPT_HOOK_INJECT  0x00000008
+#define VMCALL_READ_R3          0x00000009
+#define VMCALL_WRITE_R3         0x0000000A
+#define VMCALL_EPT_SHADOW_PAGE  0x0000000B
 
 //
 // EPT hook inject param — pre-built at PASSIVE_LEVEL, passed to VMX-root.
@@ -190,6 +193,92 @@ typedef NTSTATUS (NTAPI * fn_ZwResumeThread)(HANDLE, PULONG);
 static fn_ZwCreateThreadEx g_pZwCreateThreadEx = NULL;
 static fn_ZwResumeThread   g_pZwResumeThread   = NULL;
 
+// ---- LoadImage callback — path spoofing for DLL hijack hiding ----
+//
+// all registered LoadImage callbacks share the SAME UNICODE_STRING pointer.
+// if our callback runs first (driver loads before AC), we modify the buffer
+// before AC's callback sees it. AC sees the spoofed System32 path.
+//
+
+#define MAX_SPOOF_ENTRIES 8
+
+typedef struct _IMAGE_SPOOF_ENTRY {
+    BOOLEAN active;
+    WCHAR   real_name[64];      // DLL filename to match (e.g. L"version.dll")
+    WCHAR   fake_path[260];     // full NT path to spoof (e.g. L"\\..\\System32\\version.dll")
+    USHORT  fake_path_len;      // byte length of fake_path (not including null)
+} IMAGE_SPOOF_ENTRY;
+
+static IMAGE_SPOOF_ENTRY g_spoof_entries[MAX_SPOOF_ENTRIES] = {};
+static BOOLEAN g_image_callback_registered = FALSE;
+
+//
+// case-insensitive wchar match of filename portion of a full path.
+// returns TRUE if path ends with \filename (case-insensitive).
+//
+static BOOLEAN TdPathEndsWith(PCUNICODE_STRING path, const WCHAR * filename, USHORT name_chars)
+{
+    if (!path || !path->Buffer || !filename) return FALSE;
+
+    USHORT path_chars = path->Length / sizeof(WCHAR);
+    if (path_chars < name_chars) return FALSE;
+
+    const WCHAR * tail = path->Buffer + (path_chars - name_chars);
+    USHORT i;
+    WCHAR a, b;
+
+    // check char before filename is backslash (or path starts with filename)
+    if (path_chars > name_chars)
+    {
+        if (*(tail - 1) != L'\\') return FALSE;
+    }
+
+    for (i = 0; i < name_chars; i++)
+    {
+        a = tail[i];
+        b = filename[i];
+        if (a >= L'A' && a <= L'Z') a += 32;
+        if (b >= L'A' && b <= L'Z') b += 32;
+        if (a != b) return FALSE;
+    }
+    return TRUE;
+}
+
+static VOID NTAPI TdLoadImageCallback(
+    PUNICODE_STRING FullImageName,
+    HANDLE ProcessId,
+    PIMAGE_INFO ImageInfo)
+{
+    UNREFERENCED_PARAMETER(ProcessId);
+    UNREFERENCED_PARAMETER(ImageInfo);
+
+    if (!FullImageName || !FullImageName->Buffer) return;
+
+    int i;
+    for (i = 0; i < MAX_SPOOF_ENTRIES; i++)
+    {
+        if (!g_spoof_entries[i].active) continue;
+
+        USHORT name_len = (USHORT)wcslen(g_spoof_entries[i].real_name);
+        if (TdPathEndsWith(FullImageName, g_spoof_entries[i].real_name, name_len))
+        {
+            //
+            // match! overwrite the shared UNICODE_STRING to point to our fake path.
+            // all subsequent callbacks (including AC) see the spoofed path.
+            // the original UNICODE_STRING is stack-allocated by the caller
+            // (MiMapViewOfImageSection), so modifying it is safe.
+            //
+            DbgPrintEx(0, 0, "[td-spoof] intercepted: %wZ → %ls\n",
+                       FullImageName, g_spoof_entries[i].fake_path);
+
+            FullImageName->Buffer = g_spoof_entries[i].fake_path;
+            FullImageName->Length = g_spoof_entries[i].fake_path_len;
+            FullImageName->MaximumLength = g_spoof_entries[i].fake_path_len + sizeof(WCHAR);
+            return;
+        }
+    }
+}
+
 // ---- device / IOCTL ----
 
 #define TD_DEVICE_NAME  L"\\Device\\OphionTest"
@@ -200,6 +289,11 @@ static fn_ZwResumeThread   g_pZwResumeThread   = NULL;
 #define IOCTL_EPT_HOOK    CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 1, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_EPT_UNHOOK  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 2, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_EPT_HOOK_R3 CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 3, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_READ_R3     CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 5, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_WRITE_R3    CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 6, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PROTECT_DLL CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 7, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_DLL_DUALVIEW CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 8, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SPOOF_PATH   CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 9, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_EPT_UNHOOK_R3 CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 4, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #pragma pack(push, 8)
@@ -228,6 +322,43 @@ typedef struct _TD_R3_UNHOOK_PARAMS {
     UINT64 target_function_va;  // [in]  same VA passed to hook
     UINT64 status;              // [out]
 } TD_R3_UNHOOK_PARAMS;
+
+typedef struct _TD_PROTECT_DLL_PARAMS {
+    UINT64 target_pid;      // [in]  process containing the DLL
+    UINT64 dll_base;        // [in]  DLL base address to protect
+    UINT64 status;          // [out] NTSTATUS
+} TD_PROTECT_DLL_PARAMS;
+
+//
+// DLL dual-view: read→original legitimate DLL, execute→your code.
+// caller provides:
+//   target_pid:    process with the injected DLL
+//   dll_base:      base address of the injected DLL in target
+//   dll_size:      SizeOfImage of the injected DLL
+//   legit_path:    kernel path to the legitimate DLL file (read view)
+//
+typedef struct _TD_SPOOF_PATH_PARAMS {
+    WCHAR  real_name[64];       // [in] DLL filename to intercept (e.g. L"version.dll")
+    WCHAR  fake_path[260];      // [in] NT path to spoof (e.g. L"\\SystemRoot\\System32\\version.dll")
+    UINT64 status;              // [out]
+} TD_SPOOF_PATH_PARAMS;
+
+typedef struct _TD_DLL_DUALVIEW_PARAMS {
+    UINT64 target_pid;          // [in]
+    UINT64 dll_base;            // [in]  injected DLL base in target
+    UINT64 dll_size;            // [in]  SizeOfImage (bytes, page-aligned)
+    WCHAR  legit_path[260];     // [in]  path to legitimate DLL (e.g. L"\\SystemRoot\\System32\\version.dll")
+    UINT64 pages_hooked;        // [out] number of pages successfully hooked
+    UINT64 status;              // [out] NTSTATUS
+} TD_DLL_DUALVIEW_PARAMS;
+
+typedef struct _TD_RW_R3_PARAMS {
+    UINT64 target_pid;      // [in]
+    UINT64 target_va;       // [in]  user-mode VA to read/write
+    UINT64 size;            // [in]  bytes (max PAGE_SIZE)
+    UINT64 buffer_va;       // [in]  user-mode buffer in caller process
+    UINT64 status;          // [out] NTSTATUS
+} TD_RW_R3_PARAMS;
 #pragma pack(pop)
 
 // ---- MessageBoxA shellcode (x64 PIC) ----
@@ -1862,6 +1993,562 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         break;
     }
 
+    case IOCTL_SPOOF_PATH:
+    {
+        //
+        // configure LoadImage path spoofing.
+        // must be called BEFORE the target DLL is loaded.
+        // registers the LoadImage callback on first use.
+        //
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_SPOOF_PATH_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_SPOOF_PATH_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_SPOOF_PATH_PARAMS * p = (TD_SPOOF_PATH_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+
+        // register callback on first use
+        if (!g_image_callback_registered)
+        {
+            NTSTATUS cb_st = PsSetLoadImageNotifyRoutine(TdLoadImageCallback);
+            if (NT_SUCCESS(cb_st))
+            {
+                g_image_callback_registered = TRUE;
+                DbgPrintEx(0, 0, "[td-spoof] LoadImage callback registered\n");
+            }
+            else
+            {
+                p->status = (UINT64)cb_st;
+                irp->IoStatus.Information = sizeof(TD_SPOOF_PATH_PARAMS);
+                st = STATUS_SUCCESS;
+                break;
+            }
+        }
+
+        // find free slot
+        int slot = -1;
+        for (int i = 0; i < MAX_SPOOF_ENTRIES; i++)
+        {
+            if (!g_spoof_entries[i].active) { slot = i; break; }
+        }
+
+        if (slot < 0)
+        {
+            p->status = (UINT64)STATUS_INSUFFICIENT_RESOURCES;
+            irp->IoStatus.Information = sizeof(TD_SPOOF_PATH_PARAMS);
+            st = STATUS_SUCCESS;
+            break;
+        }
+
+        wcscpy_s(g_spoof_entries[slot].real_name, 64, p->real_name);
+        wcscpy_s(g_spoof_entries[slot].fake_path, 260, p->fake_path);
+        g_spoof_entries[slot].fake_path_len = (USHORT)(wcslen(p->fake_path) * sizeof(WCHAR));
+        g_spoof_entries[slot].active = TRUE;
+
+        p->status = (UINT64)STATUS_SUCCESS;
+        irp->IoStatus.Information = sizeof(TD_SPOOF_PATH_PARAMS);
+        st = STATUS_SUCCESS;
+
+        DbgPrintEx(0, 0, "[td-spoof] added: %ls → %ls\n",
+                   g_spoof_entries[slot].real_name, g_spoof_entries[slot].fake_path);
+        break;
+    }
+
+    case IOCTL_DLL_DUALVIEW:
+    {
+        //
+        // DLL dual-view: read→legitimate DLL, execute→injected DLL.
+        // hooks PE header + .text pages only. .data/.rdata untouched.
+        //
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_DLL_DUALVIEW_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_DLL_DUALVIEW_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_DLL_DUALVIEW_PARAMS * p = (TD_DLL_DUALVIEW_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+        p->pages_hooked = 0;
+        p->status = 0;
+
+        // --- 1. read legitimate DLL from disk ---
+        UNICODE_STRING legit_upath;
+        RtlInitUnicodeString(&legit_upath, p->legit_path);
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, &legit_upath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        IO_STATUS_BLOCK iosb;
+        HANDLE hFile = NULL;
+        NTSTATUS file_st = ZwCreateFile(&hFile, GENERIC_READ, &oa, &iosb,
+            NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, NULL, 0);
+
+        if (!NT_SUCCESS(file_st))
+        {
+            DbgPrintEx(0, 0, "[td-dv] cannot open legit DLL: 0x%08X\n", file_st);
+            p->status = (UINT64)file_st;
+            irp->IoStatus.Information = sizeof(TD_DLL_DUALVIEW_PARAMS);
+            st = STATUS_SUCCESS;
+            break;
+        }
+
+        FILE_STANDARD_INFORMATION fsi;
+        ZwQueryInformationFile(hFile, &iosb, &fsi, sizeof(fsi), FileStandardInformation);
+        SIZE_T legit_file_size = (SIZE_T)fsi.EndOfFile.QuadPart;
+
+        PVOID legit_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, legit_file_size, 'vDlL');
+        if (!legit_buf)
+        {
+            ZwClose(hFile);
+            p->status = (UINT64)STATUS_INSUFFICIENT_RESOURCES;
+            irp->IoStatus.Information = sizeof(TD_DLL_DUALVIEW_PARAMS);
+            st = STATUS_SUCCESS;
+            break;
+        }
+
+        LARGE_INTEGER offset_zero = {};
+        ZwReadFile(hFile, NULL, NULL, NULL, &iosb, legit_buf, (ULONG)legit_file_size, &offset_zero, NULL);
+        ZwClose(hFile);
+
+        DbgPrintEx(0, 0, "[td-dv] legit DLL loaded: %llu bytes\n", (UINT64)legit_file_size);
+
+        // --- 2. parse legitimate DLL: find .text section ---
+        PIMAGE_DOS_HEADER legit_dos = (PIMAGE_DOS_HEADER)legit_buf;
+        PIMAGE_NT_HEADERS64 legit_nt = (PIMAGE_NT_HEADERS64)((PUINT8)legit_buf + legit_dos->e_lfanew);
+        PIMAGE_SECTION_HEADER legit_secs = IMAGE_FIRST_SECTION(legit_nt);
+        ULONG legit_text_rva = 0, legit_text_rawoff = 0, legit_text_rawsz = 0;
+        ULONG legit_hdr_size = legit_nt->OptionalHeader.SizeOfHeaders;
+        USHORT li;
+
+        for (li = 0; li < legit_nt->FileHeader.NumberOfSections; li++)
+        {
+            if (legit_secs[li].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+            {
+                legit_text_rva    = legit_secs[li].VirtualAddress;
+                legit_text_rawoff = legit_secs[li].PointerToRawData;
+                legit_text_rawsz  = legit_secs[li].SizeOfRawData;
+                break;
+            }
+        }
+
+        // --- 3. attach to target, parse injected DLL's .text ---
+        PEPROCESS dv_proc = NULL;
+        file_st = PsLookupProcessByProcessId((HANDLE)p->target_pid, &dv_proc);
+        if (!NT_SUCCESS(file_st))
+        {
+            ExFreePoolWithTag(legit_buf, 'vDlL');
+            p->status = (UINT64)file_st;
+            irp->IoStatus.Information = sizeof(TD_DLL_DUALVIEW_PARAMS);
+            st = STATUS_SUCCESS;
+            break;
+        }
+
+        KAPC_STATE dv_apc;
+        KeStackAttachProcess(dv_proc, &dv_apc);
+
+        PVOID dll_base_va = (PVOID)p->dll_base;
+        PIMAGE_DOS_HEADER inj_dos = (PIMAGE_DOS_HEADER)dll_base_va;
+        PIMAGE_NT_HEADERS64 inj_nt = (PIMAGE_NT_HEADERS64)((PUINT8)dll_base_va + inj_dos->e_lfanew);
+        PIMAGE_SECTION_HEADER inj_secs = IMAGE_FIRST_SECTION(inj_nt);
+        ULONG inj_text_rva = 0, inj_text_vsize = 0;
+        ULONG inj_hdr_size = inj_nt->OptionalHeader.SizeOfHeaders;
+        USHORT ii;
+
+        for (ii = 0; ii < inj_nt->FileHeader.NumberOfSections; ii++)
+        {
+            if (inj_secs[ii].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+            {
+                inj_text_rva   = inj_secs[ii].VirtualAddress;
+                inj_text_vsize = inj_secs[ii].Misc.VirtualSize;
+                break;
+            }
+        }
+
+        ULONG inj_hdr_pages  = (inj_hdr_size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+        //
+        // hook range = legit DLL's .text size (not injected DLL's .text).
+        // because we show legit PE header → AC reads legit .text size worth of pages.
+        // legit .text MUST be ≤ injected .text, otherwise legit's .text range
+        // extends into injected .data → read/write conflict (user code reads
+        // .data but EPT shows legit .text content → crash).
+        //
+        //
+        // hook range = MIN(legit .text, injected .text).
+        // if legit > injected: only hook up to injected .text (avoid .data overlap).
+        //   AC may see mismatched content beyond hook range — acceptable tradeoff.
+        //   production: pad your .text to match legit DLL at compile time.
+        // if legit ≤ injected: hook all legit .text pages — perfect match.
+        //
+        ULONG hook_text_size = (legit_text_rawsz < inj_text_vsize) ? legit_text_rawsz : inj_text_vsize;
+        if (legit_text_rawsz > inj_text_vsize)
+        {
+            DbgPrintEx(0, 0, "[td-dv] WARNING: legit .text (%u) > injected .text (%u), partial cover\n",
+                       legit_text_rawsz, inj_text_vsize);
+        }
+
+        ULONG hook_text_pages = (hook_text_size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+        DbgPrintEx(0, 0, "[td-dv] injected: base=%p .text RVA=0x%X size=0x%X\n",
+                   dll_base_va, inj_text_rva, inj_text_vsize);
+        DbgPrintEx(0, 0, "[td-dv] hook range: hdr=%u pages, .text=%u pages (legit .text=0x%X)\n",
+                   inj_hdr_pages, hook_text_pages, hook_text_size);
+
+        // --- 4. per-page EPT hook: header + .text ---
+        //
+        // for each page:
+        //   a. save injected page content to kernel buffer (shadow)
+        //   b. overwrite injected page with legitimate DLL content
+        //   c. VMCALL_EPT_SHADOW_PAGE: EPT split
+        //
+        PVOID page_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'vDpg');
+        ULONG hooked = 0;
+        ULONG total_pages = inj_hdr_pages + hook_text_pages;
+        ULONG pi;
+
+        if (!page_buf)
+        {
+            KeUnstackDetachProcess(&dv_apc);
+            ObDereferenceObject(dv_proc);
+            ExFreePoolWithTag(legit_buf, 'vDlL');
+            p->status = (UINT64)STATUS_INSUFFICIENT_RESOURCES;
+            irp->IoStatus.Information = sizeof(TD_DLL_DUALVIEW_PARAMS);
+            st = STATUS_SUCCESS;
+            break;
+        }
+
+        for (pi = 0; pi < total_pages; pi++)
+        {
+            PVOID inj_page_va;
+            PUINT8 legit_src;
+            ULONG legit_avail;
+
+            if (pi < inj_hdr_pages)
+            {
+                // PE header page
+                inj_page_va = (PUINT8)dll_base_va + pi * PAGE_SIZE;
+                legit_src = (PUINT8)legit_buf + pi * PAGE_SIZE;
+                legit_avail = (legit_hdr_size > pi * PAGE_SIZE) ? (legit_hdr_size - pi * PAGE_SIZE) : 0;
+            }
+            else
+            {
+                // .text page
+                ULONG text_pi = pi - inj_hdr_pages;
+                inj_page_va = (PUINT8)dll_base_va + inj_text_rva + text_pi * PAGE_SIZE;
+                legit_src = (PUINT8)legit_buf + legit_text_rawoff + text_pi * PAGE_SIZE;
+                legit_avail = (legit_text_rawsz > text_pi * PAGE_SIZE) ? (legit_text_rawsz - text_pi * PAGE_SIZE) : 0;
+            }
+
+            // a. save injected page to kernel buffer (= shadow content for execution)
+            RtlCopyMemory(page_buf, inj_page_va, PAGE_SIZE);
+
+            // b. overwrite injected page with legitimate DLL content.
+            //    try MDL first (no API call). fallback to ZwProtectVirtualMemory
+            //    for pages where MDL IoWriteAccess fails (e.g. image READONLY pages).
+            {
+                PVOID page_aligned = (PVOID)((UINT64)inj_page_va & ~(PAGE_SIZE - 1));
+                BOOLEAN write_ok = FALSE;
+
+                // method 1: MDL (stealthy, no protection change)
+                PMDL wmdl = IoAllocateMdl(page_aligned, PAGE_SIZE, FALSE, FALSE, NULL);
+                if (wmdl)
+                {
+                    __try {
+                        MmProbeAndLockPages(wmdl, UserMode, IoWriteAccess);
+                        PVOID mapped = MmMapLockedPagesSpecifyCache(
+                            wmdl, KernelMode, MmCached, NULL, FALSE, NormalPagePriority);
+                        if (mapped)
+                        {
+                            if (legit_avail >= PAGE_SIZE)
+                                RtlCopyMemory(mapped, legit_src, PAGE_SIZE);
+                            else
+                            {
+                                if (legit_avail > 0)
+                                    RtlCopyMemory(mapped, legit_src, legit_avail);
+                                RtlZeroMemory((PUINT8)mapped + legit_avail, PAGE_SIZE - legit_avail);
+                            }
+                            MmUnmapLockedPages(mapped, wmdl);
+                            write_ok = TRUE;
+                        }
+                        MmUnlockPages(wmdl);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+                    IoFreeMdl(wmdl);
+                }
+
+                // method 2: fallback — ZwProtectVirtualMemory (for READONLY image pages)
+                if (!write_ok)
+                {
+                    PVOID pb = page_aligned;
+                    SIZE_T ps = PAGE_SIZE;
+                    ULONG op = 0, tp = 0;
+                    if (NT_SUCCESS(ZwProtectVirtualMemory(ZwCurrentProcess(), &pb, &ps,
+                                                          PAGE_READWRITE, &op)))
+                    {
+                        if (legit_avail >= PAGE_SIZE)
+                            RtlCopyMemory(inj_page_va, legit_src, PAGE_SIZE);
+                        else
+                        {
+                            if (legit_avail > 0)
+                                RtlCopyMemory(inj_page_va, legit_src, legit_avail);
+                            RtlZeroMemory((PUINT8)inj_page_va + legit_avail, PAGE_SIZE - legit_avail);
+                        }
+                        pb = page_aligned; ps = PAGE_SIZE;
+                        ZwProtectVirtualMemory(ZwCurrentProcess(), &pb, &ps, op, &tp);
+                        write_ok = TRUE;
+                    }
+                }
+
+                if (!write_ok)
+                {
+                    DbgPrintEx(0, 0, "[td-dv] write failed for page %u\n", pi);
+                    continue;
+                }
+            }
+
+            // c. get PA (post-write, may have COW'd)
+            UINT64 page_pa = MmGetPhysicalAddress(inj_page_va).QuadPart;
+            if (!page_pa) continue;
+
+            // d. VMCALL: set up EPT split
+            NTSTATUS vmst = hv_vmcall_simple(VMCALL_EPT_SHADOW_PAGE, page_pa, (UINT64)page_buf, 0);
+            if (NT_SUCCESS(vmst))
+                hooked++;
+        }
+
+        ExFreePoolWithTag(page_buf, 'vDpg');
+        KeUnstackDetachProcess(&dv_apc);
+        ObDereferenceObject(dv_proc);
+        ExFreePoolWithTag(legit_buf, 'vDlL');
+
+        p->pages_hooked = (UINT64)hooked;
+        p->status = (hooked > 0) ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
+        irp->IoStatus.Information = sizeof(TD_DLL_DUALVIEW_PARAMS);
+        st = STATUS_SUCCESS;
+
+        DbgPrintEx(0, 0, "[td-dv] done: %u/%u pages hooked\n", hooked, total_pages);
+        break;
+    }
+
+    case IOCTL_PROTECT_DLL:
+    {
+        //
+        // EPT hook LdrUnloadDll in target process — blocks unload of specified DLL.
+        // filtering happens entirely in VMX-root (no user-mode proxy needed).
+        //
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_PROTECT_DLL_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_PROTECT_DLL_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_PROTECT_DLL_PARAMS * p = (TD_PROTECT_DLL_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+
+        PEPROCESS prot_proc = NULL;
+        st = PsLookupProcessByProcessId((HANDLE)p->target_pid, &prot_proc);
+        if (!NT_SUCCESS(st)) { p->status = (UINT64)st; st = STATUS_SUCCESS; break; }
+
+        KAPC_STATE prot_apc;
+        KeStackAttachProcess(prot_proc, &prot_apc);
+
+        UINT64 prot_cr3 = __readcr3();
+
+        // resolve LdrUnloadDll from target's ntdll
+        PVOID ldr_unload_dll = NULL;
+        {
+            PPEB peb = PsGetProcessPeb(PsGetCurrentProcess());
+            TD_PEB_LDR_DATA * ldr = NULL;
+            PLIST_ENTRY head = NULL, cur = NULL;
+            TD_LDR_ENTRY * e = NULL;
+
+            __try {
+                ldr = *(TD_PEB_LDR_DATA **)((PUINT8)peb + 0x18);
+                if (ldr)
+                {
+                    head = &ldr->InMemoryOrderModuleList;
+                    cur = head->Flink;
+                    while (cur != head)
+                    {
+                        e = CONTAINING_RECORD(cur, TD_LDR_ENTRY, InMemoryOrderLinks);
+                        if (e->BaseDllName.Buffer &&
+                            TdMatchDllName(e->BaseDllName.Buffer, e->BaseDllName.Length, g_ntdll_name, 9))
+                        {
+                            PIMAGE_DOS_HEADER dh = (PIMAGE_DOS_HEADER)e->DllBase;
+                            PIMAGE_NT_HEADERS64 nh = (PIMAGE_NT_HEADERS64)((PUINT8)e->DllBase + dh->e_lfanew);
+                            ULONG erva = nh->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+                            PIMAGE_EXPORT_DIRECTORY ed = (PIMAGE_EXPORT_DIRECTORY)((PUINT8)e->DllBase + erva);
+                            PULONG na = (PULONG)((PUINT8)e->DllBase + ed->AddressOfNames);
+                            PUSHORT oa = (PUSHORT)((PUINT8)e->DllBase + ed->AddressOfNameOrdinals);
+                            PULONG fa = (PULONG)((PUINT8)e->DllBase + ed->AddressOfFunctions);
+                            ULONG ei;
+                            for (ei = 0; ei < ed->NumberOfNames; ei++)
+                            {
+                                if (strcmp((const char *)((PUINT8)e->DllBase + na[ei]), "LdrUnloadDll") == 0)
+                                {
+                                    ldr_unload_dll = (PUINT8)e->DllBase + fa[oa[ei]];
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                        cur = cur->Flink;
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        }
+
+        if (!ldr_unload_dll)
+        {
+            KeUnstackDetachProcess(&prot_apc);
+            ObDereferenceObject(prot_proc);
+            p->status = (UINT64)STATUS_NOT_FOUND;
+            irp->IoStatus.Information = sizeof(TD_PROTECT_DLL_PARAMS);
+            st = STATUS_SUCCESS;
+            break;
+        }
+
+        DbgPrintEx(0, 0, "[td] protect: LdrUnloadDll=%p dll_base=%llx pid=%llu\n",
+                   ldr_unload_dll, p->dll_base, p->target_pid);
+
+        //
+        // EPT hook LdrUnloadDll → itself (trampoline calls original).
+        // protect_dll_base passed in flags upper bits.
+        // VMX-root filter: RCX == dll_base → return SUCCESS, skip unload.
+        //
+        KAFFINITY old_aff = KeSetSystemAffinityThreadEx((KAFFINITY)1);  // CPU 0
+
+        PVOID dummy_origin = NULL;
+        UINT64 flags = (p->dll_base << 16) | 0;  // upper 48 bits = dll_base, bit 0 = 0
+
+        NTSTATUS hook_st = hv_vmcall_ex(
+            VMCALL_EPT_HOOK,
+            (UINT64)ldr_unload_dll,     // target
+            (UINT64)ldr_unload_dll,     // proxy = same (trampoline calls original for non-match)
+            (UINT64)&dummy_origin,      // origin
+            prot_cr3,                   // caller CR3
+            1,                          // hook_type = VMCALL
+            prot_cr3,                   // target_cr3 (per-process)
+            0,                          // user_trampoline = NULL
+            0,                          // user_trampoline_pa = 0
+            flags);                     // flags with protect_dll_base
+
+        KeRevertToUserAffinityThreadEx(old_aff);
+        KeUnstackDetachProcess(&prot_apc);
+        ObDereferenceObject(prot_proc);
+
+        p->status = (UINT64)hook_st;
+        irp->IoStatus.Information = sizeof(TD_PROTECT_DLL_PARAMS);
+        st = STATUS_SUCCESS;
+
+        DbgPrintEx(0, 0, "[td] protect: hook %s (st=0x%08X)\n",
+                   NT_SUCCESS(hook_st) ? "OK" : "FAILED", hook_st);
+        break;
+    }
+
+    case IOCTL_READ_R3:
+    case IOCTL_WRITE_R3:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_RW_R3_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_RW_R3_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_RW_R3_PARAMS * p = (TD_RW_R3_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+        BOOLEAN is_write = (io->Parameters.DeviceIoControl.IoControlCode == IOCTL_WRITE_R3);
+
+        if (!p->target_va || !p->size || p->size > PAGE_SIZE || !p->buffer_va)
+        { p->status = (UINT64)STATUS_INVALID_PARAMETER; st = STATUS_SUCCESS; break; }
+
+        // look up target process CR3
+        PEPROCESS rw_proc = NULL;
+        st = PsLookupProcessByProcessId((HANDLE)p->target_pid, &rw_proc);
+        if (!NT_SUCCESS(st)) { p->status = (UINT64)st; st = STATUS_SUCCESS; break; }
+
+        //
+        // get target process CR3 by briefly attaching.
+        // (EPROCESS.DirectoryTableBase is at different offsets per build,
+        //  attaching + __readcr3 is the most reliable way)
+        //
+        KAPC_STATE rw_apc;
+        KeStackAttachProcess(rw_proc, &rw_apc);
+        UINT64 target_cr3 = __readcr3();
+        KeUnstackDetachProcess(&rw_apc);
+
+        //
+        // kernel NonPaged buffer for VMCALL (user buffer may not be mapped
+        // under target CR3 — we're reading caller's buffer, not target's)
+        //
+        PVOID kbuf = ExAllocatePool2(POOL_FLAG_NON_PAGED, (SIZE_T)p->size, 'r3RW');
+        if (!kbuf)
+        {
+            ObDereferenceObject(rw_proc);
+            p->status = (UINT64)STATUS_INSUFFICIENT_RESOURCES;
+            st = STATUS_SUCCESS;
+            break;
+        }
+
+        if (is_write)
+        {
+            // copy from user buffer to kernel buffer first
+            __try {
+                RtlCopyMemory(kbuf, (PVOID)p->buffer_va, (SIZE_T)p->size);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                ExFreePoolWithTag(kbuf, 'r3RW');
+                ObDereferenceObject(rw_proc);
+                p->status = (UINT64)STATUS_ACCESS_VIOLATION;
+                st = STATUS_SUCCESS;
+                break;
+            }
+        }
+
+        //
+        // VMCALL — VMX-root switches to target_cr3, reads/writes directly.
+        // no syscall, no handle, no attach. invisible to ring 0/3 monitoring.
+        //
+        NTSTATUS rw_st = hv_vmcall_ex(
+            is_write ? VMCALL_WRITE_R3 : VMCALL_READ_R3,
+            target_cr3,
+            p->target_va,
+            (UINT64)kbuf,
+            p->size,
+            0, 0, 0, 0, 0);
+
+        if (NT_SUCCESS(rw_st) && !is_write)
+        {
+            // copy from kernel buffer to user buffer
+            __try {
+                RtlCopyMemory((PVOID)p->buffer_va, kbuf, (SIZE_T)p->size);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                rw_st = STATUS_ACCESS_VIOLATION;
+            }
+        }
+
+        //
+        // if page not resident, try page-in from guest mode and retry
+        //
+        if (rw_st == (NTSTATUS)0xC0000225ULL)  // STATUS_NOT_FOUND (page not resident)
+        {
+            KeStackAttachProcess(rw_proc, &rw_apc);
+            MmIsAddressValid((PVOID)(ULONG_PTR)p->target_va);  // triggers soft page-in
+            KeUnstackDetachProcess(&rw_apc);
+
+            // retry VMCALL
+            rw_st = hv_vmcall_ex(
+                is_write ? VMCALL_WRITE_R3 : VMCALL_READ_R3,
+                target_cr3, p->target_va, (UINT64)kbuf, p->size,
+                0, 0, 0, 0, 0);
+
+            if (NT_SUCCESS(rw_st) && !is_write)
+            {
+                __try {
+                    RtlCopyMemory((PVOID)p->buffer_va, kbuf, (SIZE_T)p->size);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    rw_st = STATUS_ACCESS_VIOLATION;
+                }
+            }
+        }
+
+        RtlSecureZeroMemory(kbuf, (SIZE_T)p->size);
+        ExFreePoolWithTag(kbuf, 'r3RW');
+        ObDereferenceObject(rw_proc);
+
+        p->status = (UINT64)rw_st;
+        irp->IoStatus.Information = sizeof(TD_RW_R3_PARAMS);
+        st = STATUS_SUCCESS;
+        break;
+    }
+
     default:
         st = STATUS_INVALID_DEVICE_REQUEST;
         break;
@@ -1885,6 +2572,12 @@ static VOID TdUnload(PDRIVER_OBJECT drv)
     }
 
     TdEptUnhookAllR3();
+
+    if (g_image_callback_registered)
+    {
+        PsRemoveLoadImageNotifyRoutine(TdLoadImageCallback);
+        g_image_callback_registered = FALSE;
+    }
 
     UNICODE_STRING sym;
     RtlInitUnicodeString(&sym, TD_SYMLINK_NAME);
@@ -1913,6 +2606,36 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     {
         RtlInitUnicodeString(&fn, L"ZwResumeThread");
         g_pZwResumeThread = (fn_ZwResumeThread)MmGetSystemRoutineAddress(&fn);
+    }
+
+    // set LDRP_IMAGE_INTEGRITY_FORCED on our driver module.
+    // without this, PsSetLoadImageNotifyRoutine fails on Win10 1607+
+    // for test-signed / unsigned drivers (integrity check).
+    {
+        typedef struct _KLDR_DATA_TABLE_ENTRY {
+            LIST_ENTRY InLoadOrderLinks;
+            PVOID ExceptionTable;
+            ULONG ExceptionTableSize;
+            PVOID GpValue;
+            PVOID NonPagedDebugInfo;
+            PVOID DllBase;
+            PVOID EntryPoint;
+            ULONG SizeOfImage;
+            UNICODE_STRING FullDllName;
+            UNICODE_STRING BaseDllName;
+            ULONG Flags;
+        } KLDR_DATA_TABLE_ENTRY, *PKLDR_DATA_TABLE_ENTRY;
+
+        PKLDR_DATA_TABLE_ENTRY pLdrData = (PKLDR_DATA_TABLE_ENTRY)drv->DriverSection;
+        if (pLdrData)
+            pLdrData->Flags |= 0x20;  // LDRP_IMAGE_INTEGRITY_FORCED
+    }
+
+    // register LoadImage callback early — before AC drivers load.
+    if (NT_SUCCESS(PsSetLoadImageNotifyRoutine(TdLoadImageCallback)))
+    {
+        g_image_callback_registered = TRUE;
+        DbgPrintEx(0, 0, "[td] LoadImage callback registered (early)\n");
     }
 
     UNICODE_STRING dev_name, sym_name;

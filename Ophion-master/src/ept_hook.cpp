@@ -273,6 +273,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
             SIZE_T ow = 0;
             while (ow < min_sz) ow += LDE((PUINT8)req->target_function + ow, 64);
             fi->hook_size = ow;
+            fi->protect_dll_base = req->protect_dll_base;
 
             RtlCopyMemory(fi->first_trampoline_address, req->target_function, ow);
             hook_write_absolute_jump(&fi->first_trampoline_address[ow],
@@ -399,6 +400,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     SIZE_T ow = 0;
     while (ow < min_sz) ow += LDE((PUINT8)req->target_function + ow, 64);
     fi->hook_size = ow;
+    fi->protect_dll_base = req->protect_dll_base;
 
     RtlCopyMemory(fi->first_trampoline_address, req->target_function, ow);
     hook_write_absolute_jump(&fi->first_trampoline_address[ow],
@@ -991,6 +993,48 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
             fc = fc->Flink;
             if ((UINT64)fi->virtual_address == rip)
             {
+                //
+                // DLL protection filter: if protect_dll_base is set,
+                // check guest RCX (DllHandle arg of LdrUnloadDll).
+                // match → return STATUS_SUCCESS without unloading.
+                // no match → redirect to original (trampoline).
+                //
+                if (fi->protect_dll_base != 0)
+                {
+                    UINT64 guest_rcx = vcpu->regs->rcx;
+                    if (guest_rcx == fi->protect_dll_base)
+                    {
+                        // block unload: set rax = 0 (STATUS_SUCCESS),
+                        // pop return address from stack, skip the function entirely.
+                        vcpu->regs->rax = 0;
+                        UINT64 guest_rsp = 0;
+                        __vmx_vmread(VMCS_GUEST_RSP, &guest_rsp);
+
+                        // read return address from [RSP] (need guest CR3 for user stack)
+                        UINT64 saved_cr3 = vmx_enter_guest_cr3();
+                        UINT64 guest_cr3 = 0;
+                        __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
+                        UINT64 prev_cr3 = __readcr3();
+                        __writecr3(guest_cr3);
+                        UINT64 prev_flags = __readeflags();
+                        __writeeflags(prev_flags | (1ULL << 18));  // SMAP bypass
+
+                        UINT64 ret_addr = *(PUINT64)guest_rsp;
+
+                        __writeeflags(prev_flags);
+                        __writecr3(prev_cr3);
+                        vmx_leave_guest_cr3(saved_cr3);
+
+                        // set RIP = return address, RSP += 8 (pop)
+                        __vmx_vmwrite(VMCS_GUEST_RIP, ret_addr);
+                        __vmx_vmwrite(VMCS_GUEST_RSP, guest_rsp + 8);
+                        return TRUE;
+                    }
+                    // not our DLL — redirect to trampoline (original function)
+                    __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->first_trampoline_address);
+                    return TRUE;
+                }
+
                 __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
                 return TRUE;
             }

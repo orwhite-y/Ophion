@@ -786,6 +786,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             local_req.user_trampoline    = (PVOID)user_tramp_va;
             local_req.user_trampoline_pa = user_tramp_pa;
             local_req.force_read_access  = (flags & 1) ? TRUE : FALSE;
+            local_req.protect_dll_base   = (flags >> 16);  // upper 48 bits = dll base to protect
             if (origin_va)
                 local_req.origin_function = (PVOID *)origin_va;
 
@@ -1161,6 +1162,236 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
 
             inj->result = TRUE;
             vmx_leave_guest_cr3(_saved_cr3_inj);
+            regs->rax = (UINT64)STATUS_SUCCESS;
+            break;
+        }
+
+        //
+        // VMCALL_READ_R3 / VMCALL_WRITE_R3 — stealth R3 memory access
+        //
+        // params:
+        //   rdx = target_cr3   (CR3 of target process)
+        //   r8  = target_va    (user-mode VA in target process)
+        //   r9  = buffer       (kernel NonPaged buffer for read/write data)
+        //   r10 = size         (bytes to read/write, max PAGE_SIZE)
+        //
+        // returns rax = NTSTATUS
+        //
+        // VMX-root switches to target CR3, accesses user VA directly.
+        // invisible to any ring 0/3 monitoring (no syscall, no handle, no attach).
+        //
+        // safety: walks guest PT first to check Present bit.
+        //         sets RFLAGS.AC for SMAP bypass.
+        //
+        case VMCALL_READ_R3:
+        case VMCALL_WRITE_R3:
+        {
+            UINT64 target_cr3  = regs->rdx;
+            UINT64 target_va   = regs->r8;
+            PVOID  buffer      = (PVOID)regs->r9;
+            SIZE_T rw_size     = (SIZE_T)regs->r10;
+            BOOLEAN is_write   = (vmcall_num == VMCALL_WRITE_R3);
+
+            if (!target_cr3 || !target_va || !buffer || !rw_size || rw_size > PAGE_SIZE)
+            {
+                regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            // switch to system CR3 (for MmGetVirtualForPhysical + buffer access)
+            UINT64 _s_cr3 = vmx_enter_guest_cr3();
+
+            //
+            // walk guest page tables BEFORE switching to target CR3.
+            // MmGetVirtualForPhysical needs system CR3 to work.
+            //
+            BOOLEAN page_ok = FALSE;
+            {
+                PHYSICAL_ADDRESS pa;
+                PUINT64 va_ptr;
+                UINT64 cr3_base = target_cr3 & ~0xFFFULL;
+
+                pa.QuadPart = (LONGLONG)(cr3_base + ((target_va >> 39) & 0x1FF) * 8);
+                va_ptr = (PUINT64)MmGetVirtualForPhysical(pa);
+                if (va_ptr && (*va_ptr & 1))
+                {
+                    UINT64 pml4e = *va_ptr;
+                    pa.QuadPart = (LONGLONG)((pml4e & 0x000FFFFFFFFFF000ULL) + ((target_va >> 30) & 0x1FF) * 8);
+                    va_ptr = (PUINT64)MmGetVirtualForPhysical(pa);
+                    if (va_ptr && (*va_ptr & 1))
+                    {
+                        UINT64 pdpe = *va_ptr;
+                        if (pdpe & (1ULL << 7)) { page_ok = TRUE; }  // 1GB
+                        else
+                        {
+                            pa.QuadPart = (LONGLONG)((pdpe & 0x000FFFFFFFFFF000ULL) + ((target_va >> 21) & 0x1FF) * 8);
+                            va_ptr = (PUINT64)MmGetVirtualForPhysical(pa);
+                            if (va_ptr && (*va_ptr & 1))
+                            {
+                                UINT64 pde = *va_ptr;
+                                if (pde & (1ULL << 7)) { page_ok = TRUE; }  // 2MB
+                                else
+                                {
+                                    pa.QuadPart = (LONGLONG)((pde & 0x000FFFFFFFFFF000ULL) + ((target_va >> 12) & 0x1FF) * 8);
+                                    va_ptr = (PUINT64)MmGetVirtualForPhysical(pa);
+                                    if (va_ptr && (*va_ptr & 1)) page_ok = TRUE;  // 4KB present
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!page_ok)
+            {
+                vmx_leave_guest_cr3(_s_cr3);
+                regs->rax = (UINT64)0xC0000225ULL;  // STATUS_NOT_FOUND
+                break;
+            }
+
+            //
+            // page present — switch to target CR3 + SMAP bypass, then R/W.
+            //
+            UINT64 _prev_cr3 = __readcr3();
+            __writecr3(target_cr3);
+            UINT64 _prev_rflags = __readeflags();
+            __writeeflags(_prev_rflags | (1ULL << 18));  // SMAP: set AC
+            _mm_mfence();
+
+            // clamp to page boundary
+            UINT64 page_remain = PAGE_SIZE - (target_va & (PAGE_SIZE - 1));
+            if (rw_size > page_remain) rw_size = page_remain;
+
+            if (is_write)
+                RtlCopyMemory((PVOID)target_va, buffer, rw_size);
+            else
+                RtlCopyMemory(buffer, (PVOID)target_va, rw_size);
+
+            // restore
+            _mm_mfence();
+            __writeeflags(_prev_rflags);
+            __writecr3(_prev_cr3);
+            vmx_leave_guest_cr3(_s_cr3);
+            regs->rax = (UINT64)STATUS_SUCCESS;
+            break;
+        }
+
+        //
+        // VMCALL_EPT_SHADOW_PAGE — page-level EPT dual-view (no function hook).
+        //
+        // params:
+        //   rdx = target_phys  (PA of page to hook, page-aligned)
+        //   r8  = shadow_buf   (kernel NonPaged buffer with shadow content, 4KB)
+        //   r9  = 0 (reserved)
+        //
+        // sets up: original page R=1,W=1,X=0 | shadow R=0,W=0,X=1
+        // no hooked_function entry — purely page-level view split.
+        //
+        case VMCALL_EPT_SHADOW_PAGE:
+        {
+            UINT64 target_phys = regs->rdx & ~0xFFFULL;
+            PVOID  shadow_buf  = (PVOID)regs->r8;
+            UINT64 target_pfn  = target_phys >> 12;
+
+            if (!target_phys || !shadow_buf)
+            {
+                regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            UINT64 _s_cr3_sp = vmx_enter_guest_cr3();
+
+            // check if already hooked
+            BOOLEAN already = FALSE;
+            PLIST_ENTRY sp_cur = g_ept->hooked_pages.Flink;
+            while (sp_cur != &g_ept->hooked_pages)
+            {
+                PEPT_HOOKED_PAGE_INFO sp_hp = CONTAINING_RECORD(sp_cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
+                sp_cur = sp_cur->Flink;
+                if (sp_hp->pfn_of_hooked_page == target_pfn) { already = TRUE; break; }
+            }
+
+            if (already)
+            {
+                vmx_leave_guest_cr3(_s_cr3_sp);
+                regs->rax = (UINT64)STATUS_SUCCESS;  // already hooked, skip
+                break;
+            }
+
+            // allocate tracking struct (no function info needed)
+            #define _PT_HOOKED_PAGE 1
+            PEPT_HOOKED_PAGE_INFO sp_hp = (PEPT_HOOKED_PAGE_INFO)
+                pool_manager_request(_PT_HOOKED_PAGE, sizeof(EPT_HOOKED_PAGE_INFO));
+            if (!sp_hp)
+            {
+                vmx_leave_guest_cr3(_s_cr3_sp);
+                regs->rax = (UINT64)STATUS_INSUFFICIENT_RESOURCES;
+                break;
+            }
+            RtlZeroMemory(sp_hp, sizeof(*sp_hp));
+            InitializeListHead(&sp_hp->hooked_functions_list);
+
+            // split 2MB → 4KB
+            PEPT_PML2_ENTRY sp_pml2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
+            PEPT_PML1_ENTRY sp_pte = NULL;
+            if (sp_pml2 && sp_pml2->LargePage)
+            {
+                PVMM_EPT_DYNAMIC_SPLIT sp_split = ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
+                if (!sp_split) { pool_manager_release(sp_hp); vmx_leave_guest_cr3(_s_cr3_sp); regs->rax = (UINT64)STATUS_UNSUCCESSFUL; break; }
+                sp_pte = &sp_split->PML1[ADDRMASK_EPT_PML1_INDEX(target_phys)];
+            }
+            else
+                sp_pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
+
+            if (!sp_pte) { pool_manager_release(sp_hp); vmx_leave_guest_cr3(_s_cr3_sp); regs->rax = (UINT64)STATUS_UNSUCCESSFUL; break; }
+
+            // allocate shadow page from stealth region
+            UINT64 sp_fake_pfn = 0;
+            sp_hp->fake_page_va = stealth_region_alloc_page(&sp_fake_pfn);
+            if (!sp_hp->fake_page_va) { pool_manager_release(sp_hp); vmx_leave_guest_cr3(_s_cr3_sp); regs->rax = (UINT64)STATUS_INSUFFICIENT_RESOURCES; break; }
+            sp_hp->pfn_of_fake_page_contents = sp_fake_pfn;
+
+            // copy shadow content
+            RtlCopyMemory(sp_hp->fake_page_va, shadow_buf, PAGE_SIZE);
+
+            // EPT X-only on shadow physical page
+            {
+                SIZE_T sp_fake_phys = (SIZE_T)(sp_fake_pfn << 12);
+                PEPT_PML2_ENTRY fp2 = ept_get_pml2(vcpu->ept_page_table, sp_fake_phys);
+                if (fp2 && fp2->LargePage)
+                    ept_split_large_page_pool(vcpu->ept_page_table, sp_fake_phys);
+                PEPT_PML1_ENTRY fp1 = ept_get_pml1(vcpu->ept_page_table, sp_fake_phys);
+                if (fp1) { fp1->ReadAccess = 0; fp1->WriteAccess = 0; fp1->ExecuteAccess = 1; }
+            }
+
+            // set up hooked page tracking
+            sp_hp->pfn_of_hooked_page = target_pfn;
+            sp_hp->entry_address = sp_pte;
+            sp_hp->target_cr3 = 0;  // global
+            sp_hp->Options = EPTO_HOOK_FUNCTION;
+
+            sp_hp->original_entry = *sp_pte;
+            sp_hp->original_entry.ReadAccess = 1;
+            sp_hp->original_entry.WriteAccess = 1;
+            sp_hp->original_entry.ExecuteAccess = 0;
+
+            sp_hp->changed_entry = sp_hp->original_entry;
+            sp_hp->changed_entry.ReadAccess    = g_ept->execute_only_supported ? 0 : 1;
+            sp_hp->changed_entry.WriteAccess   = 0;
+            sp_hp->changed_entry.ExecuteAccess = 1;
+            sp_hp->changed_entry.PageFrameNumber = sp_fake_pfn;
+
+            InsertHeadList(&g_ept->hooked_pages, &sp_hp->hooked_page_list);
+
+            // activate: original page RW no-X
+            sp_pte->ReadAccess = 1;
+            sp_pte->WriteAccess = 1;
+            sp_pte->ExecuteAccess = 0;
+
+            _mm_mfence();
+            ept_invept_single(vcpu->ept_pointer);
+
+            vmx_leave_guest_cr3(_s_cr3_sp);
             regs->rax = (UINT64)STATUS_SUCCESS;
             break;
         }

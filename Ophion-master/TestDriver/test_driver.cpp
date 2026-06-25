@@ -284,164 +284,137 @@ static BOOLEAN TdMatchDllName(const WCHAR * buf, USHORT buf_len, const WCHAR * t
     return TRUE;
 }
 
-// ---- PIC shellcode (fully self-contained) ----
+// ---- PIC shellcode (zero API calls) ----
 //
-// all data encoded as instructions — strings built on stack, function
-// pointers embedded as mov reg, imm64 (patched at build time).
-// zero external data references. no tramp_va / data page needed.
+// finds MessageBoxA by PEB walk at BUILD TIME (driver side).
+// shellcode itself only calls the pre-resolved function pointer.
+// no LoadLibrary, no GetProcAddress, no runtime PEB walk.
 //
-// patch offsets:
-//   +6:  pLoadLibraryA  (8 bytes, mov r12 imm64)
-//   +16: pGetProcAddress (8 bytes, mov r13 imm64)
+// patch offset:
+//   +6: pMessageBoxA (8 bytes, mov r12 imm64)
 //
 static const UINT8 g_shellcode_pic[] = {
     // --- prologue ---
-    0x48, 0x83, 0xEC, 0x28,                                    // sub rsp, 28h
+    0x48, 0x83, 0xEC, 0x28,                                     // sub rsp, 28h
 
-    // mov r12, pLoadLibraryA (patched at offset 6)
+    // mov r12, pMessageBoxA (patched at offset 6)
     0x49, 0xBC,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,            // [6..13]
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             // [6..13]
 
-    // mov r13, pGetProcAddress (patched at offset 16)
-    0x49, 0xBD,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,            // [16..23]
+    // sub rsp, 40h (strings on stack)
+    0x48, 0x83, 0xEC, 0x40,                                      // [14..17]
 
-    // sub rsp, 80h (strings + shadow space)
-    0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00,                  // [24..30]
+    // --- build "Ophion\0" at [rsp+20h] ---
+    0xC7, 0x44, 0x24, 0x20,  0x4F, 0x70, 0x68, 0x69,            // "Ophi"
+    0x66, 0xC7, 0x44, 0x24, 0x24,  0x6F, 0x6E,                  // "on"
+    0xC6, 0x44, 0x24, 0x26,  0x00,                               // \0
 
-    // --- build "user32.dll\0" at [rsp+20h] ---
-    0xC7, 0x44, 0x24, 0x20,  0x75, 0x73, 0x65, 0x72,           // "user"
-    0xC7, 0x44, 0x24, 0x24,  0x33, 0x32, 0x2E, 0x64,           // "32.d"
-    0x66, 0xC7, 0x44, 0x24, 0x28,  0x6C, 0x6C,                 // "ll"
-    0xC6, 0x44, 0x24, 0x2A,  0x00,                              // \0
+    // --- build "Stealth OK\0" at [rsp+30h] ---
+    0xC7, 0x44, 0x24, 0x30,  0x53, 0x74, 0x65, 0x61,            // "Stea"
+    0xC7, 0x44, 0x24, 0x34,  0x6C, 0x74, 0x68, 0x20,            // "lth "
+    0x66, 0xC7, 0x44, 0x24, 0x38,  0x4F, 0x4B,                  // "OK"
+    0xC6, 0x44, 0x24, 0x3A,  0x00,                               // \0
 
-    // --- LoadLibraryA("user32.dll") ---
-    0x48, 0x8D, 0x4C, 0x24, 0x20,                               // lea rcx, [rsp+20h]
-    0x41, 0xFF, 0xD4,                                            // call r12
-    0x48, 0x89, 0xC6,                                            // mov rsi, rax
-
-    // --- build "MessageBoxA\0" at [rsp+30h] ---
-    0xC7, 0x44, 0x24, 0x30,  0x4D, 0x65, 0x73, 0x73,           // "Mess"
-    0xC7, 0x44, 0x24, 0x34,  0x61, 0x67, 0x65, 0x42,           // "ageB"
-    0xC7, 0x44, 0x24, 0x38,  0x6F, 0x78, 0x41, 0x00,           // "oxA\0"
-
-    // --- GetProcAddress(user32, "MessageBoxA") ---
-    0x48, 0x89, 0xF1,                                            // mov rcx, rsi
-    0x48, 0x8D, 0x54, 0x24, 0x30,                               // lea rdx, [rsp+30h]
-    0x41, 0xFF, 0xD5,                                            // call r13
-    0x48, 0x89, 0xC3,                                            // mov rbx, rax
-
-    // --- build "Ophion Stealth!\0" at [rsp+40h] ---
-    0xC7, 0x44, 0x24, 0x40,  0x4F, 0x70, 0x68, 0x69,           // "Ophi"
-    0xC7, 0x44, 0x24, 0x44,  0x6F, 0x6E, 0x20, 0x53,           // "on S"
-    0xC7, 0x44, 0x24, 0x48,  0x74, 0x65, 0x61, 0x6C,           // "teal"
-    0xC7, 0x44, 0x24, 0x4C,  0x74, 0x68, 0x21, 0x00,           // "th!\0"
-
-    // --- build "Ophion\0" at [rsp+60h] ---
-    0xC7, 0x44, 0x24, 0x60,  0x4F, 0x70, 0x68, 0x69,           // "Ophi"
-    0x66, 0xC7, 0x44, 0x24, 0x64,  0x6F, 0x6E,                 // "on"
-    0xC6, 0x44, 0x24, 0x66,  0x00,                              // \0
-
-    // --- MessageBoxA(NULL, "Ophion Stealth!", "Ophion", 0) ---
+    // --- MessageBoxA(NULL, "Stealth OK", "Ophion", 0) ---
     0x48, 0x31, 0xC9,                                            // xor rcx, rcx
-    0x48, 0x8D, 0x54, 0x24, 0x40,                               // lea rdx, [rsp+40h]
-    0x4C, 0x8D, 0x44, 0x24, 0x60,                               // lea r8, [rsp+60h]
+    0x48, 0x8D, 0x54, 0x24, 0x30,                                // lea rdx, [rsp+30h]
+    0x4C, 0x8D, 0x44, 0x24, 0x20,                                // lea r8, [rsp+20h]
     0x45, 0x31, 0xC9,                                            // xor r9d, r9d
-    0xFF, 0xD3,                                                   // call rbx
+    0x41, 0xFF, 0xD4,                                            // call r12
 
     // --- epilogue ---
-    0x48, 0x81, 0xC4, 0x80, 0x00, 0x00, 0x00,                  // add rsp, 80h
+    0x48, 0x83, 0xC4, 0x40,                                      // add rsp, 40h
     0x48, 0x83, 0xC4, 0x28,                                      // add rsp, 28h
+    0x31, 0xC0,                                                   // xor eax, eax
     0xC3,                                                         // ret
 };
 
-#define PIC_PATCH_LOADLIBRARY   6       // offset of pLoadLibraryA imm64
-#define PIC_PATCH_GETPROCADDR   16      // offset of pGetProcAddress imm64
+#define PIC_PATCH_MESSAGEBOX   6       // offset of pMessageBoxA imm64
+
+static const WCHAR g_user32_name[] = L"user32.dll";
 
 //
-// build PIC shellcode: resolve kernel32 exports and patch into shellcode.
-// must be called while attached to the target process (PEB walk).
+// build PIC shellcode: resolve user32!MessageBoxA via PEB walk + export table.
+// zero runtime API calls — all resolution done here at PASSIVE_LEVEL.
+// must be called while attached to the target process.
 //
 static BOOLEAN
 TdBuildShellcodePIC(PVOID buf, SIZE_T buf_size)
 {
-    PPEB peb;
-    TD_PEB_LDR_DATA * ldr;
-    PLIST_ENTRY head, cur;
-    TD_LDR_ENTRY * e;
-    PVOID kernel32_base;
-    PIMAGE_DOS_HEADER dos_h;
-    PIMAGE_NT_HEADERS64 nt_h;
-    PIMAGE_EXPORT_DIRECTORY exp_d;
-    PULONG names_arr, funcs_arr;
-    PUSHORT ords_arr;
-    ULONG exp_rva, i;
-    UINT64 pLoadLib, pGetProc;
-    const char * fn;
-
     if (buf_size < sizeof(g_shellcode_pic)) return FALSE;
 
-    RtlZeroMemory(buf, sizeof(g_shellcode_pic));
+    RtlZeroMemory(buf, buf_size);
     RtlCopyMemory(buf, g_shellcode_pic, sizeof(g_shellcode_pic));
 
-    peb = PsGetProcessPeb(PsGetCurrentProcess());
+    PPEB peb = PsGetProcessPeb(PsGetCurrentProcess());
     if (!peb) return FALSE;
 
-    pLoadLib = 0;
-    pGetProc = 0;
-    kernel32_base = NULL;
+    UINT64 pMsgBox = 0;
+    PVOID user32_base = NULL;
 
     __try {
-        ldr = *(TD_PEB_LDR_DATA **)((PUINT8)peb + 0x18);
+        TD_PEB_LDR_DATA * ldr = *(TD_PEB_LDR_DATA **)((PUINT8)peb + 0x18);
         if (!ldr) return FALSE;
 
-        head = &ldr->InMemoryOrderModuleList;
-        cur = head->Flink;
+        PLIST_ENTRY head = &ldr->InMemoryOrderModuleList;
+        PLIST_ENTRY cur = head->Flink;
 
+        // find user32.dll in PEB module list
         while (cur != head)
         {
-            e = CONTAINING_RECORD(cur, TD_LDR_ENTRY, InMemoryOrderLinks);
+            TD_LDR_ENTRY * e = CONTAINING_RECORD(cur, TD_LDR_ENTRY, InMemoryOrderLinks);
             if (e->BaseDllName.Buffer &&
-                TdMatchDllName(e->BaseDllName.Buffer, e->BaseDllName.Length, g_k32_name, 12))
+                TdMatchDllName(e->BaseDllName.Buffer, e->BaseDllName.Length, g_user32_name, 10))
             {
-                kernel32_base = e->DllBase;
+                user32_base = e->DllBase;
                 break;
             }
             cur = cur->Flink;
         }
 
-        if (!kernel32_base) return FALSE;
-
-        dos_h = (PIMAGE_DOS_HEADER)kernel32_base;
-        nt_h = (PIMAGE_NT_HEADERS64)((PUINT8)kernel32_base + dos_h->e_lfanew);
-        exp_rva = nt_h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-        exp_d = (PIMAGE_EXPORT_DIRECTORY)((PUINT8)kernel32_base + exp_rva);
-
-        names_arr = (PULONG)((PUINT8)kernel32_base + exp_d->AddressOfNames);
-        ords_arr  = (PUSHORT)((PUINT8)kernel32_base + exp_d->AddressOfNameOrdinals);
-        funcs_arr = (PULONG)((PUINT8)kernel32_base + exp_d->AddressOfFunctions);
-
-        for (i = 0; i < exp_d->NumberOfNames; i++)
+        if (!user32_base)
         {
-            fn = (const char *)((PUINT8)kernel32_base + names_arr[i]);
-            if (!pLoadLib && strcmp(fn, "LoadLibraryA") == 0)
-                pLoadLib = (UINT64)kernel32_base + funcs_arr[ords_arr[i]];
-            if (!pGetProc && strcmp(fn, "GetProcAddress") == 0)
-                pGetProc = (UINT64)kernel32_base + funcs_arr[ords_arr[i]];
-            if (pLoadLib && pGetProc) break;
+            HYPERPLATFORM_LOG_ERROR("[td] PIC: user32.dll not found in target process");
+            return FALSE;
+        }
+
+        // walk user32 export table to find MessageBoxA
+        PIMAGE_DOS_HEADER dos_h = (PIMAGE_DOS_HEADER)user32_base;
+        PIMAGE_NT_HEADERS64 nt_h = (PIMAGE_NT_HEADERS64)((PUINT8)user32_base + dos_h->e_lfanew);
+        ULONG exp_rva = nt_h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        PIMAGE_EXPORT_DIRECTORY exp_d = (PIMAGE_EXPORT_DIRECTORY)((PUINT8)user32_base + exp_rva);
+
+        PULONG names_arr = (PULONG)((PUINT8)user32_base + exp_d->AddressOfNames);
+        PUSHORT ords_arr = (PUSHORT)((PUINT8)user32_base + exp_d->AddressOfNameOrdinals);
+        PULONG funcs_arr = (PULONG)((PUINT8)user32_base + exp_d->AddressOfFunctions);
+
+        for (ULONG i = 0; i < exp_d->NumberOfNames; i++)
+        {
+            const char * fn = (const char *)((PUINT8)user32_base + names_arr[i]);
+            if (fn[0] == 'M' && fn[1] == 'e' && fn[2] == 's' && fn[3] == 's' &&
+                fn[4] == 'a' && fn[5] == 'g' && fn[6] == 'e' && fn[7] == 'B' &&
+                fn[8] == 'o' && fn[9] == 'x' && fn[10] == 'A' && fn[11] == '\0')
+            {
+                pMsgBox = (UINT64)user32_base + funcs_arr[ords_arr[i]];
+                break;
+            }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        HYPERPLATFORM_LOG_ERROR("[td] PIC: exception walking PEB/exports");
         return FALSE;
     }
 
-    if (!pLoadLib || !pGetProc) return FALSE;
+    if (!pMsgBox)
+    {
+        HYPERPLATFORM_LOG_ERROR("[td] PIC: MessageBoxA not found in user32 exports");
+        return FALSE;
+    }
 
-    // patch immediates
-    *(PUINT64)((PUINT8)buf + PIC_PATCH_LOADLIBRARY) = pLoadLib;
-    *(PUINT64)((PUINT8)buf + PIC_PATCH_GETPROCADDR) = pGetProc;
+    // patch MessageBoxA address
+    *(PUINT64)((PUINT8)buf + PIC_PATCH_MESSAGEBOX) = pMsgBox;
 
-    HYPERPLATFORM_LOG_INFO("[td] PIC: LoadLibraryA=%llx GetProcAddress=%llx size=%u",
-               pLoadLib, pGetProc, (UINT32)sizeof(g_shellcode_pic));
+    HYPERPLATFORM_LOG_INFO("[td] PIC: user32=%p MessageBoxA=%llx size=%u (zero API calls)",
+               user32_base, pMsgBox, (UINT32)sizeof(g_shellcode_pic));
     return TRUE;
 }
 
@@ -1393,6 +1366,699 @@ TdFindGapInProcess(SIZE_T min_size, ULONG * out_offset, ULONG * out_avail)
     return NULL;
 }
 
+// =========================================================================
+//  PE Manual Mapper — kernel-side DLL loading, zero R3 API calls
+//
+//  flow:
+//    1. injector reads DLL file → sends raw bytes via IOCTL_INJECT_DLL
+//    2. driver attaches to target process
+//    3. ZwAllocateVirtualMemory(PAGE_READWRITE) for image
+//    4. copy sections, apply relocations, resolve imports (PEB walk)
+//    5. build DllMain stub at image base (overwrites DOS header)
+//    6. clear PE signature from header
+//    7. ZwProtectVirtualMemory → PAGE_EXECUTE_READ for executable sections
+//    8. EPT hook NtTestAlert → DllMain stub (oneshot, per-process CR3 filter)
+//    9. create thread at NtTestAlert → DllMain runs → thread exits
+//
+//  result: DLL is loaded without LoadLibrary, no module list entry,
+//  no load image notification, no file access from target process.
+// =========================================================================
+
+#define IOCTL_INJECT_DLL CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 5, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#pragma pack(push, 8)
+typedef struct _TD_INJECT_DLL_PARAMS {
+    UINT64 target_pid;
+    UINT32 dll_offset;     // offset of DLL data within this buffer (after header)
+    UINT32 dll_size;       // size of raw DLL file
+    UINT64 out_base;       // [out] mapped image base
+    UINT64 out_entry;      // [out] DllMain VA
+    UINT64 out_size;       // [out] image size
+} TD_INJECT_DLL_PARAMS;
+#pragma pack(pop)
+
+//
+// inline case-insensitive ASCII compare (kernel-safe, no runtime dependency)
+//
+static __forceinline BOOLEAN
+TdAsciiEqualI(const char * a, const char * b)
+{
+    while (*a && *b)
+    {
+        char ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return FALSE;
+        a++; b++;
+    }
+    return (*a == *b);
+}
+
+//
+// TdFindModuleBaseA — find loaded module by ASCII name via PEB walk.
+// walks PEB → Ldr → InMemoryOrderModuleList. compares BaseDllName
+// (Unicode) with the given ASCII name (case-insensitive).
+// must be called while attached to the target process.
+//
+static PVOID
+TdFindModuleBaseA(const char * name_ascii)
+{
+    PPEB peb = PsGetProcessPeb(PsGetCurrentProcess());
+    if (!peb) return NULL;
+
+    // compute length of ASCII name
+    USHORT name_len = 0;
+    const char * p = name_ascii;
+    while (*p) { name_len++; p++; }
+
+    // check if name has ".dll" extension already
+    BOOLEAN has_ext = FALSE;
+    if (name_len >= 4)
+    {
+        const char * ext = name_ascii + name_len - 4;
+        if ((ext[0] == '.' || ext[0] == '.') &&
+            (ext[1] == 'd' || ext[1] == 'D') &&
+            (ext[2] == 'l' || ext[2] == 'L') &&
+            (ext[3] == 'l' || ext[3] == 'L'))
+            has_ext = TRUE;
+    }
+
+    __try {
+        TD_PEB_LDR_DATA * ldr = *(TD_PEB_LDR_DATA **)((PUINT8)peb + 0x18);
+        if (!ldr) return NULL;
+
+        PLIST_ENTRY head = &ldr->InMemoryOrderModuleList;
+        PLIST_ENTRY cur = head->Flink;
+
+        while (cur != head)
+        {
+            TD_LDR_ENTRY * e = CONTAINING_RECORD(cur, TD_LDR_ENTRY, InMemoryOrderLinks);
+            if (e->BaseDllName.Buffer && e->BaseDllName.Length > 0)
+            {
+                USHORT wchar_count = e->BaseDllName.Length / sizeof(WCHAR);
+                const WCHAR * wbuf = e->BaseDllName.Buffer;
+
+                // compare Unicode BaseDllName with ASCII name
+                BOOLEAN match = FALSE;
+
+                if (has_ext)
+                {
+                    // exact match (with extension)
+                    if (wchar_count == name_len)
+                    {
+                        match = TRUE;
+                        for (USHORT i = 0; i < name_len; i++)
+                        {
+                            WCHAR wc = wbuf[i];
+                            if (wc >= L'A' && wc <= L'Z') wc += 32;
+                            char ac = name_ascii[i];
+                            if (ac >= 'A' && ac <= 'Z') ac += 32;
+                            if (wc != (WCHAR)ac) { match = FALSE; break; }
+                        }
+                    }
+                }
+                else
+                {
+                    // match without extension: BaseDllName could be "foo.dll"
+                    // name_ascii is "foo" — compare first name_len chars,
+                    // then check remaining is ".dll"
+                    if (wchar_count == name_len + 4)
+                    {
+                        match = TRUE;
+                        for (USHORT i = 0; i < name_len; i++)
+                        {
+                            WCHAR wc = wbuf[i];
+                            if (wc >= L'A' && wc <= L'Z') wc += 32;
+                            char ac = name_ascii[i];
+                            if (ac >= 'A' && ac <= 'Z') ac += 32;
+                            if (wc != (WCHAR)ac) { match = FALSE; break; }
+                        }
+                        if (match)
+                        {
+                            WCHAR c0 = wbuf[name_len];
+                            WCHAR c1 = wbuf[name_len + 1]; if (c1 >= L'A' && c1 <= L'Z') c1 += 32;
+                            WCHAR c2 = wbuf[name_len + 2]; if (c2 >= L'A' && c2 <= L'Z') c2 += 32;
+                            WCHAR c3 = wbuf[name_len + 3]; if (c3 >= L'A' && c3 <= L'Z') c3 += 32;
+                            if (c0 != L'.' || c1 != L'd' || c2 != L'l' || c3 != L'l')
+                                match = FALSE;
+                        }
+                    }
+                    // also try exact match (no extension on module name)
+                    if (!match && wchar_count == name_len)
+                    {
+                        match = TRUE;
+                        for (USHORT i = 0; i < name_len; i++)
+                        {
+                            WCHAR wc = wbuf[i];
+                            if (wc >= L'A' && wc <= L'Z') wc += 32;
+                            char ac = name_ascii[i];
+                            if (ac >= 'A' && ac <= 'Z') ac += 32;
+                            if (wc != (WCHAR)ac) { match = FALSE; break; }
+                        }
+                    }
+                }
+
+                if (match && e->DllBase)
+                    return e->DllBase;
+            }
+            cur = cur->Flink;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        HYPERPLATFORM_LOG_WARN("[td-map] exception in TdFindModuleBaseA(\"%s\")", name_ascii);
+    }
+
+    return NULL;
+}
+
+//
+// TdFindExportByName — find export by name from a module's export table.
+// walks PE export directory. returns function VA. skips forwarded exports
+// (returns NULL for forwards).
+//
+static PVOID
+TdFindExportByName(PVOID module_base, const char * func_name)
+{
+    if (!module_base || !func_name) return NULL;
+
+    __try {
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)module_base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+
+        PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((PUINT8)module_base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
+
+        ULONG exp_rva  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        ULONG exp_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        if (!exp_rva) return NULL;
+
+        PIMAGE_EXPORT_DIRECTORY exp_dir = (PIMAGE_EXPORT_DIRECTORY)((PUINT8)module_base + exp_rva);
+        PULONG  names = (PULONG)((PUINT8)module_base + exp_dir->AddressOfNames);
+        PUSHORT ords  = (PUSHORT)((PUINT8)module_base + exp_dir->AddressOfNameOrdinals);
+        PULONG  funcs = (PULONG)((PUINT8)module_base + exp_dir->AddressOfFunctions);
+
+        for (ULONG i = 0; i < exp_dir->NumberOfNames; i++)
+        {
+            const char * fn = (const char *)((PUINT8)module_base + names[i]);
+            if (TdAsciiEqualI(fn, func_name))
+            {
+                ULONG func_rva = funcs[ords[i]];
+
+                // check for forwarded export (RVA points inside export directory)
+                if (func_rva >= exp_rva && func_rva < exp_rva + exp_size)
+                    return NULL;  // forwarded — skip
+
+                return (PUINT8)module_base + func_rva;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        HYPERPLATFORM_LOG_WARN("[td-map] exception in TdFindExportByName");
+    }
+
+    return NULL;
+}
+
+//
+// TdFindExportByOrdinal — find export by ordinal from a module's export table.
+//
+static PVOID
+TdFindExportByOrdinal(PVOID module_base, USHORT ordinal)
+{
+    if (!module_base) return NULL;
+
+    __try {
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)module_base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+
+        PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((PUINT8)module_base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
+
+        ULONG exp_rva  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        ULONG exp_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        if (!exp_rva) return NULL;
+
+        PIMAGE_EXPORT_DIRECTORY exp_dir = (PIMAGE_EXPORT_DIRECTORY)((PUINT8)module_base + exp_rva);
+        PULONG funcs = (PULONG)((PUINT8)module_base + exp_dir->AddressOfFunctions);
+
+        ULONG index = ordinal - (USHORT)exp_dir->Base;
+        if (index >= exp_dir->NumberOfFunctions)
+            return NULL;
+
+        ULONG func_rva = funcs[index];
+
+        // check for forwarded export
+        if (func_rva >= exp_rva && func_rva < exp_rva + exp_size)
+            return NULL;
+
+        return (PUINT8)module_base + func_rva;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        HYPERPLATFORM_LOG_WARN("[td-map] exception in TdFindExportByOrdinal");
+    }
+
+    return NULL;
+}
+
+//
+// TdPeCopySections — copy PE headers and sections from raw DLL to mapped image.
+//
+static BOOLEAN
+TdPeCopySections(PVOID mapped_base, PUINT8 raw_dll, SIZE_T raw_size)
+{
+    __try {
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)raw_dll;
+        PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(raw_dll + dos->e_lfanew);
+
+        // copy headers
+        ULONG hdr_size = nt->OptionalHeader.SizeOfHeaders;
+        if (hdr_size > raw_size) hdr_size = (ULONG)raw_size;
+        RtlCopyMemory(mapped_base, raw_dll, hdr_size);
+
+        // copy each section
+        PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+        USHORT num_sec = nt->FileHeader.NumberOfSections;
+
+        for (USHORT i = 0; i < num_sec; i++)
+        {
+            PVOID dst = (PUINT8)mapped_base + sec[i].VirtualAddress;
+
+            if (sec[i].SizeOfRawData == 0)
+            {
+                // BSS — zero the virtual range
+                ULONG virt_sz = sec[i].Misc.VirtualSize;
+                if (virt_sz > 0)
+                    RtlZeroMemory(dst, virt_sz);
+                continue;
+            }
+
+            // validate raw data bounds
+            if (sec[i].PointerToRawData + sec[i].SizeOfRawData > raw_size)
+            {
+                HYPERPLATFORM_LOG_WARN("[td-map] section %u raw data exceeds file size", i);
+                continue;
+            }
+
+            PVOID src = raw_dll + sec[i].PointerToRawData;
+            ULONG copy_size = sec[i].SizeOfRawData;
+
+            RtlCopyMemory(dst, src, copy_size);
+
+            // if VirtualSize > SizeOfRawData, zero the remainder
+            if (sec[i].Misc.VirtualSize > copy_size)
+                RtlZeroMemory((PUINT8)dst + copy_size, sec[i].Misc.VirtualSize - copy_size);
+        }
+
+        return TRUE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        HYPERPLATFORM_LOG_ERROR("[td-map] exception in TdPeCopySections");
+        return FALSE;
+    }
+}
+
+//
+// TdPeRelocate — apply base relocations.
+// returns TRUE on success, FALSE if no relocation table and delta != 0.
+//
+static BOOLEAN
+TdPeRelocate(PVOID mapped_base, PUINT8 raw_dll, UINT64 delta)
+{
+    if (delta == 0) return TRUE;
+
+    __try {
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)raw_dll;
+        PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(raw_dll + dos->e_lfanew);
+
+        ULONG reloc_rva  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+        ULONG reloc_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+
+        if (!reloc_rva || !reloc_size)
+        {
+            // no relocation table — check if DLL has RELOCS_STRIPPED
+            if (nt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED)
+            {
+                HYPERPLATFORM_LOG_ERROR("[td-map] no reloc table and delta != 0");
+                return FALSE;
+            }
+            // relocation directory empty but delta != 0 and not stripped — fail
+            HYPERPLATFORM_LOG_ERROR("[td-map] no reloc directory, delta=0x%llX", delta);
+            return FALSE;
+        }
+
+        PIMAGE_BASE_RELOCATION block = (PIMAGE_BASE_RELOCATION)((PUINT8)mapped_base + reloc_rva);
+        PIMAGE_BASE_RELOCATION end   = (PIMAGE_BASE_RELOCATION)((PUINT8)block + reloc_size);
+
+        while (block < end && block->SizeOfBlock >= sizeof(IMAGE_BASE_RELOCATION))
+        {
+            ULONG count = (block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(USHORT);
+            PUSHORT entries = (PUSHORT)((PUINT8)block + sizeof(IMAGE_BASE_RELOCATION));
+
+            for (ULONG i = 0; i < count; i++)
+            {
+                USHORT type   = entries[i] >> 12;
+                USHORT offset = entries[i] & 0x0FFF;
+                PUINT8 target = (PUINT8)mapped_base + block->VirtualAddress + offset;
+
+                switch (type)
+                {
+                case IMAGE_REL_BASED_ABSOLUTE:
+                    // padding — skip
+                    break;
+
+                case IMAGE_REL_BASED_DIR64:
+                    *(PUINT64)target += delta;
+                    break;
+
+                case IMAGE_REL_BASED_HIGHLOW:
+                    *(PUINT32)target += (UINT32)delta;
+                    break;
+
+                default:
+                    HYPERPLATFORM_LOG_WARN("[td-map] unsupported reloc type %u", type);
+                    break;
+                }
+            }
+
+            block = (PIMAGE_BASE_RELOCATION)((PUINT8)block + block->SizeOfBlock);
+        }
+
+        return TRUE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        HYPERPLATFORM_LOG_ERROR("[td-map] exception in TdPeRelocate");
+        return FALSE;
+    }
+}
+
+//
+// TdPeResolveImports — resolve imports manually via PEB walk.
+// must be called while attached to the target process.
+//
+static BOOLEAN
+TdPeResolveImports(PVOID mapped_base)
+{
+    __try {
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)mapped_base;
+        PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((PUINT8)mapped_base + dos->e_lfanew);
+
+        ULONG imp_rva  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+        ULONG imp_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+
+        if (!imp_rva || !imp_size)
+        {
+            HYPERPLATFORM_LOG_INFO("[td-map] no import directory — nothing to resolve");
+            return TRUE;
+        }
+
+        PIMAGE_IMPORT_DESCRIPTOR imp = (PIMAGE_IMPORT_DESCRIPTOR)((PUINT8)mapped_base + imp_rva);
+
+        while (imp->Name)
+        {
+            const char * dll_name = (const char *)((PUINT8)mapped_base + imp->Name);
+            PVOID mod_base = TdFindModuleBaseA(dll_name);
+
+            if (!mod_base)
+            {
+                HYPERPLATFORM_LOG_ERROR("[td-map] import DLL not found: %s", dll_name);
+                imp++;
+                continue;
+            }
+
+            HYPERPLATFORM_LOG_INFO("[td-map] resolving imports from %s (base=%p)", dll_name, mod_base);
+
+            // OriginalFirstThunk = hint/name table, FirstThunk = IAT
+            PIMAGE_THUNK_DATA64 oft = (PIMAGE_THUNK_DATA64)((PUINT8)mapped_base +
+                (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
+            PIMAGE_THUNK_DATA64 ft  = (PIMAGE_THUNK_DATA64)((PUINT8)mapped_base + imp->FirstThunk);
+
+            while (oft->u1.AddressOfData)
+            {
+                PVOID resolved = NULL;
+
+                if (oft->u1.Ordinal & IMAGE_ORDINAL_FLAG64)
+                {
+                    USHORT ordinal = (USHORT)(oft->u1.Ordinal & 0xFFFF);
+                    resolved = TdFindExportByOrdinal(mod_base, ordinal);
+                    if (!resolved)
+                        HYPERPLATFORM_LOG_WARN("[td-map] unresolved import: %s!#%u", dll_name, ordinal);
+                }
+                else
+                {
+                    PIMAGE_IMPORT_BY_NAME ibn = (PIMAGE_IMPORT_BY_NAME)((PUINT8)mapped_base + oft->u1.AddressOfData);
+                    resolved = TdFindExportByName(mod_base, (const char *)ibn->Name);
+                    if (!resolved)
+                        HYPERPLATFORM_LOG_WARN("[td-map] unresolved import: %s!%s", dll_name, ibn->Name);
+                }
+
+                if (resolved)
+                    ft->u1.Function = (UINT64)resolved;
+
+                oft++;
+                ft++;
+            }
+
+            imp++;
+        }
+
+        return TRUE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        HYPERPLATFORM_LOG_ERROR("[td-map] exception in TdPeResolveImports");
+        return FALSE;
+    }
+}
+
+//
+// TdBuildDllMainStub — build a small x64 stub that calls DllMain(base, DLL_PROCESS_ATTACH, NULL).
+// placed at image base (overwrites DOS header). returns stub size.
+//
+// stub:
+//   sub rsp, 28h
+//   mov rcx, IMAGE_BASE
+//   mov edx, 1              ; DLL_PROCESS_ATTACH
+//   xor r8d, r8d            ; NULL
+//   mov rax, ENTRY_POINT
+//   call rax
+//   add rsp, 28h
+//   xor eax, eax
+//   ret
+//
+static UINT32
+TdBuildDllMainStub(PVOID stub_addr, UINT64 image_base, UINT64 entry_point)
+{
+    PUINT8 s = (PUINT8)stub_addr;
+    UINT32 off = 0;
+
+    // sub rsp, 28h
+    s[off++] = 0x48; s[off++] = 0x83; s[off++] = 0xEC; s[off++] = 0x28;
+
+    // mov rcx, IMAGE_BASE (imm64)
+    s[off++] = 0x48; s[off++] = 0xB9;
+    *(PUINT64)(s + off) = image_base; off += 8;
+
+    // mov edx, 1
+    s[off++] = 0xBA; s[off++] = 0x01; s[off++] = 0x00; s[off++] = 0x00; s[off++] = 0x00;
+
+    // xor r8d, r8d
+    s[off++] = 0x45; s[off++] = 0x31; s[off++] = 0xC0;
+
+    // mov rax, ENTRY_POINT (imm64)
+    s[off++] = 0x48; s[off++] = 0xB8;
+    *(PUINT64)(s + off) = entry_point; off += 8;
+
+    // call rax
+    s[off++] = 0xFF; s[off++] = 0xD0;
+
+    // add rsp, 28h
+    s[off++] = 0x48; s[off++] = 0x83; s[off++] = 0xC4; s[off++] = 0x28;
+
+    // xor eax, eax
+    s[off++] = 0x31; s[off++] = 0xC0;
+
+    // ret
+    s[off++] = 0xC3;
+
+    return off;
+}
+
+//
+// TdManualMapInProcess — main manual map function.
+// must be called while attached to the target process.
+//
+// parameters:
+//   proc       — PEPROCESS (already attached)
+//   raw_dll    — raw DLL file bytes (kernel buffer)
+//   dll_size   — size of raw DLL
+//   out_base   — receives mapped image base (user VA)
+//   out_entry  — receives DllMain VA (user VA)
+//
+static NTSTATUS
+TdManualMapInProcess(
+    PEPROCESS proc,
+    PUINT8    raw_dll,
+    SIZE_T    dll_size,
+    PVOID *   out_base,
+    PVOID *   out_entry)
+{
+    UNREFERENCED_PARAMETER(proc);
+
+    if (!raw_dll || dll_size < sizeof(IMAGE_DOS_HEADER) + sizeof(IMAGE_NT_HEADERS64))
+        return STATUS_INVALID_PARAMETER;
+
+    __try {
+        // 1. validate PE
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)raw_dll;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-map] invalid DOS signature");
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
+        PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(raw_dll + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE)
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-map] invalid PE signature");
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
+        if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64)
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-map] not AMD64 (machine=0x%04X)", nt->FileHeader.Machine);
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
+        if (!(nt->FileHeader.Characteristics & IMAGE_FILE_DLL))
+        {
+            HYPERPLATFORM_LOG_WARN("[td-map] image is not a DLL (characteristics=0x%04X)", nt->FileHeader.Characteristics);
+        }
+
+        // 2. get image size
+        SIZE_T image_size = nt->OptionalHeader.SizeOfImage;
+        if (image_size == 0 || image_size > 256 * 1024 * 1024)
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-map] invalid SizeOfImage: 0x%llX", (UINT64)image_size);
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
+        // 3. allocate PAGE_READWRITE in target process (system chooses base)
+        PVOID base = NULL;
+        NTSTATUS st = ZwAllocateVirtualMemory(
+            ZwCurrentProcess(), &base, 0, &image_size,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+        if (!NT_SUCCESS(st) || !base)
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-map] ZwAllocateVirtualMemory failed: 0x%08X", st);
+            return st;
+        }
+
+        HYPERPLATFORM_LOG_INFO("[td-map] allocated image: base=%p size=0x%llX (preferred=0x%llX)",
+                   base, (UINT64)image_size, nt->OptionalHeader.ImageBase);
+
+        // 4. copy sections
+        if (!TdPeCopySections(base, raw_dll, dll_size))
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-map] TdPeCopySections failed");
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &image_size, MEM_RELEASE);
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        // 5. apply relocations
+        UINT64 delta = (UINT64)base - nt->OptionalHeader.ImageBase;
+        if (!TdPeRelocate(base, raw_dll, delta))
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-map] TdPeRelocate failed (delta=0x%llX)", delta);
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &image_size, MEM_RELEASE);
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        // 6. resolve imports (requires PEB walk — must be attached)
+        if (!TdPeResolveImports(base))
+        {
+            HYPERPLATFORM_LOG_WARN("[td-map] TdPeResolveImports had errors (continuing)");
+        }
+
+        // 7. build DllMain stub at base+0 (overwrites DOS header)
+        PVOID entry = NULL;
+        if (nt->OptionalHeader.AddressOfEntryPoint)
+        {
+            UINT64 entry_point_va = (UINT64)base + nt->OptionalHeader.AddressOfEntryPoint;
+            UINT32 stub_size = TdBuildDllMainStub(base, (UINT64)base, entry_point_va);
+
+            HYPERPLATFORM_LOG_INFO("[td-map] DllMain stub: base=%p entry=0x%llX stub_size=%u",
+                       base, entry_point_va, stub_size);
+
+            // 8. zero from stub end to SizeOfHeaders (clear remaining PE header data)
+            ULONG hdr_size = nt->OptionalHeader.SizeOfHeaders;
+            if (stub_size < hdr_size)
+                RtlZeroMemory((PUINT8)base + stub_size, hdr_size - stub_size);
+
+            entry = base;  // stub is at base+0
+        }
+        else
+        {
+            HYPERPLATFORM_LOG_WARN("[td-map] no entry point in DLL");
+            // zero the entire header area
+            RtlZeroMemory(base, nt->OptionalHeader.SizeOfHeaders);
+            entry = NULL;
+        }
+
+        // set output before we lose access to nt headers (they're overwritten)
+        *out_base  = base;
+        *out_entry = entry;
+
+        // 9. change protection for executable sections
+        // re-parse the mapped image headers (we need section headers which are
+        // after the optional header, so they survive the stub overwrite at offset 0)
+        {
+            // use the RAW dll headers to get section info (mapped headers partially overwritten)
+            PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+            USHORT num_sec = nt->FileHeader.NumberOfSections;
+
+            for (USHORT i = 0; i < num_sec; i++)
+            {
+                if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+                {
+                    PVOID sec_base = (PUINT8)base + sec[i].VirtualAddress;
+                    SIZE_T sec_size = sec[i].Misc.VirtualSize;
+                    if (sec_size == 0) continue;
+
+                    // round up to page
+                    sec_size = (sec_size + 0xFFF) & ~(SIZE_T)0xFFF;
+
+                    ULONG old_prot = 0;
+                    st = ZwProtectVirtualMemory(
+                        ZwCurrentProcess(), &sec_base, &sec_size,
+                        PAGE_EXECUTE_READ, &old_prot);
+
+                    if (NT_SUCCESS(st))
+                        HYPERPLATFORM_LOG_INFO("[td-map] section %u (%.8s) → PAGE_EXECUTE_READ", i, sec[i].Name);
+                    else
+                        HYPERPLATFORM_LOG_WARN("[td-map] section %u protect failed: 0x%08X", i, st);
+                }
+            }
+
+            // header page (contains our stub) → PAGE_EXECUTE_READ
+            if (entry)
+            {
+                PVOID hdr_base = base;
+                SIZE_T hdr_prot_size = PAGE_SIZE;
+                ULONG old_prot = 0;
+                st = ZwProtectVirtualMemory(
+                    ZwCurrentProcess(), &hdr_base, &hdr_prot_size,
+                    PAGE_EXECUTE_READ, &old_prot);
+
+                if (NT_SUCCESS(st))
+                    HYPERPLATFORM_LOG_INFO("[td-map] header page → PAGE_EXECUTE_READ");
+                else
+                    HYPERPLATFORM_LOG_WARN("[td-map] header page protect failed: 0x%08X", st);
+            }
+        }
+
+        HYPERPLATFORM_LOG_INFO("[td-map] manual map complete: base=%p entry=%p", base, entry);
+        return STATUS_SUCCESS;
+
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        HYPERPLATFORM_LOG_ERROR("[td-map] exception in TdManualMapInProcess");
+        return STATUS_UNSUCCESSFUL;
+    }
+}
+
 static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 {
     NTSTATUS st = STATUS_SUCCESS;
@@ -1429,8 +2095,6 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         KAPC_STATE apc_state;
         KeStackAttachProcess(proc, &apc_state);
 
-        SIZE_T size = PAGE_SIZE;
-        BOOLEAN used_gap = FALSE;
         ULONG gap_offset = 0, gap_avail = 0;
 
         //
@@ -1441,7 +2105,6 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         PVOID base = TdFindGapInProcess(sizeof(g_shellcode_pic) + 32, &gap_offset, &gap_avail);
         if (base)
         {
-            used_gap = TRUE;
             HYPERPLATFORM_LOG_INFO("[td] inject: section padding VA=%p+0x%X avail=0x%X pid=%llu",
                        base, gap_offset, gap_avail, p->target_pid);
         }
@@ -1449,23 +2112,18 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         if (!base)
         {
             //
-            // fallback: allocate new page (PAGE_EXECUTE_READWRITE for CFG).
+            // no gap found — refuse to inject. never allocate new memory
+            // (VirtualAlloc creates a visible VAD that anti-cheat can scan).
             //
-            st = ZwAllocateVirtualMemory(
-                ZwCurrentProcess(), &base, 0, &size,
-                MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-
-            if (!NT_SUCCESS(st) || !base)
-            {
-                KeUnstackDetachProcess(&apc_state);
-                ObDereferenceObject(proc);
-                break;
-            }
-            gap_offset = 0;  // shellcode at page start
+            HYPERPLATFORM_LOG_ERROR("[td] inject: no section gap found, aborting (no VirtualAlloc fallback)");
+            KeUnstackDetachProcess(&apc_state);
+            ObDereferenceObject(proc);
+            st = STATUS_NOT_FOUND;
+            break;
         }
 
-        HYPERPLATFORM_LOG_INFO("[td] inject: VA=%p offset=0x%X pid=%llu gap=%d",
-                   base, gap_offset, p->target_pid, used_gap);
+        HYPERPLATFORM_LOG_INFO("[td] inject: VA=%p offset=0x%X pid=%llu (gap mode)",
+                   base, gap_offset, p->target_pid);
 
         UINT64 caller_cr3 = __readcr3();
 
@@ -1485,7 +2143,6 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         PVOID fake_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'kjnI');
         if (!fake_buf)
         {
-            if (!used_gap) ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
             KeUnstackDetachProcess(&apc_state);
             ObDereferenceObject(proc);
             st = STATUS_INSUFFICIENT_RESOURCES;
@@ -1501,7 +2158,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         // no ZwProtectVirtualMemory call (AC can monitor that API).
         // user-visible page protection stays unchanged.
         //
-        if (used_gap)
+        // COW: get a private physical page for this process
         {
             UINT64 pa_before = MmGetPhysicalAddress(base).QuadPart;
 
@@ -1571,18 +2228,11 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         {
             RtlSecureZeroMemory(fake_buf, PAGE_SIZE);
             ExFreePoolWithTag(fake_buf, 'kjnI');
-            if (!used_gap) ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
             KeUnstackDetachProcess(&apc_state);
             ObDereferenceObject(proc);
             st = STATUS_UNSUCCESSFUL;
             HYPERPLATFORM_LOG_ERROR("[td] inject: PIC shellcode build failed");
             break;
-        }
-
-        if (!used_gap)
-        {
-            // fallback: zero the original page (COW → private PA)
-            RtlZeroMemory(base, PAGE_SIZE);
         }
         // gap mode: original page untouched — DLL code + zero padding stays
 
@@ -1593,7 +2243,6 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         {
             RtlSecureZeroMemory(fake_buf, PAGE_SIZE);
             ExFreePoolWithTag(fake_buf, 'kjnI');
-            if (!used_gap) ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
             KeUnstackDetachProcess(&apc_state);
             ObDereferenceObject(proc);
             st = STATUS_INSUFFICIENT_RESOURCES;
@@ -1650,28 +2299,11 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         //
         // TODO: fix #PF handler to not arm MTF for inject hook pages, then re-enable.
         //
-        if (!used_gap && TdResolveGuestPT(caller_cr3, (UINT64)base & ~0xFFFULL, &pt_pfn, &pt_idx))
-        {
-            PHYSICAL_ADDRESS ptpa;
-            ptpa.QuadPart = (LONGLONG)(pt_pfn << 12);
-            pt_real_va = MmGetVirtualForPhysical(ptpa);
-
-            pt_page_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'kjnI');
-            if (pt_page_buf)
-            {
-                if (pt_real_va)
-                    RtlCopyMemory(pt_page_buf, pt_real_va, PAGE_SIZE);
-                else
-                    RtlZeroMemory(pt_page_buf, PAGE_SIZE);
-                ((PUINT64)pt_page_buf)[pt_idx] &= ~(1ULL << 63);
-            }
-
-            HYPERPLATFORM_LOG_INFO("[td] inject: PT PFN=%llx idx=%u va=%p", pt_pfn, pt_idx, pt_real_va);
-        }
-        else if (!used_gap)
-        {
-            HYPERPLATFORM_LOG_WARN("[td] inject: WARNING -- PT walk failed, no fake PT support");
-        }
+        //
+        // fake PT disabled for gap mode — the #PF + MTF single-step conflicts
+        // with the VMCALL at shellcode entry. gap mode uses EPT X=0 path instead.
+        // PTE NX bit is already 0 (PAGE_EXECUTE_READ .text section), no fake PT needed.
+        //
 
         // --- step 6: VMCALL to set up EPT (kernel buffers only, no user VA in VMX-root) ---
         TD_HOOK_INJECT_PARAM inj_req = {};
@@ -1718,14 +2350,13 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             }
 
             p->shellcode_va = (UINT64)entry_va;
-            p->actual_size  = (UINT64)size;
+            p->actual_size  = PAGE_SIZE;
             irp->IoStatus.Information = sizeof(TD_INJECT_PARAMS);
             HYPERPLATFORM_LOG_INFO("[td] inject: EPT hook OK");
         }
         else
         {
             HYPERPLATFORM_LOG_ERROR("[td] inject: EPT hook FAILED");
-            if (!used_gap) ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &size, MEM_RELEASE);
             st = STATUS_UNSUCCESSFUL;
         }
 
@@ -1965,6 +2596,223 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         st = TdEptUnhookR3(p->target_pid, (PVOID)p->target_function_va);
         p->status = (UINT64)st;
         irp->IoStatus.Information = sizeof(TD_R3_UNHOOK_PARAMS);
+        break;
+    }
+
+    case IOCTL_INJECT_DLL:
+    {
+        //
+        // manual-map DLL injection — zero R3 API calls.
+        // buffer layout: [TD_INJECT_DLL_PARAMS header] [raw DLL bytes]
+        //
+        ULONG in_len  = io->Parameters.DeviceIoControl.InputBufferLength;
+        ULONG out_len = io->Parameters.DeviceIoControl.OutputBufferLength;
+
+        if (in_len < sizeof(TD_INJECT_DLL_PARAMS) || out_len < sizeof(TD_INJECT_DLL_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_INJECT_DLL_PARAMS * p = (TD_INJECT_DLL_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+
+        if (p->dll_offset < sizeof(TD_INJECT_DLL_PARAMS) ||
+            p->dll_size == 0 ||
+            (UINT64)p->dll_offset + p->dll_size > in_len)
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-map] invalid DLL params: offset=%u size=%u in_len=%u",
+                       p->dll_offset, p->dll_size, in_len);
+            st = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        PUINT8 raw_dll = (PUINT8)p + p->dll_offset;
+
+        HYPERPLATFORM_LOG_INFO("[td-map] IOCTL_INJECT_DLL: pid=%llu dll_size=%u",
+                   p->target_pid, p->dll_size);
+
+        // look up target process
+        PEPROCESS proc = NULL;
+        st = PsLookupProcessByProcessId((HANDLE)p->target_pid, &proc);
+        if (!NT_SUCCESS(st))
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-map] PsLookupProcessByProcessId failed: 0x%08X", st);
+            break;
+        }
+
+        KAPC_STATE apc_state;
+        KeStackAttachProcess(proc, &apc_state);
+
+        PVOID image_base  = NULL;
+        PVOID image_entry = NULL;
+
+        st = TdManualMapInProcess(proc, raw_dll, (SIZE_T)p->dll_size, &image_base, &image_entry);
+
+        if (NT_SUCCESS(st) && image_entry)
+        {
+            HYPERPLATFORM_LOG_INFO("[td-map] mapped OK: base=%p entry=%p", image_base, image_entry);
+
+            // fill output
+            PIMAGE_DOS_HEADER raw_dos = (PIMAGE_DOS_HEADER)raw_dll;
+            PIMAGE_NT_HEADERS64 raw_nt = (PIMAGE_NT_HEADERS64)(raw_dll + raw_dos->e_lfanew);
+            p->out_base  = (UINT64)image_base;
+            p->out_entry = (UINT64)image_entry;
+            p->out_size  = raw_nt->OptionalHeader.SizeOfImage;
+            irp->IoStatus.Information = sizeof(TD_INJECT_DLL_PARAMS);
+
+            //
+            // resolve NtTestAlert from ntdll (PEB walk, reuse pattern from IOCTL_INJECT)
+            //
+            PVOID trigger_fn = NULL;
+            {
+                PPEB peb = PsGetProcessPeb(proc);
+                if (peb)
+                {
+                    __try {
+                        TD_PEB_LDR_DATA * ldr = *(TD_PEB_LDR_DATA **)((PUINT8)peb + 0x18);
+                        if (ldr)
+                        {
+                            PLIST_ENTRY ldr_head = &ldr->InMemoryOrderModuleList;
+                            PLIST_ENTRY ldr_cur = ldr_head->Flink;
+                            while (ldr_cur != ldr_head)
+                            {
+                                TD_LDR_ENTRY * ldr_e = CONTAINING_RECORD(ldr_cur, TD_LDR_ENTRY, InMemoryOrderLinks);
+                                if (ldr_e->BaseDllName.Buffer &&
+                                    TdMatchDllName(ldr_e->BaseDllName.Buffer, ldr_e->BaseDllName.Length,
+                                                   g_ntdll_name, 9))
+                                {
+                                    trigger_fn = TdFindExportByName(ldr_e->DllBase, "NtTestAlert");
+                                    HYPERPLATFORM_LOG_INFO("[td-map] ntdll=%p NtTestAlert=%p",
+                                               ldr_e->DllBase, trigger_fn);
+                                    break;
+                                }
+                                ldr_cur = ldr_cur->Flink;
+                            }
+                        }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        HYPERPLATFORM_LOG_WARN("[td-map] exception resolving NtTestAlert");
+                    }
+                }
+            }
+
+            if (!trigger_fn)
+            {
+                HYPERPLATFORM_LOG_ERROR("[td-map] cannot resolve NtTestAlert");
+                st = STATUS_NOT_FOUND;
+            }
+
+            //
+            // EPT hook NtTestAlert → stub (oneshot, per-process CR3 filter)
+            //
+            UINT64 caller_cr3 = __readcr3();
+            NTSTATUS hook_st = STATUS_UNSUCCESSFUL;
+
+            if (NT_SUCCESS(st))
+            {
+                KAFFINITY old_aff = KeSetSystemAffinityThreadEx((KAFFINITY)1);  // CPU 0
+
+                PVOID dummy_origin = NULL;
+                hook_st = hv_vmcall_ex(
+                    VMCALL_EPT_HOOK,
+                    (UINT64)trigger_fn,          // target: NtTestAlert
+                    (UINT64)image_entry,         // proxy: DllMain stub
+                    (UINT64)&dummy_origin,       // origin (unused)
+                    caller_cr3,                  // caller CR3
+                    1,                           // hook_type = VMCALL (0F 01 C1)
+                    caller_cr3,                  // target_cr3 (per-process filter)
+                    0, 0, 2);                    // no user trampoline, flags bit1 = oneshot
+
+                KeRevertToUserAffinityThreadEx(old_aff);
+
+                HYPERPLATFORM_LOG_INFO("[td-map] trigger hook %s (trigger=%p -> entry=%p st=0x%08X)",
+                           NT_SUCCESS(hook_st) ? "OK" : "FAILED", trigger_fn, image_entry, hook_st);
+
+                if (!NT_SUCCESS(hook_st))
+                    st = hook_st;
+            }
+
+            KeUnstackDetachProcess(&apc_state);
+
+            //
+            // create thread at NtTestAlert (trigger) → EPT hook → DllMain stub
+            //
+            if (NT_SUCCESS(st))
+            {
+                if (g_pZwCreateThreadEx)
+                {
+                    HANDLE thr_proc_h = NULL;
+                    NTSTATUS oh_st = ObOpenObjectByPointer(
+                        proc, OBJ_KERNEL_HANDLE, NULL,
+                        PROCESS_ALL_ACCESS, *PsProcessType, KernelMode, &thr_proc_h);
+
+                    if (NT_SUCCESS(oh_st))
+                    {
+                        HANDLE thr_h = NULL;
+                        NTSTATUS thr_st = g_pZwCreateThreadEx(
+                            &thr_h, THREAD_ALL_ACCESS, NULL, thr_proc_h,
+                            trigger_fn, NULL,
+                            THREAD_CREATE_FLAGS_CREATE_SUSPENDED,
+                            0, 0, 0, NULL);
+
+                        if (NT_SUCCESS(thr_st) && thr_h)
+                        {
+                            KAFFINITY cpu0 = (KAFFINITY)1;
+                            ZwSetInformationThread(thr_h, ThreadAffinityMask, &cpu0, sizeof(cpu0));
+
+                            if (g_pZwResumeThread)
+                            {
+                                ULONG prev = 0;
+                                g_pZwResumeThread(thr_h, &prev);
+                            }
+                            else if (g_pKeResumeThread)
+                            {
+                                PETHREAD thr_obj = NULL;
+                                if (NT_SUCCESS(ObReferenceObjectByHandle(thr_h, THREAD_ALL_ACCESS,
+                                        *PsThreadType, KernelMode, (PVOID *)&thr_obj, NULL)))
+                                {
+                                    g_pKeResumeThread((PKTHREAD)thr_obj);
+                                    ObDereferenceObject(thr_obj);
+                                }
+                            }
+                            HYPERPLATFORM_LOG_INFO("[td-map] thread SUSPENDED+CPU0+RESUMED trigger=%p", trigger_fn);
+                            ZwClose(thr_h);
+                        }
+                        else
+                            HYPERPLATFORM_LOG_ERROR("[td-map] ZwCreateThreadEx failed: 0x%08X", thr_st);
+                        ZwClose(thr_proc_h);
+                    }
+                }
+                else
+                {
+                    // fallback: RtlCreateUserThread
+                    KAFFINITY old_aff = KeSetSystemAffinityThreadEx((KAFFINITY)1);
+                    KAPC_STATE thr_apc;
+                    KeStackAttachProcess(proc, &thr_apc);
+
+                    HANDLE thr_h = NULL;
+                    CLIENT_ID cid = {};
+                    NTSTATUS thr_st = RtlCreateUserThread(
+                        ZwCurrentProcess(), NULL, FALSE, 0, 0, 0,
+                        trigger_fn, NULL, &thr_h, &cid);
+
+                    if (NT_SUCCESS(thr_st) && thr_h)
+                    {
+                        KAFFINITY cpu0 = (KAFFINITY)1;
+                        ZwSetInformationThread(thr_h, ThreadAffinityMask, &cpu0, sizeof(cpu0));
+                        ZwClose(thr_h);
+                    }
+
+                    KeUnstackDetachProcess(&thr_apc);
+                    KeRevertToUserAffinityThreadEx(old_aff);
+                    HYPERPLATFORM_LOG_INFO("[td-map] fallback RtlCreateUserThread trigger=%p st=0x%08X",
+                               trigger_fn, thr_st);
+                }
+            }
+        }
+        else
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-map] TdManualMapInProcess failed: 0x%08X", st);
+            KeUnstackDetachProcess(&apc_state);
+        }
+
+        ObDereferenceObject(proc);
         break;
     }
 

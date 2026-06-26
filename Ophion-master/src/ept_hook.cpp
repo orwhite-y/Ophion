@@ -993,11 +993,33 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
             fc = fc->Flink;
             if ((UINT64)fi->virtual_address == rip)
             {
-                // oneshot: first trigger → redirect to shellcode.
-                // subsequent triggers → redirect to trampoline (original function).
+                //
+                // oneshot: first trigger → redirect to handler (shellcode).
+                // subsequent triggers → pass through to original function.
+                //
+                // can't use fi->first_trampoline_address for R3 hooks because
+                // it's in kernel pool (R3 can't execute kernel addresses → crash).
+                //
+                // instead: temporarily swap EPT to original view (real code),
+                // let CPU re-execute from the real function, arm MTF to swap back.
+                // same technique as ept_handle_violation for non-target CR3.
+                //
                 if (fi->oneshot && fi->oneshot_fired)
                 {
-                    __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->first_trampoline_address);
+                    PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,
+                        (SIZE_T)(hp->pfn_of_hooked_page << 12));
+                    if (my_pte)
+                    {
+                        EPT_PML1_ENTRY passthrough = hp->original_entry;
+                        passthrough.ExecuteAccess = 1;
+                        ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
+                        vcpu->mtf_restore_page = hp;
+                        SIZE_T pc = 0;
+                        __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+                        pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+                        __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+                    }
+                    // don't change RIP — CPU re-executes same VA from original code
                     return TRUE;
                 }
                 if (fi->oneshot)

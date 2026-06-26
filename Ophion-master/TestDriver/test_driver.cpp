@@ -301,8 +301,12 @@ static const UINT8 g_shellcode_pic[] = {
     0x49, 0xBC,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             // [6..13]
 
+    // mov r13, pSleepEx (patched at offset 16)
+    0x49, 0xBD,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             // [16..23]
+
     // sub rsp, 40h (strings on stack)
-    0x48, 0x83, 0xEC, 0x40,                                      // [14..17]
+    0x48, 0x83, 0xEC, 0x40,                                      // [24..27]
 
     // --- build "Ophion\0" at [rsp+20h] ---
     0xC7, 0x44, 0x24, 0x20,  0x4F, 0x70, 0x68, 0x69,            // "Ophi"
@@ -315,26 +319,32 @@ static const UINT8 g_shellcode_pic[] = {
     0x66, 0xC7, 0x44, 0x24, 0x38,  0x4F, 0x4B,                  // "OK"
     0xC6, 0x44, 0x24, 0x3A,  0x00,                               // \0
 
+    // --- loop_start (offset 76) ---
     // --- MessageBoxA(NULL, "Stealth OK", "Ophion", 0) ---
     0x48, 0x31, 0xC9,                                            // xor rcx, rcx
     0x48, 0x8D, 0x54, 0x24, 0x30,                                // lea rdx, [rsp+30h]
     0x4C, 0x8D, 0x44, 0x24, 0x20,                                // lea r8, [rsp+20h]
     0x45, 0x31, 0xC9,                                            // xor r9d, r9d
-    0x41, 0xFF, 0xD4,                                            // call r12
+    0x41, 0xFF, 0xD4,                                            // call r12  (MessageBoxA)
 
-    // --- epilogue ---
-    0x48, 0x83, 0xC4, 0x40,                                      // add rsp, 40h
-    0x48, 0x83, 0xC4, 0x28,                                      // add rsp, 28h
-    0x31, 0xC0,                                                   // xor eax, eax
-    0xC3,                                                         // ret
+    // --- SleepEx(3000, FALSE) ---
+    0xB9, 0xB8, 0x0B, 0x00, 0x00,                               // mov ecx, 3000
+    0x31, 0xD2,                                                   // xor edx, edx  (FALSE)
+    0x41, 0xFF, 0xD5,                                            // call r13  (SleepEx)
+
+    // --- jmp loop_start ---
+    0xEB, 0xE1,                                                   // jmp -31 (back to loop_start at offset 76)
 };
 
 #define PIC_PATCH_MESSAGEBOX   6       // offset of pMessageBoxA imm64
+#define PIC_PATCH_SLEEPEX      16      // offset of pSleepEx imm64
 
-static const WCHAR g_user32_name[] = L"user32.dll";
+static const WCHAR g_user32_name[]  = L"user32.dll";
+static const WCHAR g_kernel32_name[] = L"kernel32.dll";
 
 //
-// build PIC shellcode: resolve user32!MessageBoxA via PEB walk + export table.
+// build PIC shellcode: resolve user32!MessageBoxA + kernel32!SleepEx
+// via PEB walk + export table.
 // zero runtime API calls — all resolution done here at PASSIVE_LEVEL.
 // must be called while attached to the target process.
 //
@@ -350,7 +360,9 @@ TdBuildShellcodePIC(PVOID buf, SIZE_T buf_size)
     if (!peb) return FALSE;
 
     UINT64 pMsgBox = 0;
+    UINT64 pSleepEx = 0;
     PVOID user32_base = NULL;
+    PVOID kernel32_base = NULL;
 
     __try {
         TD_PEB_LDR_DATA * ldr = *(TD_PEB_LDR_DATA **)((PUINT8)peb + 0x18);
@@ -359,16 +371,21 @@ TdBuildShellcodePIC(PVOID buf, SIZE_T buf_size)
         PLIST_ENTRY head = &ldr->InMemoryOrderModuleList;
         PLIST_ENTRY cur = head->Flink;
 
-        // find user32.dll in PEB module list
+        // find user32.dll and kernel32.dll in PEB module list
         while (cur != head)
         {
             TD_LDR_ENTRY * e = CONTAINING_RECORD(cur, TD_LDR_ENTRY, InMemoryOrderLinks);
-            if (e->BaseDllName.Buffer &&
-                TdMatchDllName(e->BaseDllName.Buffer, e->BaseDllName.Length, g_user32_name, 10))
+            if (e->BaseDllName.Buffer)
             {
-                user32_base = e->DllBase;
-                break;
+                if (!user32_base &&
+                    TdMatchDllName(e->BaseDllName.Buffer, e->BaseDllName.Length, g_user32_name, 10))
+                    user32_base = e->DllBase;
+
+                if (!kernel32_base &&
+                    TdMatchDllName(e->BaseDllName.Buffer, e->BaseDllName.Length, g_kernel32_name, 12))
+                    kernel32_base = e->DllBase;
             }
+            if (user32_base && kernel32_base) break;
             cur = cur->Flink;
         }
 
@@ -377,26 +394,54 @@ TdBuildShellcodePIC(PVOID buf, SIZE_T buf_size)
             HYPERPLATFORM_LOG_ERROR("[td] PIC: user32.dll not found in target process");
             return FALSE;
         }
+        if (!kernel32_base)
+        {
+            HYPERPLATFORM_LOG_ERROR("[td] PIC: kernel32.dll not found in target process");
+            return FALSE;
+        }
 
         // walk user32 export table to find MessageBoxA
-        PIMAGE_DOS_HEADER dos_h = (PIMAGE_DOS_HEADER)user32_base;
-        PIMAGE_NT_HEADERS64 nt_h = (PIMAGE_NT_HEADERS64)((PUINT8)user32_base + dos_h->e_lfanew);
-        ULONG exp_rva = nt_h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-        PIMAGE_EXPORT_DIRECTORY exp_d = (PIMAGE_EXPORT_DIRECTORY)((PUINT8)user32_base + exp_rva);
-
-        PULONG names_arr = (PULONG)((PUINT8)user32_base + exp_d->AddressOfNames);
-        PUSHORT ords_arr = (PUSHORT)((PUINT8)user32_base + exp_d->AddressOfNameOrdinals);
-        PULONG funcs_arr = (PULONG)((PUINT8)user32_base + exp_d->AddressOfFunctions);
-
-        for (ULONG i = 0; i < exp_d->NumberOfNames; i++)
         {
-            const char * fn = (const char *)((PUINT8)user32_base + names_arr[i]);
-            if (fn[0] == 'M' && fn[1] == 'e' && fn[2] == 's' && fn[3] == 's' &&
-                fn[4] == 'a' && fn[5] == 'g' && fn[6] == 'e' && fn[7] == 'B' &&
-                fn[8] == 'o' && fn[9] == 'x' && fn[10] == 'A' && fn[11] == '\0')
+            PIMAGE_DOS_HEADER dos_h = (PIMAGE_DOS_HEADER)user32_base;
+            PIMAGE_NT_HEADERS64 nt_h = (PIMAGE_NT_HEADERS64)((PUINT8)user32_base + dos_h->e_lfanew);
+            ULONG exp_rva = nt_h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+            PIMAGE_EXPORT_DIRECTORY exp_d = (PIMAGE_EXPORT_DIRECTORY)((PUINT8)user32_base + exp_rva);
+            PULONG names_arr = (PULONG)((PUINT8)user32_base + exp_d->AddressOfNames);
+            PUSHORT ords_arr = (PUSHORT)((PUINT8)user32_base + exp_d->AddressOfNameOrdinals);
+            PULONG funcs_arr = (PULONG)((PUINT8)user32_base + exp_d->AddressOfFunctions);
+
+            for (ULONG i = 0; i < exp_d->NumberOfNames; i++)
             {
-                pMsgBox = (UINT64)user32_base + funcs_arr[ords_arr[i]];
-                break;
+                const char * fn = (const char *)((PUINT8)user32_base + names_arr[i]);
+                if (fn[0] == 'M' && fn[1] == 'e' && fn[2] == 's' && fn[3] == 's' &&
+                    fn[4] == 'a' && fn[5] == 'g' && fn[6] == 'e' && fn[7] == 'B' &&
+                    fn[8] == 'o' && fn[9] == 'x' && fn[10] == 'A' && fn[11] == '\0')
+                {
+                    pMsgBox = (UINT64)user32_base + funcs_arr[ords_arr[i]];
+                    break;
+                }
+            }
+        }
+
+        // walk kernel32 export table to find SleepEx
+        {
+            PIMAGE_DOS_HEADER dos_h = (PIMAGE_DOS_HEADER)kernel32_base;
+            PIMAGE_NT_HEADERS64 nt_h = (PIMAGE_NT_HEADERS64)((PUINT8)kernel32_base + dos_h->e_lfanew);
+            ULONG exp_rva = nt_h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+            PIMAGE_EXPORT_DIRECTORY exp_d = (PIMAGE_EXPORT_DIRECTORY)((PUINT8)kernel32_base + exp_rva);
+            PULONG names_arr = (PULONG)((PUINT8)kernel32_base + exp_d->AddressOfNames);
+            PUSHORT ords_arr = (PUSHORT)((PUINT8)kernel32_base + exp_d->AddressOfNameOrdinals);
+            PULONG funcs_arr = (PULONG)((PUINT8)kernel32_base + exp_d->AddressOfFunctions);
+
+            for (ULONG i = 0; i < exp_d->NumberOfNames; i++)
+            {
+                const char * fn = (const char *)((PUINT8)kernel32_base + names_arr[i]);
+                if (fn[0] == 'S' && fn[1] == 'l' && fn[2] == 'e' && fn[3] == 'e' &&
+                    fn[4] == 'p' && fn[5] == 'E' && fn[6] == 'x' && fn[7] == '\0')
+                {
+                    pSleepEx = (UINT64)kernel32_base + funcs_arr[ords_arr[i]];
+                    break;
+                }
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -409,12 +454,18 @@ TdBuildShellcodePIC(PVOID buf, SIZE_T buf_size)
         HYPERPLATFORM_LOG_ERROR("[td] PIC: MessageBoxA not found in user32 exports");
         return FALSE;
     }
+    if (!pSleepEx)
+    {
+        HYPERPLATFORM_LOG_ERROR("[td] PIC: SleepEx not found in kernel32 exports");
+        return FALSE;
+    }
 
-    // patch MessageBoxA address
+    // patch addresses
     *(PUINT64)((PUINT8)buf + PIC_PATCH_MESSAGEBOX) = pMsgBox;
+    *(PUINT64)((PUINT8)buf + PIC_PATCH_SLEEPEX)    = pSleepEx;
 
-    HYPERPLATFORM_LOG_INFO("[td] PIC: user32=%p MessageBoxA=%llx size=%u (zero API calls)",
-               user32_base, pMsgBox, (UINT32)sizeof(g_shellcode_pic));
+    HYPERPLATFORM_LOG_INFO("[td] PIC: user32=%p MessageBoxA=%llx kernel32=%p SleepEx=%llx size=%u (resident loop)",
+               user32_base, pMsgBox, kernel32_base, pSleepEx, (UINT32)sizeof(g_shellcode_pic));
     return TRUE;
 }
 
@@ -2367,42 +2418,39 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         // instead: EPT hook a legit function → redirect to entry_va (gap shellcode).
         // thread entry = trigger function (in CFG bitmap) → EPT hook → shellcode.
         //
+        // NtYieldExecution: cold function, rarely monitored by anti-cheat.
+        // takes no params, returns immediately — perfect as thread entry stub.
+        // (NtTestAlert is a well-known injection vector and heavily monitored.)
+        //
         PVOID trigger_fn = (PVOID)p->trigger_va;
-        if (!trigger_fn && NT_SUCCESS(st))
-        {
-            // auto-resolve NtTestAlert from ntdll
-            UNICODE_STRING fn_name;
-            RtlInitUnicodeString(&fn_name, L"NtTestAlert");
-            trigger_fn = MmGetSystemRoutineAddress(&fn_name);
-            // NtTestAlert is a Zw/Nt export — kernel VA. need the user-mode ntdll VA.
-            // for user-mode: walk PEB to find ntdll!NtTestAlert RVA.
-            trigger_fn = NULL;  // can't use kernel VA for R3 hook
-        }
 
         // resolve trigger from target process's ntdll via PEB walk
         if (!trigger_fn && NT_SUCCESS(st))
         {
+            // try NtYieldExecution first, fall back to RtlSetCurrentTransaction
+            static const char * trigger_candidates[] = {
+                "NtYieldExecution",
+                "RtlSetCurrentTransaction",
+                "NtTestAlert",
+                NULL
+            };
+
             PPEB peb = PsGetProcessPeb(proc);
             if (peb)
             {
-                TD_PEB_LDR_DATA * ldr = NULL;
-                PLIST_ENTRY ldr_head = NULL, ldr_cur = NULL;
-                TD_LDR_ENTRY * ldr_e = NULL;
-
                 __try {
-                    ldr = *(TD_PEB_LDR_DATA **)((PUINT8)peb + 0x18);
+                    TD_PEB_LDR_DATA * ldr = *(TD_PEB_LDR_DATA **)((PUINT8)peb + 0x18);
                     if (ldr)
                     {
-                        ldr_head = &ldr->InMemoryOrderModuleList;
-                        ldr_cur = ldr_head->Flink;
+                        PLIST_ENTRY ldr_head = &ldr->InMemoryOrderModuleList;
+                        PLIST_ENTRY ldr_cur = ldr_head->Flink;
                         while (ldr_cur != ldr_head)
                         {
-                            ldr_e = CONTAINING_RECORD(ldr_cur, TD_LDR_ENTRY, InMemoryOrderLinks);
+                            TD_LDR_ENTRY * ldr_e = CONTAINING_RECORD(ldr_cur, TD_LDR_ENTRY, InMemoryOrderLinks);
                             if (ldr_e->BaseDllName.Buffer &&
                                 TdMatchDllName(ldr_e->BaseDllName.Buffer, ldr_e->BaseDllName.Length,
                                                g_ntdll_name, 9))
                             {
-                                // find NtTestAlert export in ntdll
                                 PIMAGE_DOS_HEADER dos_h = (PIMAGE_DOS_HEADER)ldr_e->DllBase;
                                 PIMAGE_NT_HEADERS64 nt_h = (PIMAGE_NT_HEADERS64)((PUINT8)ldr_e->DllBase + dos_h->e_lfanew);
                                 ULONG exp_rva = nt_h->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
@@ -2410,15 +2458,18 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                                 PULONG names = (PULONG)((PUINT8)ldr_e->DllBase + exp_d->AddressOfNames);
                                 PUSHORT ords = (PUSHORT)((PUINT8)ldr_e->DllBase + exp_d->AddressOfNameOrdinals);
                                 PULONG funcs = (PULONG)((PUINT8)ldr_e->DllBase + exp_d->AddressOfFunctions);
-                                ULONG ei;
 
-                                for (ei = 0; ei < exp_d->NumberOfNames; ei++)
+                                for (const char ** cand = trigger_candidates; *cand && !trigger_fn; cand++)
                                 {
-                                    const char * fn = (const char *)((PUINT8)ldr_e->DllBase + names[ei]);
-                                    if (strcmp(fn, "NtTestAlert") == 0)
+                                    for (ULONG ei = 0; ei < exp_d->NumberOfNames; ei++)
                                     {
-                                        trigger_fn = (PUINT8)ldr_e->DllBase + funcs[ords[ei]];
-                                        break;
+                                        const char * fn = (const char *)((PUINT8)ldr_e->DllBase + names[ei]);
+                                        if (strcmp(fn, *cand) == 0)
+                                        {
+                                            trigger_fn = (PUINT8)ldr_e->DllBase + funcs[ords[ei]];
+                                            HYPERPLATFORM_LOG_INFO("[td] inject: trigger=%s at %p", *cand, trigger_fn);
+                                            break;
+                                        }
                                     }
                                 }
                                 break;
@@ -2449,7 +2500,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             PVOID dummy_origin = NULL;
             hook_st = hv_vmcall_ex(
                 VMCALL_EPT_HOOK,
-                (UINT64)trigger_fn,         // target: NtTestAlert
+                (UINT64)trigger_fn,         // target: NtYieldExecution
                 (UINT64)entry_va,           // proxy: shellcode in gap
                 (UINT64)&dummy_origin,      // origin (unused)
                 caller_cr3,                 // caller CR3
@@ -2473,12 +2524,13 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         //
         // trigger hook only on CPU 0's EPT → thread MUST run on CPU 0.
         // SUSPENDED → set affinity → resume.
+        // keep thread handle for async cleanup.
         //
+        HANDLE cleanup_thr_h = NULL;
         if (NT_SUCCESS(st) && p->shellcode_va)
         {
             if (g_pZwCreateThreadEx)
             {
-                // SUSPENDED + pin CPU 0 + resume
                 HANDLE thr_proc_h = NULL;
                 NTSTATUS oh_st = ObOpenObjectByPointer(
                     proc, OBJ_KERNEL_HANDLE, NULL,
@@ -2514,7 +2566,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                             }
                         }
                         HYPERPLATFORM_LOG_INFO("[td] inject: thread SUSPENDED+CPU0+RESUMED trigger=%p", trigger_fn);
-                        ZwClose(thr_h);
+                        cleanup_thr_h = thr_h;  // keep for async cleanup (don't close yet)
                     }
                     else
                         HYPERPLATFORM_LOG_ERROR("[td] inject: ZwCreateThreadEx failed: 0x%08X", thr_st);
@@ -2523,7 +2575,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             }
             else
             {
-                // fallback: pin self to CPU 0, RtlCreateUserThread (not suspended)
+                // fallback: RtlCreateUserThread
                 KAFFINITY old_aff = KeSetSystemAffinityThreadEx((KAFFINITY)1);
                 KAPC_STATE thr_apc;
                 KeStackAttachProcess(proc, &thr_apc);
@@ -2538,13 +2590,104 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 {
                     KAFFINITY cpu0 = (KAFFINITY)1;
                     ZwSetInformationThread(thr_h, ThreadAffinityMask, &cpu0, sizeof(cpu0));
-                    ZwClose(thr_h);
+                    cleanup_thr_h = thr_h;
                 }
 
                 KeUnstackDetachProcess(&thr_apc);
                 KeRevertToUserAffinityThreadEx(old_aff);
                 HYPERPLATFORM_LOG_INFO("[td] inject: fallback RtlCreateUserThread trigger=%p st=0x%08X", trigger_fn, thr_st);
             }
+        }
+
+        //
+        // --- step 10: async cleanup — unhook trigger ASAP, inject stays resident ---
+        //
+        // trigger hook only needed for first thread creation → shellcode entry.
+        // once thread is running, unhook trigger immediately to minimize
+        // EPT violation exposure on NtYieldExecution.
+        // inject page EPT stealth stays permanently — shellcode runs forever.
+        //
+        if (cleanup_thr_h && NT_SUCCESS(st))
+        {
+            // allocate cleanup context
+            struct _INJECT_CLEANUP_CTX {
+                HANDLE          thread_handle;
+                PVOID           trigger_fn;
+                PVOID           inject_entry;
+                UINT64          target_cr3;
+                UINT64          target_pid;
+                PIO_WORKITEM    work_item;
+            };
+
+            PIO_WORKITEM wi = IoAllocateWorkItem(IoGetCurrentIrpStackLocation(irp)->DeviceObject);
+            if (wi)
+            {
+                auto * ctx = (struct _INJECT_CLEANUP_CTX *)
+                    ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(struct _INJECT_CLEANUP_CTX), 'nlcI');
+
+                if (ctx)
+                {
+                    ctx->thread_handle = cleanup_thr_h;
+                    ctx->trigger_fn    = trigger_fn;
+                    ctx->inject_entry  = entry_va;
+                    ctx->target_cr3    = caller_cr3;
+                    ctx->target_pid    = p->target_pid;
+                    ctx->work_item     = wi;
+
+                    IoQueueWorkItem(wi, [](PDEVICE_OBJECT, PVOID context) {
+                        auto * c = (struct _INJECT_CLEANUP_CTX *)context;
+
+                        // short delay — let thread start executing (trigger fires once)
+                        LARGE_INTEGER delay;
+                        delay.QuadPart = -5LL * 10000000LL;  // 5 sec
+                        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+
+                        // thread handle kept open but not waited on (thread runs forever)
+                        ZwClose(c->thread_handle);
+
+                        HYPERPLATFORM_LOG_INFO("[td] cleanup: unhooking trigger, inject stays resident");
+
+                        // unhook trigger only — inject page stays
+                        PEPROCESS proc2 = NULL;
+                        if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)c->target_pid, &proc2)))
+                        {
+                            KAPC_STATE apc2;
+                            KeStackAttachProcess(proc2, &apc2);
+
+                            KAFFINITY old = KeSetSystemAffinityThreadEx((KAFFINITY)1);
+
+                            // unhook trigger (NtYieldExecution) — no longer needed
+                            hv_vmcall_ex(VMCALL_EPT_UNHOOK,
+                                (UINT64)c->trigger_fn, 0, 0,
+                                c->target_cr3, 0, 0, 0, 0, 0);
+
+                            // inject page EPT stealth KEPT — shellcode runs permanently
+                            // read view  = original DLL code (anti-cheat sees clean page)
+                            // exec view  = shadow page (shellcode loop)
+
+                            KeRevertToUserAffinityThreadEx(old);
+                            KeUnstackDetachProcess(&apc2);
+                            ObDereferenceObject(proc2);
+
+                            HYPERPLATFORM_LOG_INFO("[td] cleanup: trigger unhook=%p, inject RESIDENT=%p",
+                                       c->trigger_fn, c->inject_entry);
+                        }
+
+                        IoFreeWorkItem(c->work_item);
+                        ExFreePoolWithTag(c, 'nlcI');
+                    }, DelayedWorkQueue, ctx);
+
+                    cleanup_thr_h = NULL;  // ownership transferred to work item
+                }
+                else
+                {
+                    IoFreeWorkItem(wi);
+                }
+            }
+
+            // if work item failed, close thread handle directly
+            if (cleanup_thr_h)
+                ZwClose(cleanup_thr_h);
         }
 
         ObDereferenceObject(proc);
@@ -2658,10 +2801,13 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             irp->IoStatus.Information = sizeof(TD_INJECT_DLL_PARAMS);
 
             //
-            // resolve NtTestAlert from ntdll (PEB walk, reuse pattern from IOCTL_INJECT)
+            // resolve trigger from ntdll (NtYieldExecution preferred, cold function)
             //
             PVOID trigger_fn = NULL;
             {
+                static const char * trigger_candidates[] = {
+                    "NtYieldExecution", "RtlSetCurrentTransaction", "NtTestAlert", NULL
+                };
                 PPEB peb = PsGetProcessPeb(proc);
                 if (peb)
                 {
@@ -2678,28 +2824,31 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                                     TdMatchDllName(ldr_e->BaseDllName.Buffer, ldr_e->BaseDllName.Length,
                                                    g_ntdll_name, 9))
                                 {
-                                    trigger_fn = TdFindExportByName(ldr_e->DllBase, "NtTestAlert");
-                                    HYPERPLATFORM_LOG_INFO("[td-map] ntdll=%p NtTestAlert=%p",
-                                               ldr_e->DllBase, trigger_fn);
+                                    for (const char ** c = trigger_candidates; *c && !trigger_fn; c++)
+                                    {
+                                        trigger_fn = TdFindExportByName(ldr_e->DllBase, *c);
+                                        if (trigger_fn)
+                                            HYPERPLATFORM_LOG_INFO("[td-map] trigger=%s at %p", *c, trigger_fn);
+                                    }
                                     break;
                                 }
                                 ldr_cur = ldr_cur->Flink;
                             }
                         }
                     } __except (EXCEPTION_EXECUTE_HANDLER) {
-                        HYPERPLATFORM_LOG_WARN("[td-map] exception resolving NtTestAlert");
+                        HYPERPLATFORM_LOG_WARN("[td-map] exception resolving trigger");
                     }
                 }
             }
 
             if (!trigger_fn)
             {
-                HYPERPLATFORM_LOG_ERROR("[td-map] cannot resolve NtTestAlert");
+                HYPERPLATFORM_LOG_ERROR("[td-map] cannot resolve trigger function");
                 st = STATUS_NOT_FOUND;
             }
 
             //
-            // EPT hook NtTestAlert → stub (oneshot, per-process CR3 filter)
+            // EPT hook trigger → stub (oneshot, per-process CR3 filter)
             //
             UINT64 caller_cr3 = __readcr3();
             NTSTATUS hook_st = STATUS_UNSUCCESSFUL;
@@ -2711,7 +2860,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 PVOID dummy_origin = NULL;
                 hook_st = hv_vmcall_ex(
                     VMCALL_EPT_HOOK,
-                    (UINT64)trigger_fn,          // target: NtTestAlert
+                    (UINT64)trigger_fn,          // target: trigger function
                     (UINT64)image_entry,         // proxy: DllMain stub
                     (UINT64)&dummy_origin,       // origin (unused)
                     caller_cr3,                  // caller CR3
@@ -2731,7 +2880,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             KeUnstackDetachProcess(&apc_state);
 
             //
-            // create thread at NtTestAlert (trigger) → EPT hook → DllMain stub
+            // create thread at trigger → EPT hook → DllMain stub
             //
             if (NT_SUCCESS(st))
             {

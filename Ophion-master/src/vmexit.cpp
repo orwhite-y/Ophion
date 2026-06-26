@@ -1546,6 +1546,33 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         vcpu->advance_rip = FALSE;
         break;
 
+    case VMX_EXIT_REASON_VMX_PREEMPTION_TIMER_EXPIRED:
+    {
+        //
+        // shadow CR3 timer: restore real guest CR3.
+        // TLB still has NX=0 cached (from shadow CR3's page walk).
+        // real CR3 has NX=1 → PTE scanner sees NX=1 (clean).
+        // code continues from TLB at native speed.
+        // NO INVVPID → TLB entry preserved!
+        //
+        PEPT_STEALTH_PAGE_INFO nx_sp = vcpu->nx_timer_restore;
+        if (nx_sp && nx_sp->shadow_cr3_phys)
+        {
+            __vmx_vmwrite(VMCS_GUEST_CR3, nx_sp->real_cr3_value);
+            // NO INVVPID — preserve TLB entry (NX=0 from shadow page tables)!
+        }
+        vcpu->nx_timer_restore = NULL;
+
+        // disable preemption timer
+        SIZE_T pin = 0;
+        __vmx_vmread(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, &pin);
+        pin &= ~(SIZE_T)PIN_BASED_VM_EXEC_CTRL_VMX_PREEMPTION_TIMER;
+        __vmx_vmwrite(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, pin);
+
+        vcpu->advance_rip = FALSE;
+        break;
+    }
+
     case VMX_EXIT_REASON_EPT_MISCONFIGURATION:
     {
         //

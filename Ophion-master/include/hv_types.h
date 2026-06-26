@@ -272,6 +272,11 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     // stealth #PF swap state: target + PT EPTs swapped for execution
     //
     PEPT_STEALTH_PAGE_INFO stealth_pf_swapped;
+
+    //
+    // NX cycle: preemption timer restore (no MTF — avoids IPI ack delay)
+    //
+    PEPT_STEALTH_PAGE_INFO nx_timer_restore;
     BOOLEAN     stealth_pf_configured;  // TRUE after this CPU's VMCS has #PF interception
 
     //
@@ -422,9 +427,15 @@ typedef struct _EPT_STEALTH_PAGE_INFO {
     UINT64          guest_cr3;
     BOOLEAN         resident;           // TRUE = DLL mode (default exec view, reads swap)
 
-    // --- PT page (shared via STEALTH_FAKE_PT) ---
-    PSTEALTH_FAKE_PT fake_pt;           // shared fake PT page info (NULL for resident mode)
+    // --- PT page info ---
+    PSTEALTH_FAKE_PT fake_pt;           // shared fake PT page info (NULL = use NX cycle instead)
+    UINT64          pt_page_pfn;        // PFN of guest PT page containing our PTE
+    PVOID           pt_page_va;         // system VA of PT page (pre-computed at PASSIVE_LEVEL, VMX-root safe)
     UINT32          pt_pte_index;       // index (0-511) of our PTE in the PT page
+
+    // --- shadow CR3 (NX bypass without touching real PTE) ---
+    UINT64          shadow_cr3_phys;    // physical address of shadow PML4 (0 = not used)
+    UINT64          real_cr3_value;     // saved real guest CR3 during shadow switch
 
 } EPT_STEALTH_PAGE_INFO, *PEPT_STEALTH_PAGE_INFO;
 
@@ -454,6 +465,7 @@ typedef struct _EPT_STEALTH_ALLOC_PARAM {
     PVOID   target_page_copy;     // [in] NonPaged buffer with target page content (4KB, for shadow copy)
     BOOLEAN pt_precomputed;       // [in] TRUE = caller filled above fields at PASSIVE_LEVEL
     BOOLEAN use_fake_pt;          // [in] TRUE = create fake PT page (NX=1 visible to scanners, NX=0 in real PTE)
+    UINT64  shadow_cr3_phys;      // [in] physical address of shadow PML4 (0 = no shadow CR3)
     volatile LONG installed;      // [internal] 0→1 by first CPU
     BOOLEAN result;               // [out]
 } EPT_STEALTH_ALLOC_PARAM, *PEPT_STEALTH_ALLOC_PARAM;

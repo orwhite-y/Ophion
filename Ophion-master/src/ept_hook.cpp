@@ -826,6 +826,7 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
         //
         if (sp->fake_pt)
         {
+            // fake PT mode: swap EPT back to fake view (NX=1 visible to scanners)
             PEPT_PML1_ENTRY pt_pte = ept_get_pml1(vcpu->ept_page_table,
                 (SIZE_T)(sp->fake_pt->pt_page_pfn << 12));
             if (pt_pte)
@@ -835,19 +836,8 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
                 // NO INVEPT — preserve stealth VA's TLB entry!
             }
         }
+        // NX cycle mode uses preemption timer, not MTF — nothing to do here.
 
-        // keep execute view — shellcode reads its own data from the same page
-        if (0 && !sp->resident)
-        {
-            PEPT_PML1_ENTRY target_pte = ept_get_pml1(vcpu->ept_page_table,
-                (SIZE_T)(sp->pfn_of_target << 12));
-            if (target_pte)
-            {
-                target_pte->AsUInt = sp->original_entry.AsUInt;
-                _mm_mfence();
-                // NO INVEPT here either for oneshot — let stale TLB be
-            }
-        }
         // for resident: target page stays in execute view → code continues from TLB
 
         vcpu->stealth_pf_swapped = NULL;

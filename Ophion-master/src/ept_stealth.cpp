@@ -333,16 +333,20 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
             }
 
             // enable #PF interception on THIS CPU if fake PT is active
+            // enable #PF interception on THIS CPU for NX cycle
             if (existing->fake_pt)
             {
-                // split PT page EPT on this CPU
+                // fake PT mode: split PT page EPT on this CPU + map to fake PT
                 UINT64 pt_phys = existing->fake_pt->pt_page_pfn << 12;
                 PEPT_PML2_ENTRY pt_p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys);
                 if (pt_p2 && pt_p2->LargePage)
                     ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)pt_phys);
                 PEPT_PML1_ENTRY pt_p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys);
                 if (pt_p1) pt_p1->AsUInt = existing->fake_pt->pt_fake_entry.AsUInt;
+            }
 
+            if (existing->fake_pt || existing->shadow_cr3_phys)
+            {
                 SIZE_T exc_bitmap = 0;
                 __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
                 exc_bitmap |= (1ULL << 14);
@@ -397,7 +401,6 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
                     }
                 }
 
-                // enable #PF interception on THIS CPU if fake PT is active
                 if (existing->fake_pt)
                 {
                     UINT64 pt_phys2 = existing->fake_pt->pt_page_pfn << 12;
@@ -406,7 +409,10 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
                         ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)pt_phys2);
                     PEPT_PML1_ENTRY pt_p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys2);
                     if (pt_p1) pt_p1->AsUInt = existing->fake_pt->pt_fake_entry.AsUInt;
+                }
 
+                if (existing->fake_pt || existing->shadow_cr3_phys)
+                {
                     SIZE_T exc_bitmap = 0;
                     __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
                     exc_bitmap |= (1ULL << 14);
@@ -454,12 +460,11 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     pt_page_pfn = req->pt_page_pfn;
     pt_idx      = req->pt_pte_index;
 
-    sp->pt_pte_index = (UINT32)pt_idx;
-    sp->resident     = req->resident;
-
-    //
-    // NX clear is done by caller at PASSIVE_LEVEL (TestDriver side).
-    //
+    sp->pt_pte_index    = (UINT32)pt_idx;
+    sp->pt_page_pfn     = pt_page_pfn;
+    sp->pt_page_va      = req->pt_page_va;
+    sp->resident        = req->resident;
+    sp->shadow_cr3_phys = req->shadow_cr3_phys;
 
     if (req->use_fake_pt && req->pt_precomputed && req->pt_page_copy)
     {
@@ -585,14 +590,19 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     // CPU page walk reads fake PT (NX=1) → #PF with I/D bit (error code bit 4).
     // HV intercepts #PF → ept_stealth_handle_pf swaps to real PT (NX=0).
     //
-    if (sp->fake_pt)
+    //
+    // enable #PF interception for NX cycle:
+    //   fake_pt mode: #PF → swap to real PT (NX=0) → MTF → swap back
+    //   no-fake-pt mode: #PF → clear NX in real PTE → MTF → restore NX
+    // both require intercepting NX violations (P=1 + I/D=1).
+    //
+    if (sp->fake_pt || sp->shadow_cr3_phys)
     {
         SIZE_T exc_bitmap = 0;
         __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
         exc_bitmap |= (1ULL << 14);  // intercept #PF (vector 14)
         __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
         // only intercept NX violation: P=1 (present) + I/D=1 (instruction fetch)
-        // P=0 (not present) #PFs are demand paging — must stay in guest
         __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x11);
         __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x11);
     }
@@ -680,40 +690,84 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
 
         if (sp->guest_va != fault_page) continue;
 
-        // 1. swap PT page EPT → real view (NX=0 visible to page walker)
+        //
+        // two modes for making NX=0 visible to CPU page walker:
+        //
+        // fake PT mode: swap PT page EPT → real PT (NX=0 pre-cleared by caller)
+        //   MTF: swap back to fake PT (NX=1)
+        //
+        // NX cycle mode (no fake PT): clear NX in real PTE from VMX-root
+        //   MTF: restore NX=1 in real PTE, don't flush TLB
+        //   TLB keeps NX=0 → code continues. TLB eviction → #PF → repeat.
+        //
         if (sp->fake_pt)
         {
+            // fake PT mode
             PEPT_PML1_ENTRY pt_pte = ept_get_pml1(vcpu->ept_page_table,
                 (SIZE_T)(sp->fake_pt->pt_page_pfn << 12));
             if (pt_pte) pt_pte->AsUInt = sp->fake_pt->pt_real_entry.AsUInt;
         }
-
-        // 2. swap target page EPT → execute view (shadow page)
-        PEPT_PML1_ENTRY target_pte = ept_get_pml1(vcpu->ept_page_table,
-            (SIZE_T)(sp->pfn_of_target << 12));
-        if (target_pte) target_pte->AsUInt = sp->execute_entry.AsUInt;
-
-        // 3. record for MTF restore
-        vcpu->stealth_pf_swapped = sp;
-
-        //
-        // 4. ARM MTF — after one instruction executes (TLB entry created),
-        //    MTF fires and swaps PT page BACK to fake view (NX=1).
-        //    BUT does NOT flush the stealth VA's TLB entry.
-        //    result: CPU continues from TLB (NX=0 cached), anti-cheat sees NX=1.
-        //
+        else if (sp->shadow_cr3_phys)
         {
+            //
+            // shadow CR3 mode: swap guest CR3 to shadow page tables (NX=0).
+            // never touches real PTEs → no conflict with MiAgeWorkingSet.
+            //
+            // flow:
+            //   1. save real guest CR3
+            //   2. write shadow CR3 to VMCS_GUEST_CR3
+            //   3. INVVPID → CPU re-walks with shadow PT → NX=0 → TLB(NX=0)
+            //   4. preemption timer (~1ms) → restore real CR3
+            //   5. TLB keeps NX=0 → code runs at native speed
+            //
+            SIZE_T real_cr3 = 0;
+            __vmx_vmread(VMCS_GUEST_CR3, &real_cr3);
+            sp->real_cr3_value = real_cr3;
+
+            // build shadow CR3 value: replace PFN, keep PCID/flags
+            UINT64 shadow_cr3_val = (real_cr3 & ~PFN_MASK) | (sp->shadow_cr3_phys & PFN_MASK);
+            __vmx_vmwrite(VMCS_GUEST_CR3, shadow_cr3_val);
+
+            // arm preemption timer (~1ms)
+            {
+                UINT64 vmx_misc = __readmsr(IA32_VMX_MISC);
+                UINT32 rate_shift = (UINT32)(vmx_misc & 0x1F);
+                UINT32 timer_val = (5000000U >> rate_shift);
+                if (timer_val < 1000) timer_val = 1000;
+
+                __vmx_vmwrite(VMCS_GUEST_VMX_PREEMPTION_TIMER_VALUE, timer_val);
+                SIZE_T pin = 0;
+                __vmx_vmread(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, &pin);
+                pin |= PIN_BASED_VM_EXEC_CTRL_VMX_PREEMPTION_TIMER;
+                __vmx_vmwrite(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, pin);
+            }
+
+            vcpu->nx_timer_restore = sp;
+        }
+
+        // fake PT mode: EPT changes + MTF
+        if (sp->fake_pt)
+        {
+            PEPT_PML1_ENTRY target_pte = ept_get_pml1(vcpu->ept_page_table,
+                (SIZE_T)(sp->pfn_of_target << 12));
+            if (target_pte) target_pte->AsUInt = sp->execute_entry.AsUInt;
+
+            vcpu->stealth_pf_swapped = sp;
             SIZE_T pc = 0;
             __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
             pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
             __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+
+            _mm_mfence();
+            ept_invept_single(vcpu->ept_pointer);
+        }
+        else
+        {
+            // shadow CR3 mode: no EPT changes, no INVEPT
+            _mm_mfence();
         }
 
-        _mm_mfence();
-        ept_invept_single(vcpu->ept_pointer);
-
-        // flush guest TLB for stealth VA so CPU re-walks page table
-        // (needs to read real PT with NX=0 and build new TLB entry)
+        // flush guest TLB for stealth VA so CPU re-walks with NX=0
         INVVPID_DESCRIPTOR desc = {0};
         desc.Vpid = VPID_TAG;
         if (g_ept->invvpid_individual_addr)

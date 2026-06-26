@@ -114,12 +114,111 @@ typedef struct _TD_STEALTH_PARAM {
     PVOID   target_page_copy;   // NonPaged buffer with target page content (4KB)
     BOOLEAN pt_precomputed;     // TRUE = caller filled above fields at PASSIVE_LEVEL
     BOOLEAN use_fake_pt;        // TRUE = create fake PT page (NX hiding)
+    UINT64  shadow_cr3_phys;    // physical address of shadow PML4 (0 = no shadow CR3)
     volatile LONG installed;
     BOOLEAN result;
 } TD_STEALTH_PARAM;
 #pragma pack(pop)
 
 #define PFN_MASK_  0x000FFFFFFFFFF000ULL
+#define NX_BIT_    (1ULL << 63)
+
+// =========================================================================
+//  shadow CR3: build minimal shadow page tables with NX=0 for one page.
+//  only duplicates the 4-level path (PML4→PDPT→PD→PT) to the target VA.
+//  all other entries share real physical pages.
+//  must be called at PASSIVE_LEVEL while attached to target process.
+// =========================================================================
+
+static PVOID g_shadow_pages[16] = {};  // track for cleanup
+static UINT32 g_shadow_page_count = 0;
+
+static PVOID
+TdShadowAllocPage(VOID)
+{
+    PVOID page = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'wdhS');
+    if (!page) return NULL;
+    RtlZeroMemory(page, PAGE_SIZE);
+    if (g_shadow_page_count < 16)
+        g_shadow_pages[g_shadow_page_count++] = page;
+    return page;
+}
+
+//
+// build shadow CR3 for a target VA: 4 pages (PML4, PDPT, PD, PT).
+// the PT page has NX=0 for the target PTE, everything else is shared.
+// returns physical address of shadow PML4, or 0 on failure.
+//
+static UINT64
+TdBuildShadowCR3(UINT64 cr3, UINT64 target_va)
+{
+    UINT32 pml4_idx = (UINT32)((target_va >> 39) & 0x1FF);
+    UINT32 pdpt_idx = (UINT32)((target_va >> 30) & 0x1FF);
+    UINT32 pd_idx   = (UINT32)((target_va >> 21) & 0x1FF);
+    UINT32 pt_idx   = (UINT32)((target_va >> 12) & 0x1FF);
+
+    PHYSICAL_ADDRESS pa;
+
+    // --- read real PML4 ---
+    pa.QuadPart = (LONGLONG)(cr3 & PFN_MASK_);
+    PUINT64 real_pml4 = (PUINT64)MmGetVirtualForPhysical(pa);
+    if (!real_pml4) return 0;
+
+    PUINT64 shadow_pml4 = (PUINT64)TdShadowAllocPage();
+    if (!shadow_pml4) return 0;
+    RtlCopyMemory(shadow_pml4, real_pml4, PAGE_SIZE);
+
+    // --- read real PDPT ---
+    UINT64 pml4e = real_pml4[pml4_idx];
+    if (!(pml4e & 1)) return 0;
+    pa.QuadPart = (LONGLONG)(pml4e & PFN_MASK_);
+    PUINT64 real_pdpt = (PUINT64)MmGetVirtualForPhysical(pa);
+    if (!real_pdpt) return 0;
+
+    PUINT64 shadow_pdpt = (PUINT64)TdShadowAllocPage();
+    if (!shadow_pdpt) return 0;
+    RtlCopyMemory(shadow_pdpt, real_pdpt, PAGE_SIZE);
+
+    // PML4 entry → shadow PDPT
+    shadow_pml4[pml4_idx] = (pml4e & ~PFN_MASK_) | MmGetPhysicalAddress(shadow_pdpt).QuadPart;
+
+    // --- read real PD ---
+    UINT64 pdpe = real_pdpt[pdpt_idx];
+    if (!(pdpe & 1) || (pdpe & (1ULL << 7))) return 0;  // 1GB page
+    pa.QuadPart = (LONGLONG)(pdpe & PFN_MASK_);
+    PUINT64 real_pd = (PUINT64)MmGetVirtualForPhysical(pa);
+    if (!real_pd) return 0;
+
+    PUINT64 shadow_pd = (PUINT64)TdShadowAllocPage();
+    if (!shadow_pd) return 0;
+    RtlCopyMemory(shadow_pd, real_pd, PAGE_SIZE);
+
+    // PDPT entry → shadow PD
+    shadow_pdpt[pdpt_idx] = (pdpe & ~PFN_MASK_) | MmGetPhysicalAddress(shadow_pd).QuadPart;
+
+    // --- read real PT ---
+    UINT64 pde = real_pd[pd_idx];
+    if (!(pde & 1) || (pde & (1ULL << 7))) return 0;  // 2MB page
+    pa.QuadPart = (LONGLONG)(pde & PFN_MASK_);
+    PUINT64 real_pt = (PUINT64)MmGetVirtualForPhysical(pa);
+    if (!real_pt) return 0;
+
+    PUINT64 shadow_pt = (PUINT64)TdShadowAllocPage();
+    if (!shadow_pt) return 0;
+    RtlCopyMemory(shadow_pt, real_pt, PAGE_SIZE);
+
+    // PD entry → shadow PT
+    shadow_pd[pd_idx] = (pde & ~PFN_MASK_) | MmGetPhysicalAddress(shadow_pt).QuadPart;
+
+    // --- clear NX for target PTE ---
+    shadow_pt[pt_idx] = shadow_pt[pt_idx] & ~NX_BIT_;
+
+    UINT64 shadow_pml4_pa = MmGetPhysicalAddress(shadow_pml4).QuadPart;
+    HYPERPLATFORM_LOG_INFO("[td-rw] shadow CR3 built: PA=0x%llX (target VA=%p, NX cleared at PT[%u])",
+               shadow_pml4_pa, (PVOID)target_va, pt_idx);
+
+    return shadow_pml4_pa;
+}
 
 //
 // walk guest page tables at PASSIVE/DISPATCH level (safe, no VMX-root).
@@ -494,7 +593,8 @@ TdStealthAllocPage(
     BOOLEAN resident,
     UINT64  pt_pfn,         // pre-computed PT page PFN (from TdResolveGuestPT)
     UINT32  pt_idx,         // pre-computed PTE index within PT page
-    BOOLEAN use_fake_pt = FALSE)  // TRUE = create fake PT (NX hiding)
+    BOOLEAN use_fake_pt = FALSE,  // TRUE = create fake PT (NX hiding)
+    UINT64  shadow_cr3_phys = 0)  // shadow CR3 phys (NX=0 for target, 0=not used)
 {
     TD_STEALTH_PARAM req = {};
     req.caller_cr3       = caller_cr3;
@@ -507,6 +607,7 @@ TdStealthAllocPage(
     req.pt_page_pfn      = pt_pfn;
     req.pt_pte_index     = pt_idx;
     req.use_fake_pt      = use_fake_pt;
+    req.shadow_cr3_phys  = shadow_cr3_phys;
 
     //
     // copy PT page and target page content into NonPaged kernel buffers.
@@ -2991,12 +3092,11 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         //   1. attach to target process
         //   2. ZwAllocateVirtualMemory(PAGE_READWRITE) — own VAD, NX=1 in PTE
         //   3. build PIC shellcode into the page
-        //   3b. direct PTE write: clear NX bit (VAD stays RW, invisible to AC)
-        //       guest NX check happens BEFORE EPT — must clear or CPU #PF
         //   4. EPT stealth: shadow page = shellcode (execute view),
         //      original page zeroed (read view = clean for anti-cheat)
+        //      NX handled by HV #PF cycle (no PTE/fake PT manipulation)
         //   5. EPT hook trigger function → redirect to shellcode VA
-        //   6. create thread at trigger → EPT hook fires → shellcode executes
+        //   6. create thread at trigger → EPT hook fires → #PF → NX cycle → executes
         //   7. async cleanup: unhook trigger after delay, inject stays resident
         //
         if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_INJECT_RW_PARAMS) ||
@@ -3061,63 +3161,10 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
 
         //
-        // step 3b: clear NX bit in real PTE via direct PTE manipulation.
+        // NO PTE NX clear needed here — HV handles NX via #PF cycle:
+        //   #PF (NX=1) → VMX-root clears NX → MTF restores NX → TLB keeps NX=0
+        //   PTE always shows NX=1 to scanners. TLB eviction → #PF → repeat.
         //
-        // PAGE_READWRITE → PTE has NX=1. CPU checks guest NX BEFORE EPT,
-        // so instruction fetch would #PF before EPT can redirect to shadow.
-        // must clear NX so CPU can execute. VAD stays PAGE_READWRITE (clean).
-        //
-        // no ZwProtectVirtualMemory — that would change VAD protection
-        // (visible to anti-cheat). direct PTE write is invisible to VAD scan.
-        //
-        {
-            UINT64 nx_cr3 = __readcr3();
-            UINT64 nx_va  = (UINT64)alloc_base;
-            PHYSICAL_ADDRESS nx_pa;
-            BOOLEAN nx_cleared = FALSE;
-
-            // PML4
-            nx_pa.QuadPart = (LONGLONG)((nx_cr3 & ~0xFFFULL) + ((nx_va >> 39) & 0x1FF) * 8);
-            PUINT64 pml4e = (PUINT64)MmGetVirtualForPhysical(nx_pa);
-            if (pml4e && (*pml4e & 1))
-            {
-                // PDPT
-                nx_pa.QuadPart = (LONGLONG)((*pml4e & PFN_MASK_) + ((nx_va >> 30) & 0x1FF) * 8);
-                PUINT64 pdpe = (PUINT64)MmGetVirtualForPhysical(nx_pa);
-                if (pdpe && (*pdpe & 1) && !(*pdpe & (1ULL << 7)))
-                {
-                    // PD
-                    nx_pa.QuadPart = (LONGLONG)((*pdpe & PFN_MASK_) + ((nx_va >> 21) & 0x1FF) * 8);
-                    PUINT64 pde = (PUINT64)MmGetVirtualForPhysical(nx_pa);
-                    if (pde && (*pde & 1) && !(*pde & (1ULL << 7)))
-                    {
-                        // PT → PTE
-                        nx_pa.QuadPart = (LONGLONG)((*pde & PFN_MASK_) + ((nx_va >> 12) & 0x1FF) * 8);
-                        PUINT64 pte = (PUINT64)MmGetVirtualForPhysical(nx_pa);
-                        if (pte && (*pte & 1))
-                        {
-                            // clear NX bit (bit 63)
-                            *pte = *pte & ~(1ULL << 63);
-                            __invlpg((PVOID)nx_va);  // flush TLB for this VA
-                            nx_cleared = TRUE;
-                        }
-                    }
-                }
-            }
-
-            HYPERPLATFORM_LOG_INFO("[td-rw] PTE NX clear: %s (VA=%p)",
-                       nx_cleared ? "OK" : "FAILED", alloc_base);
-
-            if (!nx_cleared)
-            {
-                HYPERPLATFORM_LOG_ERROR("[td-rw] cannot clear NX in PTE, aborting");
-                ZwFreeVirtualMemory(ZwCurrentProcess(), &alloc_base, &alloc_size, MEM_RELEASE);
-                KeUnstackDetachProcess(&apc_state);
-                ObDereferenceObject(proc);
-                st = STATUS_UNSUCCESSFUL;
-                break;
-            }
-        }
 
         //
         // step 4: EPT stealth — shadow page gets shellcode, original page zeroed
@@ -3143,9 +3190,20 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             break;
         }
 
-        // resident mode: NULL shellcode_buffer → HV uses target_page_copy
-        // use_fake_pt = TRUE → fake PT shows NX=1 to scanners, real PTE has NX=0
-        // process exit callback (TdProcessNotify) cleans up fake PT before teardown
+        // build shadow CR3: copies page tables with NX=0 for shellcode page.
+        // never modifies real PTEs — no conflict with MiAgeWorkingSet.
+        UINT64 shadow_cr3 = TdBuildShadowCR3(caller_cr3, (UINT64)alloc_base);
+        if (!shadow_cr3)
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-rw] shadow CR3 build failed");
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &alloc_base, &alloc_size, MEM_RELEASE);
+            KeUnstackDetachProcess(&apc_state);
+            ObDereferenceObject(proc);
+            st = STATUS_UNSUCCESSFUL;
+            break;
+        }
+
+        // resident mode: shadow CR3 handles NX bypass via #PF → CR3 swap → timer restore
         BOOLEAN stealth_ok = TdStealthAllocPage(
             caller_cr3,
             alloc_base,
@@ -3155,7 +3213,8 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             TRUE,           // resident = TRUE → default execute view
             pt_pfn,
             pt_idx,
-            TRUE);          // use_fake_pt = TRUE → NX hiding via fake PT
+            FALSE,          // use_fake_pt = FALSE
+            shadow_cr3);    // shadow CR3 with NX=0 for shellcode page
 
         if (!stealth_ok)
         {

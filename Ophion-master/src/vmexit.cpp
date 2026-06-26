@@ -946,8 +946,8 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                         __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
                         exc_bitmap |= (1ULL << 14);
                         __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-                        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x10);
-                        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x10);
+                        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x11);
+                        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x11);
                     }
                     else
                     {
@@ -991,8 +991,8 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                     __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
                     exc_bitmap |= (1ULL << 14);
                     __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x10);
-                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x10);
+                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x11);
+                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x11);
                 }
 
                 _mm_mfence();
@@ -1153,8 +1153,8 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
                 exc_bitmap |= (1ULL << 14);
                 __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x10);
-                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x10);
+                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x11);
+                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x11);
             }
 
             _mm_mfence();

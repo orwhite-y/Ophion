@@ -453,6 +453,7 @@ typedef struct _EPT_STEALTH_ALLOC_PARAM {
     PVOID   pt_page_va;           // [in] system VA of real PT page (hostcr3-mapped, for MTF resync)
     PVOID   target_page_copy;     // [in] NonPaged buffer with target page content (4KB, for shadow copy)
     BOOLEAN pt_precomputed;       // [in] TRUE = caller filled above fields at PASSIVE_LEVEL
+    BOOLEAN use_fake_pt;          // [in] TRUE = create fake PT page (NX=1 visible to scanners, NX=0 in real PTE)
     volatile LONG installed;      // [internal] 0→1 by first CPU
     BOOLEAN result;               // [out]
 } EPT_STEALTH_ALLOC_PARAM, *PEPT_STEALTH_ALLOC_PARAM;

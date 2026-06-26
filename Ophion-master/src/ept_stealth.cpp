@@ -331,6 +331,26 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
                     tp1->ExecuteAccess = 0;
                 }
             }
+
+            // enable #PF interception on THIS CPU if fake PT is active
+            if (existing->fake_pt)
+            {
+                // split PT page EPT on this CPU
+                UINT64 pt_phys = existing->fake_pt->pt_page_pfn << 12;
+                PEPT_PML2_ENTRY pt_p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys);
+                if (pt_p2 && pt_p2->LargePage)
+                    ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)pt_phys);
+                PEPT_PML1_ENTRY pt_p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys);
+                if (pt_p1) pt_p1->AsUInt = existing->fake_pt->pt_fake_entry.AsUInt;
+
+                SIZE_T exc_bitmap = 0;
+                __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
+                exc_bitmap |= (1ULL << 14);
+                __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
+                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x11);
+                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x11);
+            }
+
             _mm_mfence();
             ept_invept_single(vcpu->ept_pointer);
             return TRUE;
@@ -376,6 +396,25 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
                         tp1->ExecuteAccess = 0;
                     }
                 }
+
+                // enable #PF interception on THIS CPU if fake PT is active
+                if (existing->fake_pt)
+                {
+                    UINT64 pt_phys2 = existing->fake_pt->pt_page_pfn << 12;
+                    PEPT_PML2_ENTRY pt_p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys2);
+                    if (pt_p2 && pt_p2->LargePage)
+                        ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)pt_phys2);
+                    PEPT_PML1_ENTRY pt_p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys2);
+                    if (pt_p1) pt_p1->AsUInt = existing->fake_pt->pt_fake_entry.AsUInt;
+
+                    SIZE_T exc_bitmap = 0;
+                    __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
+                    exc_bitmap |= (1ULL << 14);
+                    __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
+                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x11);
+                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x11);
+                }
+
                 _mm_mfence();
                 ept_invept_single(vcpu->ept_pointer);
                 return TRUE;
@@ -420,14 +459,39 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
 
     //
     // NX clear is done by caller at PASSIVE_LEVEL (TestDriver side).
+    //
 
-    //
-    // EPT-only stealth: no fake PT page manipulation.
-    // execute → EPT violation → swap to shadow page (execute view)
-    // read/write → sees original page (read view)
-    // simpler and doesn't corrupt other PTEs in the same PT page.
-    //
-    sp->fake_pt = NULL;  // no fake PT
+    if (req->use_fake_pt && req->pt_precomputed && req->pt_page_copy)
+    {
+        //
+        // fake PT mode: create shared fake PT page with NX=1 for our entry.
+        // real PTE has NX=0 (cleared by caller at PASSIVE_LEVEL).
+        // anti-cheat reads fake PT → sees NX=1 → page looks non-executable.
+        // CPU page walk → #PF (NX=1 in fake PT) → HV swaps to real PT (NX=0)
+        // → TLB entry (NX=0) → MTF → swap back to fake PT.
+        //
+        sp->fake_pt = stealth_get_or_create_fake_pt(
+            vcpu, pt_page_pfn, req->pt_page_copy, req->pt_page_va);
+
+        if (sp->fake_pt)
+        {
+            sp->pt_pte_index = (UINT32)pt_idx;
+            stealth_fake_pt_set_nx(sp->fake_pt, sp->pt_pte_index);
+
+            _mm_mfence();
+            ept_invept_single(vcpu->ept_pointer);
+        }
+    }
+    else
+    {
+        //
+        // EPT-only stealth: no fake PT page manipulation.
+        // execute → EPT violation → swap to shadow page (execute view)
+        // read/write → sees original page (read view)
+        // simpler and doesn't corrupt other PTEs in the same PT page.
+        //
+        sp->fake_pt = NULL;
+    }
 
     // --- allocate shadow page from contiguous region ---
     sp->shadow_page = stealth_region_alloc_page(&sp->pfn_of_shadow);
@@ -516,7 +580,22 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
         target_pte->ExecuteAccess = 0;
     }
 
-    // no #PF interception needed — pure EPT violation driven
+    //
+    // enable #PF interception if fake PT is active.
+    // CPU page walk reads fake PT (NX=1) → #PF with I/D bit (error code bit 4).
+    // HV intercepts #PF → ept_stealth_handle_pf swaps to real PT (NX=0).
+    //
+    if (sp->fake_pt)
+    {
+        SIZE_T exc_bitmap = 0;
+        __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
+        exc_bitmap |= (1ULL << 14);  // intercept #PF (vector 14)
+        __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
+        // only intercept NX violation: P=1 (present) + I/D=1 (instruction fetch)
+        // P=0 (not present) #PFs are demand paging — must stay in guest
+        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x11);
+        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x11);
+    }
 
     InsertHeadList(&g_ept->stealth_pages, &sp->stealth_page_list);
 
@@ -816,6 +895,7 @@ ept_stealth_uninstall(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_FREE_PARAM req)
 {
     if (!g_ept || !req->target_va) return FALSE;
     UINT64 target_pfn = (req->target_phys & ~0xFFFULL) >> 12;
+    UINT64 target_gva = (UINT64)req->target_va & ~0xFFFULL;
 
     if (_InterlockedCompareExchange(&req->freed, 1, 0) == 0)
     {
@@ -825,7 +905,8 @@ ept_stealth_uninstall(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_FREE_PARAM req)
             PEPT_STEALTH_PAGE_INFO sp = CONTAINING_RECORD(cur, EPT_STEALTH_PAGE_INFO, stealth_page_list);
             cur = cur->Flink;
 
-            if (sp->pfn_of_target != target_pfn) continue;
+            // match by PFN (normal) or by guest VA (fallback when phys unavailable on process exit)
+            if (sp->pfn_of_target != target_pfn && sp->guest_va != target_gva) continue;
 
             // restore NX in real PTE
             if (sp->fake_pt)
@@ -841,13 +922,18 @@ ept_stealth_uninstall(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_FREE_PARAM req)
                 sp->fake_pt->ref_count--;
                 if (sp->fake_pt->ref_count == 0)
                 {
-                    // restore PT page EPT to RWX
-                    PEPT_PML1_ENTRY pp = ept_get_pml1(vcpu->ept_page_table,
-                        (SIZE_T)(sp->fake_pt->pt_page_pfn << 12));
-                    if (pp)
+                    // restore PT page EPT to RWX on ALL CPUs
+                    // (install set fake PT EPT on every CPU via "already installed" path)
+                    for (UINT32 ci = 0; ci < g_cpu_count; ci++)
                     {
-                        pp->ReadAccess = 1; pp->WriteAccess = 1; pp->ExecuteAccess = 1;
-                        pp->PageFrameNumber = sp->fake_pt->pt_page_pfn;
+                        if (!g_vcpu[ci].ept_page_table) continue;
+                        PEPT_PML1_ENTRY pp = ept_get_pml1(g_vcpu[ci].ept_page_table,
+                            (SIZE_T)(sp->fake_pt->pt_page_pfn << 12));
+                        if (pp)
+                        {
+                            pp->ReadAccess = 1; pp->WriteAccess = 1; pp->ExecuteAccess = 1;
+                            pp->PageFrameNumber = sp->fake_pt->pt_page_pfn;
+                        }
                     }
                     RemoveEntryList(&sp->fake_pt->fake_pt_list);
                     pool_manager_release(sp->fake_pt);

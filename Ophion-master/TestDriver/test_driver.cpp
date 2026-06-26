@@ -60,6 +60,7 @@ typedef struct _TD_PEB_LDR_DATA {
 // ---- VMCALL interface (must match Ophion hv_types.h) ----
 
 #define VMCALL_STEALTH_ALLOC    0x00000006
+#define VMCALL_STEALTH_FREE     0x00000007
 #define VMCALL_EPT_HOOK_INJECT  0x00000008
 
 //
@@ -112,6 +113,7 @@ typedef struct _TD_STEALTH_PARAM {
     PVOID   pt_page_va;         // system VA of real PT page (for MTF resync)
     PVOID   target_page_copy;   // NonPaged buffer with target page content (4KB)
     BOOLEAN pt_precomputed;     // TRUE = caller filled above fields at PASSIVE_LEVEL
+    BOOLEAN use_fake_pt;        // TRUE = create fake PT page (NX hiding)
     volatile LONG installed;
     BOOLEAN result;
 } TD_STEALTH_PARAM;
@@ -154,6 +156,9 @@ TdResolveGuestPT(UINT64 cr3, UINT64 va, UINT64 * out_pt_pfn, UINT32 * out_pte_id
     *out_pte_idx = (UINT32)((va >> 12) & 0x1FF);
     return TRUE;
 }
+
+// ---- forward declarations ----
+static VOID TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size);
 
 // ---- assembly VMCALL (vmcall.asm) ----
 
@@ -488,7 +493,8 @@ TdStealthAllocPage(
     UINT32  sc_size,        // shellcode size for this page
     BOOLEAN resident,
     UINT64  pt_pfn,         // pre-computed PT page PFN (from TdResolveGuestPT)
-    UINT32  pt_idx)         // pre-computed PTE index within PT page
+    UINT32  pt_idx,         // pre-computed PTE index within PT page
+    BOOLEAN use_fake_pt = FALSE)  // TRUE = create fake PT (NX hiding)
 {
     TD_STEALTH_PARAM req = {};
     req.caller_cr3       = caller_cr3;
@@ -500,6 +506,7 @@ TdStealthAllocPage(
     req.resident         = resident;
     req.pt_page_pfn      = pt_pfn;
     req.pt_pte_index     = pt_idx;
+    req.use_fake_pt      = use_fake_pt;
 
     //
     // copy PT page and target page content into NonPaged kernel buffers.
@@ -1436,6 +1443,16 @@ TdFindGapInProcess(SIZE_T min_size, ULONG * out_offset, ULONG * out_avail)
 // =========================================================================
 
 #define IOCTL_INJECT_DLL CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 5, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_INJECT_RW  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 6, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#pragma pack(push, 8)
+typedef struct _TD_INJECT_RW_PARAMS {
+    UINT64 target_pid;
+    UINT64 trigger_va;      // [in]  R3 function to hook as trigger (0 = auto)
+    UINT64 shellcode_va;    // [out] allocated VA
+    UINT64 alloc_size;      // [out] allocated size
+} TD_INJECT_RW_PARAMS;
+#pragma pack(pop)
 
 #pragma pack(push, 8)
 typedef struct _TD_INJECT_DLL_PARAMS {
@@ -2965,6 +2982,444 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         break;
     }
 
+    case IOCTL_INJECT_RW:
+    {
+        //
+        // RW-alloc + EPT stealth + trigger hook injection.
+        //
+        // flow:
+        //   1. attach to target process
+        //   2. ZwAllocateVirtualMemory(PAGE_READWRITE) — own VAD, NX=1 in PTE
+        //   3. build PIC shellcode into the page
+        //   3b. direct PTE write: clear NX bit (VAD stays RW, invisible to AC)
+        //       guest NX check happens BEFORE EPT — must clear or CPU #PF
+        //   4. EPT stealth: shadow page = shellcode (execute view),
+        //      original page zeroed (read view = clean for anti-cheat)
+        //   5. EPT hook trigger function → redirect to shellcode VA
+        //   6. create thread at trigger → EPT hook fires → shellcode executes
+        //   7. async cleanup: unhook trigger after delay, inject stays resident
+        //
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_INJECT_RW_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_INJECT_RW_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_INJECT_RW_PARAMS * p = (TD_INJECT_RW_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+
+        PEPROCESS proc = NULL;
+        st = PsLookupProcessByProcessId((HANDLE)p->target_pid, &proc);
+        if (!NT_SUCCESS(st)) break;
+
+        KAPC_STATE apc_state;
+        KeStackAttachProcess(proc, &apc_state);
+
+        //
+        // step 1: allocate PAGE_READWRITE in target process
+        //
+        SIZE_T alloc_size = PAGE_SIZE;
+        PVOID  alloc_base = NULL;
+
+        st = ZwAllocateVirtualMemory(
+            ZwCurrentProcess(), &alloc_base, 0, &alloc_size,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+        if (!NT_SUCCESS(st) || !alloc_base)
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-rw] ZwAllocateVirtualMemory failed: 0x%08X", st);
+            KeUnstackDetachProcess(&apc_state);
+            ObDereferenceObject(proc);
+            break;
+        }
+
+        HYPERPLATFORM_LOG_INFO("[td-rw] allocated RW page: VA=%p size=0x%llX pid=%llu",
+                   alloc_base, (UINT64)alloc_size, p->target_pid);
+
+        //
+        // step 2: build PIC shellcode directly into the allocated page
+        //
+        if (!TdBuildShellcodePIC(alloc_base, alloc_size))
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-rw] PIC shellcode build failed");
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &alloc_base, &alloc_size, MEM_RELEASE);
+            KeUnstackDetachProcess(&apc_state);
+            ObDereferenceObject(proc);
+            st = STATUS_UNSUCCESSFUL;
+            break;
+        }
+
+        //
+        // step 3: get physical address (page already committed by shellcode write)
+        //
+        UINT64 page_phys = MmGetPhysicalAddress(alloc_base).QuadPart;
+        if (!page_phys)
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-rw] MmGetPhysicalAddress=0 for VA=%p", alloc_base);
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &alloc_base, &alloc_size, MEM_RELEASE);
+            KeUnstackDetachProcess(&apc_state);
+            ObDereferenceObject(proc);
+            st = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+
+        //
+        // step 3b: clear NX bit in real PTE via direct PTE manipulation.
+        //
+        // PAGE_READWRITE → PTE has NX=1. CPU checks guest NX BEFORE EPT,
+        // so instruction fetch would #PF before EPT can redirect to shadow.
+        // must clear NX so CPU can execute. VAD stays PAGE_READWRITE (clean).
+        //
+        // no ZwProtectVirtualMemory — that would change VAD protection
+        // (visible to anti-cheat). direct PTE write is invisible to VAD scan.
+        //
+        {
+            UINT64 nx_cr3 = __readcr3();
+            UINT64 nx_va  = (UINT64)alloc_base;
+            PHYSICAL_ADDRESS nx_pa;
+            BOOLEAN nx_cleared = FALSE;
+
+            // PML4
+            nx_pa.QuadPart = (LONGLONG)((nx_cr3 & ~0xFFFULL) + ((nx_va >> 39) & 0x1FF) * 8);
+            PUINT64 pml4e = (PUINT64)MmGetVirtualForPhysical(nx_pa);
+            if (pml4e && (*pml4e & 1))
+            {
+                // PDPT
+                nx_pa.QuadPart = (LONGLONG)((*pml4e & PFN_MASK_) + ((nx_va >> 30) & 0x1FF) * 8);
+                PUINT64 pdpe = (PUINT64)MmGetVirtualForPhysical(nx_pa);
+                if (pdpe && (*pdpe & 1) && !(*pdpe & (1ULL << 7)))
+                {
+                    // PD
+                    nx_pa.QuadPart = (LONGLONG)((*pdpe & PFN_MASK_) + ((nx_va >> 21) & 0x1FF) * 8);
+                    PUINT64 pde = (PUINT64)MmGetVirtualForPhysical(nx_pa);
+                    if (pde && (*pde & 1) && !(*pde & (1ULL << 7)))
+                    {
+                        // PT → PTE
+                        nx_pa.QuadPart = (LONGLONG)((*pde & PFN_MASK_) + ((nx_va >> 12) & 0x1FF) * 8);
+                        PUINT64 pte = (PUINT64)MmGetVirtualForPhysical(nx_pa);
+                        if (pte && (*pte & 1))
+                        {
+                            // clear NX bit (bit 63)
+                            *pte = *pte & ~(1ULL << 63);
+                            __invlpg((PVOID)nx_va);  // flush TLB for this VA
+                            nx_cleared = TRUE;
+                        }
+                    }
+                }
+            }
+
+            HYPERPLATFORM_LOG_INFO("[td-rw] PTE NX clear: %s (VA=%p)",
+                       nx_cleared ? "OK" : "FAILED", alloc_base);
+
+            if (!nx_cleared)
+            {
+                HYPERPLATFORM_LOG_ERROR("[td-rw] cannot clear NX in PTE, aborting");
+                ZwFreeVirtualMemory(ZwCurrentProcess(), &alloc_base, &alloc_size, MEM_RELEASE);
+                KeUnstackDetachProcess(&apc_state);
+                ObDereferenceObject(proc);
+                st = STATUS_UNSUCCESSFUL;
+                break;
+            }
+        }
+
+        //
+        // step 4: EPT stealth — shadow page gets shellcode, original page zeroed
+        //
+        // use resident mode: shellcode_buffer = NULL → HV copies from
+        // target_page_copy (kernel NonPaged buffer, safe on any CPU).
+        // the shellcode is already written in the page, so target_page_copy
+        // contains the shellcode content → shadow page gets it.
+        // EPT: execute → shadow (shellcode), read/write → original (zeros).
+        //
+        UINT64 caller_cr3 = __readcr3();
+
+        // pre-compute PT info at PASSIVE level
+        UINT64 pt_pfn = 0;
+        UINT32 pt_idx = 0;
+        if (!TdResolveGuestPT(caller_cr3, (UINT64)alloc_base & ~0xFFFULL, &pt_pfn, &pt_idx))
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-rw] PT walk failed for VA=%p", alloc_base);
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &alloc_base, &alloc_size, MEM_RELEASE);
+            KeUnstackDetachProcess(&apc_state);
+            ObDereferenceObject(proc);
+            st = STATUS_UNSUCCESSFUL;
+            break;
+        }
+
+        // resident mode: NULL shellcode_buffer → HV uses target_page_copy
+        // use_fake_pt = TRUE → fake PT shows NX=1 to scanners, real PTE has NX=0
+        // process exit callback (TdProcessNotify) cleans up fake PT before teardown
+        BOOLEAN stealth_ok = TdStealthAllocPage(
+            caller_cr3,
+            alloc_base,
+            page_phys,
+            NULL,           // shellcode_buffer = NULL → resident copies from target_page_copy
+            0,              // shellcode_size = 0
+            TRUE,           // resident = TRUE → default execute view
+            pt_pfn,
+            pt_idx,
+            TRUE);          // use_fake_pt = TRUE → NX hiding via fake PT
+
+        if (!stealth_ok)
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-rw] EPT stealth setup failed");
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &alloc_base, &alloc_size, MEM_RELEASE);
+            KeUnstackDetachProcess(&apc_state);
+            ObDereferenceObject(proc);
+            st = STATUS_UNSUCCESSFUL;
+            break;
+        }
+
+        //
+        // step 5: zero the original page — read view is now clean
+        // EPT stealth is already active, so execute view (shadow) is untouched.
+        //
+        RtlZeroMemory(alloc_base, alloc_size);
+
+        HYPERPLATFORM_LOG_INFO("[td-rw] EPT stealth OK, original page zeroed");
+
+        // track for process exit cleanup (fake PT removal)
+        TdStealthTrackAdd(p->target_pid, alloc_base, alloc_size);
+
+        //
+        // step 6: fill output
+        //
+        p->shellcode_va = (UINT64)alloc_base;
+        p->alloc_size   = alloc_size;
+        irp->IoStatus.Information = sizeof(TD_INJECT_RW_PARAMS);
+
+        //
+        // step 7: resolve trigger function from ntdll
+        //
+        PVOID trigger_fn = (PVOID)p->trigger_va;
+        if (!trigger_fn)
+        {
+            static const char * trigger_candidates[] = {
+                "NtYieldExecution", "RtlSetCurrentTransaction", "NtTestAlert", NULL
+            };
+            PPEB peb = PsGetProcessPeb(proc);
+            if (peb)
+            {
+                __try {
+                    TD_PEB_LDR_DATA * ldr = *(TD_PEB_LDR_DATA **)((PUINT8)peb + 0x18);
+                    if (ldr)
+                    {
+                        PLIST_ENTRY ldr_head = &ldr->InMemoryOrderModuleList;
+                        PLIST_ENTRY ldr_cur = ldr_head->Flink;
+                        while (ldr_cur != ldr_head)
+                        {
+                            TD_LDR_ENTRY * ldr_e = CONTAINING_RECORD(ldr_cur, TD_LDR_ENTRY, InMemoryOrderLinks);
+                            if (ldr_e->BaseDllName.Buffer &&
+                                TdMatchDllName(ldr_e->BaseDllName.Buffer, ldr_e->BaseDllName.Length,
+                                               g_ntdll_name, 9))
+                            {
+                                for (const char ** c = trigger_candidates; *c && !trigger_fn; c++)
+                                {
+                                    trigger_fn = TdFindExportByName(ldr_e->DllBase, *c);
+                                    if (trigger_fn)
+                                        HYPERPLATFORM_LOG_INFO("[td-rw] trigger=%s at %p", *c, trigger_fn);
+                                }
+                                break;
+                            }
+                            ldr_cur = ldr_cur->Flink;
+                        }
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    HYPERPLATFORM_LOG_WARN("[td-rw] exception resolving trigger");
+                }
+            }
+        }
+
+        if (!trigger_fn)
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-rw] cannot resolve trigger function");
+            st = STATUS_NOT_FOUND;
+        }
+
+        //
+        // step 8: EPT hook trigger → shellcode VA (oneshot, per-process CR3 filter)
+        //
+        NTSTATUS hook_st = STATUS_UNSUCCESSFUL;
+        if (NT_SUCCESS(st))
+        {
+            KAFFINITY old_aff = KeSetSystemAffinityThreadEx((KAFFINITY)1);  // CPU 0
+
+            PVOID dummy_origin = NULL;
+            hook_st = hv_vmcall_ex(
+                VMCALL_EPT_HOOK,
+                (UINT64)trigger_fn,         // target: NtYieldExecution etc.
+                (UINT64)alloc_base,         // proxy: shellcode in RW page
+                (UINT64)&dummy_origin,      // origin (unused)
+                caller_cr3,                 // caller CR3
+                1,                          // hook_type = VMCALL (0F 01 C1)
+                caller_cr3,                 // target_cr3 (per-process filter)
+                0, 0, 2);                   // no user trampoline, flags bit1 = oneshot
+
+            KeRevertToUserAffinityThreadEx(old_aff);
+
+            HYPERPLATFORM_LOG_INFO("[td-rw] trigger hook %s (trigger=%p -> sc=%p st=0x%08X)",
+                       NT_SUCCESS(hook_st) ? "OK" : "FAILED", trigger_fn, alloc_base, hook_st);
+
+            if (!NT_SUCCESS(hook_st))
+                st = hook_st;
+        }
+
+        KeUnstackDetachProcess(&apc_state);
+
+        //
+        // step 9: create thread at trigger, pin to CPU 0
+        //
+        HANDLE cleanup_thr_h = NULL;
+        if (NT_SUCCESS(st))
+        {
+            if (g_pZwCreateThreadEx)
+            {
+                HANDLE thr_proc_h = NULL;
+                NTSTATUS oh_st = ObOpenObjectByPointer(
+                    proc, OBJ_KERNEL_HANDLE, NULL,
+                    PROCESS_ALL_ACCESS, *PsProcessType, KernelMode, &thr_proc_h);
+
+                if (NT_SUCCESS(oh_st))
+                {
+                    HANDLE thr_h = NULL;
+                    NTSTATUS thr_st = g_pZwCreateThreadEx(
+                        &thr_h, THREAD_ALL_ACCESS, NULL, thr_proc_h,
+                        trigger_fn, NULL,
+                        THREAD_CREATE_FLAGS_CREATE_SUSPENDED,
+                        0, 0, 0, NULL);
+
+                    if (NT_SUCCESS(thr_st) && thr_h)
+                    {
+                        KAFFINITY cpu0 = (KAFFINITY)1;
+                        ZwSetInformationThread(thr_h, ThreadAffinityMask, &cpu0, sizeof(cpu0));
+
+                        if (g_pZwResumeThread)
+                        {
+                            ULONG prev = 0;
+                            g_pZwResumeThread(thr_h, &prev);
+                        }
+                        else if (g_pKeResumeThread)
+                        {
+                            PETHREAD thr_obj = NULL;
+                            if (NT_SUCCESS(ObReferenceObjectByHandle(thr_h, THREAD_ALL_ACCESS,
+                                    *PsThreadType, KernelMode, (PVOID *)&thr_obj, NULL)))
+                            {
+                                g_pKeResumeThread((PKTHREAD)thr_obj);
+                                ObDereferenceObject(thr_obj);
+                            }
+                        }
+                        HYPERPLATFORM_LOG_INFO("[td-rw] thread SUSPENDED+CPU0+RESUMED trigger=%p", trigger_fn);
+                        cleanup_thr_h = thr_h;
+                    }
+                    else
+                        HYPERPLATFORM_LOG_ERROR("[td-rw] ZwCreateThreadEx failed: 0x%08X", thr_st);
+                    ZwClose(thr_proc_h);
+                }
+            }
+            else
+            {
+                // fallback: RtlCreateUserThread
+                KAFFINITY old_aff = KeSetSystemAffinityThreadEx((KAFFINITY)1);
+                KAPC_STATE thr_apc;
+                KeStackAttachProcess(proc, &thr_apc);
+
+                HANDLE thr_h = NULL;
+                CLIENT_ID cid = {};
+                NTSTATUS thr_st = RtlCreateUserThread(
+                    ZwCurrentProcess(), NULL, FALSE, 0, 0, 0,
+                    trigger_fn, NULL, &thr_h, &cid);
+
+                if (NT_SUCCESS(thr_st) && thr_h)
+                {
+                    KAFFINITY cpu0 = (KAFFINITY)1;
+                    ZwSetInformationThread(thr_h, ThreadAffinityMask, &cpu0, sizeof(cpu0));
+                    cleanup_thr_h = thr_h;
+                }
+
+                KeUnstackDetachProcess(&thr_apc);
+                KeRevertToUserAffinityThreadEx(old_aff);
+                HYPERPLATFORM_LOG_INFO("[td-rw] fallback RtlCreateUserThread trigger=%p st=0x%08X",
+                           trigger_fn, thr_st);
+            }
+        }
+
+        //
+        // step 10: async cleanup — unhook trigger after delay, inject stays resident
+        //
+        if (cleanup_thr_h && NT_SUCCESS(st))
+        {
+            struct _RW_CLEANUP_CTX {
+                HANDLE          thread_handle;
+                PVOID           trigger_fn;
+                PVOID           shellcode_va;
+                UINT64          target_cr3;
+                UINT64          target_pid;
+                PIO_WORKITEM    work_item;
+            };
+
+            PIO_WORKITEM wi = IoAllocateWorkItem(IoGetCurrentIrpStackLocation(irp)->DeviceObject);
+            if (wi)
+            {
+                auto * ctx = (struct _RW_CLEANUP_CTX *)
+                    ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(struct _RW_CLEANUP_CTX), 'wRcI');
+
+                if (ctx)
+                {
+                    ctx->thread_handle = cleanup_thr_h;
+                    ctx->trigger_fn    = trigger_fn;
+                    ctx->shellcode_va  = alloc_base;
+                    ctx->target_cr3    = caller_cr3;
+                    ctx->target_pid    = p->target_pid;
+                    ctx->work_item     = wi;
+
+                    IoQueueWorkItem(wi, [](PDEVICE_OBJECT, PVOID context) {
+                        auto * c = (struct _RW_CLEANUP_CTX *)context;
+
+                        // short delay — let thread start executing (trigger fires once)
+                        LARGE_INTEGER delay;
+                        delay.QuadPart = -5LL * 10000000LL;  // 5 sec
+                        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+
+                        ZwClose(c->thread_handle);
+
+                        HYPERPLATFORM_LOG_INFO("[td-rw] cleanup: unhooking trigger, inject stays resident");
+
+                        // unhook trigger only — inject EPT stealth stays permanently
+                        PEPROCESS proc2 = NULL;
+                        if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)c->target_pid, &proc2)))
+                        {
+                            KAPC_STATE apc2;
+                            KeStackAttachProcess(proc2, &apc2);
+
+                            KAFFINITY old = KeSetSystemAffinityThreadEx((KAFFINITY)1);
+
+                            hv_vmcall_ex(VMCALL_EPT_UNHOOK,
+                                (UINT64)c->trigger_fn, 0, 0,
+                                c->target_cr3, 0, 0, 0, 0, 0);
+
+                            KeRevertToUserAffinityThreadEx(old);
+                            KeUnstackDetachProcess(&apc2);
+                            ObDereferenceObject(proc2);
+
+                            HYPERPLATFORM_LOG_INFO("[td-rw] cleanup: trigger unhook=%p, inject RESIDENT=%p",
+                                       c->trigger_fn, c->shellcode_va);
+                        }
+
+                        IoFreeWorkItem(c->work_item);
+                        ExFreePoolWithTag(c, 'wRcI');
+                    }, DelayedWorkQueue, ctx);
+
+                    cleanup_thr_h = NULL;  // ownership transferred
+                }
+                else
+                    IoFreeWorkItem(wi);
+            }
+
+            if (cleanup_thr_h)
+                ZwClose(cleanup_thr_h);
+        }
+
+        ObDereferenceObject(proc);
+        break;
+    }
+
     default:
         st = STATUS_INVALID_DEVICE_REQUEST;
         break;
@@ -2976,11 +3431,129 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 }
 
 // =========================================================================
+//  stealth inject tracking + process exit cleanup
+// =========================================================================
+
+//
+// free param struct — must match Ophion's EPT_STEALTH_FREE_PARAM
+//
+#pragma pack(push, 8)
+typedef struct _TD_STEALTH_FREE_PARAM {
+    UINT64  caller_cr3;
+    PVOID   target_va;
+    UINT64  target_phys;
+    volatile LONG freed;
+    BOOLEAN result;
+} TD_STEALTH_FREE_PARAM;
+#pragma pack(pop)
+
+//
+// track stealth inject allocations for process exit cleanup
+//
+#define MAX_STEALTH_TRACKS 64
+typedef struct _STEALTH_TRACK_ENTRY {
+    BOOLEAN active;
+    UINT64  target_pid;
+    PVOID   target_va;
+    SIZE_T  alloc_size;
+} STEALTH_TRACK_ENTRY;
+
+static STEALTH_TRACK_ENTRY g_stealth_tracks[MAX_STEALTH_TRACKS] = {};
+
+static VOID
+TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size)
+{
+    for (int i = 0; i < MAX_STEALTH_TRACKS; i++)
+    {
+        if (!g_stealth_tracks[i].active)
+        {
+            g_stealth_tracks[i].target_pid  = pid;
+            g_stealth_tracks[i].target_va   = va;
+            g_stealth_tracks[i].alloc_size  = size;
+            g_stealth_tracks[i].active      = TRUE;
+            return;
+        }
+    }
+}
+
+//
+// free one stealth page via DPC broadcast → VMCALL_STEALTH_FREE
+// must be called while attached to the target process.
+//
+static BOOLEAN
+TdStealthFreePage(PVOID target_va)
+{
+    if (!target_va) return FALSE;
+    UINT64 phys = MmGetPhysicalAddress(target_va).QuadPart;
+    // phys may be 0 if page already freed/paged — still try VMCALL with VA match
+    TD_STEALTH_FREE_PARAM req = {};
+    req.caller_cr3  = __readcr3();
+    req.target_va   = target_va;
+    req.target_phys = phys;
+
+    KeGenericCallDpc([](PKDPC, PVOID Ctx, PVOID A1, PVOID A2) {
+        hv_vmcall_simple(VMCALL_STEALTH_FREE, (UINT64)Ctx, 0, 0);
+        KeSignalCallDpcSynchronize(A2);
+        KeSignalCallDpcDone(A1);
+    }, &req);
+    return req.result;
+}
+
+//
+// process exit callback — clean up stealth pages + fake PT before
+// MiDeleteFinalPageTables destroys the address space.
+//
+static VOID
+TdProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo)
+{
+    UNREFERENCED_PARAMETER(Process);
+
+    // only care about process EXIT (CreateInfo == NULL)
+    if (CreateInfo != NULL) return;
+
+    UINT64 pid = (UINT64)ProcessId;
+
+    for (int i = 0; i < MAX_STEALTH_TRACKS; i++)
+    {
+        if (!g_stealth_tracks[i].active || g_stealth_tracks[i].target_pid != pid)
+            continue;
+
+        PVOID va   = g_stealth_tracks[i].target_va;
+        SIZE_T sz  = g_stealth_tracks[i].alloc_size;
+        g_stealth_tracks[i].active = FALSE;
+
+        HYPERPLATFORM_LOG_INFO("[td-rw] process exit cleanup: pid=%llu va=%p size=0x%llX",
+                   pid, va, (UINT64)sz);
+
+        // attach to the exiting process to free stealth pages
+        KAPC_STATE apc;
+        KeStackAttachProcess(Process, &apc);
+
+        UINT64 base = (UINT64)va & ~0xFFFULL;
+        UINT64 end  = ((UINT64)va + sz + PAGE_SIZE - 1) & ~0xFFFULL;
+        for (UINT64 page = base; page < end; page += PAGE_SIZE)
+            TdStealthFreePage((PVOID)page);
+
+        KeUnstackDetachProcess(&apc);
+
+        HYPERPLATFORM_LOG_INFO("[td-rw] process exit cleanup done: pid=%llu", pid);
+    }
+}
+
+static BOOLEAN g_process_notify_registered = FALSE;
+
+// =========================================================================
 //  driver entry / unload
 // =========================================================================
 
 static VOID TdUnload(PDRIVER_OBJECT drv)
 {
+    if (g_process_notify_registered)
+    {
+        PsSetCreateProcessNotifyRoutineEx(TdProcessNotify, TRUE);
+        g_process_notify_registered = FALSE;
+    }
+
     if (g_hooked_target)
     {
         HYPERPLATFORM_LOG_INFO("[td] Unhooking R0 hook before unload...");
@@ -3046,6 +3619,19 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     drv->MajorFunction[IRP_MJ_CREATE] = TdCreateClose;
     drv->MajorFunction[IRP_MJ_CLOSE]  = TdCreateClose;
     drv->MajorFunction[IRP_MJ_DEVICE_CONTROL] = TdIoControl;
+
+    //
+    // register process exit notification for stealth page cleanup.
+    // prevents BSOD in MiDeleteFinalPageTables when fake PT is active.
+    //
+    NTSTATUS notify_st = PsSetCreateProcessNotifyRoutineEx(TdProcessNotify, FALSE);
+    if (NT_SUCCESS(notify_st))
+    {
+        g_process_notify_registered = TRUE;
+        HYPERPLATFORM_LOG_INFO("[td] Process notify callback registered.");
+    }
+    else
+        HYPERPLATFORM_LOG_WARN("[td] PsSetCreateProcessNotifyRoutineEx failed: 0x%08X", notify_st);
 
     HYPERPLATFORM_LOG_INFO("[td] Loaded. Device: %wZ", &sym_name);
     return STATUS_SUCCESS;

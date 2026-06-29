@@ -1558,8 +1558,26 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         PEPT_STEALTH_PAGE_INFO nx_sp = vcpu->nx_timer_restore;
         if (nx_sp && nx_sp->shadow_cr3_phys)
         {
-            __vmx_vmwrite(VMCS_GUEST_CR3, nx_sp->real_cr3_value);
-            // NO INVVPID — preserve TLB entry (NX=0 from shadow page tables)!
+            //
+            // check if shadow CR3 is still active.
+            // on VM exit, VMCS_GUEST_CR3 is saved from the actual CR3 register.
+            // if a context switch happened during the timer window,
+            // the guest wrote a different CR3 → we must NOT overwrite it.
+            //
+            SIZE_T current_cr3 = 0;
+            __vmx_vmread(VMCS_GUEST_CR3, &current_cr3);
+
+            UINT64 current_pfn = ((UINT64)current_cr3 & 0x000FFFFFFFFFF000ULL) >> 12;
+            UINT64 shadow_pfn  = (nx_sp->shadow_cr3_phys & 0x000FFFFFFFFFF000ULL) >> 12;
+
+            if (current_pfn == shadow_pfn)
+            {
+                // still on shadow CR3 — safe to restore real CR3
+                __vmx_vmwrite(VMCS_GUEST_CR3, nx_sp->real_cr3_value);
+                // NO INVVPID — preserve TLB entry (NX=0 from shadow page tables)!
+            }
+            // else: context switch already overwrote shadow CR3 — skip restore.
+            // TLB was flushed by context switch → next fetch → NX=1 → #PF → re-arm.
         }
         vcpu->nx_timer_restore = NULL;
 

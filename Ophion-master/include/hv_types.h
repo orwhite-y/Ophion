@@ -426,6 +426,7 @@ typedef struct _EPT_STEALTH_PAGE_INFO {
     EPT_PML1_ENTRY  execute_entry;      // execute view PTE: X only (or R+X for resident)
     UINT64          guest_cr3;
     BOOLEAN         resident;           // TRUE = DLL mode (default exec view, reads swap)
+    BOOLEAN         no_ept_split;       // TRUE = shadow CR3 only, no target EPT split/swap
 
     // --- PT page info ---
     PSTEALTH_FAKE_PT fake_pt;           // shared fake PT page info (NULL = use NX cycle instead)
@@ -466,6 +467,7 @@ typedef struct _EPT_STEALTH_ALLOC_PARAM {
     BOOLEAN pt_precomputed;       // [in] TRUE = caller filled above fields at PASSIVE_LEVEL
     BOOLEAN use_fake_pt;          // [in] TRUE = create fake PT page (NX=1 visible to scanners, NX=0 in real PTE)
     UINT64  shadow_cr3_phys;      // [in] physical address of shadow PML4 (0 = no shadow CR3)
+    BOOLEAN no_ept_split;         // [in] TRUE = shadow CR3 only, keep target EPT mapping unchanged
     volatile LONG installed;      // [internal] 0→1 by first CPU
     BOOLEAN result;               // [out]
 } EPT_STEALTH_ALLOC_PARAM, *PEPT_STEALTH_ALLOC_PARAM;

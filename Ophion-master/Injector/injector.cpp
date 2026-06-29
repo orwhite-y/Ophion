@@ -24,6 +24,7 @@
 #define IOCTL_EPT_UNHOOK_R3 CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 4, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_INJECT_DLL    CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 5, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_INJECT_RW     CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 6, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_INJECT_RW_SHADOW CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 7, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // ---- shared structs (must match TestDriver) ----
 
@@ -364,6 +365,40 @@ static int CmdInjectRW(const wchar_t* target_name)
     return ok ? 0 : 1;
 }
 
+// ---- RW-alloc + shadow CR3 NX bypass inject ----
+
+static int CmdInjectRWShadow(const wchar_t* target_name)
+{
+    printf("[*] RW-alloc + shadow CR3 inject: %ls\n", target_name);
+
+    DWORD pid = FindProcessByName(target_name);
+    if (!pid) { printf("[-] Process not found: %ls\n", target_name); return 1; }
+    printf("[+] PID: %u\n", pid);
+
+    HANDLE dev = OpenDevice();
+    if (dev == INVALID_HANDLE_VALUE) return 1;
+
+    TD_INJECT_RW_PARAMS p = {};
+    p.target_pid = (UINT64)pid;
+
+    DWORD bytes = 0;
+    BOOL ok = DeviceIoControl(dev, IOCTL_INJECT_RW_SHADOW, &p, sizeof(p), &p, sizeof(p), &bytes, NULL);
+
+    if (ok && bytes >= sizeof(TD_INJECT_RW_PARAMS))
+    {
+        printf("[+] Inject OK!\n");
+        printf("    Shellcode VA: 0x%llX\n", p.shellcode_va);
+        printf("    Alloc size:   0x%llX\n", p.alloc_size);
+        printf("[+] RW page allocated, shadow CR3 NX bypass active, no EPT page split.\n");
+        printf("[+] Trigger hook active. Watch for MessageBox from PID %u.\n", pid);
+    }
+    else
+        printf("[-] IOCTL_INJECT_RW_SHADOW failed (error %u)\n", GetLastError());
+
+    CloseHandle(dev);
+    return ok ? 0 : 1;
+}
+
 // ---- usage ----
 
 static void PrintUsage(const wchar_t* exe)
@@ -374,6 +409,7 @@ static void PrintUsage(const wchar_t* exe)
     printf("  %ls hook                         R0 EPT hook NtCreateFile (all processes)\n", exe);
     printf("  %ls unhook                       Remove R0 EPT hook\n", exe);
     printf("  %ls injectrw [process]             RW-alloc + EPT stealth inject\n", exe);
+    printf("  %ls injectrwshadow [process]       RW-alloc + shadow CR3 inject (no EPT split)\n", exe);
     printf("  %ls injectdll <process> <dllpath>  Manual-map DLL inject (no LoadLibrary)\n", exe);
     printf("  %ls hookr3 <pid> <va> <proxy> [type]  R3 EPT hook (per-process)\n", exe);
     printf("  %ls unhookr3 <pid> <va>                Remove R3 EPT hook\n", exe);
@@ -406,6 +442,11 @@ int wmain(int argc, wchar_t* argv[])
     {
         const wchar_t* target = (argc > 2) ? argv[2] : L"notepad.exe";
         return CmdInjectRW(target);
+    }
+    else if (_wcsicmp(cmd, L"injectrwshadow") == 0)
+    {
+        const wchar_t* target = (argc > 2) ? argv[2] : L"notepad.exe";
+        return CmdInjectRWShadow(target);
     }
     else if (_wcsicmp(cmd, L"injectdll") == 0)
     {

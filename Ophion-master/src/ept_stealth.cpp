@@ -315,20 +315,23 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
             // otherwise this CPU's 2MB page stays RWX and the thread
             // can execute from the original page without shadow redirection.
             //
-            PEPT_PML2_ENTRY tp2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
-            if (tp2 && tp2->LargePage)
-                ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
-
-            PEPT_PML1_ENTRY tp1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
-            if (tp1)
+            if (!existing->no_ept_split)
             {
-                if (existing->resident)
-                    tp1->AsUInt = existing->execute_entry.AsUInt;
-                else
+                PEPT_PML2_ENTRY tp2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
+                if (tp2 && tp2->LargePage)
+                    ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
+
+                PEPT_PML1_ENTRY tp1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
+                if (tp1)
                 {
-                    tp1->ReadAccess    = 1;
-                    tp1->WriteAccess   = 1;
-                    tp1->ExecuteAccess = 0;
+                    if (existing->resident)
+                        tp1->AsUInt = existing->execute_entry.AsUInt;
+                    else
+                    {
+                        tp1->ReadAccess    = 1;
+                        tp1->WriteAccess   = 1;
+                        tp1->ExecuteAccess = 0;
+                    }
                 }
             }
 
@@ -385,19 +388,22 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
             if (existing->pfn_of_target == target_pfn)
             {
                 // winner installed — split this CPU's EPT
-                PEPT_PML2_ENTRY tp2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
-                if (tp2 && tp2->LargePage)
-                    ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
-                PEPT_PML1_ENTRY tp1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
-                if (tp1)
+                if (!existing->no_ept_split)
                 {
-                    if (existing->resident)
-                        tp1->AsUInt = existing->execute_entry.AsUInt;
-                    else
+                    PEPT_PML2_ENTRY tp2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
+                    if (tp2 && tp2->LargePage)
+                        ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
+                    PEPT_PML1_ENTRY tp1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
+                    if (tp1)
                     {
-                        tp1->ReadAccess    = 1;
-                        tp1->WriteAccess   = 1;
-                        tp1->ExecuteAccess = 0;
+                        if (existing->resident)
+                            tp1->AsUInt = existing->execute_entry.AsUInt;
+                        else
+                        {
+                            tp1->ReadAccess    = 1;
+                            tp1->WriteAccess   = 1;
+                            tp1->ExecuteAccess = 0;
+                        }
                     }
                 }
 
@@ -465,6 +471,25 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     sp->pt_page_va      = req->pt_page_va;
     sp->resident        = req->resident;
     sp->shadow_cr3_phys = req->shadow_cr3_phys;
+    sp->no_ept_split    = req->no_ept_split;
+
+    if (sp->no_ept_split)
+    {
+        if (!sp->shadow_cr3_phys) { pool_manager_release(sp); return FALSE; }
+
+        SIZE_T exc_bitmap = 0;
+        __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
+        exc_bitmap |= (1ULL << 14);
+        __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
+        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x11);
+        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x11);
+
+        InsertHeadList(&g_ept->stealth_pages, &sp->stealth_page_list);
+
+        _mm_mfence();
+        ept_invept_single(vcpu->ept_pointer);
+        return TRUE;
+    }
 
     if (req->use_fake_pt && req->pt_precomputed && req->pt_page_copy)
     {
@@ -877,6 +902,8 @@ ept_stealth_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UI
     {
         PEPT_STEALTH_PAGE_INFO sp = CONTAINING_RECORD(cur, EPT_STEALTH_PAGE_INFO, stealth_page_list);
         cur = cur->Flink;
+
+        if (sp->no_ept_split) continue;
 
         if (sp->pfn_of_target == pfn || sp->pfn_of_shadow == pfn)
         {

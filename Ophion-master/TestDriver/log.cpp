@@ -479,7 +479,7 @@ _Use_decl_annotations_ static NTSTATUS LogpMakePrefix(
     // Want the current time.
     TIME_FIELDS time_fields;
     LARGE_INTEGER system_time, local_time;
-    KeQuerySystemTime(&system_time);
+    KeQuerySystemTimePrecise(&system_time);
     ExSystemTimeToLocalTime(&system_time, &local_time);
     RtlTimeToTimeFields(&local_time, &time_fields);
 

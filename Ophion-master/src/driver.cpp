@@ -17,8 +17,8 @@ DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
     broadcast_terminate_all();
     vmx_terminate();
 
-    LogTermination();
     HYPERPLATFORM_LOG_INFO("[hv] Driver unloaded.");
+    LogTermination();
 }
 
 NTSTATUS
@@ -33,8 +33,11 @@ DriverEntry(
     //
     static const wchar_t kLogFilePath[] = L"\\SystemRoot\\O.log";
     auto log_status = LogInitialization(kLogPutLevelDebug, kLogFilePath);
+    BOOLEAN log_reinit_needed = FALSE;
     if (log_status == STATUS_REINITIALIZATION_NEEDED)
-        LogRegisterReinitialization(driver_obj);
+        log_reinit_needed = TRUE;
+    else if (!NT_SUCCESS(log_status))
+        return log_status;
 
     HYPERPLATFORM_LOG_INFO("[hv] Ophion initializing...");
 
@@ -43,7 +46,9 @@ DriverEntry(
     if (!vmx_init())
     {
         HYPERPLATFORM_LOG_ERROR("[hv] VMX initialization FAILED!");
+        broadcast_terminate_all();
         vmx_terminate();
+        LogTermination();
         return STATUS_HV_OPERATION_FAILED;
     }
 
@@ -51,6 +56,9 @@ DriverEntry(
         HYPERPLATFORM_LOG_INFO("[hv] Stealth region initialized.");
     else
         HYPERPLATFORM_LOG_WARN("[hv] Stealth region init failed (stealth features disabled).");
+
+    if (log_reinit_needed)
+        LogRegisterReinitialization(driver_obj);
 
     HYPERPLATFORM_LOG_INFO("[hv] Hypervisor loaded and active on all cores!");
     return STATUS_SUCCESS;

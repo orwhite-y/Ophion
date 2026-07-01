@@ -1573,13 +1573,14 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
             if (current_pfn == shadow_pfn)
             {
                 // still on shadow CR3 — safe to restore real CR3
-                __vmx_vmwrite(VMCS_GUEST_CR3, nx_sp->real_cr3_value);
+                __vmx_vmwrite(VMCS_GUEST_CR3, vcpu->nx_timer_real_cr3);
                 // NO INVVPID — preserve TLB entry (NX=0 from shadow page tables)!
             }
             // else: context switch already overwrote shadow CR3 — skip restore.
             // TLB was flushed by context switch → next fetch → NX=1 → #PF → re-arm.
         }
         vcpu->nx_timer_restore = NULL;
+        vcpu->nx_timer_real_cr3 = 0;
 
         // disable preemption timer
         SIZE_T pin = 0;

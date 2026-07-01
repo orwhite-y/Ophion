@@ -93,9 +93,11 @@ typedef struct _EPT_HOOKED_FUNCTION_INFO {
     PUINT8      first_trampoline_address; // trampoline for calling original
     PUINT8      fake_page_contents;       // pointer to parent page's fake page
     UINT64      hook_size;                // bytes overwritten
+    UINT32      hook_type;                // 0=abs jmp, 1=VMCALL, 2=INT3
     BOOLEAN     user_trampoline;          // TRUE = trampoline is user-mode (don't pool_release)
     BOOLEAN     oneshot;                  // TRUE = redirect once, then pass through to original
     BOOLEAN     oneshot_fired;            // set by handler after first trigger
+    BOOLEAN     retiring;                 // TRUE = unhook requested; per-vCPU paths restore lazily
 } EPT_HOOKED_FUNCTION_INFO, *PEPT_HOOKED_FUNCTION_INFO;
 
 //
@@ -277,6 +279,7 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     // NX cycle: preemption timer restore (no MTF — avoids IPI ack delay)
     //
     PEPT_STEALTH_PAGE_INFO nx_timer_restore;
+    UINT64      nx_timer_real_cr3;
     BOOLEAN     stealth_pf_configured;  // TRUE after this CPU's VMCS has #PF interception
 
     //

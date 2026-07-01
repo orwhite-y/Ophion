@@ -617,6 +617,90 @@ TdBuildShellcodePIC(PVOID buf, SIZE_T buf_size)
 // NO KeGenericCallDpc — avoids 0x101 CLOCK_WATCHDOG when a CPU is
 // stuck in VMX-root (Ophion HV pre-existing bug).
 //
+#ifndef TD_MAX_DPC_CPUS
+#define TD_MAX_DPC_CPUS 64
+#endif
+#define TD_STEALTH_DPC_TAG 'dStT'
+#define TD_STEALTH_REQ_TAG 'rStT'
+
+typedef struct _TD_STEALTH_ALLOC_DPC_CTX {
+    KEVENT           done_event;
+    KDPC             dpcs[TD_MAX_DPC_CPUS];
+    TD_STEALTH_PARAM * req;
+    volatile LONG    pending_count;
+    volatile LONG    success_count;
+    volatile LONG    failure_count;
+} TD_STEALTH_ALLOC_DPC_CTX;
+
+static VOID
+TdStealthAllocDpc(PKDPC Dpc, PVOID Ctx, PVOID, PVOID)
+{
+    UNREFERENCED_PARAMETER(Dpc);
+    TD_STEALTH_ALLOC_DPC_CTX * ctx = (TD_STEALTH_ALLOC_DPC_CTX *)Ctx;
+    NTSTATUS st = hv_vmcall_simple(VMCALL_STEALTH_ALLOC, (UINT64)ctx->req, 0, 0);
+
+    if (NT_SUCCESS(st))
+        _InterlockedIncrement(&ctx->success_count);
+    else
+        _InterlockedIncrement(&ctx->failure_count);
+
+    if (_InterlockedDecrement(&ctx->pending_count) == 0)
+        KeSetEvent(&ctx->done_event, IO_NO_INCREMENT, FALSE);
+}
+
+static NTSTATUS
+TdRunStealthAllocOnCpus(TD_STEALTH_PARAM * req)
+{
+    ULONG active_count = KeQueryActiveProcessorCount(NULL);
+    if (active_count == 0)
+        return STATUS_UNSUCCESSFUL;
+    if (active_count > TD_MAX_DPC_CPUS)
+        active_count = TD_MAX_DPC_CPUS;
+
+    TD_STEALTH_ALLOC_DPC_CTX * ctx = (TD_STEALTH_ALLOC_DPC_CTX *)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(TD_STEALTH_ALLOC_DPC_CTX), TD_STEALTH_DPC_TAG);
+    if (!ctx)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    RtlZeroMemory(ctx, sizeof(*ctx));
+    ctx->req = req;
+    ctx->pending_count = (LONG)active_count;
+    KeInitializeEvent(&ctx->done_event, NotificationEvent, FALSE);
+
+    for (ULONG cpu = 0; cpu < active_count; cpu++)
+    {
+        KeInitializeDpc(&ctx->dpcs[cpu], TdStealthAllocDpc, ctx);
+        KeSetTargetProcessorDpc(&ctx->dpcs[cpu], (CCHAR)cpu);
+        if (!KeInsertQueueDpc(&ctx->dpcs[cpu], NULL, NULL))
+        {
+            _InterlockedIncrement(&ctx->failure_count);
+            if (_InterlockedDecrement(&ctx->pending_count) == 0)
+                KeSetEvent(&ctx->done_event, IO_NO_INCREMENT, FALSE);
+        }
+    }
+
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = -2LL * 1000LL * 10000LL;
+    NTSTATUS wait_st = KeWaitForSingleObject(
+        &ctx->done_event,
+        Executive,
+        KernelMode,
+        FALSE,
+        &timeout);
+
+    if (wait_st == STATUS_TIMEOUT)
+    {
+        HYPERPLATFORM_LOG_ERROR("[td-rw] stealth alloc timeout: done=%d/%u fail=%d",
+            (LONG)(active_count - ctx->pending_count), active_count, ctx->failure_count);
+        return STATUS_IO_TIMEOUT;
+    }
+
+    NTSTATUS st = (ctx->failure_count == 0 && ctx->success_count != 0) ?
+        STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    ExFreePoolWithTag(ctx, TD_STEALTH_DPC_TAG);
+    return st;
+}
+
 static BOOLEAN
 TdStealthAllocPage(
     UINT64  caller_cr3,
@@ -631,19 +715,24 @@ TdStealthAllocPage(
     UINT64  shadow_cr3_phys = 0,  // shadow CR3 phys (NX=0 for target, 0=not used)
     BOOLEAN no_ept_split = FALSE) // TRUE = shadow CR3 only, no EPT page split
 {
-    TD_STEALTH_PARAM req = {};
-    req.caller_cr3       = caller_cr3;
-    req.target_va        = page_va;
-    req.handler_function = NULL;
-    req.target_phys      = page_phys;
-    req.shellcode_buffer = sc_buf;
-    req.shellcode_size   = sc_size;
-    req.resident         = resident;
-    req.pt_page_pfn      = pt_pfn;
-    req.pt_pte_index     = pt_idx;
-    req.use_fake_pt      = use_fake_pt;
-    req.shadow_cr3_phys  = shadow_cr3_phys;
-    req.no_ept_split     = no_ept_split;
+    TD_STEALTH_PARAM * req = (TD_STEALTH_PARAM *)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(TD_STEALTH_PARAM), TD_STEALTH_REQ_TAG);
+    if (!req)
+        return FALSE;
+    RtlZeroMemory(req, sizeof(*req));
+
+    req->caller_cr3       = caller_cr3;
+    req->target_va        = page_va;
+    req->handler_function = NULL;
+    req->target_phys      = page_phys;
+    req->shellcode_buffer = sc_buf;
+    req->shellcode_size   = sc_size;
+    req->resident         = resident;
+    req->pt_page_pfn      = pt_pfn;
+    req->pt_pte_index     = pt_idx;
+    req->use_fake_pt      = use_fake_pt;
+    req->shadow_cr3_phys  = shadow_cr3_phys;
+    req->no_ept_split     = no_ept_split;
 
     //
     // copy PT page and target page content into NonPaged kernel buffers.
@@ -657,6 +746,7 @@ TdStealthAllocPage(
     {
         if (pt_buf)  ExFreePoolWithTag(pt_buf,  'htpS');
         if (tgt_buf) ExFreePoolWithTag(tgt_buf, 'htpS');
+        ExFreePoolWithTag(req, TD_STEALTH_REQ_TAG);
         return FALSE;
     }
 
@@ -676,24 +766,23 @@ TdStealthAllocPage(
         else
             RtlZeroMemory(tgt_buf, PAGE_SIZE);
 
-        req.pt_page_va = pt_va;  // system VA for VMX-root MTF resync (NULL if unavailable)
+        req->pt_page_va = pt_va;  // system VA for VMX-root MTF resync (NULL if unavailable)
     }
 
-    req.pt_page_copy     = pt_buf;
-    req.target_page_copy = tgt_buf;
-    req.pt_precomputed   = TRUE;
+    req->pt_page_copy     = pt_buf;
+    req->target_page_copy = tgt_buf;
+    req->pt_precomputed   = TRUE;
 
     // DPC broadcast — every CPU does VMCALL, each splits its own EPT.
     // same pattern as EPT hook's KeGenericCallDpc.
-    KeGenericCallDpc([](PKDPC, PVOID Ctx, PVOID A1, PVOID A2) {
-        hv_vmcall_simple(VMCALL_STEALTH_ALLOC, (UINT64)Ctx, 0, 0);
-        KeSignalCallDpcSynchronize(A2);
-        KeSignalCallDpcDone(A1);
-    }, &req);
+    NTSTATUS run_st = TdRunStealthAllocOnCpus(req);
+    if (run_st == STATUS_IO_TIMEOUT)
+        return FALSE;
 
     ExFreePoolWithTag(pt_buf,  'htpS');
     ExFreePoolWithTag(tgt_buf, 'htpS');
-    return req.result;
+    ExFreePoolWithTag(req, TD_STEALTH_REQ_TAG);
+    return NT_SUCCESS(run_st);
 }
 
 //
@@ -1063,38 +1152,66 @@ DpcEptHookR3(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
     KeSignalCallDpcDone(A1);
 }
 
-typedef struct _TRIGGER_HOOK_DPC_CTX {
-    PVOID         target;
-    PVOID         proxy;
-    PVOID *       origin;
-    UINT64        caller_cr3;
-    UINT32        hook_type;
-    UINT64        target_cr3;
-    PVOID         user_trampoline;
-    UINT64        user_trampoline_pa;
-    UINT64        flags;
-    volatile LONG success_count;
-    volatile LONG failure_count;
-    volatile LONG first_failure;
-} TRIGGER_HOOK_DPC_CTX;
+#ifndef TD_MAX_DPC_CPUS
+#define TD_MAX_DPC_CPUS 64
+#endif
+#define TD_PERCPU_VMCALL_TAG 'cVdT'
+
+typedef enum _TD_PERCPU_VMCALL_OP {
+    TdPerCpuVmcallHookTrigger = 1,
+    TdPerCpuVmcallUnhook      = 2,
+} TD_PERCPU_VMCALL_OP;
+
+typedef struct _TD_PERCPU_VMCALL_CTX {
+    KEVENT                done_event;
+    KDPC                  dpcs[TD_MAX_DPC_CPUS];
+    TD_PERCPU_VMCALL_OP   op;
+    volatile LONG         pending_count;
+    volatile LONG         success_count;
+    volatile LONG         failure_count;
+    volatile LONG         first_failure;
+    ULONG                 cpu_count;
+    PVOID                 target;
+    PVOID                 proxy;
+    PVOID *               origin;
+    UINT64                caller_cr3;
+    UINT32                hook_type;
+    UINT64                target_cr3;
+    PVOID                 user_trampoline;
+    UINT64                user_trampoline_pa;
+    UINT64                flags;
+} TD_PERCPU_VMCALL_CTX;
 
 static VOID
-DpcEptHookTrigger(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
+TdPerCpuVmcallDpc(PKDPC Dpc, PVOID Ctx, PVOID, PVOID)
 {
     UNREFERENCED_PARAMETER(Dpc);
-    TRIGGER_HOOK_DPC_CTX * ctx = (TRIGGER_HOOK_DPC_CTX *)Ctx;
+    TD_PERCPU_VMCALL_CTX * ctx = (TD_PERCPU_VMCALL_CTX *)Ctx;
+    NTSTATUS st = STATUS_INVALID_DEVICE_REQUEST;
 
-    NTSTATUS st = hv_vmcall_ex(
-        VMCALL_EPT_HOOK,
-        (UINT64)ctx->target,
-        (UINT64)ctx->proxy,
-        (UINT64)ctx->origin,
-        ctx->caller_cr3,
-        (UINT64)ctx->hook_type,
-        ctx->target_cr3,
-        (UINT64)ctx->user_trampoline,
-        ctx->user_trampoline_pa,
-        ctx->flags);
+    if (ctx->op == TdPerCpuVmcallHookTrigger)
+    {
+        st = hv_vmcall_ex(
+            VMCALL_EPT_HOOK,
+            (UINT64)ctx->target,
+            (UINT64)ctx->proxy,
+            (UINT64)ctx->origin,
+            ctx->caller_cr3,
+            (UINT64)ctx->hook_type,
+            ctx->target_cr3,
+            (UINT64)ctx->user_trampoline,
+            ctx->user_trampoline_pa,
+            ctx->flags);
+    }
+    else if (ctx->op == TdPerCpuVmcallUnhook)
+    {
+        st = hv_vmcall_ex(
+            VMCALL_EPT_UNHOOK,
+            (UINT64)ctx->target,
+            0, 0,
+            ctx->caller_cr3,
+            0, 0, 0, 0, 0);
+    }
 
     if (NT_SUCCESS(st))
     {
@@ -1106,8 +1223,59 @@ DpcEptHookTrigger(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
         _InterlockedCompareExchange(&ctx->first_failure, (LONG)st, (LONG)STATUS_SUCCESS);
     }
 
-    KeSignalCallDpcSynchronize(A2);
-    KeSignalCallDpcDone(A1);
+    if (_InterlockedDecrement(&ctx->pending_count) == 0)
+        KeSetEvent(&ctx->done_event, IO_NO_INCREMENT, FALSE);
+}
+
+static NTSTATUS
+TdRunPerCpuVmcall(TD_PERCPU_VMCALL_CTX * ctx, ULONG timeout_ms)
+{
+    ULONG active_count = KeQueryActiveProcessorCount(NULL);
+    if (active_count == 0)
+        return STATUS_UNSUCCESSFUL;
+    if (active_count > TD_MAX_DPC_CPUS)
+        active_count = TD_MAX_DPC_CPUS;
+
+    ctx->cpu_count = active_count;
+    ctx->pending_count = (LONG)active_count;
+    ctx->first_failure = STATUS_SUCCESS;
+    KeInitializeEvent(&ctx->done_event, NotificationEvent, FALSE);
+
+    for (ULONG cpu = 0; cpu < active_count; cpu++)
+    {
+        KeInitializeDpc(&ctx->dpcs[cpu], TdPerCpuVmcallDpc, ctx);
+        KeSetTargetProcessorDpc(&ctx->dpcs[cpu], (CCHAR)cpu);
+        if (!KeInsertQueueDpc(&ctx->dpcs[cpu], NULL, NULL))
+        {
+            _InterlockedIncrement(&ctx->failure_count);
+            _InterlockedCompareExchange(&ctx->first_failure, (LONG)STATUS_UNSUCCESSFUL, (LONG)STATUS_SUCCESS);
+            if (_InterlockedDecrement(&ctx->pending_count) == 0)
+                KeSetEvent(&ctx->done_event, IO_NO_INCREMENT, FALSE);
+        }
+    }
+
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = -((LONGLONG)timeout_ms * 10000LL);
+    NTSTATUS wait_st = KeWaitForSingleObject(
+        &ctx->done_event,
+        Executive,
+        KernelMode,
+        FALSE,
+        &timeout);
+
+    if (wait_st == STATUS_TIMEOUT)
+    {
+        HYPERPLATFORM_LOG_ERROR("[td-rw] per-cpu vmcall timeout: op=%u done=%d/%u fail=%d",
+            (UINT32)ctx->op,
+            (LONG)(ctx->cpu_count - ctx->pending_count),
+            ctx->cpu_count,
+            ctx->failure_count);
+        return STATUS_IO_TIMEOUT;
+    }
+
+    if (ctx->failure_count != 0)
+        return (NTSTATUS)ctx->first_failure;
+    return (ctx->success_count != 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }
 
 static NTSTATUS
@@ -1117,37 +1285,44 @@ TdInstallTriggerHookAllCpus(
     UINT64  caller_cr3,
     PVOID * origin)
 {
-    TRIGGER_HOOK_DPC_CTX ctx = {};
-    ctx.target        = trigger_fn;
-    ctx.proxy         = proxy_va;
-    ctx.origin        = origin;
-    ctx.caller_cr3    = caller_cr3;
-    ctx.hook_type     = 1;          // VMCALL (0F 01 C1)
-    ctx.target_cr3    = caller_cr3; // per-process filter
-    ctx.flags         = 2;          // oneshot
-    ctx.first_failure = STATUS_SUCCESS;
+    TD_PERCPU_VMCALL_CTX * ctx = (TD_PERCPU_VMCALL_CTX *)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(TD_PERCPU_VMCALL_CTX), TD_PERCPU_VMCALL_TAG);
+    if (!ctx)
+        return STATUS_INSUFFICIENT_RESOURCES;
 
-    KeGenericCallDpc(DpcEptHookTrigger, &ctx);
+    RtlZeroMemory(ctx, sizeof(*ctx));
+    ctx->op         = TdPerCpuVmcallHookTrigger;
+    ctx->target     = trigger_fn;
+    ctx->proxy      = proxy_va;
+    ctx->origin     = origin;
+    ctx->caller_cr3 = caller_cr3;
+    ctx->hook_type  = 1;          // VMCALL (0F 01 C1)
+    ctx->target_cr3 = caller_cr3; // per-process filter
+    ctx->flags      = 2;          // oneshot
 
-    if (ctx.failure_count != 0)
-        return (NTSTATUS)ctx.first_failure;
-    return (ctx.success_count != 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    NTSTATUS st = TdRunPerCpuVmcall(ctx, 2000);
+    if (st != STATUS_IO_TIMEOUT)
+        ExFreePoolWithTag(ctx, TD_PERCPU_VMCALL_TAG);
+    return st;
 }
 
 static NTSTATUS
 TdUnhookTriggerAllCpus(PVOID trigger_fn, UINT64 caller_cr3)
 {
-    struct {
-        PVOID    target;
-        UINT64   caller_cr3;
-        NTSTATUS result;
-    } ctx = {};
+    TD_PERCPU_VMCALL_CTX * ctx = (TD_PERCPU_VMCALL_CTX *)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(TD_PERCPU_VMCALL_CTX), TD_PERCPU_VMCALL_TAG);
+    if (!ctx)
+        return STATUS_INSUFFICIENT_RESOURCES;
 
-    ctx.target     = trigger_fn;
-    ctx.caller_cr3 = caller_cr3;
+    RtlZeroMemory(ctx, sizeof(*ctx));
+    ctx->op         = TdPerCpuVmcallUnhook;
+    ctx->target     = trigger_fn;
+    ctx->caller_cr3 = caller_cr3;
 
-    KeGenericCallDpc(DpcEptUnhook, &ctx);
-    return ctx.result;
+    NTSTATUS st = TdRunPerCpuVmcall(ctx, 1000);
+    if (st != STATUS_IO_TIMEOUT)
+        ExFreePoolWithTag(ctx, TD_PERCPU_VMCALL_TAG);
+    return st;
 }
 
 //
@@ -3605,11 +3780,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                             KAPC_STATE apc2;
                             KeStackAttachProcess(proc2, &apc2);
 
-                            KAFFINITY old = KeSetSystemAffinityThreadEx((KAFFINITY)1);
-
                             TdUnhookTriggerAllCpus(c->trigger_fn, c->target_cr3);
-
-                            KeRevertToUserAffinityThreadEx(old);
                             KeUnstackDetachProcess(&apc2);
                             ObDereferenceObject(proc2);
 

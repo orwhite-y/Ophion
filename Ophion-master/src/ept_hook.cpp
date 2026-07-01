@@ -211,6 +211,19 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
                 PEPT_HOOKED_FUNCTION_INFO efi = CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
                 if (efi->virtual_address == req->target_function)
                 {
+                    UINT64 off = EPT_PML1_PAGE_OFFSET(req->target_function);
+                    PUINT8 fake = &existing->fake_page_va[off];
+                    switch (req->hook_type) {
+                    case 0: hook_write_absolute_jump(fake, (UINT64)req->proxy_function); break;
+                    case 1: fake[0]=0x0F; fake[1]=0x01; fake[2]=0xC1; break;
+                    case 2: fake[0]=0xCC; break;
+                    }
+
+                    efi->retiring = FALSE;
+                    efi->oneshot_fired = FALSE;
+                    efi->handler_function = req->proxy_function;
+                    efi->oneshot = req->oneshot;
+                    efi->hook_type = req->hook_type;
                     func_exists = TRUE;
                     break;
                 }
@@ -267,6 +280,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
             fi->fake_page_contents = existing->fake_page_va;
             fi->handler_function   = req->proxy_function;
             fi->oneshot            = req->oneshot;
+            fi->hook_type          = req->hook_type;
 
             UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
             PUINT8 fake  = &existing->fake_page_va[off];
@@ -394,6 +408,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     fi->fake_page_contents = hp->fake_page_va;
     fi->handler_function   = req->proxy_function;
     fi->oneshot            = req->oneshot;
+    fi->hook_type          = req->hook_type;
 
     UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
     PUINT8 fake  = &hp->fake_page_va[off];
@@ -470,6 +485,37 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
 //
 // VMX-root: unhook — first CPU does list removal, all CPUs restore PTE
 //
+static BOOLEAN
+ept_hook_page_has_active_function(PEPT_HOOKED_PAGE_INFO hp)
+{
+    PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
+    while (fc != &hp->hooked_functions_list)
+    {
+        PEPT_HOOKED_FUNCTION_INFO fn = CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
+        if (!fn->retiring)
+            return TRUE;
+        fc = fc->Flink;
+    }
+    return FALSE;
+}
+
+static VOID
+ept_hook_restore_current_vcpu(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOKED_PAGE_INFO hp)
+{
+    PEPT_PML1_ENTRY p = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)(hp->pfn_of_hooked_page << 12));
+    if (!p)
+        return;
+
+    EPT_PML1_ENTRY passthrough = hp->original_entry;
+    passthrough.ReadAccess = 1;
+    passthrough.WriteAccess = 1;
+    passthrough.ExecuteAccess = 1;
+    passthrough.PageFrameNumber = hp->pfn_of_hooked_page;
+    p->AsUInt = passthrough.AsUInt;
+    _mm_mfence();
+    ept_invept_single(vcpu->ept_pointer);
+}
+
 BOOLEAN
 ept_unhook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_UNHOOK_VMCALL_PARAM req)
 {
@@ -478,36 +524,38 @@ ept_unhook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_UNHOOK_VMCALL_PARAM req)
     UINT64 phys_addr  = MmGetPhysicalAddress(req->target_function).QuadPart;
     UINT64 target_pfn = phys_addr >> 12;
 
-    // first CPU only: remove from lists and free
-    if (_InterlockedCompareExchange(&req->unhooked, 1, 0) == 0)
+    PLIST_ENTRY cur = g_ept->hooked_pages.Flink;
+    while (cur != &g_ept->hooked_pages)
     {
-        PLIST_ENTRY cur = g_ept->hooked_pages.Flink;
-        while (cur != &g_ept->hooked_pages)
-        {
-            PEPT_HOOKED_PAGE_INFO hp = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
-            cur = cur->Flink;
-            if (hp->pfn_of_hooked_page != target_pfn) continue;
+        PEPT_HOOKED_PAGE_INFO hp = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
+        cur = cur->Flink;
+        if (hp->pfn_of_hooked_page != target_pfn) continue;
 
-            PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
-            while (fc != &hp->hooked_functions_list)
+        PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
+        while (fc != &hp->hooked_functions_list)
+        {
+            PEPT_HOOKED_FUNCTION_INFO fn = CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
+            fc = fc->Flink;
+            if (fn->virtual_address == req->target_function)
             {
-                PEPT_HOOKED_FUNCTION_INFO fn = CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
-                fc = fc->Flink;
-                if (fn->virtual_address == req->target_function)
+                if (fn->fake_page_contents && fn->first_trampoline_address && fn->hook_size)
                 {
-                    RemoveEntryList(&fn->hooked_function_list);
-                    if (fn->first_trampoline_address && !fn->user_trampoline) pool_manager_release(fn->first_trampoline_address);
-                    pool_manager_release(fn);
-                    break;
+                    UINT64 off = EPT_PML1_PAGE_OFFSET(fn->virtual_address);
+                    RtlCopyMemory(&fn->fake_page_contents[off],
+                                  fn->first_trampoline_address,
+                                  fn->hook_size);
                 }
+                fn->retiring = TRUE;
+                req->result = TRUE;
+                break;
             }
-            if (IsListEmpty(&hp->hooked_functions_list))
-            {
-                RemoveEntryList(&hp->hooked_page_list);
-                pool_manager_release(hp);
-            }
-            req->result = TRUE;
-            break;
+        }
+
+        if (req->result)
+        {
+            if (!ept_hook_page_has_active_function(hp))
+                ept_hook_restore_current_vcpu(vcpu, hp);
+            return TRUE;
         }
     }
 
@@ -515,21 +563,7 @@ ept_unhook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_UNHOOK_VMCALL_PARAM req)
     // 恢复所有 CPU 的 PTE 到 RWX
     // (不能只恢复当前 CPU，其他 CPU 的 EPT PTE 也需要恢复)
     //
-    for (UINT32 i = 0; i < g_cpu_count; i++)
-    {
-        if (!g_vcpu[i].ept_page_table) continue;
-        PEPT_PML1_ENTRY p = ept_get_pml1(g_vcpu[i].ept_page_table, (SIZE_T)phys_addr);
-        if (p)
-        {
-            p->ReadAccess      = 1;
-            p->WriteAccess     = 1;
-            p->ExecuteAccess   = 1;
-            p->PageFrameNumber = target_pfn;
-        }
-    }
-    _mm_mfence();
-    ept_invept_single(vcpu->ept_pointer);
-    return TRUE;
+    return FALSE;
 }
 
 //
@@ -615,6 +649,12 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
             continue;
         }
 
+        if (!ept_hook_page_has_active_function(hp))
+        {
+            ept_hook_restore_current_vcpu(vcpu, hp);
+            return TRUE;
+        }
+
         PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)(hp->pfn_of_hooked_page << 12));
         if (!my_pte) continue;
 
@@ -676,6 +716,13 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     if (vcpu->mtf_restore_page)
     {
         PEPT_HOOKED_PAGE_INFO hp = vcpu->mtf_restore_page;
+
+        if (!ept_hook_page_has_active_function(hp))
+        {
+            ept_hook_restore_current_vcpu(vcpu, hp);
+            vcpu->mtf_restore_page = NULL;
+            return;
+        }
 
         // restore target page EPT
         PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,
@@ -983,6 +1030,12 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
             fc = fc->Flink;
             if ((UINT64)fi->virtual_address == rip)
             {
+                if (fi->retiring)
+                {
+                    ept_hook_restore_current_vcpu(vcpu, hp);
+                    return TRUE;
+                }
+
                 //
                 // oneshot: first trigger → redirect to handler (shellcode).
                 // subsequent triggers → pass through to original function.

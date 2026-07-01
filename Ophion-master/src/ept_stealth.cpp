@@ -372,13 +372,22 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     // other CPUs that lose the race will re-check the list and take the
     // "already installed" path on next iteration (after winner inserts).
     //
-    if (interlock && _InterlockedCompareExchange(interlock, 1, 0) != 0)
+    BOOLEAN full_install_owner = TRUE;
+    if (interlock)
     {
-        //
-        // another CPU is doing or has done the full install.
-        // spin briefly then re-check the list — winner should have inserted by now.
-        //
-        for (int i = 0; i < 1000; i++) _mm_pause();
+        LONG state = _InterlockedCompareExchange(interlock, 1, 0);
+        if (state != 0)
+            full_install_owner = FALSE;
+    }
+
+    if (!full_install_owner)
+    {
+        for (int i = 0; i < 1000000; i++)
+        {
+            if (!interlock || *interlock != 1)
+                break;
+            _mm_pause();
+        }
 
         cur = g_ept->stealth_pages.Flink;
         while (cur != &g_ept->stealth_pages)
@@ -433,14 +442,18 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
             }
         }
 
-        // winner failed or hasn't inserted yet — fall through to try full install
-        // (interlock is already 1, but that's fine — only one CPU reaches here)
+        return FALSE;
     }
 
     // allocate tracking struct
     PEPT_STEALTH_PAGE_INFO sp = (PEPT_STEALTH_PAGE_INFO)
         pool_manager_request(POOL_TAG_STEALTH_INFO, sizeof(EPT_STEALTH_PAGE_INFO));
-    if (!sp) return FALSE;
+    if (!sp)
+    {
+        if (interlock)
+            _InterlockedExchange(interlock, 0);
+        return FALSE;
+    }
     RtlZeroMemory(sp, sizeof(*sp));
 
     sp->guest_va         = (UINT64)req->target_va & ~0xFFFULL;
@@ -475,7 +488,13 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
 
     if (sp->no_ept_split)
     {
-        if (!sp->shadow_cr3_phys) { pool_manager_release(sp); return FALSE; }
+        if (!sp->shadow_cr3_phys)
+        {
+            pool_manager_release(sp);
+            if (interlock)
+                _InterlockedExchange(interlock, 0);
+            return FALSE;
+        }
 
         SIZE_T exc_bitmap = 0;
         __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
@@ -488,6 +507,8 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
 
         _mm_mfence();
         ept_invept_single(vcpu->ept_pointer);
+        if (interlock)
+            _InterlockedExchange(interlock, 2);
         return TRUE;
     }
 
@@ -670,6 +691,8 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
 
     _mm_mfence();
     ept_invept_single(vcpu->ept_pointer);
+    if (interlock)
+        _InterlockedExchange(interlock, 2);
 
     return TRUE;
 
@@ -692,6 +715,8 @@ fail_cleanup_fakept:
         }
     }
     pool_manager_release(sp);
+    if (interlock)
+        _InterlockedExchange(interlock, 0);
     return FALSE;
 }
 
@@ -714,6 +739,14 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
         cur = cur->Flink;
 
         if (sp->guest_va != fault_page) continue;
+
+        if (sp->guest_cr3 != 0)
+        {
+            UINT64 guest_cr3 = 0;
+            __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
+            if ((guest_cr3 & PFN_MASK) != (sp->guest_cr3 & PFN_MASK))
+                continue;
+        }
 
         //
         // two modes for making NX=0 visible to CPU page walker:
@@ -747,7 +780,7 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             //
             SIZE_T real_cr3 = 0;
             __vmx_vmread(VMCS_GUEST_CR3, &real_cr3);
-            sp->real_cr3_value = real_cr3;
+            vcpu->nx_timer_real_cr3 = real_cr3;
 
             // build shadow CR3 value: replace PFN, keep PCID/flags
             UINT64 shadow_cr3_val = (real_cr3 & ~PFN_MASK) | (sp->shadow_cr3_phys & PFN_MASK);

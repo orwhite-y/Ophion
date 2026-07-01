@@ -33,6 +33,12 @@ KeSignalCallDpcSynchronize(
 
 } // extern "C"
 
+static __forceinline UINT32
+broadcast_get_cpu_id(VOID)
+{
+    return (UINT32)(__readmsr(IA32_TSC_AUX) & 0xFFF);
+}
+
 static VOID
 dpc_init_guest(
     _In_ PKDPC  Dpc,
@@ -61,7 +67,16 @@ dpc_terminate_guest(
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(DeferredContext);
 
+    UINT32 cpu = broadcast_get_cpu_id();
+    if (!g_vcpu || cpu >= g_cpu_count || !g_vcpu[cpu].launched)
+    {
+        KeSignalCallDpcSynchronize(SystemArgument2);
+        KeSignalCallDpcDone(SystemArgument1);
+        return;
+    }
+
     asm_vmx_vmcall(VMCALL_VMXOFF, 0, 0, 0);
+    g_vcpu[cpu].launched = FALSE;
 
     KeSignalCallDpcSynchronize(SystemArgument2);
     KeSignalCallDpcDone(SystemArgument1);

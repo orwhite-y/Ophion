@@ -627,10 +627,33 @@ typedef struct _TD_STEALTH_ALLOC_DPC_CTX {
     KEVENT           done_event;
     KDPC             dpcs[TD_MAX_DPC_CPUS];
     TD_STEALTH_PARAM * req;
+    PVOID            pt_buf;
+    PVOID            tgt_buf;
     volatile LONG    pending_count;
+    volatile LONG    ref_count;
     volatile LONG    success_count;
     volatile LONG    failure_count;
+    volatile LONG    cleanup_on_complete;
 } TD_STEALTH_ALLOC_DPC_CTX;
+
+static VOID
+TdStealthAllocReleaseCtx(TD_STEALTH_ALLOC_DPC_CTX * ctx)
+{
+    if (_InterlockedDecrement(&ctx->ref_count) != 0)
+        return;
+
+    if (ctx->cleanup_on_complete)
+    {
+        if (ctx->pt_buf)
+            ExFreePoolWithTag(ctx->pt_buf, 'htpS');
+        if (ctx->tgt_buf)
+            ExFreePoolWithTag(ctx->tgt_buf, 'htpS');
+        if (ctx->req)
+            ExFreePoolWithTag(ctx->req, TD_STEALTH_REQ_TAG);
+    }
+
+    ExFreePoolWithTag(ctx, TD_STEALTH_DPC_TAG);
+}
 
 static VOID
 TdStealthAllocDpc(PKDPC Dpc, PVOID Ctx, PVOID, PVOID)
@@ -646,10 +669,11 @@ TdStealthAllocDpc(PKDPC Dpc, PVOID Ctx, PVOID, PVOID)
 
     if (_InterlockedDecrement(&ctx->pending_count) == 0)
         KeSetEvent(&ctx->done_event, IO_NO_INCREMENT, FALSE);
+    TdStealthAllocReleaseCtx(ctx);
 }
 
 static NTSTATUS
-TdRunStealthAllocOnCpus(TD_STEALTH_PARAM * req)
+TdRunStealthAllocOnCpus(TD_STEALTH_PARAM * req, PVOID pt_buf, PVOID tgt_buf)
 {
     ULONG active_count = KeQueryActiveProcessorCount(NULL);
     if (active_count == 0)
@@ -664,7 +688,10 @@ TdRunStealthAllocOnCpus(TD_STEALTH_PARAM * req)
 
     RtlZeroMemory(ctx, sizeof(*ctx));
     ctx->req = req;
+    ctx->pt_buf = pt_buf;
+    ctx->tgt_buf = tgt_buf;
     ctx->pending_count = (LONG)active_count;
+    ctx->ref_count = (LONG)active_count + 1;
     KeInitializeEvent(&ctx->done_event, NotificationEvent, FALSE);
 
     for (ULONG cpu = 0; cpu < active_count; cpu++)
@@ -676,6 +703,7 @@ TdRunStealthAllocOnCpus(TD_STEALTH_PARAM * req)
             _InterlockedIncrement(&ctx->failure_count);
             if (_InterlockedDecrement(&ctx->pending_count) == 0)
                 KeSetEvent(&ctx->done_event, IO_NO_INCREMENT, FALSE);
+            TdStealthAllocReleaseCtx(ctx);
         }
     }
 
@@ -692,16 +720,18 @@ TdRunStealthAllocOnCpus(TD_STEALTH_PARAM * req)
     {
         HYPERPLATFORM_LOG_ERROR("[td-rw] stealth alloc timeout: done=%d/%u fail=%d",
             (LONG)(active_count - ctx->pending_count), active_count, ctx->failure_count);
+        _InterlockedExchange(&ctx->cleanup_on_complete, 1);
+        TdStealthAllocReleaseCtx(ctx);
         return STATUS_IO_TIMEOUT;
     }
 
     NTSTATUS st = (ctx->failure_count == 0 && ctx->success_count != 0) ?
         STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
-    ExFreePoolWithTag(ctx, TD_STEALTH_DPC_TAG);
+    TdStealthAllocReleaseCtx(ctx);
     return st;
 }
 
-static BOOLEAN
+static NTSTATUS
 TdStealthAllocPage(
     UINT64  caller_cr3,
     PVOID   page_va,        // page-aligned target VA
@@ -718,7 +748,7 @@ TdStealthAllocPage(
     TD_STEALTH_PARAM * req = (TD_STEALTH_PARAM *)ExAllocatePool2(
         POOL_FLAG_NON_PAGED, sizeof(TD_STEALTH_PARAM), TD_STEALTH_REQ_TAG);
     if (!req)
-        return FALSE;
+        return STATUS_INSUFFICIENT_RESOURCES;
     RtlZeroMemory(req, sizeof(*req));
 
     req->caller_cr3       = caller_cr3;
@@ -747,7 +777,7 @@ TdStealthAllocPage(
         if (pt_buf)  ExFreePoolWithTag(pt_buf,  'htpS');
         if (tgt_buf) ExFreePoolWithTag(tgt_buf, 'htpS');
         ExFreePoolWithTag(req, TD_STEALTH_REQ_TAG);
-        return FALSE;
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     {
@@ -775,14 +805,14 @@ TdStealthAllocPage(
 
     // DPC broadcast — every CPU does VMCALL, each splits its own EPT.
     // same pattern as EPT hook's KeGenericCallDpc.
-    NTSTATUS run_st = TdRunStealthAllocOnCpus(req);
+    NTSTATUS run_st = TdRunStealthAllocOnCpus(req, pt_buf, tgt_buf);
     if (run_st == STATUS_IO_TIMEOUT)
-        return FALSE;
+        return run_st;
 
     ExFreePoolWithTag(pt_buf,  'htpS');
     ExFreePoolWithTag(tgt_buf, 'htpS');
     ExFreePoolWithTag(req, TD_STEALTH_REQ_TAG);
-    return NT_SUCCESS(run_st);
+    return run_st;
 }
 
 //
@@ -848,7 +878,7 @@ TdStealthInjectPages(
         //
         // shellcode mode: pass the buffer directly so VMX-root copies it
         //
-        BOOLEAN ok = TdStealthAllocPage(
+        NTSTATUS stealth_st = TdStealthAllocPage(
             caller_cr3,
             (PVOID)cur_va,
             page_phys + off_in_pg,
@@ -858,9 +888,9 @@ TdStealthInjectPages(
             pt_pfn,
             pt_idx);
 
-        if (!ok)
+        if (!NT_SUCCESS(stealth_st))
         {
-            HYPERPLATFORM_LOG_ERROR("[td] stealth page %u failed", page_count);
+            HYPERPLATFORM_LOG_ERROR("[td] stealth page %u failed: 0x%08X", page_count, stealth_st);
             return FALSE;
         }
 
@@ -3508,7 +3538,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
 
         // resident mode: shadow CR3 handles NX bypass via #PF → CR3 swap → timer restore
-        BOOLEAN stealth_ok = TdStealthAllocPage(
+        NTSTATUS stealth_st = TdStealthAllocPage(
             caller_cr3,
             alloc_base,
             page_phys,
@@ -3521,13 +3551,15 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             shadow_cr3,     // shadow CR3 with NX=0 for shellcode page
             shadow_only);   // no EPT page separation in shadow-only mode
 
-        if (!stealth_ok)
+        if (!NT_SUCCESS(stealth_st))
         {
-            HYPERPLATFORM_LOG_ERROR("[td-rw%s] stealth setup failed", shadow_only ? "-shadow" : "");
-            ZwFreeVirtualMemory(ZwCurrentProcess(), &alloc_base, &alloc_size, MEM_RELEASE);
+            HYPERPLATFORM_LOG_ERROR("[td-rw%s] stealth setup failed: 0x%08X",
+                shadow_only ? "-shadow" : "", stealth_st);
+            if (stealth_st != STATUS_IO_TIMEOUT)
+                ZwFreeVirtualMemory(ZwCurrentProcess(), &alloc_base, &alloc_size, MEM_RELEASE);
             KeUnstackDetachProcess(&apc_state);
             ObDereferenceObject(proc);
-            st = STATUS_UNSUCCESSFUL;
+            st = stealth_st;
             break;
         }
 

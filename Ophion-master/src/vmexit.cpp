@@ -946,8 +946,8 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                         __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
                         exc_bitmap |= (1ULL << 14);
                         __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-                        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x11);
-                        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x11);
+                        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x1);
+                        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x1);
                     }
                     else
                     {
@@ -991,8 +991,8 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                     __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
                     exc_bitmap |= (1ULL << 14);
                     __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x11);
-                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x11);
+                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x1);
+                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x1);
                 }
 
                 _mm_mfence();
@@ -1153,8 +1153,8 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
                 exc_bitmap |= (1ULL << 14);
                 __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x11);
-                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x11);
+                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x1);
+                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x1);
             }
 
             _mm_mfence();
@@ -1736,8 +1736,8 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                 size_t pf_error_code = 0;
                 __vmx_vmread(VMCS_VMEXIT_INTERRUPTION_ERROR_CODE, &pf_error_code);
 
-                // bit 4 = instruction fetch (I/D flag)
-                if (pf_error_code & 0x10)
+                // bit 4 = instruction fetch (I/D flag), bit 1 = write access.
+                if (pf_error_code & (0x10 | 0x02))
                 {
                     // fault address is in exit qualification for #PF
                     UINT64 fault_addr = vcpu->exit_qual;
@@ -1754,7 +1754,8 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                     }
 
                     // check inject hooks with fake PT (EPT hook pages with NX hiding)
-                    if (ept_hook_handle_pf(vcpu, fault_addr, (UINT32)pf_error_code))
+                    if ((pf_error_code & 0x10) &&
+                        ept_hook_handle_pf(vcpu, fault_addr, (UINT32)pf_error_code))
                     {
                         vcpu->advance_rip = FALSE;
                         break;

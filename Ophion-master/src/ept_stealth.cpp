@@ -28,6 +28,9 @@
 
 #define PFN_MASK  0x000FFFFFFFFFF000ULL
 #define NX_BIT    (1ULL << 63)
+#define PFEC_PRESENT      0x01
+#define PFEC_WRITE        0x02
+#define PFEC_INSTR_FETCH  0x10
 
 // =========================================================================
 //  contiguous shadow region allocator
@@ -158,6 +161,26 @@ stealth_find_pt_page(UINT64 cr3, UINT64 va, PT_PAGE_INFO * out)
     out->pte_phys     = out->pt_page_phys + pt_idx * 8;
     out->pte_value    = stealth_read_phys64(out->pte_phys);
     return (out->pte_value & 1) ? TRUE : FALSE;
+}
+
+static BOOLEAN
+stealth_shadow_pte_allows(PEPT_STEALTH_PAGE_INFO sp, UINT32 error_code)
+{
+    if (!sp || !sp->shadow_cr3_phys || !sp->pt_page_va || sp->pt_pte_index >= 512)
+        return FALSE;
+
+    volatile UINT64 * pt = (volatile UINT64 *)sp->pt_page_va;
+    UINT64 pte_value = pt[sp->pt_pte_index];
+    if (!(pte_value & 1))
+        return FALSE;
+
+    if (error_code & PFEC_INSTR_FETCH)
+        return (pte_value & NX_BIT) == 0;
+
+    if (error_code & PFEC_WRITE)
+        return (pte_value & (1ULL << 1)) != 0;
+
+    return TRUE;
 }
 
 // =========================================================================
@@ -354,8 +377,8 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
                 __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
                 exc_bitmap |= (1ULL << 14);
                 __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x11);
-                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x11);
+                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, PFEC_PRESENT);
+                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, PFEC_PRESENT);
             }
 
             _mm_mfence();
@@ -432,8 +455,8 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
                     __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
                     exc_bitmap |= (1ULL << 14);
                     __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x11);
-                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x11);
+                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, PFEC_PRESENT);
+                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, PFEC_PRESENT);
                 }
 
                 _mm_mfence();
@@ -496,12 +519,17 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
             return FALSE;
         }
 
+#if USE_PRIVATE_HOST_CR3
+        if (sp->pt_page_va)
+            hostcr3_map_va(sp->pt_page_va, PAGE_SIZE);
+#endif
+
         SIZE_T exc_bitmap = 0;
         __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
         exc_bitmap |= (1ULL << 14);
         __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x11);
-        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x11);
+        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, PFEC_PRESENT);
+        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, PFEC_PRESENT);
 
         InsertHeadList(&g_ept->stealth_pages, &sp->stealth_page_list);
 
@@ -648,9 +676,8 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
         __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
         exc_bitmap |= (1ULL << 14);  // intercept #PF (vector 14)
         __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-        // only intercept NX violation: P=1 (present) + I/D=1 (instruction fetch)
-        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x11);
-        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x11);
+        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, PFEC_PRESENT);
+        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, PFEC_PRESENT);
     }
 
     InsertHeadList(&g_ept->stealth_pages, &sp->stealth_page_list);
@@ -727,8 +754,11 @@ fail_cleanup_fakept:
 BOOLEAN
 ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error_code)
 {
-    UNREFERENCED_PARAMETER(error_code);
     if (!g_ept || IsListEmpty(&g_ept->stealth_pages)) return FALSE;
+
+    if (!(error_code & PFEC_PRESENT) ||
+        !(error_code & (PFEC_INSTR_FETCH | PFEC_WRITE)))
+        return FALSE;
 
     UINT64 fault_page = fault_addr & ~0xFFFULL;
 
@@ -758,6 +788,16 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
         //   MTF: restore NX=1 in real PTE, don't flush TLB
         //   TLB keeps NX=0 → code continues. TLB eviction → #PF → repeat.
         //
+        if (sp->shadow_cr3_phys)
+        {
+            if (!stealth_shadow_pte_allows(sp, error_code))
+                return FALSE;
+        }
+        else if (!(error_code & PFEC_INSTR_FETCH))
+        {
+            return FALSE;
+        }
+
         if (sp->fake_pt)
         {
             // fake PT mode

@@ -29,6 +29,7 @@
 #define IOCTL_ALLOC_SHADOW_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 8, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_INSTALL_TRIGGER_JUMP CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 9, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_FREE_SHADOW_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 10, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SHADOW_PROTECT_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 11, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // ---- shared structs (must match TestDriver) ----
 
@@ -83,6 +84,16 @@ typedef struct _TD_ALLOC_SHADOW_MEMORY_PARAMS {
     UINT64 shadow_cr3;
     UINT64 status;
 } TD_ALLOC_SHADOW_MEMORY_PARAMS;
+
+typedef struct _TD_SHADOW_PROTECT_PARAMS {
+    UINT64 target_pid;
+    UINT64 base_va;
+    UINT64 size;
+    UINT64 new_protect;
+    UINT64 old_protect;
+    UINT64 shadow_cr3;
+    UINT64 status;
+} TD_SHADOW_PROTECT_PARAMS;
 
 typedef struct _TD_TRIGGER_JUMP_PARAMS {
     UINT64 target_pid;
@@ -149,6 +160,44 @@ static DWORD ParseRwProtect(const wchar_t* value)
 
     printf("[-] Unsupported RW protect: %ls (use rw, wc, 0x4, or 0x8)\n", value);
     return 0;
+}
+
+static DWORD ParseShadowProtect(const wchar_t* value)
+{
+    if (!value || !*value)
+        return 0;
+
+    if (_wcsicmp(value, L"r") == 0 || _wcsicmp(value, L"ro") == 0 ||
+        _wcsicmp(value, L"readonly") == 0)
+        return PAGE_READONLY;
+
+    if (_wcsicmp(value, L"rw") == 0 || _wcsicmp(value, L"readwrite") == 0)
+        return PAGE_READWRITE;
+
+    if (_wcsicmp(value, L"x") == 0 || _wcsicmp(value, L"exec") == 0)
+        return PAGE_EXECUTE;
+
+    if (_wcsicmp(value, L"rx") == 0 || _wcsicmp(value, L"er") == 0 ||
+        _wcsicmp(value, L"execute_read") == 0)
+        return PAGE_EXECUTE_READ;
+
+    if (_wcsicmp(value, L"rwx") == 0 || _wcsicmp(value, L"erw") == 0 ||
+        _wcsicmp(value, L"execute_readwrite") == 0)
+        return PAGE_EXECUTE_READWRITE;
+
+    DWORD protect = (DWORD)wcstoul(value, NULL, 0);
+    switch (protect)
+    {
+    case PAGE_READONLY:
+    case PAGE_READWRITE:
+    case PAGE_EXECUTE:
+    case PAGE_EXECUTE_READ:
+    case PAGE_EXECUTE_READWRITE:
+        return protect;
+    default:
+        printf("[-] Unsupported shadow protect: %ls (use r, rw, x, rx, rwx, or numeric PAGE_*)\n", value);
+        return 0;
+    }
 }
 
 // ---- R3 shellcode builder for injectrw/injectrwshadow ----
@@ -900,6 +949,43 @@ static int CmdFreeMem(const wchar_t* target_name, UINT64 base_va, UINT64 size)
     return (ok && p.status == 0) ? 0 : 1;
 }
 
+static int CmdShadowProtect(UINT64 pid, UINT64 base_va, UINT64 size, DWORD new_protect)
+{
+    printf("[*] Shadow protect: pid=%llu base=0x%llX size=0x%llX protect=0x%X\n",
+        pid, base_va, size, new_protect);
+
+    HANDLE dev = OpenDevice();
+    if (dev == INVALID_HANDLE_VALUE) return 1;
+
+    TD_SHADOW_PROTECT_PARAMS p = {};
+    p.target_pid = pid;
+    p.base_va = base_va;
+    p.size = size;
+    p.new_protect = new_protect;
+
+    DWORD bytes = 0;
+    BOOL ok = DeviceIoControl(dev, IOCTL_SHADOW_PROTECT_MEMORY,
+        &p, sizeof(p), &p, sizeof(p), &bytes, NULL);
+
+    if (ok && bytes >= sizeof(TD_SHADOW_PROTECT_PARAMS))
+    {
+        printf("[+] Protect status: 0x%08llX\n", p.status);
+        printf("    Base VA:    0x%llX\n", p.base_va);
+        printf("    Size:       0x%llX\n", p.size);
+        printf("    OldProtect: 0x%llX\n", p.old_protect);
+        printf("    NewProtect: 0x%llX\n", p.new_protect);
+        printf("    Shadow CR3: 0x%llX\n", p.shadow_cr3);
+    }
+    else
+    {
+        printf("[-] IOCTL_SHADOW_PROTECT_MEMORY failed (error %u)\n", GetLastError());
+        printf("    Driver status: 0x%08llX\n", p.status);
+    }
+
+    CloseHandle(dev);
+    return (ok && p.status == 0) ? 0 : 1;
+}
+
 // ---- trigger hook, redirect selected trigger VA to selected jump VA ----
 
 static int CmdTriggerJump(UINT64 pid, UINT64 trigger_va, UINT64 jump_to_va, UINT64 flags)
@@ -949,6 +1035,7 @@ static void PrintUsage(const wchar_t* exe)
     printf("  %ls injectrwshadow [process] [rw|wc|protect]  RW-alloc + shadow CR3 inject (no EPT split)\n", exe);
     printf("  %ls allocmem <process> <size> [exec] [rw|wc|protect]  Allocate memory, optional shadow CR3 exec\n", exe);
     printf("  %ls freemem <process> <base> <size>  Free memory allocated by allocmem\n", exe);
+    printf("  %ls shadowprotect <pid> <base> <size> <r|rw|x|rx|rwx|protect>  Protect via shadow CR3\n", exe);
     printf("  %ls triggerjump <pid> <trigger|0> <jump> [flags]  Trigger hook redirect\n", exe);
     printf("  %ls injectdll <process> <dllpath>  Manual-map DLL inject (no LoadLibrary)\n", exe);
     printf("  %ls hookr3 <pid> <va> <proxy> [type]  R3 EPT hook (per-process)\n", exe);
@@ -1002,6 +1089,17 @@ int wmain(int argc, wchar_t* argv[])
         UINT64 base_va = wcstoull(argv[3], NULL, 0);
         UINT64 size = wcstoull(argv[4], NULL, 0);
         return CmdFreeMem(argv[2], base_va, size);
+    }
+    else if (_wcsicmp(cmd, L"shadowprotect") == 0)
+    {
+        if (argc < 6) { printf("Usage: shadowprotect <pid> <base_va> <size> <r|rw|x|rx|rwx|protect>\n"); return 1; }
+        UINT64 pid = wcstoull(argv[2], NULL, 0);
+        UINT64 base_va = wcstoull(argv[3], NULL, 0);
+        UINT64 size = wcstoull(argv[4], NULL, 0);
+        DWORD protect = ParseShadowProtect(argv[5]);
+        if (!protect) return 1;
+        if (!pid) { printf("[-] Invalid pid.\n"); return 1; }
+        return CmdShadowProtect(pid, base_va, size, protect);
     }
     else if (_wcsicmp(cmd, L"triggerjump") == 0)
     {

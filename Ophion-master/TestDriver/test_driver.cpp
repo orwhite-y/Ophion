@@ -124,6 +124,12 @@ typedef struct _TD_STEALTH_PARAM {
 #define PFN_MASK_  0x000FFFFFFFFFF000ULL
 #define NX_BIT_    (1ULL << 63)
 
+extern "C" {
+    NTKERNELAPI VOID KeGenericCallDpc(PKDEFERRED_ROUTINE Routine, PVOID Context);
+    NTKERNELAPI VOID KeSignalCallDpcDone(PVOID SystemArgument1);
+    NTKERNELAPI LOGICAL KeSignalCallDpcSynchronize(PVOID SystemArgument2);
+}
+
 // =========================================================================
 //  shadow CR3: build shadow page tables with NX=0 for a VA range.
 //  supports multi-megabyte ranges spanning multiple PT/PD pages.
@@ -211,6 +217,70 @@ TdShadowRegisterCr3(UINT64 shadow_cr3_phys, TD_SHADOW_BUILD_CONTEXT * ctx)
         return FALSE;
 
     RtlZeroMemory(ctx, sizeof(*ctx));
+    return TRUE;
+}
+
+static PVOID
+TdShadowVaFromPhys(UINT64 phys)
+{
+    UINT64 wanted = phys & PFN_MASK_;
+    PVOID result = NULL;
+
+    KIRQL old_irql;
+    KeAcquireSpinLock(&g_shadow_alloc_lock, &old_irql);
+
+    for (UINT32 i = 0; i < MAX_SHADOW_CR3_ALLOCS && !result; i++)
+    {
+        TD_SHADOW_CR3_ALLOCATION * entry = &g_shadow_allocs[i];
+        if (!entry->active)
+            continue;
+
+        for (UINT32 p = 0; p < entry->page_count; p++)
+        {
+            PVOID page = entry->pages[p];
+            if (!page)
+                continue;
+
+            UINT64 page_phys = MmGetPhysicalAddress(page).QuadPart & PFN_MASK_;
+            if (page_phys == wanted)
+            {
+                result = page;
+                break;
+            }
+        }
+    }
+
+    KeReleaseSpinLock(&g_shadow_alloc_lock, old_irql);
+    return result;
+}
+
+static BOOLEAN
+TdResolveShadowPT(UINT64 shadow_cr3, UINT64 va, UINT64 * out_pt_pfn, UINT32 * out_pte_idx, PVOID * out_pt_va)
+{
+    if (!shadow_cr3 || !out_pt_pfn || !out_pte_idx || !out_pt_va)
+        return FALSE;
+
+    PUINT64 table = (PUINT64)TdShadowVaFromPhys(shadow_cr3);
+    if (!table) return FALSE;
+    UINT64 pml4e = table[(va >> 39) & 0x1FF];
+    if (!(pml4e & 1)) return FALSE;
+
+    table = (PUINT64)TdShadowVaFromPhys(pml4e);
+    if (!table) return FALSE;
+    UINT64 pdpe = table[(va >> 30) & 0x1FF];
+    if (!(pdpe & 1) || (pdpe & (1ULL << 7))) return FALSE;
+
+    table = (PUINT64)TdShadowVaFromPhys(pdpe);
+    if (!table) return FALSE;
+    UINT64 pde = table[(va >> 21) & 0x1FF];
+    if (!(pde & 1) || (pde & (1ULL << 7))) return FALSE;
+
+    table = (PUINT64)TdShadowVaFromPhys(pde);
+    if (!table) return FALSE;
+
+    *out_pt_pfn = (pde & PFN_MASK_) >> 12;
+    *out_pte_idx = (UINT32)((va >> 12) & 0x1FF);
+    *out_pt_va = table;
     return TRUE;
 }
 
@@ -401,9 +471,151 @@ TdResolveGuestPT(UINT64 cr3, UINT64 va, UINT64 * out_pt_pfn, UINT32 * out_pte_id
     return TRUE;
 }
 
+static PUINT64
+TdResolveGuestPte(UINT64 cr3, UINT64 va)
+{
+    PHYSICAL_ADDRESS pa;
+    PUINT64 table;
+
+    pa.QuadPart = (LONGLONG)(cr3 & PFN_MASK_);
+    table = (PUINT64)MmGetVirtualForPhysical(pa);
+    if (!table) return NULL;
+    UINT64 pml4e = table[(va >> 39) & 0x1FF];
+    if (!(pml4e & 1)) return NULL;
+
+    pa.QuadPart = (LONGLONG)(pml4e & PFN_MASK_);
+    table = (PUINT64)MmGetVirtualForPhysical(pa);
+    if (!table) return NULL;
+    UINT64 pdpe = table[(va >> 30) & 0x1FF];
+    if (!(pdpe & 1) || (pdpe & (1ULL << 7))) return NULL;
+
+    pa.QuadPart = (LONGLONG)(pdpe & PFN_MASK_);
+    table = (PUINT64)MmGetVirtualForPhysical(pa);
+    if (!table) return NULL;
+    UINT64 pde = table[(va >> 21) & 0x1FF];
+    if (!(pde & 1) || (pde & (1ULL << 7))) return NULL;
+
+    pa.QuadPart = (LONGLONG)(pde & PFN_MASK_);
+    table = (PUINT64)MmGetVirtualForPhysical(pa);
+    if (!table) return NULL;
+    return &table[(va >> 12) & 0x1FF];
+}
+
+static BOOLEAN
+TdNormalizeShadowProtect(ULONG protect, ULONG * out_protect)
+{
+    if (!out_protect)
+        return FALSE;
+
+    protect &= 0xFF;
+    switch (protect)
+    {
+    case PAGE_READONLY:
+    case PAGE_READWRITE:
+    case PAGE_EXECUTE:
+    case PAGE_EXECUTE_READ:
+    case PAGE_EXECUTE_READWRITE:
+        *out_protect = protect;
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static ULONG
+TdProtectFromPte(UINT64 pte)
+{
+    BOOLEAN writable = (pte & (1ULL << 1)) != 0;
+    BOOLEAN executable = (pte & NX_BIT_) == 0;
+
+    if (executable)
+        return writable ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ;
+    return writable ? PAGE_READWRITE : PAGE_READONLY;
+}
+
+static VOID
+TdApplyProtectToPte(PUINT64 pte, ULONG protect)
+{
+    if (!pte)
+        return;
+
+    UINT64 v = *pte;
+    switch (protect)
+    {
+    case PAGE_READONLY:
+        v &= ~(1ULL << 1);
+        v |= NX_BIT_;
+        break;
+    case PAGE_READWRITE:
+        v |= (1ULL << 1);
+        v |= NX_BIT_;
+        break;
+    case PAGE_EXECUTE:
+    case PAGE_EXECUTE_READ:
+        v &= ~(1ULL << 1);
+        v &= ~NX_BIT_;
+        break;
+    case PAGE_EXECUTE_READWRITE:
+        v |= (1ULL << 1);
+        v &= ~NX_BIT_;
+        break;
+    }
+    *pte = v;
+}
+
+typedef struct _TD_TLB_FLUSH_RANGE {
+    UINT64 base;
+    UINT64 size;
+    UINT64 target_cr3;
+    UINT64 shadow_cr3;
+} TD_TLB_FLUSH_RANGE;
+
+static VOID
+TdFlushAddressRangeForCr3(UINT64 base, UINT64 size, UINT64 cr3)
+{
+    if (!cr3)
+        return;
+
+    UINT64 saved_cr3 = __readcr3();
+    if ((saved_cr3 & PFN_MASK_) != (cr3 & PFN_MASK_))
+        __writecr3(cr3);
+
+    UINT64 end = base + size;
+    for (UINT64 page = base; page < end; page += PAGE_SIZE)
+        __invlpg((PVOID)page);
+
+    __writecr3(saved_cr3);
+}
+
+static VOID
+TdFlushAddressRange(UINT64 base_va, SIZE_T size, UINT64 target_cr3, UINT64 shadow_cr3)
+{
+    if (!base_va || !size)
+        return;
+
+    UINT64 start = base_va & ~0xFFFULL;
+    UINT64 end = (base_va + size + PAGE_SIZE - 1) & ~0xFFFULL;
+    for (UINT64 page = start; page < end; page += PAGE_SIZE)
+        __invlpg((PVOID)page);
+
+    if (shadow_cr3)
+        TdFlushAddressRangeForCr3(start, end - start, shadow_cr3);
+
+    TD_TLB_FLUSH_RANGE range = { start, end - start, target_cr3, shadow_cr3 };
+    KeGenericCallDpc([](PKDPC, PVOID Ctx, PVOID A1, PVOID A2) {
+        auto * r = (TD_TLB_FLUSH_RANGE *)Ctx;
+        TdFlushAddressRangeForCr3(r->base, r->size, r->target_cr3);
+        TdFlushAddressRangeForCr3(r->base, r->size, r->shadow_cr3);
+        KeSignalCallDpcSynchronize(A2);
+        KeSignalCallDpcDone(A1);
+    }, &range);
+}
+
 // ---- forward declarations ----
 static BOOLEAN TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3);
 static UINT64 TdStealthTrackRemove(UINT64 pid, PVOID va);
+static BOOLEAN TdStealthTrackFindOverlap(UINT64 pid, PVOID base_va, SIZE_T size, PVOID * out_base, SIZE_T * out_size, UINT64 * out_shadow_cr3);
+static BOOLEAN TdStealthTrackHasPartialOverlap(UINT64 pid, PVOID base_va, SIZE_T size);
 static BOOLEAN TdStealthFreePage(PVOID target_va);
 
 // ---- assembly VMCALL (vmcall.asm) ----
@@ -864,6 +1076,20 @@ TdStealthAllocPage(
         return STATUS_INSUFFICIENT_RESOURCES;
     RtlZeroMemory(req, sizeof(*req));
 
+    UINT64 effective_pt_pfn = pt_pfn;
+    UINT32 effective_pt_idx = pt_idx;
+    PVOID effective_pt_va = NULL;
+
+    if (no_ept_split && shadow_cr3_phys)
+    {
+        if (!TdResolveShadowPT(shadow_cr3_phys, (UINT64)page_va,
+            &effective_pt_pfn, &effective_pt_idx, &effective_pt_va))
+        {
+            ExFreePoolWithTag(req, TD_STEALTH_REQ_TAG);
+            return STATUS_UNSUCCESSFUL;
+        }
+    }
+
     req->caller_cr3       = caller_cr3;
     req->target_va        = page_va;
     req->handler_function = NULL;
@@ -871,8 +1097,8 @@ TdStealthAllocPage(
     req->shellcode_buffer = sc_buf;
     req->shellcode_size   = sc_size;
     req->resident         = resident;
-    req->pt_page_pfn      = pt_pfn;
-    req->pt_pte_index     = pt_idx;
+    req->pt_page_pfn      = effective_pt_pfn;
+    req->pt_pte_index     = effective_pt_idx;
     req->use_fake_pt      = use_fake_pt;
     req->shadow_cr3_phys  = shadow_cr3_phys;
     req->no_ept_split     = no_ept_split;
@@ -895,12 +1121,14 @@ TdStealthAllocPage(
 
     {
         PHYSICAL_ADDRESS pa;
-        pa.QuadPart = (LONGLONG)(pt_pfn << 12);
+        pa.QuadPart = (LONGLONG)(effective_pt_pfn << 12);
         PVOID pt_va = MmGetVirtualForPhysical(pa);
         if (pt_va)
             RtlCopyMemory(pt_buf, pt_va, PAGE_SIZE);
         else
             RtlZeroMemory(pt_buf, PAGE_SIZE);
+        if (!effective_pt_va)
+            effective_pt_va = pt_va;
 
         pa.QuadPart = (LONGLONG)(page_phys & ~0xFFFULL);
         PVOID tgt_va = MmGetVirtualForPhysical(pa);
@@ -909,7 +1137,7 @@ TdStealthAllocPage(
         else
             RtlZeroMemory(tgt_buf, PAGE_SIZE);
 
-        req->pt_page_va = pt_va;  // system VA for VMX-root MTF resync (NULL if unavailable)
+        req->pt_page_va = effective_pt_va;  // system VA for VMX-root MTF resync / shadow PTE check
     }
 
     req->pt_page_copy     = pt_buf;
@@ -1991,6 +2219,7 @@ TdFindGapInProcess(SIZE_T min_size, ULONG * out_offset, ULONG * out_avail)
 #define IOCTL_ALLOC_SHADOW_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 8, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_INSTALL_TRIGGER_JUMP CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 9, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_FREE_SHADOW_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 10, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SHADOW_PROTECT_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 11, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #pragma pack(push, 8)
 typedef struct _TD_INJECT_RW_PARAMS {
@@ -2011,6 +2240,16 @@ typedef struct _TD_ALLOC_SHADOW_MEMORY_PARAMS {
     UINT64 shadow_cr3;      // [out] physical address of shadow PML4, 0 for plain RW
     UINT64 status;          // [out] NTSTATUS
 } TD_ALLOC_SHADOW_MEMORY_PARAMS;
+
+typedef struct _TD_SHADOW_PROTECT_PARAMS {
+    UINT64 target_pid;      // [in]
+    UINT64 base_va;         // [in]
+    UINT64 size;            // [in/out] requested size, rounded to page size on success
+    UINT64 new_protect;     // [in] PAGE_READONLY/PAGE_READWRITE/PAGE_EXECUTE*
+    UINT64 old_protect;     // [out] previous shadow view protect, or real PTE protect
+    UINT64 shadow_cr3;      // [out] active shadow CR3, 0 if restored to original view
+    UINT64 status;          // [out] NTSTATUS
+} TD_SHADOW_PROTECT_PARAMS;
 
 typedef struct _TD_TRIGGER_JUMP_PARAMS {
     UINT64 target_pid;      // [in]
@@ -4243,6 +4482,13 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
         SIZE_T free_size = (SIZE_T)((p->size + PAGE_SIZE - 1) & ~(UINT64)(PAGE_SIZE - 1));
         PVOID free_base = (PVOID)p->base_va;
+        if (!free_size || (UINT64)free_base > (~0ULL - free_size))
+        {
+            st = STATUS_INTEGER_OVERFLOW;
+            p->status = (UINT64)(ULONG)st;
+            irp->IoStatus.Information = sizeof(TD_ALLOC_SHADOW_MEMORY_PARAMS);
+            break;
+        }
 
         PEPROCESS proc = NULL;
         st = PsLookupProcessByProcessId((HANDLE)p->target_pid, &proc);
@@ -4256,26 +4502,42 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         KAPC_STATE apc_state;
         KeStackAttachProcess(proc, &apc_state);
 
-        UINT64 shadow_cr3 = TdStealthTrackRemove(p->target_pid, free_base);
-        if (!shadow_cr3)
-            shadow_cr3 = p->shadow_cr3;
-
-        if (shadow_cr3)
+        UINT64 freed_shadow_cr3 = 0;
+        if (TdStealthTrackHasPartialOverlap(p->target_pid, free_base, free_size))
         {
-            UINT64 base = (UINT64)free_base & ~0xFFFULL;
-            UINT64 end = ((UINT64)free_base + free_size + PAGE_SIZE - 1) & ~0xFFFULL;
-            for (UINT64 page = base; page < end; page += PAGE_SIZE)
+            st = STATUS_CONFLICTING_ADDRESSES;
+        }
+
+        for (;;)
+        {
+            if (!NT_SUCCESS(st))
+                break;
+
+            PVOID tracked_base = NULL;
+            SIZE_T tracked_size = 0;
+            UINT64 shadow_cr3 = 0;
+            if (!TdStealthTrackFindOverlap(
+                p->target_pid, free_base, free_size, &tracked_base, &tracked_size, &shadow_cr3))
+                break;
+
+            UINT64 tracked_start = (UINT64)tracked_base;
+            UINT64 tracked_end = tracked_start + tracked_size;
+
+            for (UINT64 page = tracked_start; page < tracked_end; page += PAGE_SIZE)
                 TdStealthFreePage((PVOID)page);
 
+            TdStealthTrackRemove(p->target_pid, tracked_base);
             TdShadowFreeCr3(shadow_cr3);
+            freed_shadow_cr3 = shadow_cr3;
         }
 
         SIZE_T release_size = 0;
-        st = ZwFreeVirtualMemory(ZwCurrentProcess(), &free_base, &release_size, MEM_RELEASE);
+        if (NT_SUCCESS(st))
+            st = ZwFreeVirtualMemory(ZwCurrentProcess(), &free_base, &release_size, MEM_RELEASE);
         if (NT_SUCCESS(st))
         {
             HYPERPLATFORM_LOG_INFO("[td-free] freed memory: pid=%llu VA=%p size=0x%llX shadow_cr3=0x%llX",
-                       p->target_pid, (PVOID)p->base_va, (UINT64)free_size, shadow_cr3);
+                       p->target_pid, (PVOID)p->base_va, (UINT64)free_size, freed_shadow_cr3);
             p->base_va = 0;
             p->shadow_cr3 = 0;
         }
@@ -4288,6 +4550,252 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         p->size = (UINT64)free_size;
         p->status = (UINT64)(ULONG)st;
         irp->IoStatus.Information = sizeof(TD_ALLOC_SHADOW_MEMORY_PARAMS);
+
+        KeUnstackDetachProcess(&apc_state);
+        ObDereferenceObject(proc);
+        break;
+    }
+
+    case IOCTL_SHADOW_PROTECT_MEMORY:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_SHADOW_PROTECT_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_SHADOW_PROTECT_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_SHADOW_PROTECT_PARAMS * p =
+            (TD_SHADOW_PROTECT_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+
+        if (!p->target_pid || !p->base_va || !p->size)
+        {
+            st = STATUS_INVALID_PARAMETER;
+            p->status = (UINT64)(ULONG)st;
+            irp->IoStatus.Information = sizeof(TD_SHADOW_PROTECT_PARAMS);
+            break;
+        }
+
+        if (p->size > (MAXSIZE_T - (PAGE_SIZE - 1)))
+        {
+            st = STATUS_INTEGER_OVERFLOW;
+            p->status = (UINT64)(ULONG)st;
+            irp->IoStatus.Information = sizeof(TD_SHADOW_PROTECT_PARAMS);
+            break;
+        }
+
+        ULONG new_protect = 0;
+        if (!TdNormalizeShadowProtect((ULONG)p->new_protect, &new_protect))
+        {
+            st = STATUS_INVALID_PARAMETER;
+            p->status = (UINT64)(ULONG)st;
+            irp->IoStatus.Information = sizeof(TD_SHADOW_PROTECT_PARAMS);
+            break;
+        }
+
+        UINT64 start = p->base_va & ~0xFFFULL;
+        SIZE_T protect_size = (SIZE_T)((p->size + (p->base_va - start) + PAGE_SIZE - 1) & ~(UINT64)(PAGE_SIZE - 1));
+        if (!protect_size || start > (~0ULL - protect_size))
+        {
+            st = STATUS_INTEGER_OVERFLOW;
+            p->status = (UINT64)(ULONG)st;
+            irp->IoStatus.Information = sizeof(TD_SHADOW_PROTECT_PARAMS);
+            break;
+        }
+        UINT64 end = start + protect_size;
+
+        PEPROCESS proc = NULL;
+        st = PsLookupProcessByProcessId((HANDLE)p->target_pid, &proc);
+        if (!NT_SUCCESS(st))
+        {
+            p->status = (UINT64)(ULONG)st;
+            irp->IoStatus.Information = sizeof(TD_SHADOW_PROTECT_PARAMS);
+            break;
+        }
+
+        KAPC_STATE apc_state;
+        KeStackAttachProcess(proc, &apc_state);
+
+        UINT64 caller_cr3 = __readcr3();
+        PVOID tracked_base = NULL;
+        SIZE_T tracked_size = 0;
+        UINT64 shadow_cr3 = 0;
+        UINT64 flush_shadow_cr3 = 0;
+        BOOLEAN tracked = TdStealthTrackFindOverlap(
+            p->target_pid, (PVOID)start, protect_size, &tracked_base, &tracked_size, &shadow_cr3);
+        flush_shadow_cr3 = shadow_cr3;
+
+        if (tracked)
+        {
+            UINT64 tracked_start = (UINT64)tracked_base;
+            UINT64 tracked_end = (UINT64)tracked_base + tracked_size;
+            if (start < tracked_start || end > tracked_end)
+            {
+                st = STATUS_CONFLICTING_ADDRESSES;
+                goto ShadowProtectExit;
+            }
+        }
+
+        PUINT64 old_view_pte = tracked ?
+            TdResolveGuestPte(shadow_cr3, start) :
+            TdResolveGuestPte(caller_cr3, start);
+        if (!old_view_pte || !(*old_view_pte & 1))
+        {
+            st = STATUS_NOT_FOUND;
+            goto ShadowProtectExit;
+        }
+        p->old_protect = TdProtectFromPte(*old_view_pte);
+
+        BOOLEAN all_same_as_real = TRUE;
+        for (UINT64 page = start; page < end; page += PAGE_SIZE)
+        {
+            PUINT64 real_pte = TdResolveGuestPte(caller_cr3, page);
+            if (!real_pte || !(*real_pte & 1))
+            {
+                st = STATUS_NOT_FOUND;
+                goto ShadowProtectExit;
+            }
+
+            UINT64 wanted = *real_pte;
+            TdApplyProtectToPte(&wanted, new_protect);
+            if (wanted != *real_pte)
+                all_same_as_real = FALSE;
+        }
+
+        if (!tracked && !all_same_as_real)
+        {
+            shadow_cr3 = TdBuildShadowCR3(caller_cr3, start, protect_size);
+            flush_shadow_cr3 = shadow_cr3;
+            if (!shadow_cr3)
+            {
+                st = STATUS_UNSUCCESSFUL;
+                goto ShadowProtectExit;
+            }
+
+            SIZE_T pages_installed = 0;
+            for (UINT64 page = start; page < end; page += PAGE_SIZE)
+            {
+                UINT64 page_phys = MmGetPhysicalAddress((PVOID)page).QuadPart;
+                UINT64 pt_pfn = 0;
+                UINT32 pt_idx = 0;
+
+                if (!page_phys || !TdResolveGuestPT(caller_cr3, page, &pt_pfn, &pt_idx))
+                {
+                    st = STATUS_UNSUCCESSFUL;
+                    break;
+                }
+
+                NTSTATUS stealth_st = TdStealthAllocPage(
+                    caller_cr3,
+                    (PVOID)page,
+                    page_phys,
+                    NULL,
+                    0,
+                    TRUE,
+                    pt_pfn,
+                    pt_idx,
+                    FALSE,
+                    shadow_cr3,
+                    TRUE);
+
+                if (!NT_SUCCESS(stealth_st))
+                {
+                    st = stealth_st;
+                    break;
+                }
+
+                pages_installed++;
+            }
+
+            if (!NT_SUCCESS(st))
+            {
+                for (SIZE_T i = 0; i < pages_installed; i++)
+                    TdStealthFreePage((PVOID)(start + (i * PAGE_SIZE)));
+                TdShadowFreeCr3(shadow_cr3);
+                shadow_cr3 = 0;
+                goto ShadowProtectExit;
+            }
+
+            if (!TdStealthTrackAdd(p->target_pid, (PVOID)start, protect_size, shadow_cr3))
+            {
+                for (UINT64 page = start; page < end; page += PAGE_SIZE)
+                    TdStealthFreePage((PVOID)page);
+                TdShadowFreeCr3(shadow_cr3);
+                shadow_cr3 = 0;
+                st = STATUS_INSUFFICIENT_RESOURCES;
+                goto ShadowProtectExit;
+            }
+
+            tracked = TRUE;
+            tracked_base = (PVOID)start;
+            tracked_size = protect_size;
+            flush_shadow_cr3 = shadow_cr3;
+        }
+
+        if (tracked)
+        {
+            for (UINT64 page = start; page < end; page += PAGE_SIZE)
+            {
+                PUINT64 real_pte = TdResolveGuestPte(caller_cr3, page);
+                PUINT64 shadow_pte = TdResolveGuestPte(shadow_cr3, page);
+                if (!real_pte || !shadow_pte || !(*real_pte & 1) || !(*shadow_pte & 1))
+                {
+                    st = STATUS_NOT_FOUND;
+                    goto ShadowProtectExit;
+                }
+
+                UINT64 wanted = *real_pte;
+                TdApplyProtectToPte(&wanted, new_protect);
+                if (wanted == *real_pte)
+                    *shadow_pte = *real_pte;
+                else
+                    *shadow_pte = wanted;
+            }
+
+            BOOLEAN tracked_has_diff = FALSE;
+            if (tracked_base && tracked_size)
+            {
+                UINT64 tracked_end = (UINT64)tracked_base + tracked_size;
+                for (UINT64 page = (UINT64)tracked_base; page < tracked_end; page += PAGE_SIZE)
+                {
+                    PUINT64 real_pte = TdResolveGuestPte(caller_cr3, page);
+                    PUINT64 shadow_pte = TdResolveGuestPte(shadow_cr3, page);
+                    if (!real_pte || !shadow_pte || !(*real_pte & 1) || !(*shadow_pte & 1))
+                    {
+                        st = STATUS_NOT_FOUND;
+                        goto ShadowProtectExit;
+                    }
+
+                    if (TdProtectFromPte(*shadow_pte) != TdProtectFromPte(*real_pte))
+                    {
+                        tracked_has_diff = TRUE;
+                        break;
+                    }
+                }
+            }
+
+            if (!tracked_has_diff && tracked_base && tracked_size)
+            {
+                TdFlushAddressRange((UINT64)tracked_base, tracked_size, caller_cr3, shadow_cr3);
+                for (UINT64 page = (UINT64)tracked_base;
+                     page < (UINT64)tracked_base + tracked_size;
+                     page += PAGE_SIZE)
+                    TdStealthFreePage((PVOID)page);
+
+                TdStealthTrackRemove(p->target_pid, tracked_base);
+                TdShadowFreeCr3(shadow_cr3);
+                shadow_cr3 = 0;
+                flush_shadow_cr3 = 0;
+            }
+        }
+
+        TdFlushAddressRange(start, protect_size, caller_cr3, flush_shadow_cr3);
+        st = STATUS_SUCCESS;
+
+    ShadowProtectExit:
+        p->base_va = start;
+        p->size = (UINT64)protect_size;
+        p->new_protect = new_protect;
+        p->shadow_cr3 = shadow_cr3;
+        p->status = (UINT64)(ULONG)st;
+        irp->IoStatus.Information = sizeof(TD_SHADOW_PROTECT_PARAMS);
 
         KeUnstackDetachProcess(&apc_state);
         ObDereferenceObject(proc);
@@ -4444,6 +4952,78 @@ TdStealthTrackRemove(UINT64 pid, PVOID va)
 
     KeReleaseSpinLock(&g_stealth_track_lock, old_irql);
     return shadow_cr3;
+}
+
+static BOOLEAN
+TdStealthTrackFindOverlap(UINT64 pid, PVOID base_va, SIZE_T size, PVOID * out_base, SIZE_T * out_size, UINT64 * out_shadow_cr3)
+{
+    if (!size)
+        return FALSE;
+
+    BOOLEAN found = FALSE;
+    UINT64 req_base = (UINT64)base_va;
+    if (req_base > (~0ULL - size))
+        return FALSE;
+    UINT64 req_end = req_base + size;
+
+    KIRQL old_irql;
+    KeAcquireSpinLock(&g_stealth_track_lock, &old_irql);
+
+    for (int i = 0; i < MAX_STEALTH_TRACKS; i++)
+    {
+        STEALTH_TRACK_ENTRY * entry = &g_stealth_tracks[i];
+        if (!entry->active || entry->target_pid != pid)
+            continue;
+
+        UINT64 base = (UINT64)entry->target_va;
+        UINT64 end = base + entry->alloc_size;
+        if (req_base < end && req_end > base)
+        {
+            if (out_base) *out_base = entry->target_va;
+            if (out_size) *out_size = entry->alloc_size;
+            if (out_shadow_cr3) *out_shadow_cr3 = entry->shadow_cr3_phys;
+            found = TRUE;
+            break;
+        }
+    }
+
+    KeReleaseSpinLock(&g_stealth_track_lock, old_irql);
+    return found;
+}
+
+static BOOLEAN
+TdStealthTrackHasPartialOverlap(UINT64 pid, PVOID base_va, SIZE_T size)
+{
+    if (!size)
+        return FALSE;
+
+    UINT64 req_base = (UINT64)base_va;
+    if (req_base > (~0ULL - size))
+        return TRUE;
+    UINT64 req_end = req_base + size;
+    BOOLEAN partial = FALSE;
+
+    KIRQL old_irql;
+    KeAcquireSpinLock(&g_stealth_track_lock, &old_irql);
+
+    for (int i = 0; i < MAX_STEALTH_TRACKS; i++)
+    {
+        STEALTH_TRACK_ENTRY * entry = &g_stealth_tracks[i];
+        if (!entry->active || entry->target_pid != pid)
+            continue;
+
+        UINT64 base = (UINT64)entry->target_va;
+        UINT64 end = base + entry->alloc_size;
+        if (req_base < end && req_end > base &&
+            (base < req_base || end > req_end))
+        {
+            partial = TRUE;
+            break;
+        }
+    }
+
+    KeReleaseSpinLock(&g_stealth_track_lock, old_irql);
+    return partial;
 }
 
 //

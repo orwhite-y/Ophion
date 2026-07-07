@@ -668,8 +668,16 @@ static fn_ZwResumeThread   g_pZwResumeThread   = NULL;
 #define IOCTL_EPT_UNHOOK  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 2, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_EPT_HOOK_R3 CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 3, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_EPT_UNHOOK_R3 CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 4, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_RESOLVE_EXPORT CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 12, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #pragma pack(push, 8)
+typedef struct _TD_RESOLVE_EXPORT_PARAMS {
+    UINT64 target_pid;          // [in]  target process PID
+    UINT64 messageboxa_va;      // [out] user32!MessageBoxA VA in target process
+    UINT64 sleepex_va;          // [out] kernel32!SleepEx VA in target process
+    UINT64 status;              // [out] NTSTATUS
+} TD_RESOLVE_EXPORT_PARAMS;
+
 typedef struct _TD_INJECT_PARAMS {
     UINT64 target_pid;
     UINT64 alloc_size;
@@ -2288,6 +2296,35 @@ TdAsciiEqualI(const char * a, const char * b)
     return (*a == *b);
 }
 
+static __forceinline BOOLEAN
+TdAsciiEqualIBounded(const char * a, const char * b, ULONG max_len)
+{
+    for (ULONG i = 0; i < max_len; i++)
+    {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return FALSE;
+        if (!ca) return TRUE;
+    }
+    return FALSE;
+}
+
+static __forceinline BOOLEAN
+TdAsciiStartsWithI(const char * text, const char * prefix)
+{
+    while (*prefix)
+    {
+        char ca = *text, cb = *prefix;
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return FALSE;
+        text++;
+        prefix++;
+    }
+    return TRUE;
+}
+
 //
 // TdFindModuleBaseA — find loaded module by ASCII name via PEB walk.
 // walks PEB → Ldr → InMemoryOrderModuleList. compares BaseDllName
@@ -2323,8 +2360,9 @@ TdFindModuleBaseA(const char * name_ascii)
 
         PLIST_ENTRY head = &ldr->InMemoryOrderModuleList;
         PLIST_ENTRY cur = head->Flink;
+        ULONG seen = 0;
 
-        while (cur != head)
+        while (cur != head && seen++ < 512)
         {
             TD_LDR_ENTRY * e = CONTAINING_RECORD(cur, TD_LDR_ENTRY, InMemoryOrderLinks);
             if (e->BaseDllName.Buffer && e->BaseDllName.Length > 0)
@@ -2410,9 +2448,10 @@ TdFindModuleBaseA(const char * name_ascii)
 // (returns NULL for forwards).
 //
 static PVOID
-TdFindExportByName(PVOID module_base, const char * func_name)
+TdFindExportByNameEx(PVOID module_base, const char * func_name, ULONG depth)
 {
     if (!module_base || !func_name) return NULL;
+    if (depth > 4) return NULL;
 
     __try {
         PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)module_base;
@@ -2423,9 +2462,17 @@ TdFindExportByName(PVOID module_base, const char * func_name)
 
         ULONG exp_rva  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
         ULONG exp_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
-        if (!exp_rva) return NULL;
+        if (!exp_rva || exp_size < sizeof(IMAGE_EXPORT_DIRECTORY)) return NULL;
+        if (exp_rva + exp_size < exp_rva) return NULL;
 
         PIMAGE_EXPORT_DIRECTORY exp_dir = (PIMAGE_EXPORT_DIRECTORY)((PUINT8)module_base + exp_rva);
+        if (!exp_dir->NumberOfNames || !exp_dir->NumberOfFunctions ||
+            exp_dir->NumberOfNames > 0x10000 ||
+            exp_dir->NumberOfFunctions > 0x10000 ||
+            !exp_dir->AddressOfNames || !exp_dir->AddressOfNameOrdinals ||
+            !exp_dir->AddressOfFunctions)
+            return NULL;
+
         PULONG  names = (PULONG)((PUINT8)module_base + exp_dir->AddressOfNames);
         PUSHORT ords  = (PUSHORT)((PUINT8)module_base + exp_dir->AddressOfNameOrdinals);
         PULONG  funcs = (PULONG)((PUINT8)module_base + exp_dir->AddressOfFunctions);
@@ -2433,9 +2480,66 @@ TdFindExportByName(PVOID module_base, const char * func_name)
         for (ULONG i = 0; i < exp_dir->NumberOfNames; i++)
         {
             const char * fn = (const char *)((PUINT8)module_base + names[i]);
-            if (TdAsciiEqualI(fn, func_name))
+            if (TdAsciiEqualIBounded(fn, func_name, 256))
             {
-                ULONG func_rva = funcs[ords[i]];
+                USHORT ord = ords[i];
+                if (ord >= exp_dir->NumberOfFunctions)
+                    return NULL;
+
+                ULONG func_rva = funcs[ord];
+                if (!func_rva)
+                    return NULL;
+
+                if (func_rva >= exp_rva && func_rva < exp_rva + exp_size)
+                {
+                    const char * fwd = (const char *)((PUINT8)module_base + func_rva);
+                    const char * exp_end = (const char *)((PUINT8)module_base + exp_rva + exp_size);
+                    char dll_name[128] = {};
+                    char export_name[128] = {};
+                    ULONG dll_len = 0;
+                    ULONG export_len = 0;
+                    BOOLEAN saw_dot = FALSE;
+                    BOOLEAN saw_null = FALSE;
+
+                    for (const char * p = fwd; p < exp_end && (ULONG)(p - fwd) < 255; p++)
+                    {
+                        char c = *p;
+                        if (!c) { saw_null = TRUE; break; }
+
+                        if (!saw_dot)
+                        {
+                            if (c == '.')
+                            {
+                                saw_dot = TRUE;
+                                continue;
+                            }
+                            if (dll_len + 1 >= sizeof(dll_name))
+                                return NULL;
+                            dll_name[dll_len++] = c;
+                        }
+                        else
+                        {
+                            if (export_len + 1 >= sizeof(export_name))
+                                return NULL;
+                            export_name[export_len++] = c;
+                        }
+                    }
+
+                    if (!saw_dot || !saw_null || !dll_len || !export_len)
+                        return NULL;
+
+                    PVOID forward_base = TdFindModuleBaseA(dll_name);
+                    if (!forward_base &&
+                        (TdAsciiStartsWithI(dll_name, "api-") ||
+                         TdAsciiStartsWithI(dll_name, "ext-")))
+                    {
+                        forward_base = TdFindModuleBaseA("kernelbase.dll");
+                    }
+                    if (!forward_base)
+                        return NULL;
+
+                    return TdFindExportByNameEx(forward_base, export_name, depth + 1);
+                }
 
                 // check for forwarded export (RVA points inside export directory)
                 if (func_rva >= exp_rva && func_rva < exp_rva + exp_size)
@@ -2449,6 +2553,12 @@ TdFindExportByName(PVOID module_base, const char * func_name)
     }
 
     return NULL;
+}
+
+static PVOID
+TdFindExportByName(PVOID module_base, const char * func_name)
+{
+    return TdFindExportByNameEx(module_base, func_name, 0);
 }
 
 static PVOID
@@ -4796,6 +4906,76 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         p->shadow_cr3 = shadow_cr3;
         p->status = (UINT64)(ULONG)st;
         irp->IoStatus.Information = sizeof(TD_SHADOW_PROTECT_PARAMS);
+
+        KeUnstackDetachProcess(&apc_state);
+        ObDereferenceObject(proc);
+        break;
+    }
+
+    case IOCTL_RESOLVE_EXPORT:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_RESOLVE_EXPORT_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_RESOLVE_EXPORT_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_RESOLVE_EXPORT_PARAMS * p = (TD_RESOLVE_EXPORT_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+        p->messageboxa_va = 0;
+        p->sleepex_va = 0;
+
+        if (!p->target_pid)
+        {
+            st = STATUS_INVALID_PARAMETER;
+            p->status = (UINT64)(ULONG)st;
+            irp->IoStatus.Information = sizeof(TD_RESOLVE_EXPORT_PARAMS);
+            break;
+        }
+
+        PEPROCESS proc = NULL;
+        st = PsLookupProcessByProcessId((HANDLE)p->target_pid, &proc);
+        if (!NT_SUCCESS(st))
+        {
+            p->status = (UINT64)(ULONG)st;
+            irp->IoStatus.Information = sizeof(TD_RESOLVE_EXPORT_PARAMS);
+            break;
+        }
+
+        KAPC_STATE apc_state;
+        KeStackAttachProcess(proc, &apc_state);
+
+        UINT64 pMsgBox = 0;
+        UINT64 pSleepEx = 0;
+        PVOID user32_base = NULL;
+        PVOID kernel32_base = NULL;
+
+        __try {
+            user32_base = TdFindModuleBaseA("user32.dll");
+            kernel32_base = TdFindModuleBaseA("kernel32.dll");
+
+            if (user32_base)
+                pMsgBox = (UINT64)TdFindExportByName(user32_base, "MessageBoxA");
+
+            if (kernel32_base)
+                pSleepEx = (UINT64)TdFindExportByName(kernel32_base, "SleepEx");
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            HYPERPLATFORM_LOG_ERROR("[td] resolve export: exception walking PEB/exports");
+            st = STATUS_UNSUCCESSFUL;
+        }
+
+        if (!pMsgBox)
+            HYPERPLATFORM_LOG_WARN("[td] resolve export: MessageBoxA not found in user32");
+        if (!pSleepEx)
+            HYPERPLATFORM_LOG_WARN("[td] resolve export: SleepEx not found in kernel32");
+
+        if (NT_SUCCESS(st) && (!pMsgBox || !pSleepEx))
+            st = STATUS_NOT_FOUND;
+
+        p->messageboxa_va = pMsgBox;
+        p->sleepex_va = pSleepEx;
+        p->status = (UINT64)(ULONG)st;
+        irp->IoStatus.Information = sizeof(TD_RESOLVE_EXPORT_PARAMS);
+
+        HYPERPLATFORM_LOG_INFO("[td] resolve export: pid=%llu MessageBoxA=0x%llX SleepEx=0x%llX",
+                   p->target_pid, pMsgBox, pSleepEx);
 
         KeUnstackDetachProcess(&apc_state);
         ObDereferenceObject(proc);

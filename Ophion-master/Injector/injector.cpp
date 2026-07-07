@@ -30,10 +30,18 @@
 #define IOCTL_INSTALL_TRIGGER_JUMP CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 9, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_FREE_SHADOW_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 10, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_SHADOW_PROTECT_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 11, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_RESOLVE_EXPORT CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 12, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // ---- shared structs (must match TestDriver) ----
 
 #pragma pack(push, 8)
+typedef struct _TD_RESOLVE_EXPORT_PARAMS {
+    UINT64 target_pid;          // [in]  target process PID
+    UINT64 messageboxa_va;      // [out] user32!MessageBoxA VA in target process
+    UINT64 sleepex_va;          // [out] kernel32!SleepEx VA in target process
+    UINT64 status;              // [out] NTSTATUS
+} TD_RESOLVE_EXPORT_PARAMS;
+
 typedef struct _TD_INJECT_PARAMS {
     UINT64 target_pid;
     UINT64 alloc_size;
@@ -515,23 +523,32 @@ static bool BuildShellcodeR3(DWORD pid, BYTE* out_buf, DWORD out_size, DWORD* ou
 {
     if (out_size < sizeof(g_shellcode_pic_r3)) return false;
 
-    UINT64 msgbox = ResolveRemoteExport(pid, L"user32.dll", "MessageBoxA");
-    UINT64 sleep_ex = ResolveRemoteExport(pid, L"kernel32.dll", "SleepEx");
-    if (!msgbox || !sleep_ex)
+    // resolve MessageBoxA + SleepEx via driver IOCTL (PEB walk in target process context)
+    HANDLE dev = OpenDevice();
+    if (dev == INVALID_HANDLE_VALUE) return false;
+
+    TD_RESOLVE_EXPORT_PARAMS rp = {};
+    rp.target_pid = (UINT64)pid;
+
+    DWORD bytes = 0;
+    BOOL ok = DeviceIoControl(dev, IOCTL_RESOLVE_EXPORT, &rp, sizeof(rp), &rp, sizeof(rp), &bytes, NULL);
+    CloseHandle(dev);
+
+    if (!ok || bytes < sizeof(TD_RESOLVE_EXPORT_PARAMS) || rp.status != 0 || !rp.messageboxa_va || !rp.sleepex_va)
     {
-        printf("[-] Resolve remote exports failed: MessageBoxA=0x%llX SleepEx=0x%llX\n",
-            msgbox, sleep_ex);
+        printf("[-] BuildShellcodeR3: driver resolve export failed (ok=%u status=0x%llX msgbox=0x%llX sleepex=0x%llX)\n",
+            ok, rp.status, rp.messageboxa_va, rp.sleepex_va);
         return false;
     }
 
     ZeroMemory(out_buf, out_size);
     memcpy(out_buf, g_shellcode_pic_r3, sizeof(g_shellcode_pic_r3));
-    *(UINT64*)(out_buf + R3_PIC_PATCH_MESSAGEBOX) = msgbox;
-    *(UINT64*)(out_buf + R3_PIC_PATCH_SLEEPEX) = sleep_ex;
+    *(UINT64*)(out_buf + R3_PIC_PATCH_MESSAGEBOX) = rp.messageboxa_va;
+    *(UINT64*)(out_buf + R3_PIC_PATCH_SLEEPEX) = rp.sleepex_va;
     *out_shellcode_size = (DWORD)sizeof(g_shellcode_pic_r3);
 
-    printf("[+] R3 shellcode built: MessageBoxA=0x%llX SleepEx=0x%llX size=0x%X\n",
-        msgbox, sleep_ex, *out_shellcode_size);
+    printf("[+] R3 shellcode built via driver: MessageBoxA=0x%llX SleepEx=0x%llX size=0x%X\n",
+        rp.messageboxa_va, rp.sleepex_va, *out_shellcode_size);
     return true;
 }
 
@@ -1022,6 +1039,49 @@ static int CmdTriggerJump(UINT64 pid, UINT64 trigger_va, UINT64 jump_to_va, UINT
     return (ok && p.status == 0) ? 0 : 1;
 }
 
+// ---- resolve export (MessageBoxA + SleepEx) via driver ----
+
+static int CmdResolveExport(const wchar_t* target_name)
+{
+    printf("[*] Resolve Export: %ls\n", target_name);
+
+    DWORD pid = FindProcessByName(target_name);
+    if (!pid) { printf("[-] Process not found.\n"); return 1; }
+    printf("[+] PID: %u\n", pid);
+
+    HANDLE dev = OpenDevice();
+    if (dev == INVALID_HANDLE_VALUE) return 1;
+
+    TD_RESOLVE_EXPORT_PARAMS p = {};
+    p.target_pid = (UINT64)pid;
+
+    DWORD bytes = 0;
+    BOOL ok = DeviceIoControl(dev, IOCTL_RESOLVE_EXPORT, &p, sizeof(p), &p, sizeof(p), &bytes, NULL);
+
+    bool resolved = (ok &&
+        bytes >= sizeof(TD_RESOLVE_EXPORT_PARAMS) &&
+        p.status == 0 &&
+        p.messageboxa_va != 0 &&
+        p.sleepex_va != 0);
+
+    if (ok && bytes >= sizeof(TD_RESOLVE_EXPORT_PARAMS))
+    {
+        printf("[+] Resolve export status: 0x%08llX\n", p.status);
+        printf("    MessageBoxA VA: 0x%llX\n", p.messageboxa_va);
+        printf("    SleepEx VA:     0x%llX\n", p.sleepex_va);
+        if (!resolved)
+            printf("[-] Resolve export returned incomplete result.\n");
+    }
+    else
+    {
+        printf("[-] IOCTL_RESOLVE_EXPORT failed (error %u)\n", GetLastError());
+        printf("    Driver status: 0x%08llX\n", p.status);
+    }
+
+    CloseHandle(dev);
+    return resolved ? 0 : 1;
+}
+
 // ---- usage ----
 
 static void PrintUsage(const wchar_t* exe)
@@ -1040,6 +1100,7 @@ static void PrintUsage(const wchar_t* exe)
     printf("  %ls injectdll <process> <dllpath>  Manual-map DLL inject (no LoadLibrary)\n", exe);
     printf("  %ls hookr3 <pid> <va> <proxy> [type]  R3 EPT hook (per-process)\n", exe);
     printf("  %ls unhookr3 <pid> <va>                Remove R3 EPT hook\n", exe);
+    printf("  %ls resolvetest [process]              Resolve MessageBoxA+SleepEx via driver\n", exe);
     printf("\n");
     printf("Hook types: 0=abs jump (14B), 1=VMCALL (3B), 2=INT3 (1B)\n");
 }
@@ -1050,7 +1111,9 @@ int wmain(int argc, wchar_t* argv[])
 {
     if (argc < 2)
     {
-        return CmdInjectRWShadow(L"notepad.exe", PAGE_READWRITE);
+        return CmdInjectRWShadow(L"PioneerGame.exe", PAGE_READWRITE);
+        //return CmdInjectRWShadow(L"notepad.exe", PAGE_READWRITE);
+
     }
 
     const wchar_t* cmd = argv[1];
@@ -1138,6 +1201,11 @@ int wmain(int argc, wchar_t* argv[])
         UINT64 pid       = wcstoull(argv[2], NULL, 0);
         UINT64 target_va = wcstoull(argv[3], NULL, 16);
         return CmdUnhookR3(pid, target_va);
+    }
+    else if (_wcsicmp(cmd, L"resolvetest") == 0)
+    {
+        const wchar_t* target = (argc > 2) ? argv[2] : L"notepad.exe";
+        return CmdResolveExport(target);
     }
     else
     {

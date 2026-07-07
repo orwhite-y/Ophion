@@ -220,7 +220,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
                     }
 
                     efi->retiring = FALSE;
-                    efi->oneshot_fired = FALSE;
+                    efi->oneshot_fired = 0;
                     efi->handler_function = req->proxy_function;
                     efi->oneshot = req->oneshot;
                     efi->hook_type = req->hook_type;
@@ -1047,7 +1047,8 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                 // let CPU re-execute from the real function, arm MTF to swap back.
                 // same technique as ept_handle_violation for non-target CR3.
                 //
-                if (fi->oneshot && fi->oneshot_fired)
+                if (fi->oneshot &&
+                    _InterlockedCompareExchange(&fi->oneshot_fired, 1, 0) != 0)
                 {
                     PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,
                         (SIZE_T)(hp->pfn_of_hooked_page << 12));
@@ -1065,9 +1066,6 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                     // don't change RIP — CPU re-executes same VA from original code
                     return TRUE;
                 }
-                if (fi->oneshot)
-                    fi->oneshot_fired = TRUE;
-
                 __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
                 return TRUE;
             }

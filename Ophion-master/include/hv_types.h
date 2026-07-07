@@ -96,7 +96,7 @@ typedef struct _EPT_HOOKED_FUNCTION_INFO {
     UINT32      hook_type;                // 0=abs jmp, 1=VMCALL, 2=INT3
     BOOLEAN     user_trampoline;          // TRUE = trampoline is user-mode (don't pool_release)
     BOOLEAN     oneshot;                  // TRUE = redirect once, then pass through to original
-    BOOLEAN     oneshot_fired;            // set by handler after first trigger
+    volatile LONG oneshot_fired;          // atomically set by handler after first trigger
     BOOLEAN     retiring;                 // TRUE = unhook requested; per-vCPU paths restore lazily
 } EPT_HOOKED_FUNCTION_INFO, *PEPT_HOOKED_FUNCTION_INFO;
 

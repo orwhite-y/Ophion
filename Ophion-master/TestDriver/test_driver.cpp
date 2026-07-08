@@ -4163,7 +4163,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 // wait for oneshot to fire (or timeout after 10 seconds)
                 //
                 LARGE_INTEGER poll_interval;
-                poll_interval.QuadPart = -50LL * 10000LL;  // 50 ms per poll
+                poll_interval.QuadPart = -1LL * 10000LL;  // 1 ms per poll
                 LARGE_INTEGER total_timeout;
                 total_timeout.QuadPart = -10LL * 1000LL * 10000LL;  // 10 seconds max
 
@@ -4173,7 +4173,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                         break;
                     if (total_timeout.QuadPart >= 0)
                         break;
-                    total_timeout.QuadPart += 50LL * 10000LL;
+                    total_timeout.QuadPart += 1LL * 10000LL;
                 }
 
                 ZwClose(c->thread_handle);
@@ -4961,7 +4961,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 LARGE_INTEGER total_timeout;
                 total_timeout.QuadPart = -10LL * 1000LL * 10000LL;  // 10 seconds max
                 LARGE_INTEGER poll_interval;
-                poll_interval.QuadPart = -50LL * 10000LL;  // 50 ms per poll
+                poll_interval.QuadPart = -1LL * 10000LL;  // 1 ms per poll
 
                 while (c->fired_signal == 0)
                 {
@@ -4969,7 +4969,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                         break;
                     if (total_timeout.QuadPart >= 0)
                         break;
-                    total_timeout.QuadPart += 50LL * 10000LL;
+                    total_timeout.QuadPart += 1LL * 10000LL;
                 }
 
                 ZwClose(c->thread_handle);

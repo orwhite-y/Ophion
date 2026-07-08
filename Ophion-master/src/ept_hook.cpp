@@ -1100,9 +1100,16 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                     //
                     if (_InterlockedCompareExchange(&fi->oneshot_fired, 1, 0) == 0)
                     {
+                        //
+                        // retire immediately on the first successful target-thread hit.
+                        // from this point on, every CPU/thread will pass through the
+                        // original function while R0 asynchronously unhooks all CPUs.
+                        //
+                        fi->retiring = TRUE;
+
                         // first hit — notify cleanup worker
                         if (fi->external_fired)
-                            *fi->external_fired = 1;
+                            _InterlockedExchange(fi->external_fired, 1);
 
                         __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
                         return TRUE;

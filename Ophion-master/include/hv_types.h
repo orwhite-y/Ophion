@@ -97,6 +97,7 @@ typedef struct _EPT_HOOKED_FUNCTION_INFO {
     BOOLEAN     user_trampoline;          // TRUE = trampoline is user-mode (don't pool_release)
     BOOLEAN     oneshot;                  // TRUE = redirect once, then pass through to original
     volatile LONG oneshot_fired;          // atomically set by handler after first trigger
+    volatile LONG * external_fired;       // [in] if non-NULL, set to 1 when oneshot fires (for cleanup worker)
     UINT64      expected_tid;             // 0 = any thread, non-0 = only this TID may redirect
     BOOLEAN     retiring;                 // TRUE = unhook requested; per-vCPU paths restore lazily
 } EPT_HOOKED_FUNCTION_INFO, *PEPT_HOOKED_FUNCTION_INFO;
@@ -277,10 +278,12 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     PEPT_STEALTH_PAGE_INFO stealth_pf_swapped;
 
     //
-    // NX cycle: preemption timer restore (no MTF — avoids IPI ack delay)
+    // NX cycle: preemption timer restore (no MTF – avoids IPI ack delay)
     //
     PEPT_STEALTH_PAGE_INFO nx_timer_restore;
     UINT64      nx_timer_real_cr3;
+    PEPT_STEALTH_PAGE_INFO shadow_mtf_restore;
+    UINT64      shadow_mtf_real_cr3;
     BOOLEAN     stealth_pf_configured;  // TRUE after this CPU's VMCS has #PF interception
 
     //
@@ -304,6 +307,7 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_STEALTH_ALLOC    0x00000006
 #define VMCALL_STEALTH_FREE     0x00000007
 #define VMCALL_EPT_HOOK_INJECT  0x00000008
+#define VMCALL_EPT_SET_EXTERNAL_FIRED 0x00000009
 
 //
 // VMCALL identifier in rax — like UnrealVTDbg's VMCALL_IDENTIFIER
@@ -347,6 +351,7 @@ typedef struct _EPT_HOOK_VMCALL_PARAM {
     BOOLEAN force_read_access;    // [in] TRUE = changed_entry R=1 (shellcode self-read)
     BOOLEAN oneshot;              // [in] TRUE = redirect to proxy once, then pass-through to trampoline
     UINT64  expected_tid;         // [in] 0 = any thread, non-0 = only this TID may redirect
+    volatile LONG * external_fired; // [in] optional kernel NonPaged signal set to 1 on first oneshot hit
 } EPT_HOOK_VMCALL_PARAM, *PEPT_HOOK_VMCALL_PARAM;
 
 //
@@ -442,7 +447,8 @@ typedef struct _EPT_STEALTH_PAGE_INFO {
     // --- shadow CR3 (NX bypass without touching real PTE) ---
     UINT64          shadow_cr3_phys;    // physical address of shadow PML4 (0 = not used)
     UINT64          real_cr3_value;     // saved real guest CR3 during shadow switch
-
+    BOOLEAN         allow_write_pf;     // TRUE = shadow CR3 path may handle write #PF
+    
 } EPT_STEALTH_PAGE_INFO, *PEPT_STEALTH_PAGE_INFO;
 
 //
@@ -473,6 +479,7 @@ typedef struct _EPT_STEALTH_ALLOC_PARAM {
     BOOLEAN use_fake_pt;          // [in] TRUE = create fake PT page (NX=1 visible to scanners, NX=0 in real PTE)
     UINT64  shadow_cr3_phys;      // [in] physical address of shadow PML4 (0 = no shadow CR3)
     BOOLEAN no_ept_split;         // [in] TRUE = shadow CR3 only, keep target EPT mapping unchanged
+    BOOLEAN allow_write_pf;       // [in] TRUE = shadow CR3 path may handle write #PF
     volatile LONG installed;      // [internal] 0→1 by first CPU
     BOOLEAN result;               // [out]
 } EPT_STEALTH_ALLOC_PARAM, *PEPT_STEALTH_ALLOC_PARAM;

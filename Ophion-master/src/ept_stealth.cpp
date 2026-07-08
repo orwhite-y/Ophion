@@ -178,7 +178,11 @@ stealth_shadow_pte_allows(PEPT_STEALTH_PAGE_INFO sp, UINT32 error_code)
         return (pte_value & NX_BIT) == 0;
 
     if (error_code & PFEC_WRITE)
+    {
+        if (!sp->allow_write_pf)
+            return FALSE;
         return (pte_value & (1ULL << 1)) != 0;
+    }
 
     return TRUE;
 }
@@ -508,6 +512,7 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     sp->resident        = req->resident;
     sp->shadow_cr3_phys = req->shadow_cr3_phys;
     sp->no_ept_split    = req->no_ept_split;
+    sp->allow_write_pf  = req->allow_write_pf;
 
     if (sp->no_ept_split)
     {
@@ -528,8 +533,16 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
         __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
         exc_bitmap |= (1ULL << 14);
         __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, PFEC_PRESENT);
-        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, PFEC_PRESENT);
+        if (sp->allow_write_pf)
+        {
+            __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, PFEC_PRESENT);
+            __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, PFEC_PRESENT);
+        }
+        else
+        {
+            __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, PFEC_PRESENT | PFEC_INSTR_FETCH);
+            __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, PFEC_PRESENT | PFEC_INSTR_FETCH);
+        }
 
         InsertHeadList(&g_ept->stealth_pages, &sp->stealth_page_list);
 
@@ -826,21 +839,36 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             UINT64 shadow_cr3_val = (real_cr3 & ~PFN_MASK) | (sp->shadow_cr3_phys & PFN_MASK);
             __vmx_vmwrite(VMCS_GUEST_CR3, shadow_cr3_val);
 
-            // arm preemption timer (~1ms)
+            if (sp->allow_write_pf)
             {
-                UINT64 vmx_misc = __readmsr(IA32_VMX_MISC);
-                UINT32 rate_shift = (UINT32)(vmx_misc & 0x1F);
-                UINT32 timer_val = (5000000U >> rate_shift);
-                if (timer_val < 1000) timer_val = 1000;
+                // shadow-protect path: keep timer-based restore for write faults.
+                {
+                    UINT64 vmx_misc = __readmsr(IA32_VMX_MISC);
+                    UINT32 rate_shift = (UINT32)(vmx_misc & 0x1F);
+                    UINT32 timer_val = (5000000U >> rate_shift);
+                    if (timer_val < 1000) timer_val = 1000;
 
-                __vmx_vmwrite(VMCS_GUEST_VMX_PREEMPTION_TIMER_VALUE, timer_val);
-                SIZE_T pin = 0;
-                __vmx_vmread(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, &pin);
-                pin |= PIN_BASED_VM_EXEC_CTRL_VMX_PREEMPTION_TIMER;
-                __vmx_vmwrite(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, pin);
+                    __vmx_vmwrite(VMCS_GUEST_VMX_PREEMPTION_TIMER_VALUE, timer_val);
+                    SIZE_T pin = 0;
+                    __vmx_vmread(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, &pin);
+                    pin |= PIN_BASED_VM_EXEC_CTRL_VMX_PREEMPTION_TIMER;
+                    __vmx_vmwrite(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, pin);
+                }
+
+                vcpu->nx_timer_restore = sp;
             }
+            else
+            {
+                // inject shadow-exec path: restore real CR3 on the very next MTF
+                // so the thread does not keep running inside the shadow CR3 window.
+                vcpu->shadow_mtf_restore = sp;
+                vcpu->shadow_mtf_real_cr3 = real_cr3;
 
-            vcpu->nx_timer_restore = sp;
+                SIZE_T pc = 0;
+                __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+                pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+                __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+            }
         }
 
         // fake PT mode: EPT changes + MTF

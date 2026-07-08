@@ -225,6 +225,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
                     efi->oneshot = req->oneshot;
                     efi->expected_tid = req->expected_tid;
                     efi->hook_type = req->hook_type;
+                    efi->external_fired = req->external_fired;
                     func_exists = TRUE;
                     break;
                 }
@@ -283,6 +284,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
             fi->oneshot            = req->oneshot;
             fi->expected_tid       = req->expected_tid;
             fi->hook_type          = req->hook_type;
+            fi->external_fired     = req->external_fired;
 
             UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
             PUINT8 fake  = &existing->fake_page_va[off];
@@ -412,6 +414,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     fi->oneshot            = req->oneshot;
     fi->expected_tid       = req->expected_tid;
     fi->hook_type          = req->hook_type;
+    fi->external_fired     = req->external_fired;
 
     UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
     PUINT8 fake  = &hp->fake_page_va[off];
@@ -716,7 +719,27 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     pc &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
     __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
 
-    if (vcpu->mtf_restore_page)
+    if (vcpu->shadow_mtf_restore)
+    {
+        SIZE_T current_cr3 = 0;
+        __vmx_vmread(VMCS_GUEST_CR3, &current_cr3);
+
+        PEPT_STEALTH_PAGE_INFO sp = vcpu->shadow_mtf_restore;
+        UINT64 current_pfn = ((UINT64)current_cr3 & 0x000FFFFFFFFFF000ULL) >> 12;
+        UINT64 shadow_pfn  = (sp->shadow_cr3_phys & 0x000FFFFFFFFFF000ULL) >> 12;
+
+        if (current_pfn == shadow_pfn)
+        {
+            __vmx_vmwrite(VMCS_GUEST_CR3, vcpu->shadow_mtf_real_cr3);
+            // do NOT INVVPID here: preserve the executable TLB entry built
+            // under shadow CR3, but keep the shadow-CR3 window to one instruction.
+        }
+
+        vcpu->shadow_mtf_restore = NULL;
+        vcpu->shadow_mtf_real_cr3 = 0;
+    }
+
+    else if (vcpu->mtf_restore_page)
     {
         PEPT_HOOKED_PAGE_INFO hp = vcpu->mtf_restore_page;
 
@@ -1069,9 +1092,26 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                     return TRUE;
                 }
 
-                if (fi->oneshot &&
-                    _InterlockedCompareExchange(&fi->oneshot_fired, 1, 0) != 0)
+                if (fi->oneshot)
                 {
+                    //
+                    // first trigger: redirect to handler (shellcode).
+                    // signal external waiter (cleanup worker) that oneshot has fired.
+                    //
+                    if (_InterlockedCompareExchange(&fi->oneshot_fired, 1, 0) == 0)
+                    {
+                        // first hit — notify cleanup worker
+                        if (fi->external_fired)
+                            *fi->external_fired = 1;
+
+                        __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
+                        return TRUE;
+                    }
+
+                    //
+                    // subsequent triggers: pass through to original function.
+                    // swap EPT to original view, arm MTF to restore after one instruction.
+                    //
                     PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,
                         (SIZE_T)(hp->pfn_of_hooked_page << 12));
                     if (my_pte)

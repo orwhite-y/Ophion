@@ -757,18 +757,19 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             //   r12 = target_cr3      (0 = R0 hook, non-0 = R3 per-process)
             //   r13 = user_trampoline (R3 executable buffer, NULL = kernel pool)
             //   r14 = user_trampoline_pa (pre-computed PA)
-            //   r15 = flags (low32: bit 0 = force_read_access, bit 1 = oneshot;
-            //                high32: expected TID for oneshot trigger, 0 = any)
+            //   r15 = expected_tid (full 64-bit, 0 = any thread)
+            //   r11 = hook_type (low32) | flags (high32: bit 0 = force_read_access, bit 1 = oneshot)
             //
             UINT64 target_va       = regs->rdx;
             UINT64 proxy_va        = regs->r8;
             UINT64 origin_va       = regs->r9;
             UINT64 caller_cr3      = regs->r10;
             UINT32 hook_type       = (UINT32)regs->r11;
+            UINT64 flags           = regs->r11 >> 32;   // high32: force_read_access(bit0), oneshot(bit1)
             UINT64 target_cr3      = regs->r12;
             UINT64 user_tramp_va   = regs->r13;
             UINT64 user_tramp_pa   = regs->r14;
-            UINT64 flags           = regs->r15;
+            UINT64 expected_tid    = regs->r15;          // full 64-bit TID filter
 
             if (!target_va || !caller_cr3)
             {
@@ -788,7 +789,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             local_req.user_trampoline_pa = user_tramp_pa;
             local_req.force_read_access  = (flags & 1) ? TRUE : FALSE;
             local_req.oneshot            = (flags & 2) ? TRUE : FALSE;
-            local_req.expected_tid       = flags >> 32;
+            local_req.expected_tid       = expected_tid;
             if (origin_va)
                 local_req.origin_function = (PVOID *)origin_va;
 

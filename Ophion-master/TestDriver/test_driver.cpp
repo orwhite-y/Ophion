@@ -28,12 +28,24 @@ extern "C" NTKERNELAPI PPEB PsGetProcessPeb(PEPROCESS Process);
 extern "C" NTSYSAPI NTSTATUS NTAPI ZwProtectVirtualMemory(
     HANDLE ProcessHandle, PVOID * BaseAddress, PSIZE_T RegionSize,
     ULONG NewProtect, PULONG OldProtect);
+extern "C" NTSYSAPI PVOID NTAPI RtlPcToFileHeader(PVOID PcValue, PVOID * BaseOfImage);
+extern "C" NTSYSAPI PIMAGE_NT_HEADERS NTAPI RtlImageNtHeader(PVOID Base);
 
 typedef ULONG (NTAPI * fn_KeResumeThread)(PKTHREAD Thread);
 static fn_KeResumeThread g_pKeResumeThread = NULL;
 
 typedef NTSTATUS (NTAPI * fn_PsResumeThread)(PETHREAD Thread, PULONG PreviousSuspendCount);
 static fn_PsResumeThread g_pPsResumeThread = NULL;
+
+static BOOLEAN TdAsciiEqualI(const char * a, const char * b);
+static NTSTATUS TdNtResumeThreadBySSDT(HANDLE thread_h, PULONG previous_count);
+
+typedef struct _TD_SYSTEM_SERVICE_DESCRIPTOR_TABLE {
+    PULONG ServiceTableBase;
+    PULONG ServiceCounterTableBase;
+    ULONG_PTR NumberOfServices;
+    PUCHAR ParamTableBase;
+} TD_SYSTEM_SERVICE_DESCRIPTOR_TABLE, *PTD_SYSTEM_SERVICE_DESCRIPTOR_TABLE;
 
 typedef struct _TD_UNICODE_STRING {
     USHORT Length;
@@ -672,13 +684,25 @@ TdResolveNtoskrnlExport(const char * func_name)
     static PVOID g_ntoskrnl_base = NULL;
     if (!g_ntoskrnl_base)
     {
-        UNICODE_STRING nt_name;
-        RtlInitUnicodeString(&nt_name, L"ntoskrnl.exe");
-        g_ntoskrnl_base = (PVOID)MmGetSystemRoutineAddress(&nt_name);
+        UNICODE_STRING fn_name;
+        PVOID known_routine = NULL;
+        PVOID image_base = NULL;
+
+        RtlInitUnicodeString(&fn_name, L"NtClose");
+        known_routine = (PVOID)MmGetSystemRoutineAddress(&fn_name);
+        if (!known_routine)
+        {
+            RtlInitUnicodeString(&fn_name, L"ZwClose");
+            known_routine = (PVOID)MmGetSystemRoutineAddress(&fn_name);
+        }
+
+        if (known_routine)
+            RtlPcToFileHeader(known_routine, &image_base);
+
+        g_ntoskrnl_base = image_base;
         if (!g_ntoskrnl_base)
         {
-            // fallback: hardcoded known base (rarely needed)
-            g_ntoskrnl_base = (PVOID)0xFFFFF80000000000ULL;
+            HYPERPLATFORM_LOG_WARN("[td] TdResolveNtoskrnlExport: failed to locate ntoskrnl base");
         }
     }
 
@@ -716,7 +740,9 @@ TdResolveNtoskrnlExport(const char * func_name)
                     ULONG func_rva = funcs[ord];
                     if (func_rva >= exp_rva && func_rva < exp_rva + exp_sz)
                         return NULL;  // forwarded export — skip
-                    return (PUINT8)g_ntoskrnl_base + func_rva;
+                    PVOID resolved = (PUINT8)g_ntoskrnl_base + func_rva;
+                    HYPERPLATFORM_LOG_INFO("[td] nt export %s = %p", func_name, resolved);
+                    return resolved;
                 }
             }
         }
@@ -727,6 +753,159 @@ TdResolveNtoskrnlExport(const char * func_name)
     }
 
     return NULL;
+}
+
+static PVOID
+TdGetNtoskrnlBase(ULONG * image_size)
+{
+    static PVOID g_nt_base = NULL;
+    static ULONG g_nt_size = 0;
+
+    if (!g_nt_base)
+    {
+        UNICODE_STRING fn_name;
+        PVOID known_routine = NULL;
+        PVOID image_base = NULL;
+
+        RtlInitUnicodeString(&fn_name, L"NtClose");
+        known_routine = (PVOID)MmGetSystemRoutineAddress(&fn_name);
+        if (!known_routine)
+        {
+            RtlInitUnicodeString(&fn_name, L"ZwClose");
+            known_routine = (PVOID)MmGetSystemRoutineAddress(&fn_name);
+        }
+
+        if (known_routine)
+            RtlPcToFileHeader(known_routine, &image_base);
+
+        if (image_base)
+        {
+            PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)image_base;
+            PIMAGE_NT_HEADERS64 nt = NULL;
+            if (dos->e_magic == IMAGE_DOS_SIGNATURE)
+                nt = (PIMAGE_NT_HEADERS64)((PUINT8)image_base + dos->e_lfanew);
+            g_nt_base = image_base;
+            if (nt && nt->Signature == IMAGE_NT_SIGNATURE)
+                g_nt_size = nt->OptionalHeader.SizeOfImage;
+        }
+    }
+
+    if (image_size)
+        *image_size = g_nt_size;
+    return g_nt_base;
+}
+
+static PVOID
+TdSearchPattern(const UCHAR * pattern, UCHAR wildcard, SIZE_T length, PUCHAR base, SIZE_T size)
+{
+    if (!pattern || !base || !length || size < length)
+        return NULL;
+
+    for (SIZE_T i = 0; i <= size - length; i++)
+    {
+        BOOLEAN match = TRUE;
+        for (SIZE_T j = 0; j < length; j++)
+        {
+            if (pattern[j] != wildcard && base[i + j] != pattern[j])
+            {
+                match = FALSE;
+                break;
+            }
+        }
+        if (match)
+            return base + i;
+    }
+
+    return NULL;
+}
+
+static PTD_SYSTEM_SERVICE_DESCRIPTOR_TABLE
+TdGetSSDTBase()
+{
+    static PTD_SYSTEM_SERVICE_DESCRIPTOR_TABLE g_ssdt = NULL;
+    if (g_ssdt)
+        return g_ssdt;
+
+    PUCHAR nt_base = (PUCHAR)TdGetNtoskrnlBase(NULL);
+    if (!nt_base)
+        return NULL;
+
+    PIMAGE_DOS_HEADER dos_h = (PIMAGE_DOS_HEADER)nt_base;
+    PIMAGE_NT_HEADERS64 nt = NULL;
+    if (dos_h->e_magic == IMAGE_DOS_SIGNATURE)
+        nt = (PIMAGE_NT_HEADERS64)(nt_base + dos_h->e_lfanew);
+    if (!nt || nt->Signature != IMAGE_NT_SIGNATURE)
+        return NULL;
+
+    PIMAGE_SECTION_HEADER first_sec = IMAGE_FIRST_SECTION(nt);
+    for (USHORT i = 0; i < nt->FileHeader.NumberOfSections; i++)
+    {
+        PIMAGE_SECTION_HEADER sec = &first_sec[i];
+        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
+            !(sec->Characteristics & IMAGE_SCN_MEM_NOT_PAGED) ||
+            (sec->Characteristics & IMAGE_SCN_MEM_DISCARDABLE))
+        {
+            continue;
+        }
+
+        if (*(PULONG)sec->Name == 'TINI' || *(PULONG)sec->Name == 'EGAP')
+            continue;
+
+        static const UCHAR pattern[] = {
+            0x4C, 0x8D, 0x15, 0xCC, 0xCC, 0xCC, 0xCC,
+            0x4C, 0x8D, 0x1D, 0xCC, 0xCC, 0xCC, 0xCC, 0xF7
+        };
+
+        PUCHAR found = (PUCHAR)TdSearchPattern(pattern, 0xCC, sizeof(pattern),
+            nt_base + sec->VirtualAddress, sec->Misc.VirtualSize);
+        if (found)
+        {
+            g_ssdt = (PTD_SYSTEM_SERVICE_DESCRIPTOR_TABLE)
+                (found + *(PLONG)(found + 3) + 7);
+            return g_ssdt;
+        }
+    }
+
+    return NULL;
+}
+
+static PVOID
+TdGetSSDTEntry(ULONG index)
+{
+    PTD_SYSTEM_SERVICE_DESCRIPTOR_TABLE ssdt = TdGetSSDTBase();
+    if (!ssdt || !ssdt->ServiceTableBase || index >= ssdt->NumberOfServices)
+        return NULL;
+
+    return (PUCHAR)ssdt->ServiceTableBase + (((PLONG)ssdt->ServiceTableBase)[index] >> 4);
+}
+
+static ULONG
+TdGetPreviousModeOffset()
+{
+    static ULONG g_prev_mode_offset = 0;
+    if (g_prev_mode_offset)
+        return g_prev_mode_offset;
+
+    UNICODE_STRING fn_name;
+    RtlInitUnicodeString(&fn_name, L"ExGetPreviousMode");
+    PUCHAR p = (PUCHAR)MmGetSystemRoutineAddress(&fn_name);
+    if (!p)
+        return 0;
+
+    for (SIZE_T i = 0; i + 6 < 0x40; i++)
+    {
+        if (p[i] == 0x0F && p[i + 1] == 0xB6)
+        {
+            UCHAR modrm = p[i + 2];
+            if ((modrm & 0xC0) == 0x80)
+            {
+                g_prev_mode_offset = *(ULONG UNALIGNED *)(p + i + 3);
+                break;
+            }
+        }
+    }
+
+    return g_prev_mode_offset;
 }
 
 static NTSTATUS
@@ -740,6 +919,9 @@ TdResumeThreadHandle(HANDLE thread_h, PULONG previous_count)
 
     if (g_pZwResumeThread)
         return g_pZwResumeThread(thread_h, prev);
+
+    if (!g_pPsResumeThread && !g_pKeResumeThread)
+        return TdNtResumeThreadBySSDT(thread_h, prev);
 
     PETHREAD thread_obj = NULL;
     NTSTATUS st = ObReferenceObjectByHandle(thread_h, THREAD_ALL_ACCESS,
@@ -758,7 +940,7 @@ TdResumeThreadHandle(HANDLE thread_h, PULONG previous_count)
     }
     else
     {
-        st = STATUS_NOT_SUPPORTED;
+        st = TdNtResumeThreadBySSDT(thread_h, prev);
     }
 
     ObDereferenceObject(thread_obj);
@@ -1614,6 +1796,7 @@ typedef struct _R3_HOOK_DPC_CTX {
     PVOID    user_trampoline;
     UINT64   user_trampoline_pa;
     UINT64   flags;             // bit 0 = force_read_access (shellcode self-read)
+    UINT64   expected_tid;      // 0 = any thread
     NTSTATUS result;
 } R3_HOOK_DPC_CTX;
 
@@ -1629,11 +1812,11 @@ DpcEptHookR3(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
         (UINT64)ctx->proxy,
         (UINT64)ctx->origin,
         ctx->caller_cr3,
-        (UINT64)ctx->hook_type,
+        (UINT64)ctx->hook_type | (ctx->flags << 32),
         ctx->target_cr3,
         (UINT64)ctx->user_trampoline,
         ctx->user_trampoline_pa,
-        ctx->flags);
+        ctx->expected_tid);
 
     KeSignalCallDpcSynchronize(A2);
     KeSignalCallDpcDone(A1);
@@ -1685,11 +1868,11 @@ TdPerCpuVmcallDpc(PKDPC Dpc, PVOID Ctx, PVOID, PVOID)
             (UINT64)ctx->proxy,
             (UINT64)ctx->origin,
             ctx->caller_cr3,
-            (UINT64)ctx->hook_type,
-            ctx->target_cr3,
-            (UINT64)ctx->user_trampoline,
-            ctx->user_trampoline_pa,
-            ctx->flags | (ctx->expected_tid << 32));
+            (UINT64)ctx->hook_type | (ctx->flags << 32),  // r11 = hook_type(low32) | flags(high32)
+            ctx->target_cr3,                        // r12 = target_cr3
+            (UINT64)ctx->user_trampoline,           // r13 = user_trampoline
+            ctx->user_trampoline_pa,                // r14 = user_trampoline_pa
+            ctx->expected_tid);                     // r15 = expected_tid (full 64-bit)
     }
     else if (ctx->op == TdPerCpuVmcallUnhook)
     {
@@ -1788,8 +1971,8 @@ TdInstallTriggerHookAllCpus(
     ctx->caller_cr3 = caller_cr3;
     ctx->hook_type  = 1;          // VMCALL (0F 01 C1)
     ctx->target_cr3 = caller_cr3; // per-process filter
-    ctx->flags      = (flags ? flags : 2) & 0xFFFFFFFFULL;
-    ctx->expected_tid = expected_tid & 0xFFFFFFFFULL;
+    ctx->flags      = (flags ? flags : 2);
+    ctx->expected_tid = expected_tid;
 
     NTSTATUS st = TdRunPerCpuVmcall(ctx, 2000);
     if (st != STATUS_IO_TIMEOUT)
@@ -2670,6 +2853,119 @@ static PVOID
 TdFindExportByName(PVOID module_base, const char * func_name)
 {
     return TdFindExportByNameEx(module_base, func_name, 0);
+}
+
+static BOOLEAN
+TdExtractSyscallIndexFromStub(PVOID stub, PULONG index_out)
+{
+    if (!stub || !index_out)
+        return FALSE;
+
+    __try {
+        PUCHAR p = (PUCHAR)stub;
+
+        if (p[0] == 0xE9)
+        {
+            LONG rel = *(LONG UNALIGNED *)(p + 1);
+            p = p + 5 + rel;
+        }
+        else if (p[0] == 0xFF && p[1] == 0x25)
+        {
+            LONG rel = *(LONG UNALIGNED *)(p + 2);
+            PUCHAR * indirect = (PUCHAR *)(p + 6 + rel);
+            p = *indirect;
+        }
+
+        for (SIZE_T i = 0; i + 7 < 0x20; i++)
+        {
+            if (p[i] == 0xB8)
+            {
+                ULONG idx = *(ULONG UNALIGNED *)(p + i + 1);
+                for (SIZE_T j = i + 5; j + 1 < 0x20; j++)
+                {
+                    if (p[j] == 0x0F && p[j + 1] == 0x05)
+                    {
+                        *index_out = idx;
+                        return TRUE;
+                    }
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+
+    return FALSE;
+}
+
+static BOOLEAN
+TdResolveUserSyscallIndex(const char * export_name, PULONG index_out)
+{
+    if (!export_name || !index_out)
+        return FALSE;
+
+    PVOID ntdll_base = TdFindModuleBaseA("ntdll");
+    if (!ntdll_base)
+        ntdll_base = TdFindModuleBaseA("ntdll.dll");
+    if (!ntdll_base)
+        return FALSE;
+
+    PVOID stub = TdFindExportByName(ntdll_base, export_name);
+    if (!stub)
+        return FALSE;
+
+    return TdExtractSyscallIndexFromStub(stub, index_out);
+}
+
+typedef NTSTATUS (NTAPI * fn_NtResumeThreadSsdt)(HANDLE, PULONG);
+
+static NTSTATUS
+TdNtResumeThreadBySSDT(HANDLE thread_h, PULONG previous_count)
+{
+    static ULONG g_resume_index = (ULONG)-1;
+
+    if (!thread_h)
+        return STATUS_INVALID_PARAMETER;
+
+    if (g_resume_index == (ULONG)-1)
+    {
+        ULONG idx = 0;
+        if (!TdResolveUserSyscallIndex("NtResumeThread", &idx) &&
+            !TdResolveUserSyscallIndex("ZwResumeThread", &idx))
+        {
+            HYPERPLATFORM_LOG_WARN("[td] TdNtResumeThreadBySSDT: failed to resolve syscall index");
+            return STATUS_NOT_FOUND;
+        }
+
+        g_resume_index = idx;
+        HYPERPLATFORM_LOG_INFO("[td] TdNtResumeThreadBySSDT: syscall index=0x%X", g_resume_index);
+    }
+
+    fn_NtResumeThreadSsdt nt_resume =
+        (fn_NtResumeThreadSsdt)TdGetSSDTEntry(g_resume_index);
+    if (!nt_resume)
+    {
+        HYPERPLATFORM_LOG_WARN("[td] TdNtResumeThreadBySSDT: SSDT entry lookup failed for 0x%X", g_resume_index);
+        return STATUS_NOT_FOUND;
+    }
+
+    ULONG prev_mode_offset = TdGetPreviousModeOffset();
+    if (!prev_mode_offset)
+    {
+        HYPERPLATFORM_LOG_WARN("[td] TdNtResumeThreadBySSDT: PreviousMode offset not found");
+        return STATUS_NOT_FOUND;
+    }
+
+    PULONG prev_arg = previous_count;
+    ULONG local_prev = 0;
+    if (!prev_arg)
+        prev_arg = &local_prev;
+
+    PUCHAR p_prev_mode = (PUCHAR)PsGetCurrentThread() + prev_mode_offset;
+    UCHAR saved_mode = *p_prev_mode;
+    *p_prev_mode = KernelMode;
+    NTSTATUS st = nt_resume(thread_h, prev_arg);
+    *p_prev_mode = saved_mode;
+    return st;
 }
 
 static PVOID
@@ -3637,21 +3933,8 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                         KAFFINITY cpu0 = (KAFFINITY)1;
                         ZwSetInformationThread(thr_h, ThreadAffinityMask, &cpu0, sizeof(cpu0));
 
-                        if (g_pZwResumeThread)
-                        {
-                            ULONG prev = 0;
-                            g_pZwResumeThread(thr_h, &prev);
-                        }
-                        else if (g_pKeResumeThread)
-                        {
-                            PETHREAD thr_obj = NULL;
-                            if (NT_SUCCESS(ObReferenceObjectByHandle(thr_h, THREAD_ALL_ACCESS,
-                                    *PsThreadType, KernelMode, (PVOID *)&thr_obj, NULL)))
-                            {
-                                g_pKeResumeThread((PKTHREAD)thr_obj);
-                                ObDereferenceObject(thr_obj);
-                            }
-                        }
+                        ULONG prev = 0;
+                        TdResumeThreadHandle(thr_h, &prev);
                         HYPERPLATFORM_LOG_INFO("[td] inject: thread SUSPENDED+CPU0+RESUMED trigger=%p", trigger_fn);
                         cleanup_thr_h = thr_h;  // keep for async cleanup (don't close yet)
                     }
@@ -3992,21 +4275,8 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                             KAFFINITY cpu0 = (KAFFINITY)1;
                             ZwSetInformationThread(thr_h, ThreadAffinityMask, &cpu0, sizeof(cpu0));
 
-                            if (g_pZwResumeThread)
-                            {
-                                ULONG prev = 0;
-                                g_pZwResumeThread(thr_h, &prev);
-                            }
-                            else if (g_pKeResumeThread)
-                            {
-                                PETHREAD thr_obj = NULL;
-                                if (NT_SUCCESS(ObReferenceObjectByHandle(thr_h, THREAD_ALL_ACCESS,
-                                        *PsThreadType, KernelMode, (PVOID *)&thr_obj, NULL)))
-                                {
-                                    g_pKeResumeThread((PKTHREAD)thr_obj);
-                                    ObDereferenceObject(thr_obj);
-                                }
-                            }
+                            ULONG prev = 0;
+                            TdResumeThreadHandle(thr_h, &prev);
                             HYPERPLATFORM_LOG_INFO("[td-map] thread SUSPENDED+CPU0+RESUMED trigger=%p", trigger_fn);
                             ZwClose(thr_h);
                         }
@@ -4392,7 +4662,6 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                     else
                     {
                         cleanup_thr_h = thr_h;
-                        thread_started = TRUE;  // RtlCreateUserThread with TRUE = already suspended
                     }
                 }
                 else
@@ -4441,6 +4710,8 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             {
                 HYPERPLATFORM_LOG_ERROR("[td-rw] thread resume failed: 0x%08X", resume_st);
                 st = resume_st;
+                ZwClose(cleanup_thr_h);
+                cleanup_thr_h = NULL;
             }
         }
 
@@ -5480,6 +5751,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
         RtlInitUnicodeString(&fn, L"ZwResumeThread");
         g_pZwResumeThread = (fn_ZwResumeThread)MmGetSystemRoutineAddress(&fn);
     }
+    if (!g_pZwResumeThread)
+        g_pZwResumeThread = (fn_ZwResumeThread)TdResolveNtoskrnlExport("NtResumeThread");
+    if (!g_pZwResumeThread)
+        g_pZwResumeThread = (fn_ZwResumeThread)TdResolveNtoskrnlExport("ZwResumeThread");
 
     // resolve PsResumeThread and KeResumeThread via ntoskrnl export table walk
     // (Blackbone-style — these are not in MmGetSystemRoutineAddress's table)

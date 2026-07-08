@@ -660,6 +660,75 @@ typedef NTSTATUS (NTAPI * fn_ZwResumeThread)(HANDLE, PULONG);
 static fn_ZwCreateThreadEx g_pZwCreateThreadEx = NULL;
 static fn_ZwResumeThread   g_pZwResumeThread   = NULL;
 
+//
+// resolve a function by name from ntoskrnl.exe's export table.
+// this finds APIs that MmGetSystemRoutineAddress cannot see
+// (e.g. PsResumeThread, KeResumeThread, etc.).
+// Blackbone uses the same technique.
+//
+static PVOID
+TdResolveNtoskrnlExport(const char * func_name)
+{
+    static PVOID g_ntoskrnl_base = NULL;
+    if (!g_ntoskrnl_base)
+    {
+        UNICODE_STRING nt_name;
+        RtlInitUnicodeString(&nt_name, L"ntoskrnl.exe");
+        g_ntoskrnl_base = (PVOID)MmGetSystemRoutineAddress(&nt_name);
+        if (!g_ntoskrnl_base)
+        {
+            // fallback: hardcoded known base (rarely needed)
+            g_ntoskrnl_base = (PVOID)0xFFFFF80000000000ULL;
+        }
+    }
+
+    if (!g_ntoskrnl_base || !func_name)
+        return NULL;
+
+    __try
+    {
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)g_ntoskrnl_base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+            return NULL;
+
+        PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((PUINT8)g_ntoskrnl_base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE)
+            return NULL;
+
+        ULONG exp_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        ULONG exp_sz  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        if (!exp_rva || exp_sz < sizeof(IMAGE_EXPORT_DIRECTORY))
+            return NULL;
+
+        PIMAGE_EXPORT_DIRECTORY exp_dir = (PIMAGE_EXPORT_DIRECTORY)((PUINT8)g_ntoskrnl_base + exp_rva);
+        PULONG names = (PULONG)((PUINT8)g_ntoskrnl_base + exp_dir->AddressOfNames);
+        PUSHORT ords = (PUSHORT)((PUINT8)g_ntoskrnl_base + exp_dir->AddressOfNameOrdinals);
+        PULONG funcs = (PULONG)((PUINT8)g_ntoskrnl_base + exp_dir->AddressOfFunctions);
+
+        for (ULONG i = 0; i < exp_dir->NumberOfNames; i++)
+        {
+            const char * fn = (const char *)((PUINT8)g_ntoskrnl_base + names[i]);
+            if (fn && TdAsciiEqualI(fn, func_name))
+            {
+                USHORT ord = ords[i];
+                if (ord < exp_dir->NumberOfFunctions)
+                {
+                    ULONG func_rva = funcs[ord];
+                    if (func_rva >= exp_rva && func_rva < exp_rva + exp_sz)
+                        return NULL;  // forwarded export — skip
+                    return (PUINT8)g_ntoskrnl_base + func_rva;
+                }
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        HYPERPLATFORM_LOG_WARN("[td] TdResolveNtoskrnlExport exception for %s", func_name);
+    }
+
+    return NULL;
+}
+
 static NTSTATUS
 TdResumeThreadHandle(HANDLE thread_h, PULONG previous_count)
 {
@@ -5403,9 +5472,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
         RtlInitUnicodeString(&fn, L"ZwCreateThreadEx");
         g_pZwCreateThreadEx = (fn_ZwCreateThreadEx)MmGetSystemRoutineAddress(&fn);
     }
-    RtlInitUnicodeString(&fn, L"PsResumeThread");
-    g_pPsResumeThread = (fn_PsResumeThread)MmGetSystemRoutineAddress(&fn);
-
+    // resolve ZwResumeThread via MmGetSystemRoutineAddress (exported)
     RtlInitUnicodeString(&fn, L"NtResumeThread");
     g_pZwResumeThread = (fn_ZwResumeThread)MmGetSystemRoutineAddress(&fn);
     if (!g_pZwResumeThread)
@@ -5414,10 +5481,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
         g_pZwResumeThread = (fn_ZwResumeThread)MmGetSystemRoutineAddress(&fn);
     }
 
-    RtlInitUnicodeString(&fn, L"KeResumeThread");
-    g_pKeResumeThread = (fn_KeResumeThread)MmGetSystemRoutineAddress(&fn);
-    HYPERPLATFORM_LOG_INFO("[td] thread APIs: create=%p ps_resume=%p zw_resume=%p ke_resume=%p",
-        g_pZwCreateThreadEx, g_pPsResumeThread, g_pZwResumeThread, g_pKeResumeThread);
+    // resolve PsResumeThread and KeResumeThread via ntoskrnl export table walk
+    // (Blackbone-style — these are not in MmGetSystemRoutineAddress's table)
+    g_pPsResumeThread = (fn_PsResumeThread)TdResolveNtoskrnlExport("PsResumeThread");
+    g_pKeResumeThread = (fn_KeResumeThread)TdResolveNtoskrnlExport("KeResumeThread");
+
+    HYPERPLATFORM_LOG_INFO("[td] thread APIs: create=%p zw_resume=%p ps_resume=%p ke_resume=%p",
+        g_pZwCreateThreadEx, g_pZwResumeThread, g_pPsResumeThread, g_pKeResumeThread);
 
     UNICODE_STRING dev_name, sym_name;
     RtlInitUnicodeString(&dev_name, TD_DEVICE_NAME);

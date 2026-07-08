@@ -4,6 +4,13 @@
 #include "hv.h"
 #include "log.h"
 
+extern volatile LONG g_dbg_shadow_pf_seen;
+extern volatile LONG g_dbg_shadow_pf_allowed;
+extern volatile LONG g_dbg_shadow_pf_switched;
+
+static volatile LONG g_dbg_shadow_timer_restore = 0;
+static volatile LONG g_dbg_shadow_timer_skip = 0;
+
 static __forceinline VOID
 vmexit_advance_rip(VIRTUAL_MACHINE_STATE * vcpu)
 {
@@ -1173,6 +1180,43 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             regs->rax = (UINT64)STATUS_SUCCESS;
             break;
 
+        case VMCALL_EPT_SET_EXTERNAL_FIRED:
+        {
+            PVOID target_va = (PVOID)regs->rdx;
+            volatile LONG * ext_fired = (volatile LONG *)regs->r8;
+            UINT64 caller_cr3 = regs->r9;
+            BOOLEAN found = FALSE;
+
+            if (g_ept && target_va && ext_fired)
+            {
+                PLIST_ENTRY cur = g_ept->hooked_pages.Flink;
+                while (cur != &g_ept->hooked_pages)
+                {
+                    PEPT_HOOKED_PAGE_INFO hp = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
+                    cur = cur->Flink;
+                    if (caller_cr3 && hp->target_cr3 != caller_cr3) continue;
+
+                    PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
+                    while (fc != &hp->hooked_functions_list)
+                    {
+                        PEPT_HOOKED_FUNCTION_INFO fi = CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
+                        fc = fc->Flink;
+                        if (fi->virtual_address == target_va)
+                        {
+                            fi->external_fired = ext_fired;
+                            found = TRUE;
+                            break;
+                        }
+                    }
+                    if (found)
+                        break;
+                }
+            }
+
+            regs->rax = found ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_NOT_FOUND;
+            break;
+        }
+
         case VMCALL_VMXOFF:
         {
             UINT64 instr_len = 0;
@@ -1577,7 +1621,12 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
             {
                 // still on shadow CR3 — safe to restore real CR3
                 __vmx_vmwrite(VMCS_GUEST_CR3, vcpu->nx_timer_real_cr3);
+                _InterlockedIncrement(&g_dbg_shadow_timer_restore);
                 // NO INVVPID — preserve TLB entry (NX=0 from shadow page tables)!
+            }
+            else
+            {
+                _InterlockedIncrement(&g_dbg_shadow_timer_skip);
             }
             // else: context switch already overwrote shadow CR3 — skip restore.
             // TLB was flushed by context switch → next fetch → NX=1 → #PF → re-arm.

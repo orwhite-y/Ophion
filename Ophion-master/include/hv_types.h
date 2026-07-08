@@ -97,6 +97,7 @@ typedef struct _EPT_HOOKED_FUNCTION_INFO {
     BOOLEAN     user_trampoline;          // TRUE = trampoline is user-mode (don't pool_release)
     BOOLEAN     oneshot;                  // TRUE = redirect once, then pass through to original
     volatile LONG oneshot_fired;          // atomically set by handler after first trigger
+    volatile LONG * external_fired;       // optional NonPaged signal set on first oneshot hit
     UINT64      expected_tid;             // 0 = any thread, non-0 = only this TID may redirect
     BOOLEAN     retiring;                 // TRUE = unhook requested; per-vCPU paths restore lazily
 } EPT_HOOKED_FUNCTION_INFO, *PEPT_HOOKED_FUNCTION_INFO;
@@ -304,6 +305,7 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_STEALTH_ALLOC    0x00000006
 #define VMCALL_STEALTH_FREE     0x00000007
 #define VMCALL_EPT_HOOK_INJECT  0x00000008
+#define VMCALL_EPT_SET_EXTERNAL_FIRED 0x00000009
 
 //
 // VMCALL identifier in rax — like UnrealVTDbg's VMCALL_IDENTIFIER
@@ -347,6 +349,7 @@ typedef struct _EPT_HOOK_VMCALL_PARAM {
     BOOLEAN force_read_access;    // [in] TRUE = changed_entry R=1 (shellcode self-read)
     BOOLEAN oneshot;              // [in] TRUE = redirect to proxy once, then pass-through to trampoline
     UINT64  expected_tid;         // [in] 0 = any thread, non-0 = only this TID may redirect
+    volatile LONG * external_fired; // [in] optional kernel NonPaged signal set to 1 on first oneshot hit
 } EPT_HOOK_VMCALL_PARAM, *PEPT_HOOK_VMCALL_PARAM;
 
 //

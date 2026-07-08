@@ -77,6 +77,7 @@ typedef struct _TD_PEB_LDR_DATA {
 #define VMCALL_STEALTH_ALLOC    0x00000006
 #define VMCALL_STEALTH_FREE     0x00000007
 #define VMCALL_EPT_HOOK_INJECT  0x00000008
+#define VMCALL_EPT_SET_EXTERNAL_FIRED 0x00000009
 
 //
 // EPT hook inject param — pre-built at PASSIVE_LEVEL, passed to VMX-root.
@@ -1420,20 +1421,38 @@ TdStealthAllocPage(
     {
         PHYSICAL_ADDRESS pa;
         pa.QuadPart = (LONGLONG)(effective_pt_pfn << 12);
-        PVOID pt_va = MmGetVirtualForPhysical(pa);
-        if (pt_va)
-            RtlCopyMemory(pt_buf, pt_va, PAGE_SIZE);
-        else
-            RtlZeroMemory(pt_buf, PAGE_SIZE);
+        PVOID pt_va = effective_pt_va ? effective_pt_va : MmGetVirtualForPhysical(pa);
+        PVOID target_page_base = (PVOID)((UINT64)page_va & ~0xFFFULL);
+
+        __try
+        {
+            if (pt_va)
+                RtlCopyMemory(pt_buf, pt_va, PAGE_SIZE);
+            else
+                RtlZeroMemory(pt_buf, PAGE_SIZE);
+
+            //
+            // We are still attached to the target process here, so copy the
+            // target page through its current process VA instead of trying to
+            // re-derive a transient VA from the physical page.
+            //
+            if (target_page_base)
+                RtlCopyMemory(tgt_buf, target_page_base, PAGE_SIZE);
+            else
+                RtlZeroMemory(tgt_buf, PAGE_SIZE);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            ExFreePoolWithTag(pt_buf, 'htpS');
+            ExFreePoolWithTag(tgt_buf, 'htpS');
+            ExFreePoolWithTag(req, TD_STEALTH_REQ_TAG);
+            HYPERPLATFORM_LOG_ERROR("[td-rw] TdStealthAllocPage copy fault: page_va=%p pt_va=%p",
+                target_page_base, pt_va);
+            return GetExceptionCode();
+        }
+
         if (!effective_pt_va)
             effective_pt_va = pt_va;
-
-        pa.QuadPart = (LONGLONG)(page_phys & ~0xFFFULL);
-        PVOID tgt_va = MmGetVirtualForPhysical(pa);
-        if (tgt_va)
-            RtlCopyMemory(tgt_buf, tgt_va, PAGE_SIZE);
-        else
-            RtlZeroMemory(tgt_buf, PAGE_SIZE);
 
         req->pt_page_va = effective_pt_va;  // system VA for VMX-root MTF resync / shadow PTE check
     }
@@ -1956,7 +1975,8 @@ TdInstallTriggerHookAllCpus(
     UINT64  caller_cr3,
     UINT64  flags,
     UINT64  expected_tid,
-    PVOID * origin)
+    PVOID * origin,
+    volatile LONG * fired_signal)
 {
     TD_PERCPU_VMCALL_CTX * ctx = (TD_PERCPU_VMCALL_CTX *)ExAllocatePool2(
         POOL_FLAG_NON_PAGED, sizeof(TD_PERCPU_VMCALL_CTX), TD_PERCPU_VMCALL_TAG);
@@ -1977,6 +1997,22 @@ TdInstallTriggerHookAllCpus(
     NTSTATUS st = TdRunPerCpuVmcall(ctx, 2000);
     if (st != STATUS_IO_TIMEOUT)
         ExFreePoolWithTag(ctx, TD_PERCPU_VMCALL_TAG);
+
+    if (NT_SUCCESS(st) && fired_signal)
+    {
+        NTSTATUS fired_st = hv_vmcall_ex(
+            VMCALL_EPT_SET_EXTERNAL_FIRED,
+            (UINT64)trigger_fn,
+            (UINT64)fired_signal,
+            caller_cr3,
+            0, 0, 0, 0, 0, 0);
+        if (!NT_SUCCESS(fired_st))
+        {
+            HYPERPLATFORM_LOG_ERROR("[td] TdInstallTriggerHookAllCpus: "
+                "VMCALL_EPT_SET_EXTERNAL_FIRED failed for trigger=%p st=0x%08X",
+                trigger_fn, fired_st);
+        }
+    }
     return st;
 }
 
@@ -2972,7 +3008,7 @@ static PVOID
 TdResolveDefaultTrigger(PEPROCESS proc, const char * log_prefix)
 {
     static const char * trigger_candidates[] = {
-        "NtYieldExecution", "RtlSetCurrentTransaction", "NtTestAlert", NULL
+        "NtTestAlert", "RtlSetCurrentTransaction", NULL
     };
 
     PVOID trigger_fn = NULL;
@@ -4171,12 +4207,12 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             irp->IoStatus.Information = sizeof(TD_INJECT_DLL_PARAMS);
 
             //
-            // resolve trigger from ntdll (NtYieldExecution preferred, cold function)
+            // resolve trigger from ntdll (prefer cold functions that are not hot scheduler paths)
             //
             PVOID trigger_fn = NULL;
             {
                 static const char * trigger_candidates[] = {
-                    "NtYieldExecution", "RtlSetCurrentTransaction", "NtTestAlert", NULL
+                    "NtTestAlert", "RtlSetCurrentTransaction", NULL
                 };
                 PPEB peb = PsGetProcessPeb(proc);
                 if (peb)
@@ -4526,7 +4562,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         if (!trigger_fn)
         {
             static const char * trigger_candidates[] = {
-                "NtYieldExecution", "RtlSetCurrentTransaction", "NtTestAlert", NULL
+                "NtTestAlert", "RtlSetCurrentTransaction", NULL
             };
             PPEB peb = PsGetProcessPeb(proc);
             if (peb)
@@ -4676,13 +4712,62 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
 
         //
-        // step 9: EPT hook trigger → shellcode VA (TID-filtered, oneshot)
+        // step 9: prepare cleanup ctx before resume so we can signal immediate unhook
+        //
+        struct _RW_CLEANUP_CTX {
+            HANDLE          thread_handle;
+            PVOID           trigger_fn;
+            PVOID           shellcode_va;
+            UINT64          target_cr3;
+            UINT64          target_pid;
+            PIO_WORKITEM    work_item;
+            volatile LONG   fired_signal;
+        };
+
+        PIO_WORKITEM wi = NULL;
+        struct _RW_CLEANUP_CTX * cleanup_ctx = NULL;
+
+        if (cleanup_thr_h && NT_SUCCESS(st))
+        {
+            wi = IoAllocateWorkItem(IoGetCurrentIrpStackLocation(irp)->DeviceObject);
+            if (wi)
+            {
+                cleanup_ctx = (struct _RW_CLEANUP_CTX *)
+                    ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(struct _RW_CLEANUP_CTX), 'wRcI');
+            }
+        }
+
+        if (cleanup_ctx)
+        {
+            cleanup_ctx->thread_handle = cleanup_thr_h;
+            cleanup_ctx->trigger_fn    = trigger_fn;
+            cleanup_ctx->shellcode_va  = alloc_base;
+            cleanup_ctx->target_cr3    = caller_cr3;
+            cleanup_ctx->target_pid    = p->target_pid;
+            cleanup_ctx->work_item     = wi;
+            cleanup_ctx->fired_signal  = 0;
+        }
+        else if (cleanup_thr_h && NT_SUCCESS(st))
+        {
+            st = STATUS_INSUFFICIENT_RESOURCES;
+            ZwClose(cleanup_thr_h);
+            cleanup_thr_h = NULL;
+            if (wi)
+            {
+                IoFreeWorkItem(wi);
+                wi = NULL;
+            }
+        }
+
+        //
+        // step 10: EPT hook trigger → shellcode VA (TID-filtered, oneshot)
         //
         if (NT_SUCCESS(st) && expected_tid)
         {
             PVOID dummy_origin = NULL;
+            volatile LONG * fired_ptr = cleanup_ctx ? &cleanup_ctx->fired_signal : NULL;
             NTSTATUS hook_st = TdInstallTriggerHookAllCpus(
-                trigger_fn, alloc_base, caller_cr3, 2, expected_tid, &dummy_origin);
+                trigger_fn, alloc_base, caller_cr3, 2, expected_tid, &dummy_origin, fired_ptr);
 
             HYPERPLATFORM_LOG_INFO("[td-rw] trigger hook %s trigger=%p sc=%p tid=%llu st=0x%08X",
                        NT_SUCCESS(hook_st) ? "OK" : "FAILED", trigger_fn, alloc_base, expected_tid, hook_st);
@@ -4696,7 +4781,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         KeUnstackDetachProcess(&apc_state);
 
         //
-        // step 10: resume thread (now hook is active with correct TID)
+        // step 11: resume thread (now hook is active with correct TID)
         //
         if (NT_SUCCESS(st) && cleanup_thr_h)
         {
@@ -4716,74 +4801,60 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
 
         //
-        // step 10: async cleanup — unhook trigger after delay, inject stays resident
+        // step 12: async cleanup — unhook trigger immediately after first hit
         //
-        if (cleanup_thr_h && NT_SUCCESS(st))
+        if (cleanup_ctx)
         {
-            struct _RW_CLEANUP_CTX {
-                HANDLE          thread_handle;
-                PVOID           trigger_fn;
-                PVOID           shellcode_va;
-                UINT64          target_cr3;
-                UINT64          target_pid;
-                PIO_WORKITEM    work_item;
-            };
+            IoQueueWorkItem(wi, [](PDEVICE_OBJECT, PVOID context) {
+                auto * c = (struct _RW_CLEANUP_CTX *)context;
 
-            PIO_WORKITEM wi = IoAllocateWorkItem(IoGetCurrentIrpStackLocation(irp)->DeviceObject);
-            if (wi)
-            {
-                auto * ctx = (struct _RW_CLEANUP_CTX *)
-                    ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(struct _RW_CLEANUP_CTX), 'wRcI');
+                LARGE_INTEGER total_timeout;
+                total_timeout.QuadPart = -10LL * 1000LL * 10000LL;
+                LARGE_INTEGER poll_interval;
+                poll_interval.QuadPart = -1LL * 10000LL;
 
-                if (ctx)
+                while (c->fired_signal == 0)
                 {
-                    ctx->thread_handle = cleanup_thr_h;
-                    ctx->trigger_fn    = trigger_fn;
-                    ctx->shellcode_va  = alloc_base;
-                    ctx->target_cr3    = caller_cr3;
-                    ctx->target_pid    = p->target_pid;
-                    ctx->work_item     = wi;
-
-                    IoQueueWorkItem(wi, [](PDEVICE_OBJECT, PVOID context) {
-                        auto * c = (struct _RW_CLEANUP_CTX *)context;
-
-                        // short delay — let thread start executing (trigger fires once)
-                        LARGE_INTEGER delay;
-                        delay.QuadPart = -5LL * 10000000LL;  // 5 sec
-                        KeDelayExecutionThread(KernelMode, FALSE, &delay);
-
-                        ZwClose(c->thread_handle);
-
-                        HYPERPLATFORM_LOG_INFO("[td-rw] cleanup: unhooking trigger, inject stays resident");
-
-                        // unhook trigger only — inject EPT stealth stays permanently
-                        PEPROCESS proc2 = NULL;
-                        if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)c->target_pid, &proc2)))
-                        {
-                            KAPC_STATE apc2;
-                            KeStackAttachProcess(proc2, &apc2);
-
-                            TdUnhookTriggerAllCpus(c->trigger_fn, c->target_cr3);
-                            KeUnstackDetachProcess(&apc2);
-                            ObDereferenceObject(proc2);
-
-                            HYPERPLATFORM_LOG_INFO("[td-rw] cleanup: trigger unhook=%p, inject RESIDENT=%p",
-                                       c->trigger_fn, c->shellcode_va);
-                        }
-
-                        IoFreeWorkItem(c->work_item);
-                        ExFreePoolWithTag(c, 'wRcI');
-                    }, DelayedWorkQueue, ctx);
-
-                    cleanup_thr_h = NULL;  // ownership transferred
+                    if (KeDelayExecutionThread(KernelMode, FALSE, &poll_interval) != STATUS_SUCCESS)
+                        break;
+                    if (total_timeout.QuadPart >= 0)
+                        break;
+                    total_timeout.QuadPart += 1LL * 10000LL;
                 }
-                else
-                    IoFreeWorkItem(wi);
-            }
 
-            if (cleanup_thr_h)
-                ZwClose(cleanup_thr_h);
+                ZwClose(c->thread_handle);
+
+                HYPERPLATFORM_LOG_INFO("[td-rw] cleanup: unhooking trigger (fired=%ld), inject stays resident",
+                    c->fired_signal);
+
+                PEPROCESS proc2 = NULL;
+                if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)c->target_pid, &proc2)))
+                {
+                    KAPC_STATE apc2;
+                    KeStackAttachProcess(proc2, &apc2);
+
+                    TdUnhookTriggerAllCpus(c->trigger_fn, c->target_cr3);
+                    KeUnstackDetachProcess(&apc2);
+                    ObDereferenceObject(proc2);
+
+                    HYPERPLATFORM_LOG_INFO("[td-rw] cleanup: trigger unhook=%p, inject RESIDENT=%p",
+                        c->trigger_fn, c->shellcode_va);
+                }
+
+                IoFreeWorkItem(c->work_item);
+                ExFreePoolWithTag(c, 'wRcI');
+            }, DelayedWorkQueue, cleanup_ctx);
+
+            cleanup_thr_h = NULL;
         }
+        else
+        {
+            if (wi)
+                IoFreeWorkItem(wi);
+        }
+
+        if (cleanup_thr_h)
+            ZwClose(cleanup_thr_h);
 
         if (NT_SUCCESS(st) && !thread_started)
             st = STATUS_UNSUCCESSFUL;
@@ -5430,7 +5501,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             UINT64 flags = p->flags ? p->flags : 2;
 
             st = TdInstallTriggerHookAllCpus(
-                trigger_fn, (PVOID)p->jump_to_va, caller_cr3, flags, 0, &dummy_origin);
+                trigger_fn, (PVOID)p->jump_to_va, caller_cr3, flags, 0, &dummy_origin, NULL);
 
             HYPERPLATFORM_LOG_INFO("[td-trigger] hook %s trigger=%p jump=%p flags=0x%llX st=0x%08X",
                        NT_SUCCESS(st) ? "OK" : "FAILED",

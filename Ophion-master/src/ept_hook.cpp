@@ -225,6 +225,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
                     efi->oneshot = req->oneshot;
                     efi->expected_tid = req->expected_tid;
                     efi->hook_type = req->hook_type;
+                    efi->external_fired = req->external_fired;
                     func_exists = TRUE;
                     break;
                 }
@@ -283,6 +284,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
             fi->oneshot            = req->oneshot;
             fi->expected_tid       = req->expected_tid;
             fi->hook_type          = req->hook_type;
+            fi->external_fired     = req->external_fired;
 
             UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
             PUINT8 fake  = &existing->fake_page_va[off];
@@ -412,6 +414,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     fi->oneshot            = req->oneshot;
     fi->expected_tid       = req->expected_tid;
     fi->hook_type          = req->hook_type;
+    fi->external_fired     = req->external_fired;
 
     UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
     PUINT8 fake  = &hp->fake_page_va[off];
@@ -695,9 +698,47 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
                     SIZE_T pc = 0;
                     __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
                     pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
-                    __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+                        __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
                     return TRUE;
                 }
+            }
+
+            //
+            // TID-filtered oneshot: decide as early as possible.
+            // if a non-target thread is executing the hooked entry VA,
+            // keep it on the original page here and avoid exposing the
+            // fake page / VMCALL path at all.
+            //
+            UINT64 rip = vcpu->vmexit_rip;
+            PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
+            while (fc != &hp->hooked_functions_list)
+            {
+                PEPT_HOOKED_FUNCTION_INFO fi =
+                    CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
+                fc = fc->Flink;
+
+                if ((UINT64)fi->virtual_address != rip)
+                    continue;
+
+                if (fi->expected_tid)
+                {
+                    UINT64 current_tid = (UINT64)(ULONG_PTR)PsGetCurrentThreadId();
+                    if (current_tid != fi->expected_tid)
+                    {
+                        EPT_PML1_ENTRY passthrough = hp->original_entry;
+                        passthrough.ExecuteAccess = 1;
+                        ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
+                        vcpu->mtf_restore_page = hp;
+
+                        SIZE_T pc = 0;
+                        __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+                        pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+                        __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+                        return TRUE;
+                    }
+                }
+
+                break;
             }
 
             // target process (or R0 hook): swap to fake page (hook visible)
@@ -1069,9 +1110,17 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                     return TRUE;
                 }
 
-                if (fi->oneshot &&
-                    _InterlockedCompareExchange(&fi->oneshot_fired, 1, 0) != 0)
+                if (fi->oneshot)
                 {
+                    if (_InterlockedCompareExchange(&fi->oneshot_fired, 1, 0) == 0)
+                    {
+                        fi->retiring = TRUE;
+                        if (fi->external_fired)
+                            _InterlockedExchange(fi->external_fired, 1);
+                        __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
+                        return TRUE;
+                    }
+
                     PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,
                         (SIZE_T)(hp->pfn_of_hooked_page << 12));
                     if (my_pte)

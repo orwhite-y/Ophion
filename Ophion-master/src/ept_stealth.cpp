@@ -32,6 +32,11 @@
 #define PFEC_WRITE        0x02
 #define PFEC_INSTR_FETCH  0x10
 
+volatile LONG g_dbg_shadow_pf_seen = 0;
+volatile LONG g_dbg_shadow_pf_allowed = 0;
+volatile LONG g_dbg_shadow_pf_switched = 0;
+volatile LONG g_dbg_shadow_pf_reject = 0;
+
 // =========================================================================
 //  contiguous shadow region allocator
 // =========================================================================
@@ -790,8 +795,16 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
         //
         if (sp->shadow_cr3_phys)
         {
-            if (!stealth_shadow_pte_allows(sp, error_code))
-                return FALSE;
+            _InterlockedIncrement(&g_dbg_shadow_pf_seen);
+            if (!(error_code & PFEC_INSTR_FETCH))
+            {
+                if (!stealth_shadow_pte_allows(sp, error_code))
+                {
+                    _InterlockedIncrement(&g_dbg_shadow_pf_reject);
+                    return FALSE;
+                }
+            }
+            _InterlockedIncrement(&g_dbg_shadow_pf_allowed);
         }
         else if (!(error_code & PFEC_INSTR_FETCH))
         {
@@ -818,16 +831,26 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             //   4. preemption timer (~1ms) → restore real CR3
             //   5. TLB keeps NX=0 → code runs at native speed
             //
-            SIZE_T real_cr3 = 0;
-            __vmx_vmread(VMCS_GUEST_CR3, &real_cr3);
-            vcpu->nx_timer_real_cr3 = real_cr3;
+            SIZE_T current_cr3 = 0;
+            __vmx_vmread(VMCS_GUEST_CR3, &current_cr3);
 
-            // build shadow CR3 value: replace PFN, keep PCID/flags
-            UINT64 shadow_cr3_val = (real_cr3 & ~PFN_MASK) | (sp->shadow_cr3_phys & PFN_MASK);
-            __vmx_vmwrite(VMCS_GUEST_CR3, shadow_cr3_val);
+            UINT64 current_pfn = (UINT64)current_cr3 & PFN_MASK;
+            UINT64 shadow_pfn  = sp->shadow_cr3_phys & PFN_MASK;
+            BOOLEAN already_on_shadow = (current_pfn == shadow_pfn);
 
-            // arm preemption timer (~1ms)
+            if (!already_on_shadow)
             {
+                vcpu->nx_timer_real_cr3 = current_cr3;
+
+                // build shadow CR3 value: replace PFN, keep PCID/flags
+                UINT64 shadow_cr3_val = (current_cr3 & ~PFN_MASK) | shadow_pfn;
+                __vmx_vmwrite(VMCS_GUEST_CR3, shadow_cr3_val);
+                _InterlockedIncrement(&g_dbg_shadow_pf_switched);
+            }
+
+            if (!already_on_shadow || !vcpu->nx_timer_restore)
+            {
+                // arm preemption timer (~1ms)
                 UINT64 vmx_misc = __readmsr(IA32_VMX_MISC);
                 UINT32 rate_shift = (UINT32)(vmx_misc & 0x1F);
                 UINT32 timer_val = (5000000U >> rate_shift);
@@ -838,9 +861,9 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
                 __vmx_vmread(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, &pin);
                 pin |= PIN_BASED_VM_EXEC_CTRL_VMX_PREEMPTION_TIMER;
                 __vmx_vmwrite(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, pin);
-            }
 
-            vcpu->nx_timer_restore = sp;
+                vcpu->nx_timer_restore = sp;
+            }
         }
 
         // fake PT mode: EPT changes + MTF

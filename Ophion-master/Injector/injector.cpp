@@ -1111,8 +1111,8 @@ int wmain(int argc, wchar_t* argv[])
 {
     if (argc < 2)
     {
-        //return CmdInjectRWShadow(L"PioneerGame.exe", PAGE_READWRITE);
-        return CmdInjectRWShadow(L"notepad.exe", PAGE_READWRITE);
+        return CmdInjectRWShadow(L"PioneerGame.exe", PAGE_READWRITE);
+        //return CmdInjectRWShadow(L"notepad.exe", PAGE_READWRITE);
 
     }
 

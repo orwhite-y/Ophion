@@ -28,20 +28,10 @@
 #define IOCTL_INJECT_RW_SHADOW CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 7, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_ALLOC_SHADOW_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 8, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_INSTALL_TRIGGER_JUMP CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 9, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_FREE_SHADOW_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 10, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_SHADOW_PROTECT_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 11, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_RESOLVE_EXPORT CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 12, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // ---- shared structs (must match TestDriver) ----
 
 #pragma pack(push, 8)
-typedef struct _TD_RESOLVE_EXPORT_PARAMS {
-    UINT64 target_pid;          // [in]  target process PID
-    UINT64 messageboxa_va;      // [out] user32!MessageBoxA VA in target process
-    UINT64 sleepex_va;          // [out] kernel32!SleepEx VA in target process
-    UINT64 status;              // [out] NTSTATUS
-} TD_RESOLVE_EXPORT_PARAMS;
-
 typedef struct _TD_INJECT_PARAMS {
     UINT64 target_pid;
     UINT64 alloc_size;
@@ -80,28 +70,16 @@ typedef struct _TD_INJECT_RW_PARAMS {
     UINT64 shellcode_va;    // [out] allocated VA
     UINT64 alloc_size;      // [out] allocated size
     UINT64 shellcode_size;  // [in] bytes appended after this struct
-    UINT64 alloc_protect;   // [in] PAGE_READWRITE/PAGE_WRITECOPY, 0 = PAGE_READWRITE
 } TD_INJECT_RW_PARAMS;
 
 typedef struct _TD_ALLOC_SHADOW_MEMORY_PARAMS {
     UINT64 target_pid;
     UINT64 size;
     UINT64 need_execute;
-    UINT64 alloc_protect;
     UINT64 base_va;
     UINT64 shadow_cr3;
     UINT64 status;
 } TD_ALLOC_SHADOW_MEMORY_PARAMS;
-
-typedef struct _TD_SHADOW_PROTECT_PARAMS {
-    UINT64 target_pid;
-    UINT64 base_va;
-    UINT64 size;
-    UINT64 new_protect;
-    UINT64 old_protect;
-    UINT64 shadow_cr3;
-    UINT64 status;
-} TD_SHADOW_PROTECT_PARAMS;
 
 typedef struct _TD_TRIGGER_JUMP_PARAMS {
     UINT64 target_pid;
@@ -151,61 +129,6 @@ static HANDLE OpenDevice()
         printf("    Make sure Ophion.sys and TestEptHook.sys are loaded.\n");
     }
     return h;
-}
-
-static DWORD ParseRwProtect(const wchar_t* value)
-{
-    if (!value || !*value || _wcsicmp(value, L"rw") == 0)
-        return PAGE_READWRITE;
-
-    if (_wcsicmp(value, L"wc") == 0 || _wcsicmp(value, L"copy") == 0 ||
-        _wcsicmp(value, L"writecopy") == 0)
-        return PAGE_WRITECOPY;
-
-    DWORD protect = (DWORD)wcstoul(value, NULL, 0);
-    if (protect == PAGE_READWRITE || protect == PAGE_WRITECOPY)
-        return protect;
-
-    printf("[-] Unsupported RW protect: %ls (use rw, wc, 0x4, or 0x8)\n", value);
-    return 0;
-}
-
-static DWORD ParseShadowProtect(const wchar_t* value)
-{
-    if (!value || !*value)
-        return 0;
-
-    if (_wcsicmp(value, L"r") == 0 || _wcsicmp(value, L"ro") == 0 ||
-        _wcsicmp(value, L"readonly") == 0)
-        return PAGE_READONLY;
-
-    if (_wcsicmp(value, L"rw") == 0 || _wcsicmp(value, L"readwrite") == 0)
-        return PAGE_READWRITE;
-
-    if (_wcsicmp(value, L"x") == 0 || _wcsicmp(value, L"exec") == 0)
-        return PAGE_EXECUTE;
-
-    if (_wcsicmp(value, L"rx") == 0 || _wcsicmp(value, L"er") == 0 ||
-        _wcsicmp(value, L"execute_read") == 0)
-        return PAGE_EXECUTE_READ;
-
-    if (_wcsicmp(value, L"rwx") == 0 || _wcsicmp(value, L"erw") == 0 ||
-        _wcsicmp(value, L"execute_readwrite") == 0)
-        return PAGE_EXECUTE_READWRITE;
-
-    DWORD protect = (DWORD)wcstoul(value, NULL, 0);
-    switch (protect)
-    {
-    case PAGE_READONLY:
-    case PAGE_READWRITE:
-    case PAGE_EXECUTE:
-    case PAGE_EXECUTE_READ:
-    case PAGE_EXECUTE_READWRITE:
-        return protect;
-    default:
-        printf("[-] Unsupported shadow protect: %ls (use r, rw, x, rx, rwx, or numeric PAGE_*)\n", value);
-        return 0;
-    }
 }
 
 // ---- R3 shellcode builder for injectrw/injectrwshadow ----
@@ -344,17 +267,10 @@ static void* RvaToFilePtr(BYTE* image, DWORD image_size, IMAGE_NT_HEADERS64* nt,
     if (!image || !nt || !need)
         return NULL;
 
-    if (rva > image_size || need > image_size - rva)
-        return NULL;
-
-    if (rva < nt->OptionalHeader.SizeOfHeaders)
+    if (rva < nt->OptionalHeader.SizeOfHeaders && rva + need <= image_size)
         return image + rva;
 
     IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
-    BYTE* sec_end = (BYTE*)sec + (UINT64)nt->FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER);
-    if (sec_end > image + image_size)
-        return NULL;
-
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++)
     {
         DWORD va = sec[i].VirtualAddress;
@@ -362,10 +278,10 @@ static void* RvaToFilePtr(BYTE* image, DWORD image_size, IMAGE_NT_HEADERS64* nt,
         DWORD raw_size = sec[i].SizeOfRawData;
         DWORD span = sec[i].Misc.VirtualSize > raw_size ? sec[i].Misc.VirtualSize : raw_size;
 
-        if (rva >= va && rva - va < span && need <= span - (rva - va))
+        if (rva >= va && rva + need <= va + span)
         {
             DWORD off = raw + (rva - va);
-            if (off <= image_size && need <= image_size - off)
+            if (off + need <= image_size)
                 return image + off;
             return NULL;
         }
@@ -388,23 +304,6 @@ static bool FileAnsiEquals(BYTE* image, DWORD image_size, const char* file_str, 
 
     DWORD end = (DWORD)(off + strlen(expected));
     return end < image_size && file_str[strlen(expected)] == '\0';
-}
-
-static char* FileAnsiFindChar(BYTE* image, DWORD image_size, char* file_str, char ch)
-{
-    UINT64 off = (UINT64)((BYTE*)file_str - image);
-    if (off >= image_size)
-        return NULL;
-
-    for (DWORD i = (DWORD)off; i < image_size; i++)
-    {
-        if (image[i] == ch)
-            return (char*)(image + i);
-        if (image[i] == '\0')
-            return NULL;
-    }
-
-    return NULL;
 }
 
 static UINT64 ResolveRemoteExportFromFile(
@@ -480,7 +379,7 @@ static UINT64 ResolveRemoteExportFromFile(
             char* fwd = (char*)RvaToFilePtr(image, image_size, nt, func_rva, 1);
             if (fwd)
             {
-                char* dot = FileAnsiFindChar(image, image_size, fwd, '.');
+                char* dot = strchr(fwd, '.');
                 if (dot && dot != fwd && dot[1])
                 {
                     char fwd_mod_ascii[64] = {};
@@ -523,32 +422,23 @@ static bool BuildShellcodeR3(DWORD pid, BYTE* out_buf, DWORD out_size, DWORD* ou
 {
     if (out_size < sizeof(g_shellcode_pic_r3)) return false;
 
-    // resolve MessageBoxA + SleepEx via driver IOCTL (PEB walk in target process context)
-    HANDLE dev = OpenDevice();
-    if (dev == INVALID_HANDLE_VALUE) return false;
-
-    TD_RESOLVE_EXPORT_PARAMS rp = {};
-    rp.target_pid = (UINT64)pid;
-
-    DWORD bytes = 0;
-    BOOL ok = DeviceIoControl(dev, IOCTL_RESOLVE_EXPORT, &rp, sizeof(rp), &rp, sizeof(rp), &bytes, NULL);
-    CloseHandle(dev);
-
-    if (!ok || bytes < sizeof(TD_RESOLVE_EXPORT_PARAMS) || rp.status != 0 || !rp.messageboxa_va || !rp.sleepex_va)
+    UINT64 msgbox = ResolveRemoteExport(pid, L"user32.dll", "MessageBoxA");
+    UINT64 sleep_ex = ResolveRemoteExport(pid, L"kernel32.dll", "SleepEx");
+    if (!msgbox || !sleep_ex)
     {
-        printf("[-] BuildShellcodeR3: driver resolve export failed (ok=%u status=0x%llX msgbox=0x%llX sleepex=0x%llX)\n",
-            ok, rp.status, rp.messageboxa_va, rp.sleepex_va);
+        printf("[-] Resolve remote exports failed: MessageBoxA=0x%llX SleepEx=0x%llX\n",
+            msgbox, sleep_ex);
         return false;
     }
 
     ZeroMemory(out_buf, out_size);
     memcpy(out_buf, g_shellcode_pic_r3, sizeof(g_shellcode_pic_r3));
-    *(UINT64*)(out_buf + R3_PIC_PATCH_MESSAGEBOX) = rp.messageboxa_va;
-    *(UINT64*)(out_buf + R3_PIC_PATCH_SLEEPEX) = rp.sleepex_va;
+    *(UINT64*)(out_buf + R3_PIC_PATCH_MESSAGEBOX) = msgbox;
+    *(UINT64*)(out_buf + R3_PIC_PATCH_SLEEPEX) = sleep_ex;
     *out_shellcode_size = (DWORD)sizeof(g_shellcode_pic_r3);
 
-    printf("[+] R3 shellcode built via driver: MessageBoxA=0x%llX SleepEx=0x%llX size=0x%X\n",
-        rp.messageboxa_va, rp.sleepex_va, *out_shellcode_size);
+    printf("[+] R3 shellcode built: MessageBoxA=0x%llX SleepEx=0x%llX size=0x%X\n",
+        msgbox, sleep_ex, *out_shellcode_size);
     return true;
 }
 
@@ -775,9 +665,9 @@ static int CmdInjectDll(const wchar_t* target_name, const wchar_t* dll_path)
 
 // ---- RW-alloc + EPT stealth inject ----
 
-static int CmdInjectRW(const wchar_t* target_name, DWORD alloc_protect)
+static int CmdInjectRW(const wchar_t* target_name)
 {
-    printf("[*] RW-alloc + EPT stealth inject: %ls protect=0x%X\n", target_name, alloc_protect);
+    printf("[*] RW-alloc + EPT stealth inject: %ls\n", target_name);
 
     DWORD pid = FindProcessByName(target_name);
     if (!pid) { printf("[-] Process not found: %ls\n", target_name); return 1; }
@@ -797,7 +687,6 @@ static int CmdInjectRW(const wchar_t* target_name, DWORD alloc_protect)
 
     TD_INJECT_RW_PARAMS* p = (TD_INJECT_RW_PARAMS*)buf;
     p->target_pid = (UINT64)pid;
-    p->alloc_protect = alloc_protect;
     if (!BuildShellcodeR3(pid, buf + sizeof(TD_INJECT_RW_PARAMS),
                           total_size - sizeof(TD_INJECT_RW_PARAMS),
                           &shellcode_size))
@@ -818,7 +707,6 @@ static int CmdInjectRW(const wchar_t* target_name, DWORD alloc_protect)
         printf("    Shellcode VA: 0x%llX\n", p->shellcode_va);
         printf("    Alloc size:   0x%llX\n", p->alloc_size);
         printf("    R3 SC size:   0x%llX\n", p->shellcode_size);
-        printf("    RW protect:   0x%llX\n", p->alloc_protect);
         printf("[+] RW page allocated, EPT read=zeroed, EPT exec=shellcode.\n");
         printf("[+] Trigger hook active. Watch for MessageBox from PID %u.\n", pid);
     }
@@ -832,9 +720,9 @@ static int CmdInjectRW(const wchar_t* target_name, DWORD alloc_protect)
 
 // ---- RW-alloc + shadow CR3 NX bypass inject ----
 
-static int CmdInjectRWShadow(const wchar_t* target_name, DWORD alloc_protect)
+static int CmdInjectRWShadow(const wchar_t* target_name)
 {
-    printf("[*] RW-alloc + shadow CR3 inject: %ls protect=0x%X\n", target_name, alloc_protect);
+    printf("[*] RW-alloc + shadow CR3 inject: %ls\n", target_name);
 
     DWORD pid = FindProcessByName(target_name);
     if (!pid) { printf("[-] Process not found: %ls\n", target_name); return 1; }
@@ -854,7 +742,6 @@ static int CmdInjectRWShadow(const wchar_t* target_name, DWORD alloc_protect)
 
     TD_INJECT_RW_PARAMS* p = (TD_INJECT_RW_PARAMS*)buf;
     p->target_pid = (UINT64)pid;
-    p->alloc_protect = alloc_protect;
     if (!BuildShellcodeR3(pid, buf + sizeof(TD_INJECT_RW_PARAMS),
                           total_size - sizeof(TD_INJECT_RW_PARAMS),
                           &shellcode_size))
@@ -875,7 +762,6 @@ static int CmdInjectRWShadow(const wchar_t* target_name, DWORD alloc_protect)
         printf("    Shellcode VA: 0x%llX\n", p->shellcode_va);
         printf("    Alloc size:   0x%llX\n", p->alloc_size);
         printf("    R3 SC size:   0x%llX\n", p->shellcode_size);
-        printf("    RW protect:   0x%llX\n", p->alloc_protect);
         printf("[+] RW page allocated, shadow CR3 NX bypass active, no EPT page split.\n");
         printf("[+] Trigger hook active. Watch for MessageBox from PID %u.\n", pid);
     }
@@ -889,10 +775,10 @@ static int CmdInjectRWShadow(const wchar_t* target_name, DWORD alloc_protect)
 
 // ---- generic RW allocation, optional shadow CR3 executable view ----
 
-static int CmdAllocMem(const wchar_t* target_name, UINT64 size, bool need_execute, DWORD alloc_protect)
+static int CmdAllocMem(const wchar_t* target_name, UINT64 size, bool need_execute)
 {
-    printf("[*] Alloc memory: %ls size=0x%llX exec=%u protect=0x%X\n",
-        target_name, size, need_execute ? 1 : 0, alloc_protect);
+    printf("[*] Alloc memory: %ls size=0x%llX exec=%u\n",
+        target_name, size, need_execute ? 1 : 0);
 
     DWORD pid = FindProcessByName(target_name);
     if (!pid) { printf("[-] Process not found: %ls\n", target_name); return 1; }
@@ -905,7 +791,6 @@ static int CmdAllocMem(const wchar_t* target_name, UINT64 size, bool need_execut
     p.target_pid = (UINT64)pid;
     p.size = size;
     p.need_execute = need_execute ? 1 : 0;
-    p.alloc_protect = alloc_protect;
 
     DWORD bytes = 0;
     BOOL ok = DeviceIoControl(dev, IOCTL_ALLOC_SHADOW_MEMORY,
@@ -916,86 +801,11 @@ static int CmdAllocMem(const wchar_t* target_name, UINT64 size, bool need_execut
         printf("[+] Alloc status: 0x%08llX\n", p.status);
         printf("    Base VA:    0x%llX\n", p.base_va);
         printf("    Size:       0x%llX\n", p.size);
-        printf("    Protect:    0x%llX\n", p.alloc_protect);
         printf("    Shadow CR3: 0x%llX\n", p.shadow_cr3);
     }
     else
     {
         printf("[-] IOCTL_ALLOC_SHADOW_MEMORY failed (error %u)\n", GetLastError());
-        printf("    Driver status: 0x%08llX\n", p.status);
-    }
-
-    CloseHandle(dev);
-    return (ok && p.status == 0) ? 0 : 1;
-}
-
-static int CmdFreeMem(const wchar_t* target_name, UINT64 base_va, UINT64 size)
-{
-    printf("[*] Free memory: %ls base=0x%llX size=0x%llX\n",
-        target_name, base_va, size);
-
-    DWORD pid = FindProcessByName(target_name);
-    if (!pid) { printf("[-] Process not found: %ls\n", target_name); return 1; }
-    printf("[+] PID: %u\n", pid);
-
-    HANDLE dev = OpenDevice();
-    if (dev == INVALID_HANDLE_VALUE) return 1;
-
-    TD_ALLOC_SHADOW_MEMORY_PARAMS p = {};
-    p.target_pid = (UINT64)pid;
-    p.base_va = base_va;
-    p.size = size;
-
-    DWORD bytes = 0;
-    BOOL ok = DeviceIoControl(dev, IOCTL_FREE_SHADOW_MEMORY,
-        &p, sizeof(p), &p, sizeof(p), &bytes, NULL);
-
-    if (ok && bytes >= sizeof(TD_ALLOC_SHADOW_MEMORY_PARAMS))
-    {
-        printf("[+] Free status: 0x%08llX\n", p.status);
-        printf("    Base VA: 0x%llX\n", p.base_va);
-        printf("    Size:    0x%llX\n", p.size);
-    }
-    else
-    {
-        printf("[-] IOCTL_FREE_SHADOW_MEMORY failed (error %u)\n", GetLastError());
-        printf("    Driver status: 0x%08llX\n", p.status);
-    }
-
-    CloseHandle(dev);
-    return (ok && p.status == 0) ? 0 : 1;
-}
-
-static int CmdShadowProtect(UINT64 pid, UINT64 base_va, UINT64 size, DWORD new_protect)
-{
-    printf("[*] Shadow protect: pid=%llu base=0x%llX size=0x%llX protect=0x%X\n",
-        pid, base_va, size, new_protect);
-
-    HANDLE dev = OpenDevice();
-    if (dev == INVALID_HANDLE_VALUE) return 1;
-
-    TD_SHADOW_PROTECT_PARAMS p = {};
-    p.target_pid = pid;
-    p.base_va = base_va;
-    p.size = size;
-    p.new_protect = new_protect;
-
-    DWORD bytes = 0;
-    BOOL ok = DeviceIoControl(dev, IOCTL_SHADOW_PROTECT_MEMORY,
-        &p, sizeof(p), &p, sizeof(p), &bytes, NULL);
-
-    if (ok && bytes >= sizeof(TD_SHADOW_PROTECT_PARAMS))
-    {
-        printf("[+] Protect status: 0x%08llX\n", p.status);
-        printf("    Base VA:    0x%llX\n", p.base_va);
-        printf("    Size:       0x%llX\n", p.size);
-        printf("    OldProtect: 0x%llX\n", p.old_protect);
-        printf("    NewProtect: 0x%llX\n", p.new_protect);
-        printf("    Shadow CR3: 0x%llX\n", p.shadow_cr3);
-    }
-    else
-    {
-        printf("[-] IOCTL_SHADOW_PROTECT_MEMORY failed (error %u)\n", GetLastError());
         printf("    Driver status: 0x%08llX\n", p.status);
     }
 
@@ -1039,49 +849,6 @@ static int CmdTriggerJump(UINT64 pid, UINT64 trigger_va, UINT64 jump_to_va, UINT
     return (ok && p.status == 0) ? 0 : 1;
 }
 
-// ---- resolve export (MessageBoxA + SleepEx) via driver ----
-
-static int CmdResolveExport(const wchar_t* target_name)
-{
-    printf("[*] Resolve Export: %ls\n", target_name);
-
-    DWORD pid = FindProcessByName(target_name);
-    if (!pid) { printf("[-] Process not found.\n"); return 1; }
-    printf("[+] PID: %u\n", pid);
-
-    HANDLE dev = OpenDevice();
-    if (dev == INVALID_HANDLE_VALUE) return 1;
-
-    TD_RESOLVE_EXPORT_PARAMS p = {};
-    p.target_pid = (UINT64)pid;
-
-    DWORD bytes = 0;
-    BOOL ok = DeviceIoControl(dev, IOCTL_RESOLVE_EXPORT, &p, sizeof(p), &p, sizeof(p), &bytes, NULL);
-
-    bool resolved = (ok &&
-        bytes >= sizeof(TD_RESOLVE_EXPORT_PARAMS) &&
-        p.status == 0 &&
-        p.messageboxa_va != 0 &&
-        p.sleepex_va != 0);
-
-    if (ok && bytes >= sizeof(TD_RESOLVE_EXPORT_PARAMS))
-    {
-        printf("[+] Resolve export status: 0x%08llX\n", p.status);
-        printf("    MessageBoxA VA: 0x%llX\n", p.messageboxa_va);
-        printf("    SleepEx VA:     0x%llX\n", p.sleepex_va);
-        if (!resolved)
-            printf("[-] Resolve export returned incomplete result.\n");
-    }
-    else
-    {
-        printf("[-] IOCTL_RESOLVE_EXPORT failed (error %u)\n", GetLastError());
-        printf("    Driver status: 0x%08llX\n", p.status);
-    }
-
-    CloseHandle(dev);
-    return resolved ? 0 : 1;
-}
-
 // ---- usage ----
 
 static void PrintUsage(const wchar_t* exe)
@@ -1091,16 +858,13 @@ static void PrintUsage(const wchar_t* exe)
     printf("  %ls inject [process]             Stealth inject (default: notepad.exe)\n", exe);
     printf("  %ls hook                         R0 EPT hook NtCreateFile (all processes)\n", exe);
     printf("  %ls unhook                       Remove R0 EPT hook\n", exe);
-    printf("  %ls injectrw [process] [rw|wc|protect]  RW-alloc + EPT stealth inject\n", exe);
-    printf("  %ls injectrwshadow [process] [rw|wc|protect]  RW-alloc + shadow CR3 inject (no EPT split)\n", exe);
-    printf("  %ls allocmem <process> <size> [exec] [rw|wc|protect]  Allocate memory, optional shadow CR3 exec\n", exe);
-    printf("  %ls freemem <process> <base> <size>  Free memory allocated by allocmem\n", exe);
-    printf("  %ls shadowprotect <pid> <base> <size> <r|rw|x|rx|rwx|protect>  Protect via shadow CR3\n", exe);
+    printf("  %ls injectrw [process]             RW-alloc + EPT stealth inject\n", exe);
+    printf("  %ls injectrwshadow [process]       RW-alloc + shadow CR3 inject (no EPT split)\n", exe);
+    printf("  %ls allocmem <process> <size> [exec]  Allocate RW memory, optional shadow CR3 exec\n", exe);
     printf("  %ls triggerjump <pid> <trigger|0> <jump> [flags]  Trigger hook redirect\n", exe);
     printf("  %ls injectdll <process> <dllpath>  Manual-map DLL inject (no LoadLibrary)\n", exe);
     printf("  %ls hookr3 <pid> <va> <proxy> [type]  R3 EPT hook (per-process)\n", exe);
     printf("  %ls unhookr3 <pid> <va>                Remove R3 EPT hook\n", exe);
-    printf("  %ls resolvetest [process]              Resolve MessageBoxA+SleepEx via driver\n", exe);
     printf("\n");
     printf("Hook types: 0=abs jump (14B), 1=VMCALL (3B), 2=INT3 (1B)\n");
 }
@@ -1111,8 +875,11 @@ int wmain(int argc, wchar_t* argv[])
 {
     if (argc < 2)
     {
-        //return CmdInjectRWShadow(L"PioneerGame.exe", PAGE_READWRITE);
-        return CmdInjectRWShadow(L"notepad.exe", PAGE_READWRITE);
+        //return CmdInjectRWShadow(L"PioneerGame-d.exe");
+        return CmdInjectRWShadow(L"notepad.exe");
+
+          return CmdInject(L"PioneerGame-d.exe");
+        //return CmdInject(L"notepad.exe");
 
     }
 
@@ -1126,43 +893,19 @@ int wmain(int argc, wchar_t* argv[])
     else if (_wcsicmp(cmd, L"injectrw") == 0)
     {
         const wchar_t* target = (argc > 2) ? argv[2] : L"notepad.exe";
-        DWORD protect = ParseRwProtect((argc > 3) ? argv[3] : L"rw");
-        if (!protect) return 1;
-        return CmdInjectRW(target, protect);
+        return CmdInjectRW(target);
     }
     else if (_wcsicmp(cmd, L"injectrwshadow") == 0)
     {
         const wchar_t* target = (argc > 2) ? argv[2] : L"notepad.exe";
-        DWORD protect = ParseRwProtect((argc > 3) ? argv[3] : L"rw");
-        if (!protect) return 1;
-        return CmdInjectRWShadow(target, protect);
+        return CmdInjectRWShadow(target);
     }
     else if (_wcsicmp(cmd, L"allocmem") == 0)
     {
-        if (argc < 4) { printf("Usage: allocmem <process> <size> [exec] [rw|wc|protect]\n"); return 1; }
+        if (argc < 4) { printf("Usage: allocmem <process> <size> [exec]\n"); return 1; }
         UINT64 size = wcstoull(argv[3], NULL, 0);
         bool need_execute = (argc > 4) ? (wcstoull(argv[4], NULL, 0) != 0) : false;
-        DWORD protect = ParseRwProtect((argc > 5) ? argv[5] : L"rw");
-        if (!protect) return 1;
-        return CmdAllocMem(argv[2], size, need_execute, protect);
-    }
-    else if (_wcsicmp(cmd, L"freemem") == 0)
-    {
-        if (argc < 5) { printf("Usage: freemem <process> <base_va> <size>\n"); return 1; }
-        UINT64 base_va = wcstoull(argv[3], NULL, 0);
-        UINT64 size = wcstoull(argv[4], NULL, 0);
-        return CmdFreeMem(argv[2], base_va, size);
-    }
-    else if (_wcsicmp(cmd, L"shadowprotect") == 0)
-    {
-        if (argc < 6) { printf("Usage: shadowprotect <pid> <base_va> <size> <r|rw|x|rx|rwx|protect>\n"); return 1; }
-        UINT64 pid = wcstoull(argv[2], NULL, 0);
-        UINT64 base_va = wcstoull(argv[3], NULL, 0);
-        UINT64 size = wcstoull(argv[4], NULL, 0);
-        DWORD protect = ParseShadowProtect(argv[5]);
-        if (!protect) return 1;
-        if (!pid) { printf("[-] Invalid pid.\n"); return 1; }
-        return CmdShadowProtect(pid, base_va, size, protect);
+        return CmdAllocMem(argv[2], size, need_execute);
     }
     else if (_wcsicmp(cmd, L"triggerjump") == 0)
     {
@@ -1178,10 +921,10 @@ int wmain(int argc, wchar_t* argv[])
         if (argc < 4) { printf("Usage: injectdll <process> <dllpath>\n"); return 1; }
         return CmdInjectDll(argv[2], argv[3]);
     }
-    else if (_wcsicmp(cmd, L"hook") == 0)
-    {
-        return CmdHook();
-    }
+    //else if (_wcsicmp(cmd, L"hook") == 0)
+    //{
+    //    return CmdHook();
+    //}
     else if (_wcsicmp(cmd, L"unhook") == 0)
     {
         return CmdUnhook();
@@ -1201,11 +944,6 @@ int wmain(int argc, wchar_t* argv[])
         UINT64 pid       = wcstoull(argv[2], NULL, 0);
         UINT64 target_va = wcstoull(argv[3], NULL, 16);
         return CmdUnhookR3(pid, target_va);
-    }
-    else if (_wcsicmp(cmd, L"resolvetest") == 0)
-    {
-        const wchar_t* target = (argc > 2) ? argv[2] : L"notepad.exe";
-        return CmdResolveExport(target);
     }
     else
     {

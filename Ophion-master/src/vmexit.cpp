@@ -757,7 +757,8 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             //   r12 = target_cr3      (0 = R0 hook, non-0 = R3 per-process)
             //   r13 = user_trampoline (R3 executable buffer, NULL = kernel pool)
             //   r14 = user_trampoline_pa (pre-computed PA)
-            //   r15 = flags (bit 0 = force_read_access for shellcode self-read)
+            //   r15 = flags (low32: bit 0 = force_read_access, bit 1 = oneshot;
+            //                high32: expected TID for oneshot trigger, 0 = any)
             //
             UINT64 target_va       = regs->rdx;
             UINT64 proxy_va        = regs->r8;
@@ -787,6 +788,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             local_req.user_trampoline_pa = user_tramp_pa;
             local_req.force_read_access  = (flags & 1) ? TRUE : FALSE;
             local_req.oneshot            = (flags & 2) ? TRUE : FALSE;
+            local_req.expected_tid       = flags >> 32;
             if (origin_va)
                 local_req.origin_function = (PVOID *)origin_va;
 

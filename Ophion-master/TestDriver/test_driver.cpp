@@ -32,6 +32,9 @@ extern "C" NTSYSAPI NTSTATUS NTAPI ZwProtectVirtualMemory(
 typedef ULONG (NTAPI * fn_KeResumeThread)(PKTHREAD Thread);
 static fn_KeResumeThread g_pKeResumeThread = NULL;
 
+typedef NTSTATUS (NTAPI * fn_PsResumeThread)(PETHREAD Thread, PULONG PreviousSuspendCount);
+static fn_PsResumeThread g_pPsResumeThread = NULL;
+
 typedef struct _TD_UNICODE_STRING {
     USHORT Length;
     USHORT MaximumLength;
@@ -656,6 +659,42 @@ typedef NTSTATUS (NTAPI * fn_ZwResumeThread)(HANDLE, PULONG);
 
 static fn_ZwCreateThreadEx g_pZwCreateThreadEx = NULL;
 static fn_ZwResumeThread   g_pZwResumeThread   = NULL;
+
+static NTSTATUS
+TdResumeThreadHandle(HANDLE thread_h, PULONG previous_count)
+{
+    if (!thread_h)
+        return STATUS_INVALID_PARAMETER;
+
+    ULONG local_prev = 0;
+    PULONG prev = previous_count ? previous_count : &local_prev;
+
+    if (g_pZwResumeThread)
+        return g_pZwResumeThread(thread_h, prev);
+
+    PETHREAD thread_obj = NULL;
+    NTSTATUS st = ObReferenceObjectByHandle(thread_h, THREAD_ALL_ACCESS,
+        *PsThreadType, KernelMode, (PVOID *)&thread_obj, NULL);
+    if (!NT_SUCCESS(st))
+        return st;
+
+    if (g_pPsResumeThread)
+    {
+        st = g_pPsResumeThread(thread_obj, prev);
+    }
+    else if (g_pKeResumeThread)
+    {
+        *prev = g_pKeResumeThread((PKTHREAD)thread_obj);
+        st = STATUS_SUCCESS;
+    }
+    else
+    {
+        st = STATUS_NOT_SUPPORTED;
+    }
+
+    ObDereferenceObject(thread_obj);
+    return st;
+}
 
 // ---- device / IOCTL ----
 
@@ -1559,6 +1598,7 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
     PVOID                 user_trampoline;
     UINT64                user_trampoline_pa;
     UINT64                flags;
+    UINT64                expected_tid;
 } TD_PERCPU_VMCALL_CTX;
 
 static VOID
@@ -1580,7 +1620,7 @@ TdPerCpuVmcallDpc(PKDPC Dpc, PVOID Ctx, PVOID, PVOID)
             ctx->target_cr3,
             (UINT64)ctx->user_trampoline,
             ctx->user_trampoline_pa,
-            ctx->flags);
+            ctx->flags | (ctx->expected_tid << 32));
     }
     else if (ctx->op == TdPerCpuVmcallUnhook)
     {
@@ -1663,6 +1703,7 @@ TdInstallTriggerHookAllCpus(
     PVOID   proxy_va,
     UINT64  caller_cr3,
     UINT64  flags,
+    UINT64  expected_tid,
     PVOID * origin)
 {
     TD_PERCPU_VMCALL_CTX * ctx = (TD_PERCPU_VMCALL_CTX *)ExAllocatePool2(
@@ -1678,7 +1719,8 @@ TdInstallTriggerHookAllCpus(
     ctx->caller_cr3 = caller_cr3;
     ctx->hook_type  = 1;          // VMCALL (0F 01 C1)
     ctx->target_cr3 = caller_cr3; // per-process filter
-    ctx->flags      = flags ? flags : 2;
+    ctx->flags      = (flags ? flags : 2) & 0xFFFFFFFFULL;
+    ctx->expected_tid = expected_tid & 0xFFFFFFFFULL;
 
     NTSTATUS st = TdRunPerCpuVmcall(ctx, 2000);
     if (st != STATUS_IO_TIMEOUT)
@@ -4187,29 +4229,10 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
 
         //
-        // step 8: EPT hook trigger → shellcode VA (oneshot, per-process CR3 filter)
-        //
-        NTSTATUS hook_st = STATUS_UNSUCCESSFUL;
-        if (NT_SUCCESS(st))
-        {
-            PVOID dummy_origin = NULL;
-            hook_st = TdInstallTriggerHookAllCpus(trigger_fn, alloc_base, caller_cr3, 2, &dummy_origin);
-
-            HYPERPLATFORM_LOG_INFO("[td-rw] trigger hook %s (trigger=%p -> sc=%p st=0x%08X)",
-                       NT_SUCCESS(hook_st) ? "OK" : "FAILED", trigger_fn, alloc_base, hook_st);
-
-            if (!NT_SUCCESS(hook_st))
-                st = hook_st;
-            else
-                trigger_hooked = TRUE;
-        }
-
-        KeUnstackDetachProcess(&apc_state);
-
-        //
-        // step 9: create thread at trigger
+        // step 8: create thread at trigger (SUSPENDED) — before hook, no race
         //
         HANDLE cleanup_thr_h = NULL;
+        UINT64 expected_tid = 0;
         if (NT_SUCCESS(st))
         {
             if (g_pZwCreateThreadEx)
@@ -4230,45 +4253,26 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
                     if (NT_SUCCESS(thr_st) && thr_h)
                     {
-                        BOOLEAN resumed = FALSE;
-                        if (g_pZwResumeThread)
+                        // resolve TID from thread handle
+                        PETHREAD thr_obj = NULL;
+                        NTSTATUS tid_st = ObReferenceObjectByHandle(thr_h, THREAD_ALL_ACCESS,
+                            *PsThreadType, KernelMode, (PVOID *)&thr_obj, NULL);
+                        if (NT_SUCCESS(tid_st))
                         {
-                            ULONG prev = 0;
-                            NTSTATUS resume_st = g_pZwResumeThread(thr_h, &prev);
-                            if (NT_SUCCESS(resume_st))
-                                resumed = TRUE;
-                            else
-                                st = resume_st;
-                        }
-                        else if (g_pKeResumeThread)
-                        {
-                            PETHREAD thr_obj = NULL;
-                            NTSTATUS ref_st = ObReferenceObjectByHandle(thr_h, THREAD_ALL_ACCESS,
-                                *PsThreadType, KernelMode, (PVOID *)&thr_obj, NULL);
-                            if (NT_SUCCESS(ref_st))
-                            {
-                                g_pKeResumeThread((PKTHREAD)thr_obj);
-                                ObDereferenceObject(thr_obj);
-                                resumed = TRUE;
-                            }
-                            else
-                                st = ref_st;
-                        }
-                        else
-                        {
-                            st = STATUS_NOT_SUPPORTED;
+                            expected_tid = (UINT64)(ULONG_PTR)PsGetThreadId(thr_obj);
+                            ObDereferenceObject(thr_obj);
                         }
 
-                        if (resumed)
+                        if (!expected_tid)
                         {
-                            HYPERPLATFORM_LOG_INFO("[td-rw] thread SUSPENDED+RESUMED trigger=%p", trigger_fn);
-                            cleanup_thr_h = thr_h;
-                            thread_started = TRUE;
+                            HYPERPLATFORM_LOG_ERROR("[td-rw] cannot resolve created thread TID");
+                            st = STATUS_UNSUCCESSFUL;
+                            ZwClose(thr_h);
                         }
                         else
                         {
-                            HYPERPLATFORM_LOG_ERROR("[td-rw] thread resume failed: 0x%08X", st);
-                            ZwClose(thr_h);
+                            cleanup_thr_h = thr_h;
+                            HYPERPLATFORM_LOG_INFO("[td-rw] thread SUSPENDED trigger=%p tid=%llu", trigger_fn, expected_tid);
                         }
                     }
                     else
@@ -4286,20 +4290,41 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             }
             else
             {
-                // fallback: RtlCreateUserThread
+                // fallback: RtlCreateUserThread (suspended)
                 KAPC_STATE thr_apc;
                 KeStackAttachProcess(proc, &thr_apc);
 
                 HANDLE thr_h = NULL;
                 CLIENT_ID cid = {};
                 NTSTATUS thr_st = RtlCreateUserThread(
-                    ZwCurrentProcess(), NULL, FALSE, 0, 0, 0,
+                    ZwCurrentProcess(), NULL, TRUE, 0, 0, 0,
                     trigger_fn, NULL, &thr_h, &cid);
 
                 if (NT_SUCCESS(thr_st) && thr_h)
                 {
-                    cleanup_thr_h = thr_h;
-                    thread_started = TRUE;
+                    expected_tid = (UINT64)(ULONG_PTR)cid.UniqueThread;
+                    if (!expected_tid)
+                    {
+                        PETHREAD thr_obj = NULL;
+                        NTSTATUS tid_st = ObReferenceObjectByHandle(thr_h, THREAD_ALL_ACCESS,
+                            *PsThreadType, KernelMode, (PVOID *)&thr_obj, NULL);
+                        if (NT_SUCCESS(tid_st))
+                        {
+                            expected_tid = (UINT64)(ULONG_PTR)PsGetThreadId(thr_obj);
+                            ObDereferenceObject(thr_obj);
+                        }
+                    }
+
+                    if (!expected_tid)
+                    {
+                        st = STATUS_UNSUCCESSFUL;
+                        ZwClose(thr_h);
+                    }
+                    else
+                    {
+                        cleanup_thr_h = thr_h;
+                        thread_started = TRUE;  // RtlCreateUserThread with TRUE = already suspended
+                    }
                 }
                 else
                 {
@@ -4307,8 +4332,46 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 }
 
                 KeUnstackDetachProcess(&thr_apc);
-                HYPERPLATFORM_LOG_INFO("[td-rw] fallback RtlCreateUserThread trigger=%p st=0x%08X",
-                           trigger_fn, thr_st);
+                HYPERPLATFORM_LOG_INFO("[td-rw] fallback RtlCreateUserThread trigger=%p tid=%llu st=0x%08X",
+                           trigger_fn, expected_tid, thr_st);
+            }
+        }
+
+        //
+        // step 9: EPT hook trigger → shellcode VA (TID-filtered, oneshot)
+        //
+        if (NT_SUCCESS(st) && expected_tid)
+        {
+            PVOID dummy_origin = NULL;
+            NTSTATUS hook_st = TdInstallTriggerHookAllCpus(
+                trigger_fn, alloc_base, caller_cr3, 2, expected_tid, &dummy_origin);
+
+            HYPERPLATFORM_LOG_INFO("[td-rw] trigger hook %s trigger=%p sc=%p tid=%llu st=0x%08X",
+                       NT_SUCCESS(hook_st) ? "OK" : "FAILED", trigger_fn, alloc_base, expected_tid, hook_st);
+
+            if (!NT_SUCCESS(hook_st))
+                st = hook_st;
+            else
+                trigger_hooked = TRUE;
+        }
+
+        KeUnstackDetachProcess(&apc_state);
+
+        //
+        // step 10: resume thread (now hook is active with correct TID)
+        //
+        if (NT_SUCCESS(st) && cleanup_thr_h)
+        {
+            NTSTATUS resume_st = TdResumeThreadHandle(cleanup_thr_h, NULL);
+            if (NT_SUCCESS(resume_st))
+            {
+                HYPERPLATFORM_LOG_INFO("[td-rw] thread RESUMED trigger=%p tid=%llu", trigger_fn, expected_tid);
+                thread_started = TRUE;
+            }
+            else
+            {
+                HYPERPLATFORM_LOG_ERROR("[td-rw] thread resume failed: 0x%08X", resume_st);
+                st = resume_st;
             }
         }
 
@@ -5027,7 +5090,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             UINT64 flags = p->flags ? p->flags : 2;
 
             st = TdInstallTriggerHookAllCpus(
-                trigger_fn, (PVOID)p->jump_to_va, caller_cr3, flags, &dummy_origin);
+                trigger_fn, (PVOID)p->jump_to_va, caller_cr3, flags, 0, &dummy_origin);
 
             HYPERPLATFORM_LOG_INFO("[td-trigger] hook %s trigger=%p jump=%p flags=0x%llX st=0x%08X",
                        NT_SUCCESS(st) ? "OK" : "FAILED",
@@ -5340,6 +5403,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
         RtlInitUnicodeString(&fn, L"ZwCreateThreadEx");
         g_pZwCreateThreadEx = (fn_ZwCreateThreadEx)MmGetSystemRoutineAddress(&fn);
     }
+    RtlInitUnicodeString(&fn, L"PsResumeThread");
+    g_pPsResumeThread = (fn_PsResumeThread)MmGetSystemRoutineAddress(&fn);
+
     RtlInitUnicodeString(&fn, L"NtResumeThread");
     g_pZwResumeThread = (fn_ZwResumeThread)MmGetSystemRoutineAddress(&fn);
     if (!g_pZwResumeThread)
@@ -5350,6 +5416,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
 
     RtlInitUnicodeString(&fn, L"KeResumeThread");
     g_pKeResumeThread = (fn_KeResumeThread)MmGetSystemRoutineAddress(&fn);
+    HYPERPLATFORM_LOG_INFO("[td] thread APIs: create=%p ps_resume=%p zw_resume=%p ke_resume=%p",
+        g_pZwCreateThreadEx, g_pPsResumeThread, g_pZwResumeThread, g_pKeResumeThread);
 
     UNICODE_STRING dev_name, sym_name;
     RtlInitUnicodeString(&dev_name, TD_DEVICE_NAME);

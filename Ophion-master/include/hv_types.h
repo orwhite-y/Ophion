@@ -97,6 +97,7 @@ typedef struct _EPT_HOOKED_FUNCTION_INFO {
     BOOLEAN     user_trampoline;          // TRUE = trampoline is user-mode (don't pool_release)
     BOOLEAN     oneshot;                  // TRUE = redirect once, then pass through to original
     volatile LONG oneshot_fired;          // atomically set by handler after first trigger
+    UINT64      expected_tid;             // 0 = any thread, non-0 = only this TID may redirect
     BOOLEAN     retiring;                 // TRUE = unhook requested; per-vCPU paths restore lazily
 } EPT_HOOKED_FUNCTION_INFO, *PEPT_HOOKED_FUNCTION_INFO;
 
@@ -345,6 +346,7 @@ typedef struct _EPT_HOOK_VMCALL_PARAM {
     //
     BOOLEAN force_read_access;    // [in] TRUE = changed_entry R=1 (shellcode self-read)
     BOOLEAN oneshot;              // [in] TRUE = redirect to proxy once, then pass-through to trampoline
+    UINT64  expected_tid;         // [in] 0 = any thread, non-0 = only this TID may redirect
 } EPT_HOOK_VMCALL_PARAM, *PEPT_HOOK_VMCALL_PARAM;
 
 //

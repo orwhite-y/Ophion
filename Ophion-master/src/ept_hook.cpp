@@ -223,6 +223,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
                     efi->oneshot_fired = 0;
                     efi->handler_function = req->proxy_function;
                     efi->oneshot = req->oneshot;
+                    efi->expected_tid = req->expected_tid;
                     efi->hook_type = req->hook_type;
                     func_exists = TRUE;
                     break;
@@ -280,6 +281,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
             fi->fake_page_contents = existing->fake_page_va;
             fi->handler_function   = req->proxy_function;
             fi->oneshot            = req->oneshot;
+            fi->expected_tid       = req->expected_tid;
             fi->hook_type          = req->hook_type;
 
             UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
@@ -408,6 +410,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     fi->fake_page_contents = hp->fake_page_va;
     fi->handler_function   = req->proxy_function;
     fi->oneshot            = req->oneshot;
+    fi->expected_tid       = req->expected_tid;
     fi->hook_type          = req->hook_type;
 
     UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
@@ -1047,6 +1050,25 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                 // let CPU re-execute from the real function, arm MTF to swap back.
                 // same technique as ept_handle_violation for non-target CR3.
                 //
+                UINT64 current_tid = (UINT64)(ULONG_PTR)PsGetCurrentThreadId();
+                if (fi->expected_tid && current_tid != fi->expected_tid)
+                {
+                    PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,
+                        (SIZE_T)(hp->pfn_of_hooked_page << 12));
+                    if (my_pte)
+                    {
+                        EPT_PML1_ENTRY passthrough = hp->original_entry;
+                        passthrough.ExecuteAccess = 1;
+                        ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
+                        vcpu->mtf_restore_page = hp;
+                        SIZE_T pc = 0;
+                        __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+                        pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+                        __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+                    }
+                    return TRUE;
+                }
+
                 if (fi->oneshot &&
                     _InterlockedCompareExchange(&fi->oneshot_fired, 1, 0) != 0)
                 {

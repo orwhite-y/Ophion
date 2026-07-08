@@ -1,0 +1,496 @@
+diff --git a/Ophion-master/Injector/injector.cpp b/Ophion-master/Injector/injector.cpp
+index eb022e6..afe22e5 100644
+--- a/Ophion-master/Injector/injector.cpp
++++ b/Ophion-master/Injector/injector.cpp
+@@ -1111,8 +1111,8 @@ int wmain(int argc, wchar_t* argv[])
+ {
+     if (argc < 2)
+     {
+-        return CmdInjectRWShadow(L"PioneerGame.exe", PAGE_READWRITE);
+-        //return CmdInjectRWShadow(L"notepad.exe", PAGE_READWRITE);
++        //return CmdInjectRWShadow(L"PioneerGame.exe", PAGE_READWRITE);
++        return CmdInjectRWShadow(L"notepad.exe", PAGE_READWRITE);
+ 
+     }
+ 
+diff --git a/Ophion-master/TestDriver/test_driver.cpp b/Ophion-master/TestDriver/test_driver.cpp
+index eeedd51..3e70059 100644
+--- a/Ophion-master/TestDriver/test_driver.cpp
++++ b/Ophion-master/TestDriver/test_driver.cpp
+@@ -32,6 +32,9 @@ extern "C" NTSYSAPI NTSTATUS NTAPI ZwProtectVirtualMemory(
+ typedef ULONG (NTAPI * fn_KeResumeThread)(PKTHREAD Thread);
+ static fn_KeResumeThread g_pKeResumeThread = NULL;
+ 
++typedef NTSTATUS (NTAPI * fn_PsResumeThread)(PETHREAD Thread, PULONG PreviousSuspendCount);
++static fn_PsResumeThread g_pPsResumeThread = NULL;
++
+ typedef struct _TD_UNICODE_STRING {
+     USHORT Length;
+     USHORT MaximumLength;
+@@ -646,6 +649,9 @@ extern "C" {
+ // ---- undocumented API ----
+ 
+ #define THREAD_CREATE_FLAGS_CREATE_SUSPENDED 0x00000001
++#define TD_EXPECTED_TID_BLOCKED 0xFFFFFFFFULL
++#define TD_GATE_STUB_SIZE       0x1000
++#define TD_GATE_FLAG_OFFSET     0x40
+ 
+ typedef NTSTATUS (NTAPI * fn_ZwCreateThreadEx)(
+     PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, HANDLE,
+@@ -656,6 +662,65 @@ typedef NTSTATUS (NTAPI * fn_ZwResumeThread)(HANDLE, PULONG);
+ 
+ static fn_ZwCreateThreadEx g_pZwCreateThreadEx = NULL;
+ static fn_ZwResumeThread   g_pZwResumeThread   = NULL;
++static fn_ZwResumeThread   g_pZwAlertResumeThread = NULL;
++
++static VOID
++TdBuildTriggerGateStub(PUCHAR stub_va, PVOID gate_flag, PVOID trigger_fn)
++{
++    RtlZeroMemory(stub_va, TD_GATE_STUB_SIZE);
++
++    UINT32 i = 0;
++    stub_va[i++] = 0x48; stub_va[i++] = 0xB8;          // mov rax, gate_flag
++    *(UINT64 *)&stub_va[i] = (UINT64)gate_flag; i += 8;
++    stub_va[i++] = 0x83; stub_va[i++] = 0x38; stub_va[i++] = 0x01; // cmp dword ptr [rax], 1
++    stub_va[i++] = 0x74; stub_va[i++] = 0x04;          // je ready
++    stub_va[i++] = 0xF3; stub_va[i++] = 0x90;          // pause
++    stub_va[i++] = 0xEB; stub_va[i++] = 0xF7;          // jmp cmp
++    stub_va[i++] = 0x48; stub_va[i++] = 0xB8;          // mov rax, trigger_fn
++    *(UINT64 *)&stub_va[i] = (UINT64)trigger_fn; i += 8;
++    stub_va[i++] = 0xFF; stub_va[i++] = 0xD0;          // call rax
++    stub_va[i++] = 0xC3;                               // ret
++
++    *(volatile LONG *)gate_flag = 0;
++}
++
++static NTSTATUS
++TdResumeThreadHandle(HANDLE thread_h, PULONG previous_count)
++{
++    if (!thread_h)
++        return STATUS_INVALID_PARAMETER;
++
++    ULONG local_prev = 0;
++    PULONG prev = previous_count ? previous_count : &local_prev;
++
++    if (g_pZwResumeThread)
++        return g_pZwResumeThread(thread_h, prev);
++    if (g_pZwAlertResumeThread)
++        return g_pZwAlertResumeThread(thread_h, prev);
++
++    PETHREAD thread_obj = NULL;
++    NTSTATUS st = ObReferenceObjectByHandle(thread_h, THREAD_ALL_ACCESS,
++        *PsThreadType, KernelMode, (PVOID *)&thread_obj, NULL);
++    if (!NT_SUCCESS(st))
++        return st;
++
++    if (g_pPsResumeThread)
++    {
++        st = g_pPsResumeThread(thread_obj, prev);
++    }
++    else if (g_pKeResumeThread)
++    {
++        *prev = g_pKeResumeThread((PKTHREAD)thread_obj);
++        st = STATUS_SUCCESS;
++    }
++    else
++    {
++        st = STATUS_NOT_SUPPORTED;
++    }
++
++    ObDereferenceObject(thread_obj);
++    return st;
++}
+ 
+ // ---- device / IOCTL ----
+ 
+@@ -1559,6 +1624,7 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
+     PVOID                 user_trampoline;
+     UINT64                user_trampoline_pa;
+     UINT64                flags;
++    UINT64                expected_tid;
+ } TD_PERCPU_VMCALL_CTX;
+ 
+ static VOID
+@@ -1580,7 +1646,7 @@ TdPerCpuVmcallDpc(PKDPC Dpc, PVOID Ctx, PVOID, PVOID)
+             ctx->target_cr3,
+             (UINT64)ctx->user_trampoline,
+             ctx->user_trampoline_pa,
+-            ctx->flags);
++            ctx->flags | (ctx->expected_tid << 32));
+     }
+     else if (ctx->op == TdPerCpuVmcallUnhook)
+     {
+@@ -1663,6 +1729,7 @@ TdInstallTriggerHookAllCpus(
+     PVOID   proxy_va,
+     UINT64  caller_cr3,
+     UINT64  flags,
++    UINT64  expected_tid,
+     PVOID * origin)
+ {
+     TD_PERCPU_VMCALL_CTX * ctx = (TD_PERCPU_VMCALL_CTX *)ExAllocatePool2(
+@@ -1678,7 +1745,8 @@ TdInstallTriggerHookAllCpus(
+     ctx->caller_cr3 = caller_cr3;
+     ctx->hook_type  = 1;          // VMCALL (0F 01 C1)
+     ctx->target_cr3 = caller_cr3; // per-process filter
+-    ctx->flags      = flags ? flags : 2;
++    ctx->flags      = (flags ? flags : 2) & 0xFFFFFFFFULL;
++    ctx->expected_tid = expected_tid & 0xFFFFFFFFULL;
+ 
+     NTSTATUS st = TdRunPerCpuVmcall(ctx, 2000);
+     if (st != STATUS_IO_TIMEOUT)
+@@ -4186,30 +4254,61 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
+             st = STATUS_NOT_FOUND;
+         }
+ 
++        PVOID gate_base = NULL;
++        SIZE_T gate_size = TD_GATE_STUB_SIZE;
++        PVOID gate_flag = NULL;
++        if (NT_SUCCESS(st))
++        {
++            NTSTATUS gate_st = ZwAllocateVirtualMemory(
++                ZwCurrentProcess(),
++                &gate_base,
++                0,
++                &gate_size,
++                MEM_COMMIT | MEM_RESERVE,
++                PAGE_EXECUTE_READWRITE);
++
++            if (NT_SUCCESS(gate_st) && gate_base)
++            {
++                gate_flag = (PUCHAR)gate_base + TD_GATE_FLAG_OFFSET;
++                TdBuildTriggerGateStub((PUCHAR)gate_base, gate_flag, trigger_fn);
++                HYPERPLATFORM_LOG_INFO("[td-rw] gate stub allocated: VA=%p flag=%p trigger=%p",
++                    gate_base, gate_flag, trigger_fn);
++            }
++            else
++            {
++                HYPERPLATFORM_LOG_ERROR("[td-rw] gate stub alloc failed: 0x%08X", gate_st);
++                st = gate_st;
++            }
++        }
++
+         //
+         // step 8: EPT hook trigger → shellcode VA (oneshot, per-process CR3 filter)
+         //
+-        NTSTATUS hook_st = STATUS_UNSUCCESSFUL;
++        KeUnstackDetachProcess(&apc_state);
++
++        //
++        // step 9: create thread at trigger
++        //
++        HANDLE cleanup_thr_h = NULL;
+         if (NT_SUCCESS(st))
+         {
+             PVOID dummy_origin = NULL;
+-            hook_st = TdInstallTriggerHookAllCpus(trigger_fn, alloc_base, caller_cr3, 2, &dummy_origin);
++            NTSTATUS hook_st = TdInstallTriggerHookAllCpus(
++                trigger_fn, alloc_base, caller_cr3, 2, TD_EXPECTED_TID_BLOCKED, &dummy_origin);
+ 
+-            HYPERPLATFORM_LOG_INFO("[td-rw] trigger hook %s (trigger=%p -> sc=%p st=0x%08X)",
++            HYPERPLATFORM_LOG_INFO("[td-rw] trigger hook %s trigger=%p sc=%p tid=BLOCKED st=0x%08X",
+                        NT_SUCCESS(hook_st) ? "OK" : "FAILED", trigger_fn, alloc_base, hook_st);
+ 
+             if (!NT_SUCCESS(hook_st))
++            {
+                 st = hook_st;
++            }
+             else
++            {
+                 trigger_hooked = TRUE;
++            }
+         }
+ 
+-        KeUnstackDetachProcess(&apc_state);
+-
+-        //
+-        // step 9: create thread at trigger
+-        //
+-        HANDLE cleanup_thr_h = NULL;
+         if (NT_SUCCESS(st))
+         {
+             if (g_pZwCreateThreadEx)
+@@ -4224,50 +4323,61 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
+                     HANDLE thr_h = NULL;
+                     NTSTATUS thr_st = g_pZwCreateThreadEx(
+                         &thr_h, THREAD_ALL_ACCESS, NULL, thr_proc_h,
+-                        trigger_fn, NULL,
+-                        THREAD_CREATE_FLAGS_CREATE_SUSPENDED,
++                        gate_base, NULL,
++                        0,
+                         0, 0, 0, NULL);
+ 
+                     if (NT_SUCCESS(thr_st) && thr_h)
+                     {
+-                        BOOLEAN resumed = FALSE;
+-                        if (g_pZwResumeThread)
++                        UINT64 expected_tid = 0;
++                        PETHREAD tid_thr_obj = NULL;
++                        NTSTATUS tid_st = ObReferenceObjectByHandle(thr_h, THREAD_ALL_ACCESS,
++                            *PsThreadType, KernelMode, (PVOID *)&tid_thr_obj, NULL);
++                        if (NT_SUCCESS(tid_st))
+                         {
+-                            ULONG prev = 0;
+-                            NTSTATUS resume_st = g_pZwResumeThread(thr_h, &prev);
+-                            if (NT_SUCCESS(resume_st))
+-                                resumed = TRUE;
+-                            else
+-                                st = resume_st;
++                            expected_tid = (UINT64)(ULONG_PTR)PsGetThreadId(tid_thr_obj);
++                            ObDereferenceObject(tid_thr_obj);
+                         }
+-                        else if (g_pKeResumeThread)
++
++                        if (!expected_tid)
+                         {
+-                            PETHREAD thr_obj = NULL;
+-                            NTSTATUS ref_st = ObReferenceObjectByHandle(thr_h, THREAD_ALL_ACCESS,
+-                                *PsThreadType, KernelMode, (PVOID *)&thr_obj, NULL);
+-                            if (NT_SUCCESS(ref_st))
+-                            {
+-                                g_pKeResumeThread((PKTHREAD)thr_obj);
+-                                ObDereferenceObject(thr_obj);
+-                                resumed = TRUE;
+-                            }
+-                            else
+-                                st = ref_st;
++                            HYPERPLATFORM_LOG_ERROR("[td-rw] cannot resolve created thread TID: 0x%08X", tid_st);
++                            st = NT_SUCCESS(tid_st) ? STATUS_UNSUCCESSFUL : tid_st;
+                         }
+                         else
+                         {
+-                            st = STATUS_NOT_SUPPORTED;
++                            PVOID dummy_origin = NULL;
++                            NTSTATUS hook_st = TdInstallTriggerHookAllCpus(
++                                trigger_fn, alloc_base, caller_cr3, 2, expected_tid, &dummy_origin);
++
++                            HYPERPLATFORM_LOG_INFO("[td-rw] trigger hook %s trigger=%p sc=%p tid=%llu st=0x%08X",
++                                       NT_SUCCESS(hook_st) ? "OK" : "FAILED",
++                                       trigger_fn, alloc_base, expected_tid, hook_st);
++
++                            if (!NT_SUCCESS(hook_st))
++                                st = hook_st;
++                            else
++                                trigger_hooked = TRUE;
+                         }
+ 
+-                        if (resumed)
++                        if (NT_SUCCESS(st))
+                         {
+-                            HYPERPLATFORM_LOG_INFO("[td-rw] thread SUSPENDED+RESUMED trigger=%p", trigger_fn);
++                            InterlockedExchange((volatile LONG *)gate_flag, 1);
++                            HYPERPLATFORM_LOG_INFO("[td-rw] gate opened trigger=%p tid=%llu",
++                                trigger_fn, expected_tid);
+                             cleanup_thr_h = thr_h;
+                             thread_started = TRUE;
+                         }
+                         else
+                         {
+-                            HYPERPLATFORM_LOG_ERROR("[td-rw] thread resume failed: 0x%08X", st);
++                            if (trigger_hooked)
++                            {
++                                KAPC_STATE unhook_apc;
++                                KeStackAttachProcess(proc, &unhook_apc);
++                                TdUnhookTriggerAllCpus(trigger_fn, caller_cr3);
++                                KeUnstackDetachProcess(&unhook_apc);
++                                trigger_hooked = FALSE;
++                            }
+                             ZwClose(thr_h);
+                         }
+                     }
+@@ -4294,12 +4404,58 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
+                 CLIENT_ID cid = {};
+                 NTSTATUS thr_st = RtlCreateUserThread(
+                     ZwCurrentProcess(), NULL, FALSE, 0, 0, 0,
+-                    trigger_fn, NULL, &thr_h, &cid);
++                    gate_base, NULL, &thr_h, &cid);
+ 
+                 if (NT_SUCCESS(thr_st) && thr_h)
+                 {
+-                    cleanup_thr_h = thr_h;
+-                    thread_started = TRUE;
++                    UINT64 expected_tid = (UINT64)(ULONG_PTR)cid.UniqueThread;
++                    if (!expected_tid)
++                    {
++                        PETHREAD tid_thr_obj = NULL;
++                        NTSTATUS tid_st = ObReferenceObjectByHandle(thr_h, THREAD_ALL_ACCESS,
++                            *PsThreadType, KernelMode, (PVOID *)&tid_thr_obj, NULL);
++                        if (NT_SUCCESS(tid_st))
++                        {
++                            expected_tid = (UINT64)(ULONG_PTR)PsGetThreadId(tid_thr_obj);
++                            ObDereferenceObject(tid_thr_obj);
++                        }
++                    }
++
++                    if (!expected_tid)
++                    {
++                        st = STATUS_UNSUCCESSFUL;
++                    }
++                    else
++                    {
++                        PVOID dummy_origin = NULL;
++                        NTSTATUS hook_st = TdInstallTriggerHookAllCpus(
++                            trigger_fn, alloc_base, caller_cr3, 2, expected_tid, &dummy_origin);
++
++                        HYPERPLATFORM_LOG_INFO("[td-rw] fallback trigger hook %s trigger=%p sc=%p tid=%llu st=0x%08X",
++                                   NT_SUCCESS(hook_st) ? "OK" : "FAILED",
++                                   trigger_fn, alloc_base, expected_tid, hook_st);
++
++                        if (!NT_SUCCESS(hook_st))
++                            st = hook_st;
++                        else
++                            trigger_hooked = TRUE;
++                    }
++
++                    if (NT_SUCCESS(st))
++                    {
++                        InterlockedExchange((volatile LONG *)gate_flag, 1);
++                        cleanup_thr_h = thr_h;
++                        thread_started = TRUE;
++                    }
++                    else
++                    {
++                        if (trigger_hooked)
++                        {
++                            TdUnhookTriggerAllCpus(trigger_fn, caller_cr3);
++                            trigger_hooked = FALSE;
++                        }
++                        ZwClose(thr_h);
++                    }
+                 }
+                 else
+                 {
+@@ -5027,7 +5183,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
+             UINT64 flags = p->flags ? p->flags : 2;
+ 
+             st = TdInstallTriggerHookAllCpus(
+-                trigger_fn, (PVOID)p->jump_to_va, caller_cr3, flags, &dummy_origin);
++                trigger_fn, (PVOID)p->jump_to_va, caller_cr3, flags, 0, &dummy_origin);
+ 
+             HYPERPLATFORM_LOG_INFO("[td-trigger] hook %s trigger=%p jump=%p flags=0x%llX st=0x%08X",
+                        NT_SUCCESS(st) ? "OK" : "FAILED",
+@@ -5340,6 +5496,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
+         RtlInitUnicodeString(&fn, L"ZwCreateThreadEx");
+         g_pZwCreateThreadEx = (fn_ZwCreateThreadEx)MmGetSystemRoutineAddress(&fn);
+     }
++    RtlInitUnicodeString(&fn, L"PsResumeThread");
++    g_pPsResumeThread = (fn_PsResumeThread)MmGetSystemRoutineAddress(&fn);
++
+     RtlInitUnicodeString(&fn, L"NtResumeThread");
+     g_pZwResumeThread = (fn_ZwResumeThread)MmGetSystemRoutineAddress(&fn);
+     if (!g_pZwResumeThread)
+@@ -5347,9 +5506,19 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
+         RtlInitUnicodeString(&fn, L"ZwResumeThread");
+         g_pZwResumeThread = (fn_ZwResumeThread)MmGetSystemRoutineAddress(&fn);
+     }
++    RtlInitUnicodeString(&fn, L"NtAlertResumeThread");
++    g_pZwAlertResumeThread = (fn_ZwResumeThread)MmGetSystemRoutineAddress(&fn);
++    if (!g_pZwAlertResumeThread)
++    {
++        RtlInitUnicodeString(&fn, L"ZwAlertResumeThread");
++        g_pZwAlertResumeThread = (fn_ZwResumeThread)MmGetSystemRoutineAddress(&fn);
++    }
+ 
+     RtlInitUnicodeString(&fn, L"KeResumeThread");
+     g_pKeResumeThread = (fn_KeResumeThread)MmGetSystemRoutineAddress(&fn);
++    HYPERPLATFORM_LOG_INFO("[td] thread APIs: create=%p ps_resume=%p zw_resume=%p alert_resume=%p ke_resume=%p",
++        g_pZwCreateThreadEx, g_pPsResumeThread, g_pZwResumeThread,
++        g_pZwAlertResumeThread, g_pKeResumeThread);
+ 
+     UNICODE_STRING dev_name, sym_name;
+     RtlInitUnicodeString(&dev_name, TD_DEVICE_NAME);
+diff --git a/Ophion-master/include/hv_types.h b/Ophion-master/include/hv_types.h
+index 5724940..1f9de7e 100644
+--- a/Ophion-master/include/hv_types.h
++++ b/Ophion-master/include/hv_types.h
+@@ -97,6 +97,7 @@ typedef struct _EPT_HOOKED_FUNCTION_INFO {
+     BOOLEAN     user_trampoline;          // TRUE = trampoline is user-mode (don't pool_release)
+     BOOLEAN     oneshot;                  // TRUE = redirect once, then pass through to original
+     volatile LONG oneshot_fired;          // atomically set by handler after first trigger
++    UINT64      expected_tid;             // 0 = any thread, non-0 = only this TID may redirect
+     BOOLEAN     retiring;                 // TRUE = unhook requested; per-vCPU paths restore lazily
+ } EPT_HOOKED_FUNCTION_INFO, *PEPT_HOOKED_FUNCTION_INFO;
+ 
+@@ -345,6 +346,7 @@ typedef struct _EPT_HOOK_VMCALL_PARAM {
+     //
+     BOOLEAN force_read_access;    // [in] TRUE = changed_entry R=1 (shellcode self-read)
+     BOOLEAN oneshot;              // [in] TRUE = redirect to proxy once, then pass-through to trampoline
++    UINT64  expected_tid;         // [in] 0 = any thread, non-0 = only this TID may redirect
+ } EPT_HOOK_VMCALL_PARAM, *PEPT_HOOK_VMCALL_PARAM;
+ 
+ //
+diff --git a/Ophion-master/src/ept_hook.cpp b/Ophion-master/src/ept_hook.cpp
+index 773b058..1b4d58c 100644
+--- a/Ophion-master/src/ept_hook.cpp
++++ b/Ophion-master/src/ept_hook.cpp
+@@ -223,6 +223,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
+                     efi->oneshot_fired = 0;
+                     efi->handler_function = req->proxy_function;
+                     efi->oneshot = req->oneshot;
++                    efi->expected_tid = req->expected_tid;
+                     efi->hook_type = req->hook_type;
+                     func_exists = TRUE;
+                     break;
+@@ -280,6 +281,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
+             fi->fake_page_contents = existing->fake_page_va;
+             fi->handler_function   = req->proxy_function;
+             fi->oneshot            = req->oneshot;
++            fi->expected_tid       = req->expected_tid;
+             fi->hook_type          = req->hook_type;
+ 
+             UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
+@@ -408,6 +410,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
+     fi->fake_page_contents = hp->fake_page_va;
+     fi->handler_function   = req->proxy_function;
+     fi->oneshot            = req->oneshot;
++    fi->expected_tid       = req->expected_tid;
+     fi->hook_type          = req->hook_type;
+ 
+     UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
+@@ -1047,6 +1050,25 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
+                 // let CPU re-execute from the real function, arm MTF to swap back.
+                 // same technique as ept_handle_violation for non-target CR3.
+                 //
++                UINT64 current_tid = (UINT64)(ULONG_PTR)PsGetCurrentThreadId();
++                if (fi->expected_tid && current_tid != fi->expected_tid)
++                {
++                    PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,
++                        (SIZE_T)(hp->pfn_of_hooked_page << 12));
++                    if (my_pte)
++                    {
++                        EPT_PML1_ENTRY passthrough = hp->original_entry;
++                        passthrough.ExecuteAccess = 1;
++                        ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
++                        vcpu->mtf_restore_page = hp;
++                        SIZE_T pc = 0;
++                        __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
++                        pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
++                        __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
++                    }
++                    return TRUE;
++                }
++
+                 if (fi->oneshot &&
+                     _InterlockedCompareExchange(&fi->oneshot_fired, 1, 0) != 0)
+                 {
+diff --git a/Ophion-master/src/vmexit.cpp b/Ophion-master/src/vmexit.cpp
+index f5c5375..465c5a5 100644
+--- a/Ophion-master/src/vmexit.cpp
++++ b/Ophion-master/src/vmexit.cpp
+@@ -757,7 +757,8 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
+             //   r12 = target_cr3      (0 = R0 hook, non-0 = R3 per-process)
+             //   r13 = user_trampoline (R3 executable buffer, NULL = kernel pool)
+             //   r14 = user_trampoline_pa (pre-computed PA)
+-            //   r15 = flags (bit 0 = force_read_access for shellcode self-read)
++            //   r15 = flags (low32: bit 0 = force_read_access, bit 1 = oneshot;
++            //                high32: expected TID for oneshot trigger, 0 = any)
+             //
+             UINT64 target_va       = regs->rdx;
+             UINT64 proxy_va        = regs->r8;
+@@ -787,6 +788,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
+             local_req.user_trampoline_pa = user_tramp_pa;
+             local_req.force_read_access  = (flags & 1) ? TRUE : FALSE;
+             local_req.oneshot            = (flags & 2) ? TRUE : FALSE;
++            local_req.expected_tid       = flags >> 32;
+             if (origin_va)
+                 local_req.origin_function = (PVOID *)origin_va;
+ 

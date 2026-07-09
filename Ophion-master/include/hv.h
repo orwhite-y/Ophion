@@ -181,6 +181,7 @@ BOOLEAN ept_stealth_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_
 // #PF handler — intercepts instruction-fetch page faults (NX violations)
 // temporarily swaps PT page EPT to real view so CPU page walk sees NX=0
 BOOLEAN ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error_code);
+VOID    ept_update_pf_intercept(VIRTUAL_MACHINE_STATE * vcpu);
 
 // shared fake PT page management (VMX-root safe)
 PSTEALTH_FAKE_PT stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, PVOID pt_page_va_hint, PVOID real_page_va);

@@ -37,6 +37,75 @@ volatile LONG g_dbg_shadow_pf_allowed = 0;
 volatile LONG g_dbg_shadow_pf_switched = 0;
 volatile LONG g_dbg_shadow_pf_reject = 0;
 
+VOID
+ept_update_pf_intercept(VIRTUAL_MACHINE_STATE * vcpu)
+{
+    if (!vcpu)
+        return;
+
+    BOOLEAN need_exec_pf = FALSE;
+    BOOLEAN need_write_pf = FALSE;
+
+    if (g_ept)
+    {
+        PLIST_ENTRY cur = g_ept->stealth_pages.Flink;
+        while (cur != &g_ept->stealth_pages)
+        {
+            PEPT_STEALTH_PAGE_INFO sp = CONTAINING_RECORD(cur, EPT_STEALTH_PAGE_INFO, stealth_page_list);
+            cur = cur->Flink;
+
+            if (sp->fake_pt || sp->shadow_cr3_phys)
+                need_exec_pf = TRUE;
+            if (sp->intercept_write)
+                need_write_pf = TRUE;
+            if (need_exec_pf && need_write_pf)
+                break;
+        }
+
+        if (!need_exec_pf)
+        {
+            cur = g_ept->hooked_pages.Flink;
+            while (cur != &g_ept->hooked_pages)
+            {
+                PEPT_HOOKED_PAGE_INFO hp = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
+                cur = cur->Flink;
+                if (hp->fake_pt || hp->exec_pt_page)
+                {
+                    need_exec_pf = TRUE;
+                    break;
+                }
+            }
+        }
+    }
+
+    SIZE_T exc_bitmap = 0;
+    __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
+
+    if (need_exec_pf || need_write_pf)
+        exc_bitmap |= (1ULL << 14);
+    else
+        exc_bitmap &= ~(1ULL << 14);
+    __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
+
+    if (need_write_pf)
+    {
+        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, PFEC_PRESENT);
+        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, PFEC_PRESENT);
+    }
+    else if (need_exec_pf)
+    {
+        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, PFEC_PRESENT | PFEC_INSTR_FETCH);
+        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, PFEC_PRESENT | PFEC_INSTR_FETCH);
+    }
+    else
+    {
+        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0);
+        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0);
+    }
+
+    vcpu->stealth_pf_configured = (need_exec_pf || need_write_pf) ? TRUE : FALSE;
+}
+
 // =========================================================================
 //  contiguous shadow region allocator
 // =========================================================================
@@ -377,14 +446,7 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
             }
 
             if (existing->fake_pt || existing->shadow_cr3_phys)
-            {
-                SIZE_T exc_bitmap = 0;
-                __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
-                exc_bitmap |= (1ULL << 14);
-                __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, PFEC_PRESENT);
-                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, PFEC_PRESENT);
-            }
+                ept_update_pf_intercept(vcpu);
 
             _mm_mfence();
             ept_invept_single(vcpu->ept_pointer);
@@ -455,14 +517,7 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
                 }
 
                 if (existing->fake_pt || existing->shadow_cr3_phys)
-                {
-                    SIZE_T exc_bitmap = 0;
-                    __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
-                    exc_bitmap |= (1ULL << 14);
-                    __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, PFEC_PRESENT);
-                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, PFEC_PRESENT);
-                }
+                    ept_update_pf_intercept(vcpu);
 
                 _mm_mfence();
                 ept_invept_single(vcpu->ept_pointer);
@@ -513,6 +568,7 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     sp->resident        = req->resident;
     sp->shadow_cr3_phys = req->shadow_cr3_phys;
     sp->no_ept_split    = req->no_ept_split;
+    sp->intercept_write = req->intercept_write;
 
     if (sp->no_ept_split)
     {
@@ -529,14 +585,8 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
             hostcr3_map_va(sp->pt_page_va, PAGE_SIZE);
 #endif
 
-        SIZE_T exc_bitmap = 0;
-        __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
-        exc_bitmap |= (1ULL << 14);
-        __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, PFEC_PRESENT);
-        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, PFEC_PRESENT);
-
         InsertHeadList(&g_ept->stealth_pages, &sp->stealth_page_list);
+        ept_update_pf_intercept(vcpu);
 
         _mm_mfence();
         ept_invept_single(vcpu->ept_pointer);
@@ -675,17 +725,9 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     //   no-fake-pt mode: #PF → clear NX in real PTE → MTF → restore NX
     // both require intercepting NX violations (P=1 + I/D=1).
     //
-    if (sp->fake_pt || sp->shadow_cr3_phys)
-    {
-        SIZE_T exc_bitmap = 0;
-        __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
-        exc_bitmap |= (1ULL << 14);  // intercept #PF (vector 14)
-        __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, PFEC_PRESENT);
-        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, PFEC_PRESENT);
-    }
-
     InsertHeadList(&g_ept->stealth_pages, &sp->stealth_page_list);
+    if (sp->fake_pt || sp->shadow_cr3_phys)
+        ept_update_pf_intercept(vcpu);
 
     //
     //
@@ -821,15 +863,10 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
         else if (sp->shadow_cr3_phys)
         {
             //
-            // shadow CR3 mode: swap guest CR3 to shadow page tables (NX=0).
-            // never touches real PTEs → no conflict with MiAgeWorkingSet.
-            //
-            // flow:
-            //   1. save real guest CR3
-            //   2. write shadow CR3 to VMCS_GUEST_CR3
-            //   3. INVVPID → CPU re-walks with shadow PT → NX=0 → TLB(NX=0)
-            //   4. preemption timer (~1ms) → restore real CR3
-            //   5. TLB keeps NX=0 → code runs at native speed
+            // shadow CR3 mode: swap guest CR3 to shadow page tables (NX=0),
+            // let exactly one guest instruction retire, then restore real CR3
+            // from MTF. This keeps the shadow window extremely small and avoids
+            // letting the guest run for an arbitrary timer interval on shadow CR3.
             //
             SIZE_T current_cr3 = 0;
             __vmx_vmread(VMCS_GUEST_CR3, &current_cr3);
@@ -839,31 +876,22 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             BOOLEAN already_on_shadow = (current_pfn == shadow_pfn);
 
             if (!already_on_shadow)
-            {
                 vcpu->nx_timer_real_cr3 = current_cr3;
 
+            vcpu->nx_timer_restore = sp;
+
+            if (!already_on_shadow)
+            {
                 // build shadow CR3 value: replace PFN, keep PCID/flags
                 UINT64 shadow_cr3_val = (current_cr3 & ~PFN_MASK) | shadow_pfn;
                 __vmx_vmwrite(VMCS_GUEST_CR3, shadow_cr3_val);
                 _InterlockedIncrement(&g_dbg_shadow_pf_switched);
             }
 
-            if (!already_on_shadow || !vcpu->nx_timer_restore)
-            {
-                // arm preemption timer (~1ms)
-                UINT64 vmx_misc = __readmsr(IA32_VMX_MISC);
-                UINT32 rate_shift = (UINT32)(vmx_misc & 0x1F);
-                UINT32 timer_val = (5000000U >> rate_shift);
-                if (timer_val < 1000) timer_val = 1000;
-
-                __vmx_vmwrite(VMCS_GUEST_VMX_PREEMPTION_TIMER_VALUE, timer_val);
-                SIZE_T pin = 0;
-                __vmx_vmread(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, &pin);
-                pin |= PIN_BASED_VM_EXEC_CTRL_VMX_PREEMPTION_TIMER;
-                __vmx_vmwrite(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, pin);
-
-                vcpu->nx_timer_restore = sp;
-            }
+            SIZE_T pc = 0;
+            __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+            pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+            __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
         }
 
         // fake PT mode: EPT changes + MTF
@@ -888,16 +916,23 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             _mm_mfence();
         }
 
-        // flush guest TLB for stealth VA so CPU re-walks with NX=0
-        INVVPID_DESCRIPTOR desc = {0};
-        desc.Vpid = VPID_TAG;
-        if (g_ept->invvpid_individual_addr)
+        //
+        // shadow CR3 mode relies on the shadow translation surviving until MTF
+        // gives us a chance to restore the real CR3, so do not invalidate the
+        // just-warmed guest TLB entry here.
+        //
+        if (sp->fake_pt)
         {
-            desc.LinearAddress = fault_addr;
-            asm_invvpid(InvvpidIndividualAddress, &desc);
+            INVVPID_DESCRIPTOR desc = {0};
+            desc.Vpid = VPID_TAG;
+            if (g_ept->invvpid_individual_addr)
+            {
+                desc.LinearAddress = fault_addr;
+                asm_invvpid(InvvpidIndividualAddress, &desc);
+            }
+            else
+                asm_invvpid(InvvpidSingleContext, &desc);
         }
-        else
-            asm_invvpid(InvvpidSingleContext, &desc);
 
         return TRUE;
     }
@@ -1141,6 +1176,7 @@ ept_stealth_uninstall(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_FREE_PARAM req)
 
     _mm_mfence();
     ept_invept_single(vcpu->ept_pointer);
+    ept_update_pf_intercept(vcpu);
     return TRUE;
 }
 

@@ -132,6 +132,7 @@ typedef struct _TD_STEALTH_PARAM {
     BOOLEAN use_fake_pt;        // TRUE = create fake PT page (NX hiding)
     UINT64  shadow_cr3_phys;    // physical address of shadow PML4 (0 = no shadow CR3)
     BOOLEAN no_ept_split;       // TRUE = shadow CR3 only, keep target EPT mapping unchanged
+    BOOLEAN intercept_write;    // TRUE = keep write-side #PF interception enabled
     volatile LONG installed;
     BOOLEAN result;
 } TD_STEALTH_PARAM;
@@ -1367,7 +1368,8 @@ TdStealthAllocPage(
     UINT32  pt_idx,         // pre-computed PTE index within PT page
     BOOLEAN use_fake_pt = FALSE,  // TRUE = create fake PT (NX hiding)
     UINT64  shadow_cr3_phys = 0,  // shadow CR3 phys (NX=0 for target, 0=not used)
-    BOOLEAN no_ept_split = FALSE) // TRUE = shadow CR3 only, no EPT page split
+    BOOLEAN no_ept_split = FALSE, // TRUE = shadow CR3 only, no EPT page split
+    BOOLEAN intercept_write = FALSE)
 {
     TD_STEALTH_PARAM * req = (TD_STEALTH_PARAM *)ExAllocatePool2(
         POOL_FLAG_NON_PAGED, sizeof(TD_STEALTH_PARAM), TD_STEALTH_REQ_TAG);
@@ -1401,6 +1403,7 @@ TdStealthAllocPage(
     req->use_fake_pt      = use_fake_pt;
     req->shadow_cr3_phys  = shadow_cr3_phys;
     req->no_ept_split     = no_ept_split;
+    req->intercept_write  = intercept_write;
 
     //
     // copy PT page and target page content into NonPaged kernel buffers.
@@ -1544,7 +1547,11 @@ TdStealthInjectPages(
             chunk,
             resident,
             pt_pfn,
-            pt_idx);
+            pt_idx,
+            FALSE,
+            0,
+            FALSE,
+            FALSE);
 
         if (!NT_SUCCESS(stealth_st))
         {
@@ -4510,7 +4517,8 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             pt_idx,
             FALSE,          // use_fake_pt = FALSE
             shadow_cr3,     // shadow CR3 with NX=0 for shellcode page
-            shadow_only);   // no EPT page separation in shadow-only mode
+            shadow_only,    // no EPT page separation in shadow-only mode
+            FALSE);
 
         if (!NT_SUCCESS(stealth_st))
         {
@@ -4991,7 +4999,8 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                     pt_idx,
                     FALSE,
                     shadow_cr3,
-                    TRUE);
+                    TRUE,
+                    FALSE);
 
                 if (!NT_SUCCESS(stealth_st))
                 {
@@ -5277,6 +5286,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                     pt_idx,
                     FALSE,
                     shadow_cr3,
+                    TRUE,
                     TRUE);
 
                 if (!NT_SUCCESS(stealth_st))

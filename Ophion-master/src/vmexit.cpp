@@ -952,12 +952,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                         PEPT_PML1_ENTRY pp1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys);
                         if (pp1) pp1->AsUInt = ex->fake_pt->pt_fake_entry.AsUInt;
 
-                        size_t exc_bitmap = 0;
-                        __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
-                        exc_bitmap |= (1ULL << 14);
-                        __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-                        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x1);
-                        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x1);
+                        ept_update_pf_intercept(vcpu);
                     }
                     else
                     {
@@ -997,12 +992,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 //
                 if (inj->pt_page_pfn && inj->pt_page_copy)
                 {
-                    size_t exc_bitmap = 0;
-                    __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
-                    exc_bitmap |= (1ULL << 14);
-                    __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x1);
-                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x1);
+                        ept_update_pf_intercept(vcpu);
                 }
 
                 _mm_mfence();
@@ -1159,12 +1149,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             {
                 pte->AsUInt = hp->changed_entry.AsUInt;
 
-                size_t exc_bitmap = 0;
-                __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bitmap);
-                exc_bitmap |= (1ULL << 14);
-                __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bitmap);
-                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0x1);
-                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0x1);
+                ept_update_pf_intercept(vcpu);
             }
 
             _mm_mfence();
@@ -1595,46 +1580,8 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
     case VMX_EXIT_REASON_VMX_PREEMPTION_TIMER_EXPIRED:
     {
-        //
-        // shadow CR3 timer: restore real guest CR3.
-        // TLB still has NX=0 cached (from shadow CR3's page walk).
-        // real CR3 has NX=1 → PTE scanner sees NX=1 (clean).
-        // code continues from TLB at native speed.
-        // NO INVVPID → TLB entry preserved!
-        //
-        PEPT_STEALTH_PAGE_INFO nx_sp = vcpu->nx_timer_restore;
-        if (nx_sp && nx_sp->shadow_cr3_phys)
-        {
-            //
-            // check if shadow CR3 is still active.
-            // on VM exit, VMCS_GUEST_CR3 is saved from the actual CR3 register.
-            // if a context switch happened during the timer window,
-            // the guest wrote a different CR3 → we must NOT overwrite it.
-            //
-            SIZE_T current_cr3 = 0;
-            __vmx_vmread(VMCS_GUEST_CR3, &current_cr3);
-
-            UINT64 current_pfn = ((UINT64)current_cr3 & 0x000FFFFFFFFFF000ULL) >> 12;
-            UINT64 shadow_pfn  = (nx_sp->shadow_cr3_phys & 0x000FFFFFFFFFF000ULL) >> 12;
-
-            if (current_pfn == shadow_pfn)
-            {
-                // still on shadow CR3 — safe to restore real CR3
-                __vmx_vmwrite(VMCS_GUEST_CR3, vcpu->nx_timer_real_cr3);
-                _InterlockedIncrement(&g_dbg_shadow_timer_restore);
-                // NO INVVPID — preserve TLB entry (NX=0 from shadow page tables)!
-            }
-            else
-            {
-                _InterlockedIncrement(&g_dbg_shadow_timer_skip);
-            }
-            // else: context switch already overwrote shadow CR3 — skip restore.
-            // TLB was flushed by context switch → next fetch → NX=1 → #PF → re-arm.
-        }
-        vcpu->nx_timer_restore = NULL;
-        vcpu->nx_timer_real_cr3 = 0;
-
-        // disable preemption timer
+        // Shadow-CR3 restore no longer uses the VMX preemption timer.
+        // If a stale timer exit arrives, just make sure the pin control is off.
         SIZE_T pin = 0;
         __vmx_vmread(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, &pin);
         pin &= ~(SIZE_T)PIN_BASED_VM_EXEC_CTRL_VMX_PREEMPTION_TIMER;

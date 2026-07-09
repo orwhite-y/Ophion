@@ -278,7 +278,9 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     PEPT_STEALTH_PAGE_INFO stealth_pf_swapped;
 
     //
-    // NX cycle: preemption timer restore (no MTF — avoids IPI ack delay)
+    // Shadow-CR3 single-step restore state.
+    // After a #PF on NX=1, VMX-root switches to shadow CR3, lets one guest
+    // instruction retire, and restores the real CR3 from MTF.
     //
     PEPT_STEALTH_PAGE_INFO nx_timer_restore;
     UINT64      nx_timer_real_cr3;
@@ -435,6 +437,7 @@ typedef struct _EPT_STEALTH_PAGE_INFO {
     UINT64          guest_cr3;
     BOOLEAN         resident;           // TRUE = DLL mode (default exec view, reads swap)
     BOOLEAN         no_ept_split;       // TRUE = shadow CR3 only, no target EPT split/swap
+    BOOLEAN         intercept_write;    // TRUE = this page needs write-side #PF mediation
 
     // --- PT page info ---
     PSTEALTH_FAKE_PT fake_pt;           // shared fake PT page info (NULL = use NX cycle instead)
@@ -462,6 +465,7 @@ typedef struct _EPT_STEALTH_ALLOC_PARAM {
     PVOID   shellcode_buffer;     // [in] if non-NULL: shellcode for THIS page's execute view
     UINT32  shellcode_size;       // [in] shellcode bytes for this page (max PAGE_SIZE)
     BOOLEAN resident;             // [in] TRUE = DLL mode: default execute view, no #PF overhead
+    BOOLEAN intercept_write;      // [in] TRUE = keep write-side #PF interception enabled
     //
     // pre-computed guest PT info (filled by caller at PASSIVE/DISPATCH level).
     // avoids pa_to_va (MmGetVirtualForPhysical) in VMX-root which can deadlock

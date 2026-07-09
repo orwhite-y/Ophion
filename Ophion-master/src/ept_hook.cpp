@@ -757,6 +757,28 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     pc &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
     __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
 
+    //
+    // Shadow-CR3 restore must run first. The same MTF exit can also carry
+    // other restore state, and we do not want a prior branch to skip this one.
+    //
+    if (vcpu->nx_timer_restore)
+    {
+        PEPT_STEALTH_PAGE_INFO sp = vcpu->nx_timer_restore;
+        if (sp && sp->shadow_cr3_phys && vcpu->nx_timer_real_cr3)
+        {
+            SIZE_T current_cr3 = 0;
+            __vmx_vmread(VMCS_GUEST_CR3, &current_cr3);
+
+            UINT64 current_pfn = (UINT64)current_cr3 & CR3_ADDR_MASK;
+            UINT64 shadow_pfn  = sp->shadow_cr3_phys & CR3_ADDR_MASK;
+            if (current_pfn == shadow_pfn)
+                __vmx_vmwrite(VMCS_GUEST_CR3, vcpu->nx_timer_real_cr3);
+        }
+
+        vcpu->nx_timer_restore = NULL;
+        vcpu->nx_timer_real_cr3 = 0;
+    }
+
     if (vcpu->mtf_restore_page)
     {
         PEPT_HOOKED_PAGE_INFO hp = vcpu->mtf_restore_page;

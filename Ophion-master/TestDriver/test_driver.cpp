@@ -112,12 +112,14 @@ typedef struct _TD_HOOK_INJECT_PARAM {
 #pragma pack(push, 8)
 typedef struct _TD_STEALTH_PARAM {
     UINT64  caller_cr3;
+    UINT64  target_pid;
     PVOID   target_va;
     PVOID   handler_function;
     UINT64  target_phys;
     PVOID   shellcode_buffer;
     UINT32  shellcode_size;
     BOOLEAN resident;
+    BOOLEAN intercept_write;
     //
     // pre-computed guest PT info (filled at PASSIVE/DISPATCH level).
     // avoids MmGetVirtualForPhysical (pa_to_va) in VMX-root which deadlocks
@@ -132,7 +134,6 @@ typedef struct _TD_STEALTH_PARAM {
     BOOLEAN use_fake_pt;        // TRUE = create fake PT page (NX hiding)
     UINT64  shadow_cr3_phys;    // physical address of shadow PML4 (0 = no shadow CR3)
     BOOLEAN no_ept_split;       // TRUE = shadow CR3 only, keep target EPT mapping unchanged
-    BOOLEAN intercept_write;    // TRUE = keep write-side #PF interception enabled
     volatile LONG installed;
     BOOLEAN result;
 } TD_STEALTH_PARAM;
@@ -299,6 +300,20 @@ TdResolveShadowPT(UINT64 shadow_cr3, UINT64 va, UINT64 * out_pt_pfn, UINT32 * ou
     *out_pte_idx = (UINT32)((va >> 12) & 0x1FF);
     *out_pt_va = table;
     return TRUE;
+}
+
+static PUINT64
+TdResolveShadowPte(UINT64 shadow_cr3, UINT64 va)
+{
+    UINT64 pt_pfn = 0;
+    UINT32 pte_idx = 0;
+    PVOID pt_va = NULL;
+
+    if (!TdResolveShadowPT(shadow_cr3, va, &pt_pfn, &pte_idx, &pt_va) || !pt_va)
+        return NULL;
+
+    UNREFERENCED_PARAMETER(pt_pfn);
+    return &((PUINT64)pt_va)[pte_idx];
 }
 
 static BOOLEAN
@@ -1403,6 +1418,7 @@ TdStealthAllocPage(
     }
 
     req->caller_cr3       = caller_cr3;
+    req->target_pid       = (UINT64)(ULONG_PTR)PsGetCurrentProcessId();
     req->target_va        = page_va;
     req->handler_function = NULL;
     req->target_phys      = page_phys;
@@ -5282,10 +5298,12 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
 
         PUINT64 old_view_pte = tracked ?
-            TdResolveGuestPte(shadow_cr3, start) :
+            TdResolveShadowPte(shadow_cr3, start) :
             TdResolveGuestPte(caller_cr3, start);
         if (!old_view_pte || !(*old_view_pte & 1))
         {
+            HYPERPLATFORM_LOG_ERROR("[td-protect] old view PTE not found: pid=%llu va=%p tracked=%u cr3=0x%llX shadow=0x%llX pte=%p",
+                p->target_pid, (PVOID)start, tracked, caller_cr3, shadow_cr3, old_view_pte);
             st = STATUS_NOT_FOUND;
             goto ShadowProtectExit;
         }
@@ -5297,6 +5315,8 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             PUINT64 real_pte = TdResolveGuestPte(caller_cr3, page);
             if (!real_pte || !(*real_pte & 1))
             {
+                HYPERPLATFORM_LOG_ERROR("[td-protect] real PTE not found while scanning: pid=%llu va=%p cr3=0x%llX pte=%p",
+                    p->target_pid, (PVOID)page, caller_cr3, real_pte);
                 st = STATUS_NOT_FOUND;
                 goto ShadowProtectExit;
             }
@@ -5383,9 +5403,12 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             for (UINT64 page = start; page < end; page += PAGE_SIZE)
             {
                 PUINT64 real_pte = TdResolveGuestPte(caller_cr3, page);
-                PUINT64 shadow_pte = TdResolveGuestPte(shadow_cr3, page);
+                PUINT64 shadow_pte = TdResolveShadowPte(shadow_cr3, page);
                 if (!real_pte || !shadow_pte || !(*real_pte & 1) || !(*shadow_pte & 1))
                 {
+                    HYPERPLATFORM_LOG_ERROR("[td-protect] tracked PTE not found while applying: pid=%llu va=%p real=%p shadow=%p realv=0x%llX shadowv=0x%llX",
+                        p->target_pid, (PVOID)page, real_pte, shadow_pte,
+                        real_pte ? *real_pte : 0, shadow_pte ? *shadow_pte : 0);
                     st = STATUS_NOT_FOUND;
                     goto ShadowProtectExit;
                 }
@@ -5396,6 +5419,12 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                     *shadow_pte = *real_pte;
                 else
                     *shadow_pte = wanted;
+
+                if (page == start)
+                {
+                    HYPERPLATFORM_LOG_INFO("[td-protect] applied: pid=%llu va=%p real=0x%llX shadow=0x%llX new=0x%X",
+                        p->target_pid, (PVOID)page, *real_pte, *shadow_pte, new_protect);
+                }
             }
 
             BOOLEAN tracked_has_diff = FALSE;
@@ -5405,9 +5434,12 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 for (UINT64 page = (UINT64)tracked_base; page < tracked_end; page += PAGE_SIZE)
                 {
                     PUINT64 real_pte = TdResolveGuestPte(caller_cr3, page);
-                    PUINT64 shadow_pte = TdResolveGuestPte(shadow_cr3, page);
+                    PUINT64 shadow_pte = TdResolveShadowPte(shadow_cr3, page);
                     if (!real_pte || !shadow_pte || !(*real_pte & 1) || !(*shadow_pte & 1))
                     {
+                        HYPERPLATFORM_LOG_ERROR("[td-protect] tracked PTE not found while checking diff: pid=%llu va=%p real=%p shadow=%p realv=0x%llX shadowv=0x%llX",
+                            p->target_pid, (PVOID)page, real_pte, shadow_pte,
+                            real_pte ? *real_pte : 0, shadow_pte ? *shadow_pte : 0);
                         st = STATUS_NOT_FOUND;
                         goto ShadowProtectExit;
                     }
@@ -5443,7 +5475,8 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         p->size = (UINT64)protect_size;
         p->new_protect = new_protect;
         p->shadow_cr3 = shadow_cr3;
-        p->status = (UINT64)(ULONG)st;
+        if (p->status == 0)
+            p->status = (UINT64)(ULONG)st;
         irp->IoStatus.Information = sizeof(TD_SHADOW_PROTECT_PARAMS);
 
         KeUnstackDetachProcess(&apc_state);

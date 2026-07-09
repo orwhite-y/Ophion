@@ -435,6 +435,7 @@ typedef struct _EPT_STEALTH_PAGE_INFO {
     EPT_PML1_ENTRY  original_entry;     // read view PTE: R+W, no X
     EPT_PML1_ENTRY  execute_entry;      // execute view PTE: X only (or R+X for resident)
     UINT64          guest_cr3;
+    UINT64          target_pid;         // optional process filter for KVA-shadow/user CR3 cases
     BOOLEAN         resident;           // TRUE = DLL mode (default exec view, reads swap)
     BOOLEAN         no_ept_split;       // TRUE = shadow CR3 only, no target EPT split/swap
     BOOLEAN         intercept_write;    // TRUE = this page needs write-side #PF mediation
@@ -459,6 +460,7 @@ typedef struct _EPT_STEALTH_PAGE_INFO {
 //
 typedef struct _EPT_STEALTH_ALLOC_PARAM {
     UINT64  caller_cr3;           // [in] guest CR3
+    UINT64  target_pid;            // [in] optional target PID, 0 = filter by caller_cr3 only
     PVOID   target_va;            // [in] PAGE_READWRITE memory in guest
     PVOID   handler_function;     // [in] function to dispatch VMCALL to (NULL for shellcode mode)
     UINT64  target_phys;          // [in] pre-computed physical address of target_va

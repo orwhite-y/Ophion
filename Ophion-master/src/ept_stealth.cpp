@@ -30,6 +30,7 @@
 #define NX_BIT    (1ULL << 63)
 #define PFEC_PRESENT      0x01
 #define PFEC_WRITE        0x02
+#define PFEC_USER         0x04
 #define PFEC_INSTR_FETCH  0x10
 
 volatile LONG g_dbg_shadow_pf_seen = 0;
@@ -89,8 +90,8 @@ ept_update_pf_intercept(VIRTUAL_MACHINE_STATE * vcpu)
 
     if (need_write_pf)
     {
-        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, PFEC_PRESENT);
-        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, PFEC_PRESENT);
+        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, PFEC_PRESENT | PFEC_USER);
+        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, PFEC_PRESENT | PFEC_USER);
     }
     else if (need_exec_pf)
     {
@@ -543,6 +544,7 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     sp->pfn_of_target    = target_pfn;
     sp->handler_function = req->handler_function;
     sp->guest_cr3        = req->caller_cr3;
+    sp->target_pid       = req->target_pid;
 
     // --- resolve guest PT page info ---
     //
@@ -817,7 +819,13 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
 
         if (sp->guest_va != fault_page) continue;
 
-        if (sp->guest_cr3 != 0)
+        if (sp->target_pid != 0)
+        {
+            UINT64 current_pid = (UINT64)(ULONG_PTR)PsGetCurrentProcessId();
+            if (current_pid != sp->target_pid)
+                continue;
+        }
+        else if (sp->guest_cr3 != 0)
         {
             UINT64 guest_cr3 = 0;
             __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
@@ -886,6 +894,13 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
                 UINT64 shadow_cr3_val = (current_cr3 & ~PFN_MASK) | shadow_pfn;
                 __vmx_vmwrite(VMCS_GUEST_CR3, shadow_cr3_val);
                 _InterlockedIncrement(&g_dbg_shadow_pf_switched);
+            }
+
+            if (error_code & PFEC_WRITE)
+            {
+                INVVPID_DESCRIPTOR desc = {0};
+                desc.Vpid = VPID_TAG;
+                asm_invvpid(InvvpidSingleContext, &desc);
             }
 
             SIZE_T pc = 0;
@@ -968,11 +983,17 @@ ept_handle_stealth_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         // without this, a different process with the same VA executing VMCALL
         // would be incorrectly redirected.
         //
-        if (sp->guest_cr3 != 0)
+        if (sp->target_pid != 0)
+        {
+            UINT64 current_pid = (UINT64)(ULONG_PTR)PsGetCurrentProcessId();
+            if (current_pid != sp->target_pid)
+                continue;
+        }
+        else if (sp->guest_cr3 != 0)
         {
             UINT64 guest_cr3 = 0;
             __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
-            if ((guest_cr3 & 0x000FFFFFFFFFF000ULL) != (sp->guest_cr3 & 0x000FFFFFFFFFF000ULL))
+            if ((guest_cr3 & PFN_MASK) != (sp->guest_cr3 & PFN_MASK))
                 continue;
         }
 

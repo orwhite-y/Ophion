@@ -5,6 +5,7 @@ PUBLIC asm_get_rflags
 PUBLIC asm_reload_gdtr
 PUBLIC asm_reload_idtr
 PUBLIC asm_reload_tr
+PUBLIC asm_read_cr2
 PUBLIC asm_write_cr2
 
 .code _text
@@ -40,6 +41,11 @@ asm_reload_tr PROC
     ltr     cx
     ret
 asm_reload_tr ENDP
+
+asm_read_cr2 PROC
+    mov     rax, cr2
+    ret
+asm_read_cr2 ENDP
 
 asm_write_cr2 PROC
     mov     cr2, rcx

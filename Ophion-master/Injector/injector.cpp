@@ -1148,6 +1148,196 @@ static int CmdShadowProtect(UINT64 pid, UINT64 base_va, UINT64 size, DWORD new_p
     return (ok && p.status == 0) ? 0 : 1;
 }
 
+static bool ShadowProtectSelf(UINT64 base_va, UINT64 size, DWORD new_protect, DWORD* old_protect)
+{
+    HANDLE dev = OpenDevice();
+    if (dev == INVALID_HANDLE_VALUE) return false;
+
+    TD_SHADOW_PROTECT_PARAMS p = {};
+    p.target_pid = GetCurrentProcessId();
+    p.base_va = base_va;
+    p.size = size;
+    p.new_protect = new_protect;
+
+    DWORD bytes = 0;
+    BOOL ok = DeviceIoControl(dev, IOCTL_SHADOW_PROTECT_MEMORY,
+        &p, sizeof(p), &p, sizeof(p), &bytes, NULL);
+    CloseHandle(dev);
+
+    if (!ok || bytes < sizeof(TD_SHADOW_PROTECT_PARAMS) || p.status != 0)
+    {
+        printf("[-] ShadowProtectSelf failed: ok=%u gle=%u status=0x%08llX base=0x%llX size=0x%llX protect=0x%X\n",
+            ok, GetLastError(), p.status, base_va, size, new_protect);
+        return false;
+    }
+
+    if (old_protect)
+        *old_protect = (DWORD)p.old_protect;
+
+    printf("[+] ShadowProtectSelf OK: base=0x%llX size=0x%llX old=0x%X new=0x%X shadow_cr3=0x%llX\n",
+        p.base_va, p.size, (DWORD)p.old_protect, (DWORD)p.new_protect, p.shadow_cr3);
+    return true;
+}
+
+static void PrintBytesLine(const char* label, const BYTE* p, SIZE_T len)
+{
+    printf("%s", label);
+    for (SIZE_T i = 0; i < len; i++)
+        printf(" %02X", p[i]);
+    printf("\n");
+}
+
+static bool IsGapByte(BYTE b)
+{
+    return b == 0xCC || b == 0x90 || b == 0x00;
+}
+
+static BYTE* FindNtdllCodeGap(SIZE_T needed_len)
+{
+    const BYTE gap_types[] = { 0xCC, 0x90, 0x00 };
+    SIZE_T min_run = needed_len < 16 ? 16 : needed_len;
+
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll)
+        return NULL;
+
+    BYTE* base = (BYTE*)ntdll;
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return NULL;
+
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return NULL;
+
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+    {
+        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE))
+            continue;
+
+        BYTE* start = base + sec->VirtualAddress;
+        SIZE_T size = sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData;
+        if (size < needed_len)
+            continue;
+
+        for (SIZE_T type_idx = 0; type_idx < sizeof(gap_types); type_idx++)
+        {
+            BYTE gap_byte = gap_types[type_idx];
+            if (!IsGapByte(gap_byte) || size < min_run)
+                continue;
+
+            for (SIZE_T off = 0; off <= size - min_run; off++)
+            {
+                BYTE* p = start + off;
+                UINT_PTR page0 = (UINT_PTR)p & ~0xFFFULL;
+                UINT_PTR page1 = ((UINT_PTR)p + needed_len - 1) & ~0xFFFULL;
+                if (page0 != page1)
+                    continue;
+
+                bool match = true;
+                for (SIZE_T j = 0; j < min_run; j++)
+                {
+                    if (p[j] != gap_byte)
+                    {
+                        match = false;
+                        break;
+                    }
+                }
+
+                if (match)
+                    return p;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+static int CmdShadowGapTest()
+{
+    enum { patch_len = 8 };
+    BYTE* gap = FindNtdllCodeGap(patch_len);
+    if (!gap)
+    {
+        printf("[-] Could not find a suitable ntdll executable gap in current process.\n");
+        return 1;
+    }
+
+    BYTE original[patch_len] = {};
+    BYTE pattern[patch_len] = { 0x48, 0x31, 0xC0, 0x90, 0x90, 0x90, 0xCC, 0xCC };
+    memcpy(original, gap, patch_len);
+
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (!VirtualQuery(gap, &mbi, sizeof(mbi)))
+    {
+        printf("[-] VirtualQuery failed for gap=%p gle=%u\n", gap, GetLastError());
+        return 1;
+    }
+
+    volatile BYTE touch = 0;
+    BYTE* page_base = (BYTE*)((UINT_PTR)gap & ~0xFFFULL);
+    for (SIZE_T i = 0; i < 0x1000; i += 0x40)
+        touch ^= page_base[i];
+    UNREFERENCED_PARAMETER(touch);
+
+    printf("[*] Shadow gap test current pid=%u ntdll gap=%p len=0x%llX\n",
+        GetCurrentProcessId(), gap, (UINT64)patch_len);
+    printf("    VQ Base=%p AllocBase=%p Region=0x%llX State=0x%X Protect=0x%X Type=0x%X\n",
+        mbi.BaseAddress, mbi.AllocationBase, (UINT64)mbi.RegionSize, mbi.State, mbi.Protect, mbi.Type);
+    PrintBytesLine("    Before:", original, patch_len);
+
+    DWORD old_protect = 0;
+    if (!ShadowProtectSelf((UINT64)gap, patch_len, PAGE_EXECUTE_READWRITE, &old_protect))
+        return 1;
+
+    int result = 0;
+    bool write_ok = false;
+    __try
+    {
+        memcpy(gap, pattern, patch_len);
+        write_ok = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        printf("[-] Write test pattern faulted: 0x%08X\n", GetExceptionCode());
+    }
+
+    PrintBytesLine("    After write:", gap, patch_len);
+    if (!write_ok)
+        result = 1;
+
+    bool restore_ok = false;
+    if (write_ok)
+    {
+        __try
+        {
+            memcpy(gap, original, patch_len);
+            restore_ok = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            printf("[-] Restore original bytes faulted: 0x%08X\n", GetExceptionCode());
+        }
+    }
+
+    PrintBytesLine("    Restored:", gap, patch_len);
+    if (!restore_ok)
+        result = 1;
+
+    if (!old_protect)
+        old_protect = PAGE_EXECUTE_READ;
+    if (!ShadowProtectSelf((UINT64)gap, patch_len, old_protect, NULL))
+        result = 1;
+
+    PrintBytesLine("    Final:", gap, patch_len);
+    if (result == 0)
+        printf("[+] Shadow gap test completed.\n");
+    else
+        printf("[-] Shadow gap test completed with errors.\n");
+    return result;
+}
+
 // ---- trigger hook, redirect selected trigger VA to selected jump VA ----
 
 static int CmdTriggerJump(UINT64 pid, UINT64 trigger_va, UINT64 jump_to_va, UINT64 flags)
@@ -1241,6 +1431,7 @@ static void PrintUsage(const wchar_t* exe)
     printf("  %ls allocmem <process> <size> [exec] [rw|wc|protect]  Allocate memory, optional shadow CR3 exec\n", exe);
     printf("  %ls freemem <process> <base> <size>  Free memory allocated by allocmem\n", exe);
     printf("  %ls shadowprotect <pid> <base> <size> <r|rw|x|rx|rwx|protect>  Protect via shadow CR3\n", exe);
+    printf("  %ls shadowgaptest                 Patch/restore current ntdll code gap via shadow protect\n", exe);
     printf("  %ls triggerjump <pid> <trigger|0> <jump> [flags]  Trigger hook redirect\n", exe);
     printf("  %ls injectdll <process> <dllpath>  Manual-map DLL inject (no LoadLibrary)\n", exe);
     printf("  %ls hookr3 <pid> <va> <proxy> [type]  R3 EPT hook (per-process)\n", exe);
@@ -1308,6 +1499,10 @@ int wmain(int argc, wchar_t* argv[])
         if (!protect) return 1;
         if (!pid) { printf("[-] Invalid pid.\n"); return 1; }
         return CmdShadowProtect(pid, base_va, size, protect);
+    }
+    else if (_wcsicmp(cmd, L"shadowgaptest") == 0)
+    {
+        return CmdShadowGapTest();
     }
     else if (_wcsicmp(cmd, L"triggerjump") == 0)
     {

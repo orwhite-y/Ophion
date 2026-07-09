@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 // ---- IOCTL codes (must match TestDriver) ----
 
@@ -519,27 +520,35 @@ static UINT64 ResolveRemoteExport(DWORD pid, const wchar_t* module_name, const c
     return ResolveRemoteExportFromFile(pid, info.path, info.base, export_name, 0);
 }
 
+static bool ResolveShellcodeApisR3(DWORD pid, TD_RESOLVE_EXPORT_PARAMS* rp)
+{
+    HANDLE dev = OpenDevice();
+    if (dev == INVALID_HANDLE_VALUE) return false;
+
+    ZeroMemory(rp, sizeof(*rp));
+    rp->target_pid = (UINT64)pid;
+
+    DWORD bytes = 0;
+    BOOL ok = DeviceIoControl(dev, IOCTL_RESOLVE_EXPORT, rp, sizeof(*rp), rp, sizeof(*rp), &bytes, NULL);
+    CloseHandle(dev);
+
+    if (!ok || bytes < sizeof(TD_RESOLVE_EXPORT_PARAMS) || rp->status != 0 || !rp->messageboxa_va || !rp->sleepex_va)
+    {
+        printf("[-] ResolveShellcodeApisR3: driver resolve export failed (ok=%u status=0x%llX msgbox=0x%llX sleepex=0x%llX)\n",
+            ok, rp->status, rp->messageboxa_va, rp->sleepex_va);
+        return false;
+    }
+
+    return true;
+}
+
 static bool BuildShellcodeR3(DWORD pid, BYTE* out_buf, DWORD out_size, DWORD* out_shellcode_size)
 {
     if (out_size < sizeof(g_shellcode_pic_r3)) return false;
 
-    // resolve MessageBoxA + SleepEx via driver IOCTL (PEB walk in target process context)
-    HANDLE dev = OpenDevice();
-    if (dev == INVALID_HANDLE_VALUE) return false;
-
     TD_RESOLVE_EXPORT_PARAMS rp = {};
-    rp.target_pid = (UINT64)pid;
-
-    DWORD bytes = 0;
-    BOOL ok = DeviceIoControl(dev, IOCTL_RESOLVE_EXPORT, &rp, sizeof(rp), &rp, sizeof(rp), &bytes, NULL);
-    CloseHandle(dev);
-
-    if (!ok || bytes < sizeof(TD_RESOLVE_EXPORT_PARAMS) || rp.status != 0 || !rp.messageboxa_va || !rp.sleepex_va)
-    {
-        printf("[-] BuildShellcodeR3: driver resolve export failed (ok=%u status=0x%llX msgbox=0x%llX sleepex=0x%llX)\n",
-            ok, rp.status, rp.messageboxa_va, rp.sleepex_va);
+    if (!ResolveShellcodeApisR3(pid, &rp))
         return false;
-    }
 
     ZeroMemory(out_buf, out_size);
     memcpy(out_buf, g_shellcode_pic_r3, sizeof(g_shellcode_pic_r3));
@@ -549,6 +558,141 @@ static bool BuildShellcodeR3(DWORD pid, BYTE* out_buf, DWORD out_size, DWORD* ou
 
     printf("[+] R3 shellcode built via driver: MessageBoxA=0x%llX SleepEx=0x%llX size=0x%X\n",
         rp.messageboxa_va, rp.sleepex_va, *out_shellcode_size);
+    return true;
+}
+
+static bool EmitByte(BYTE* buf, DWORD cap, DWORD* pos, BYTE v)
+{
+    if (*pos >= cap) return false;
+    buf[(*pos)++] = v;
+    return true;
+}
+
+static bool EmitBytes(BYTE* buf, DWORD cap, DWORD* pos, const BYTE* src, DWORD len)
+{
+    if (len > cap || *pos > cap - len) return false;
+    memcpy(buf + *pos, src, len);
+    *pos += len;
+    return true;
+}
+
+static bool EmitU32(BYTE* buf, DWORD cap, DWORD* pos, UINT32 v)
+{
+    return EmitBytes(buf, cap, pos, (const BYTE*)&v, sizeof(v));
+}
+
+static bool EmitU64(BYTE* buf, DWORD cap, DWORD* pos, UINT64 v)
+{
+    return EmitBytes(buf, cap, pos, (const BYTE*)&v, sizeof(v));
+}
+
+static bool EmitRel32(BYTE* buf, DWORD cap, DWORD* pos, DWORD instr_end_abs, DWORD target_abs)
+{
+    INT64 rel = (INT64)target_abs - (INT64)instr_end_abs;
+    if (rel < INT_MIN || rel > INT_MAX) return false;
+    return EmitU32(buf, cap, pos, (UINT32)(INT32)rel);
+}
+
+static bool WritePageString(BYTE* out_buf, DWORD out_size, DWORD abs_off, const char* s)
+{
+    size_t len = strlen(s) + 1;
+    if (len > out_size || abs_off > out_size - len) return false;
+    memcpy(out_buf + abs_off, s, len);
+    return true;
+}
+
+static bool BuildShellcodeR3PageWalk(DWORD pid, BYTE* out_buf, DWORD out_size, DWORD* out_shellcode_size)
+{
+    const DWORD kPageSize = 0x1000;
+    const DWORD kPageCount = 10;
+    const DWORD kPayloadSize = kPageSize * kPageCount;
+    const DWORD kTextOff = 0x300;
+    const DWORD kCaptionOff = 0x340;
+
+    if (out_size < kPayloadSize) return false;
+
+    TD_RESOLVE_EXPORT_PARAMS rp = {};
+    if (!ResolveShellcodeApisR3(pid, &rp))
+        return false;
+
+    ZeroMemory(out_buf, out_size);
+
+    for (DWORD page = 0; page < kPageCount; page++)
+    {
+        BYTE* code = out_buf + page * kPageSize;
+        DWORD pos = 0;
+        DWORD page_abs = page * kPageSize;
+        DWORD text_abs = page_abs + kTextOff;
+        DWORD caption_abs = page_abs + kCaptionOff;
+        char text[64] = {};
+        const char caption[] = "Ophion multi-page";
+
+        snprintf(text, sizeof(text), "Shadow page test %u/%u", page + 1, kPageCount);
+        if (!WritePageString(out_buf, out_size, text_abs, text) ||
+            !WritePageString(out_buf, out_size, caption_abs, caption))
+            return false;
+
+        const BYTE prolog[] = { 0x48, 0x83, 0xEC, 0x28 };       // sub rsp, 28h
+        const BYTE xor_ecx[] = { 0x31, 0xC9 };                  // xor ecx, ecx
+        const BYTE lea_rdx[] = { 0x48, 0x8D, 0x15 };            // lea rdx, [rip+disp32]
+        const BYTE lea_r8[] = { 0x4C, 0x8D, 0x05 };             // lea r8, [rip+disp32]
+        const BYTE xor_r9d[] = { 0x45, 0x31, 0xC9 };            // xor r9d, r9d
+        const BYTE mov_rax[] = { 0x48, 0xB8 };                  // mov rax, imm64
+        const BYTE call_rax[] = { 0xFF, 0xD0 };                 // call rax
+        const BYTE epilog[] = { 0x48, 0x83, 0xC4, 0x28 };       // add rsp, 28h
+
+        if (!EmitBytes(code, kPageSize, &pos, prolog, sizeof(prolog)) ||
+            !EmitBytes(code, kPageSize, &pos, xor_ecx, sizeof(xor_ecx)))
+            return false;
+
+        DWORD lea_abs = page_abs + pos;
+        if (!EmitBytes(code, kPageSize, &pos, lea_rdx, sizeof(lea_rdx)) ||
+            !EmitRel32(code, kPageSize, &pos, lea_abs + 7, text_abs))
+            return false;
+
+        lea_abs = page_abs + pos;
+        if (!EmitBytes(code, kPageSize, &pos, lea_r8, sizeof(lea_r8)) ||
+            !EmitRel32(code, kPageSize, &pos, lea_abs + 7, caption_abs) ||
+            !EmitBytes(code, kPageSize, &pos, xor_r9d, sizeof(xor_r9d)) ||
+            !EmitBytes(code, kPageSize, &pos, mov_rax, sizeof(mov_rax)) ||
+            !EmitU64(code, kPageSize, &pos, rp.messageboxa_va) ||
+            !EmitBytes(code, kPageSize, &pos, call_rax, sizeof(call_rax)) ||
+            !EmitBytes(code, kPageSize, &pos, epilog, sizeof(epilog)))
+            return false;
+
+        if (page + 1 < kPageCount)
+        {
+            DWORD jmp_abs = page_abs + pos;
+            if (!EmitByte(code, kPageSize, &pos, 0xE9) ||
+                !EmitRel32(code, kPageSize, &pos, jmp_abs + 5, (page + 1) * kPageSize))
+                return false;
+        }
+        else
+        {
+            DWORD loop_abs = page_abs + pos;
+            const BYTE mov_ecx_1000[] = { 0xB9, 0xE8, 0x03, 0x00, 0x00 }; // mov ecx, 1000
+            const BYTE xor_edx[] = { 0x31, 0xD2 };                        // xor edx, edx
+            DWORD jmp_abs = 0;
+
+            if (!EmitBytes(code, kPageSize, &pos, prolog, sizeof(prolog)) ||
+                !EmitBytes(code, kPageSize, &pos, mov_ecx_1000, sizeof(mov_ecx_1000)) ||
+                !EmitBytes(code, kPageSize, &pos, xor_edx, sizeof(xor_edx)) ||
+                !EmitBytes(code, kPageSize, &pos, mov_rax, sizeof(mov_rax)) ||
+                !EmitU64(code, kPageSize, &pos, rp.sleepex_va) ||
+                !EmitBytes(code, kPageSize, &pos, call_rax, sizeof(call_rax)) ||
+                !EmitBytes(code, kPageSize, &pos, epilog, sizeof(epilog)))
+                return false;
+
+            jmp_abs = page_abs + pos;
+            if (!EmitByte(code, kPageSize, &pos, 0xE9) ||
+                !EmitRel32(code, kPageSize, &pos, jmp_abs + 5, loop_abs))
+                return false;
+        }
+    }
+
+    *out_shellcode_size = kPayloadSize;
+    printf("[+] R3 10-page test shellcode built via driver: MessageBoxA=0x%llX SleepEx=0x%llX size=0x%X pages=%u\n",
+        rp.messageboxa_va, rp.sleepex_va, *out_shellcode_size, kPageCount);
     return true;
 }
 
@@ -843,8 +987,9 @@ static int CmdInjectRWShadow(const wchar_t* target_name, DWORD alloc_protect)
     HANDLE dev = OpenDevice();
     if (dev == INVALID_HANDLE_VALUE) return 1;
 
+    const DWORD shadow_test_shellcode_capacity = 10 * 0x1000;
     DWORD shellcode_size = 0;
-    DWORD total_size = sizeof(TD_INJECT_RW_PARAMS) + sizeof(g_shellcode_pic_r3);
+    DWORD total_size = sizeof(TD_INJECT_RW_PARAMS) + shadow_test_shellcode_capacity;
     BYTE* buf = (BYTE*)calloc(1, total_size);
     if (!buf)
     {
@@ -855,9 +1000,9 @@ static int CmdInjectRWShadow(const wchar_t* target_name, DWORD alloc_protect)
     TD_INJECT_RW_PARAMS* p = (TD_INJECT_RW_PARAMS*)buf;
     p->target_pid = (UINT64)pid;
     p->alloc_protect = alloc_protect;
-    if (!BuildShellcodeR3(pid, buf + sizeof(TD_INJECT_RW_PARAMS),
-                          total_size - sizeof(TD_INJECT_RW_PARAMS),
-                          &shellcode_size))
+    if (!BuildShellcodeR3PageWalk(pid, buf + sizeof(TD_INJECT_RW_PARAMS),
+                                  total_size - sizeof(TD_INJECT_RW_PARAMS),
+                                  &shellcode_size))
     {
         free(buf);
         CloseHandle(dev);
@@ -1111,8 +1256,8 @@ int wmain(int argc, wchar_t* argv[])
 {
     if (argc < 2)
     {
-        return CmdInjectRWShadow(L"PioneerGame.exe", PAGE_READWRITE);
-        //return CmdInjectRWShadow(L"notepad.exe", PAGE_READWRITE);
+        //return CmdInjectRWShadow(L"PioneerGame.exe", PAGE_READWRITE);
+        return CmdInjectRWShadow(L"notepad.exe", PAGE_READWRITE);
 
     }
 

@@ -1042,7 +1042,7 @@ static int CmdInjectRWShadowEx(const wchar_t* target_name, DWORD alloc_protect, 
 
 static int CmdInjectRWShadow(const wchar_t* target_name, DWORD alloc_protect)
 {
-    return CmdInjectRWShadowEx(target_name, alloc_protect, true);
+    return CmdInjectRWShadowEx(target_name, alloc_protect, false);
 }
 
 static int CmdInjectRWShadow10(const wchar_t* target_name, DWORD alloc_protect)

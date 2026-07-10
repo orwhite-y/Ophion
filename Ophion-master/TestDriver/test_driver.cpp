@@ -1452,7 +1452,7 @@ TdStealthAllocPage(
     }
 
     req->caller_cr3       = caller_cr3;
-    req->target_pid       = intercept_write ? (UINT64)(ULONG_PTR)PsGetCurrentProcessId() : 0;
+    req->target_pid       = 0;
     req->target_va        = page_va;
     req->handler_function = NULL;
     req->target_phys      = page_phys;

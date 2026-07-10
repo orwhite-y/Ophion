@@ -772,12 +772,7 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
             UINT64 current_pfn = (UINT64)current_cr3 & CR3_ADDR_MASK;
             UINT64 shadow_pfn  = sp->shadow_cr3_phys & CR3_ADDR_MASK;
             if (current_pfn == shadow_pfn)
-            {
                 __vmx_vmwrite(VMCS_GUEST_CR3, vcpu->nx_timer_real_cr3);
-                INVVPID_DESCRIPTOR desc = {0};
-                desc.Vpid = VPID_TAG;
-                asm_invvpid(InvvpidSingleContext, &desc);
-            }
         }
 
         vcpu->nx_timer_restore = NULL;

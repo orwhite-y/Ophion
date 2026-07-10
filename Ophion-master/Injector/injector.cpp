@@ -976,7 +976,7 @@ static int CmdInjectRW(const wchar_t* target_name, DWORD alloc_protect)
 
 // ---- RW-alloc + shadow CR3 NX bypass inject ----
 
-static int CmdInjectRWShadow(const wchar_t* target_name, DWORD alloc_protect)
+static int CmdInjectRWShadowEx(const wchar_t* target_name, DWORD alloc_protect, bool page_walk_test)
 {
     printf("[*] RW-alloc + shadow CR3 inject: %ls protect=0x%X\n", target_name, alloc_protect);
 
@@ -987,7 +987,7 @@ static int CmdInjectRWShadow(const wchar_t* target_name, DWORD alloc_protect)
     HANDLE dev = OpenDevice();
     if (dev == INVALID_HANDLE_VALUE) return 1;
 
-    const DWORD shadow_test_shellcode_capacity = 10 * 0x1000;
+    const DWORD shadow_test_shellcode_capacity = page_walk_test ? (10 * 0x1000) : 0x1000;
     DWORD shellcode_size = 0;
     DWORD total_size = sizeof(TD_INJECT_RW_PARAMS) + shadow_test_shellcode_capacity;
     BYTE* buf = (BYTE*)calloc(1, total_size);
@@ -1000,9 +1000,16 @@ static int CmdInjectRWShadow(const wchar_t* target_name, DWORD alloc_protect)
     TD_INJECT_RW_PARAMS* p = (TD_INJECT_RW_PARAMS*)buf;
     p->target_pid = (UINT64)pid;
     p->alloc_protect = alloc_protect;
-    if (!BuildShellcodeR3PageWalk(pid, buf + sizeof(TD_INJECT_RW_PARAMS),
-                                  total_size - sizeof(TD_INJECT_RW_PARAMS),
-                                  &shellcode_size))
+
+    bool built = page_walk_test ?
+        BuildShellcodeR3PageWalk(pid, buf + sizeof(TD_INJECT_RW_PARAMS),
+                                 total_size - sizeof(TD_INJECT_RW_PARAMS),
+                                 &shellcode_size) :
+        BuildShellcodeR3(pid, buf + sizeof(TD_INJECT_RW_PARAMS),
+                         total_size - sizeof(TD_INJECT_RW_PARAMS),
+                         &shellcode_size);
+
+    if (!built)
     {
         free(buf);
         CloseHandle(dev);
@@ -1030,6 +1037,16 @@ static int CmdInjectRWShadow(const wchar_t* target_name, DWORD alloc_protect)
     free(buf);
     CloseHandle(dev);
     return ok ? 0 : 1;
+}
+
+static int CmdInjectRWShadow(const wchar_t* target_name, DWORD alloc_protect)
+{
+    return CmdInjectRWShadowEx(target_name, alloc_protect, true);
+}
+
+static int CmdInjectRWShadow10(const wchar_t* target_name, DWORD alloc_protect)
+{
+    return CmdInjectRWShadowEx(target_name, alloc_protect, true);
 }
 
 // ---- generic RW allocation, optional shadow CR3 executable view ----
@@ -1428,6 +1445,7 @@ static void PrintUsage(const wchar_t* exe)
     printf("  %ls unhook                       Remove R0 EPT hook\n", exe);
     printf("  %ls injectrw [process] [rw|wc|protect]  RW-alloc + EPT stealth inject\n", exe);
     printf("  %ls injectrwshadow [process] [rw|wc|protect]  RW-alloc + shadow CR3 inject (no EPT split)\n", exe);
+    printf("  %ls injectrwshadow10 [process] [rw|wc|protect]  10-page shadow CR3 MessageBox test\n", exe);
     printf("  %ls allocmem <process> <size> [exec] [rw|wc|protect]  Allocate memory, optional shadow CR3 exec\n", exe);
     printf("  %ls freemem <process> <base> <size>  Free memory allocated by allocmem\n", exe);
     printf("  %ls shadowprotect <pid> <base> <size> <r|rw|x|rx|rwx|protect>  Protect via shadow CR3\n", exe);
@@ -1472,6 +1490,13 @@ int wmain(int argc, wchar_t* argv[])
         DWORD protect = ParseRwProtect((argc > 3) ? argv[3] : L"rw");
         if (!protect) return 1;
         return CmdInjectRWShadow(target, protect);
+    }
+    else if (_wcsicmp(cmd, L"injectrwshadow10") == 0)
+    {
+        const wchar_t* target = (argc > 2) ? argv[2] : L"notepad.exe";
+        DWORD protect = ParseRwProtect((argc > 3) ? argv[3] : L"rw");
+        if (!protect) return 1;
+        return CmdInjectRWShadow10(target, protect);
     }
     else if (_wcsicmp(cmd, L"allocmem") == 0)
     {

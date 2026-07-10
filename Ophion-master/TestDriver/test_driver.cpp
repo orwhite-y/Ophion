@@ -649,6 +649,8 @@ static UINT64 TdStealthTrackRemove(UINT64 pid, PVOID va);
 static BOOLEAN TdStealthTrackFindOverlap(UINT64 pid, PVOID base_va, SIZE_T size, PVOID * out_base, SIZE_T * out_size, UINT64 * out_shadow_cr3);
 static BOOLEAN TdStealthTrackHasPartialOverlap(UINT64 pid, PVOID base_va, SIZE_T size);
 static BOOLEAN TdStealthFreePage(PVOID target_va);
+static BOOLEAN g_process_notify_registered = FALSE;
+static BOOLEAN g_process_notify_ex_registered = FALSE;
 
 // ---- assembly VMCALL (vmcall.asm) ----
 
@@ -959,6 +961,38 @@ TdResumeThreadHandle(HANDLE thread_h, PULONG previous_count)
     {
         st = TdNtResumeThreadBySSDT(thread_h, prev);
     }
+
+    ObDereferenceObject(thread_obj);
+    return st;
+}
+
+static NTSTATUS
+TdMakeKernelThreadHandle(HANDLE thread_h, HANDLE * kernel_thread_h, UINT64 * thread_id)
+{
+    if (!thread_h || !kernel_thread_h)
+        return STATUS_INVALID_PARAMETER;
+
+    *kernel_thread_h = NULL;
+    if (thread_id)
+        *thread_id = 0;
+
+    PETHREAD thread_obj = NULL;
+    NTSTATUS st = ObReferenceObjectByHandle(thread_h, THREAD_ALL_ACCESS,
+        *PsThreadType, KernelMode, (PVOID *)&thread_obj, NULL);
+    if (!NT_SUCCESS(st))
+        return st;
+
+    if (thread_id)
+        *thread_id = (UINT64)(ULONG_PTR)PsGetThreadId(thread_obj);
+
+    st = ObOpenObjectByPointer(
+        thread_obj,
+        OBJ_KERNEL_HANDLE,
+        NULL,
+        THREAD_ALL_ACCESS,
+        *PsThreadType,
+        KernelMode,
+        kernel_thread_h);
 
     ObDereferenceObject(thread_obj);
     return st;
@@ -1418,7 +1452,7 @@ TdStealthAllocPage(
     }
 
     req->caller_cr3       = caller_cr3;
-    req->target_pid       = (UINT64)(ULONG_PTR)PsGetCurrentProcessId();
+    req->target_pid       = intercept_write ? (UINT64)(ULONG_PTR)PsGetCurrentProcessId() : 0;
     req->target_va        = page_va;
     req->handler_function = NULL;
     req->target_phys      = page_phys;
@@ -4445,6 +4479,13 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         PUINT8 r3_shellcode = (PUINT8)(p + 1);
         ULONG alloc_protect = (ULONG)(p->alloc_protect ? p->alloc_protect : PAGE_READWRITE);
 
+        if (shadow_only && !g_process_notify_registered)
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-rw-shadow] process notify unavailable; refusing persistent shadow injection");
+            st = STATUS_DEVICE_NOT_READY;
+            break;
+        }
+
         if (!r3_shellcode_size64 ||
             r3_shellcode_size64 > TD_MAX_INJECT_RW_SIZE ||
             r3_shellcode_size64 > 0xFFFFFFFFULL ||
@@ -4694,25 +4735,21 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
                     if (NT_SUCCESS(thr_st) && thr_h)
                     {
-                        // resolve TID from thread handle
-                        PETHREAD thr_obj = NULL;
-                        NTSTATUS tid_st = ObReferenceObjectByHandle(thr_h, THREAD_ALL_ACCESS,
-                            *PsThreadType, KernelMode, (PVOID *)&thr_obj, NULL);
-                        if (NT_SUCCESS(tid_st))
-                        {
-                            expected_tid = (UINT64)(ULONG_PTR)PsGetThreadId(thr_obj);
-                            ObDereferenceObject(thr_obj);
-                        }
+                        HANDLE kernel_thr_h = NULL;
+                        NTSTATUS kh_st = TdMakeKernelThreadHandle(thr_h, &kernel_thr_h, &expected_tid);
+                        ZwClose(thr_h);
 
-                        if (!expected_tid)
+                        if (!NT_SUCCESS(kh_st) || !kernel_thr_h || !expected_tid)
                         {
-                            HYPERPLATFORM_LOG_ERROR("[td-rw] cannot resolve created thread TID");
-                            st = STATUS_UNSUCCESSFUL;
-                            ZwClose(thr_h);
+                            HYPERPLATFORM_LOG_ERROR("[td-rw] cannot convert created thread handle: st=0x%08X tid=%llu",
+                                kh_st, expected_tid);
+                            if (kernel_thr_h)
+                                ZwClose(kernel_thr_h);
+                            st = NT_SUCCESS(kh_st) ? STATUS_UNSUCCESSFUL : kh_st;
                         }
                         else
                         {
-                            cleanup_thr_h = thr_h;
+                            cleanup_thr_h = kernel_thr_h;
                             HYPERPLATFORM_LOG_INFO("[td-rw] thread SUSPENDED trigger=%p tid=%llu", trigger_fn, expected_tid);
                         }
                     }
@@ -4744,26 +4781,25 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 if (NT_SUCCESS(thr_st) && thr_h)
                 {
                     expected_tid = (UINT64)(ULONG_PTR)cid.UniqueThread;
-                    if (!expected_tid)
-                    {
-                        PETHREAD thr_obj = NULL;
-                        NTSTATUS tid_st = ObReferenceObjectByHandle(thr_h, THREAD_ALL_ACCESS,
-                            *PsThreadType, KernelMode, (PVOID *)&thr_obj, NULL);
-                        if (NT_SUCCESS(tid_st))
-                        {
-                            expected_tid = (UINT64)(ULONG_PTR)PsGetThreadId(thr_obj);
-                            ObDereferenceObject(thr_obj);
-                        }
-                    }
 
+                    HANDLE kernel_thr_h = NULL;
+                    UINT64 resolved_tid = expected_tid;
+                    NTSTATUS kh_st = TdMakeKernelThreadHandle(thr_h, &kernel_thr_h, &resolved_tid);
+                    ZwClose(thr_h);
                     if (!expected_tid)
+                        expected_tid = resolved_tid;
+
+                    if (!NT_SUCCESS(kh_st) || !kernel_thr_h || !expected_tid)
                     {
-                        st = STATUS_UNSUCCESSFUL;
-                        ZwClose(thr_h);
+                        HYPERPLATFORM_LOG_ERROR("[td-rw] cannot convert fallback thread handle: st=0x%08X tid=%llu",
+                            kh_st, expected_tid);
+                        if (kernel_thr_h)
+                            ZwClose(kernel_thr_h);
+                        st = !expected_tid ? STATUS_UNSUCCESSFUL : kh_st;
                     }
                     else
                     {
-                        cleanup_thr_h = thr_h;
+                        cleanup_thr_h = kernel_thr_h;
                     }
                 }
                 else
@@ -4851,10 +4887,12 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         //
         if (NT_SUCCESS(st) && cleanup_thr_h)
         {
-            NTSTATUS resume_st = TdResumeThreadHandle(cleanup_thr_h, NULL);
+            ULONG prev_count = 0;
+            NTSTATUS resume_st = TdResumeThreadHandle(cleanup_thr_h, &prev_count);
             if (NT_SUCCESS(resume_st))
             {
-                HYPERPLATFORM_LOG_INFO("[td-rw] thread RESUMED trigger=%p tid=%llu", trigger_fn, expected_tid);
+                HYPERPLATFORM_LOG_INFO("[td-rw] thread RESUMED trigger=%p tid=%llu prev=%u",
+                    trigger_fn, expected_tid, prev_count);
                 thread_started = TRUE;
             }
             else
@@ -4996,6 +5034,15 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         BOOLEAN need_execute = (p->need_execute != 0);
         ULONG alloc_protect = (ULONG)(p->alloc_protect ? p->alloc_protect : PAGE_READWRITE);
         PEPROCESS proc = NULL;
+
+        if (need_execute && !g_process_notify_registered)
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-alloc] process notify unavailable; refusing persistent shadow allocation");
+            st = STATUS_DEVICE_NOT_READY;
+            p->status = (UINT64)(ULONG)st;
+            irp->IoStatus.Information = sizeof(TD_ALLOC_SHADOW_MEMORY_PARAMS);
+            break;
+        }
 
         if (alloc_protect != PAGE_READWRITE && alloc_protect != PAGE_WRITECOPY)
         {
@@ -5329,6 +5376,13 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
         if (!tracked && !all_same_as_real)
         {
+            if (!g_process_notify_registered)
+            {
+                HYPERPLATFORM_LOG_ERROR("[td-protect] process notify unavailable; refusing persistent shadow protect");
+                st = STATUS_DEVICE_NOT_READY;
+                goto ShadowProtectExit;
+            }
+
             shadow_cr3 = TdBuildShadowCR3(caller_cr3, start, protect_size);
             flush_shadow_cr3 = shadow_cr3;
             if (!shadow_cr3)
@@ -5806,15 +5860,8 @@ TdStealthFreePage(PVOID target_va)
 // MiDeleteFinalPageTables destroys the address space.
 //
 static VOID
-TdProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo)
+TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
 {
-    UNREFERENCED_PARAMETER(Process);
-
-    // only care about process EXIT (CreateInfo == NULL)
-    if (CreateInfo != NULL) return;
-
-    UINT64 pid = (UINT64)ProcessId;
-
     for (int i = 0; i < MAX_STEALTH_TRACKS; i++)
     {
         PVOID va = NULL;
@@ -5858,7 +5905,32 @@ TdProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO Crea
     }
 }
 
-static BOOLEAN g_process_notify_registered = FALSE;
+static VOID
+TdProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo)
+{
+    if (CreateInfo != NULL) return;
+    TdCleanupStealthForProcess(Process, (UINT64)ProcessId);
+}
+
+static VOID
+TdProcessNotifyLegacy(HANDLE ParentId, HANDLE ProcessId, BOOLEAN Create)
+{
+    UNREFERENCED_PARAMETER(ParentId);
+
+    if (Create) return;
+
+    PEPROCESS proc = NULL;
+    NTSTATUS st = PsLookupProcessByProcessId(ProcessId, &proc);
+    if (!NT_SUCCESS(st))
+    {
+        HYPERPLATFORM_LOG_WARN("[td-rw] legacy process exit cleanup lookup failed: pid=%llu st=0x%08X",
+            (UINT64)ProcessId, st);
+        return;
+    }
+
+    TdCleanupStealthForProcess(proc, (UINT64)ProcessId);
+    ObDereferenceObject(proc);
+}
 
 // =========================================================================
 //  driver entry / unload
@@ -5868,8 +5940,12 @@ static VOID TdUnload(PDRIVER_OBJECT drv)
 {
     if (g_process_notify_registered)
     {
-        PsSetCreateProcessNotifyRoutineEx(TdProcessNotify, TRUE);
+        if (g_process_notify_ex_registered)
+            PsSetCreateProcessNotifyRoutineEx(TdProcessNotify, TRUE);
+        else
+            PsSetCreateProcessNotifyRoutine(TdProcessNotifyLegacy, TRUE);
         g_process_notify_registered = FALSE;
+        g_process_notify_ex_registered = FALSE;
     }
 
     if (g_hooked_target)
@@ -5958,10 +6034,24 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     if (NT_SUCCESS(notify_st))
     {
         g_process_notify_registered = TRUE;
-        HYPERPLATFORM_LOG_INFO("[td] Process notify callback registered.");
+        g_process_notify_ex_registered = TRUE;
+        HYPERPLATFORM_LOG_INFO("[td] Process notify callback registered (Ex).");
     }
     else
+    {
         HYPERPLATFORM_LOG_WARN("[td] PsSetCreateProcessNotifyRoutineEx failed: 0x%08X", notify_st);
+        NTSTATUS legacy_st = PsSetCreateProcessNotifyRoutine(TdProcessNotifyLegacy, FALSE);
+        if (NT_SUCCESS(legacy_st))
+        {
+            g_process_notify_registered = TRUE;
+            g_process_notify_ex_registered = FALSE;
+            HYPERPLATFORM_LOG_INFO("[td] Process notify callback registered (legacy).");
+        }
+        else
+        {
+            HYPERPLATFORM_LOG_ERROR("[td] PsSetCreateProcessNotifyRoutine legacy failed: 0x%08X", legacy_st);
+        }
+    }
 
     HYPERPLATFORM_LOG_INFO("[td] Loaded. Device: %wZ", &sym_name);
     return STATUS_SUCCESS;

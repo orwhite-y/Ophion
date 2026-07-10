@@ -1179,7 +1179,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 {
                     PEPT_HOOKED_PAGE_INFO hp = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
                     cur = cur->Flink;
-                    if (caller_cr3 && hp->target_cr3 != caller_cr3) continue;
+                    if (caller_cr3 && hp->target_cr3 != (caller_cr3 & 0x000FFFFFFFFFF000ULL)) continue;
 
                     PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
                     while (fc != &hp->hooked_functions_list)
@@ -1734,11 +1734,13 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
             {
                 size_t pf_error_code = 0;
                 __vmx_vmread(VMCS_VMEXIT_INTERRUPTION_ERROR_CODE, &pf_error_code);
-                UINT64 fault_addr = vcpu->exit_qual;
-
-                // bit 4 = instruction fetch, bit 2 = user, bit 1 = write access.
-                if (fault_addr && (pf_error_code & 0x04) && (pf_error_code & (0x10 | 0x02)))
+                // bit 4 = instruction fetch (I/D flag), bit 1 = write access.
+                // Keep this gate aligned with the known-good 01bc1de path:
+                // ept_stealth_handle_pf() does the precise page/CR3/PID filtering.
+                if (pf_error_code & (0x10 | 0x02))
                 {
+                    UINT64 fault_addr = vcpu->exit_qual;
+
                     if (ept_stealth_handle_pf(vcpu, fault_addr, (UINT32)pf_error_code))
                     {
                         //
@@ -1763,6 +1765,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                 // not our stealth page — fall through to re-inject #PF normally.
                 // must set CR2 to the fault address before re-injection.
                 //
+                asm_write_cr2(vcpu->exit_qual);
             }
 
             if (int_info.InterruptionType == INTERRUPT_TYPE_NMI)

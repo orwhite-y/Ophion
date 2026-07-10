@@ -987,9 +987,9 @@ static int CmdInjectRWShadowEx(const wchar_t* target_name, DWORD alloc_protect, 
     HANDLE dev = OpenDevice();
     if (dev == INVALID_HANDLE_VALUE) return 1;
 
-    const DWORD shadow_test_shellcode_capacity = page_walk_test ? (10 * 0x1000) : 0x1000;
+    const DWORD shellcode_capacity = page_walk_test ? (10 * 0x1000) : (DWORD)sizeof(g_shellcode_pic_r3);
     DWORD shellcode_size = 0;
-    DWORD total_size = sizeof(TD_INJECT_RW_PARAMS) + shadow_test_shellcode_capacity;
+    DWORD total_size = sizeof(TD_INJECT_RW_PARAMS) + shellcode_capacity;
     BYTE* buf = (BYTE*)calloc(1, total_size);
     if (!buf)
     {
@@ -1017,9 +1017,10 @@ static int CmdInjectRWShadowEx(const wchar_t* target_name, DWORD alloc_protect, 
     }
     p->shellcode_size = shellcode_size;
 
+    DWORD ioctl_size = sizeof(TD_INJECT_RW_PARAMS) + shellcode_size;
     DWORD bytes = 0;
     BOOL ok = DeviceIoControl(dev, IOCTL_INJECT_RW_SHADOW,
-        buf, total_size, buf, total_size, &bytes, NULL);
+        buf, ioctl_size, buf, ioctl_size, &bytes, NULL);
 
     if (ok && bytes >= sizeof(TD_INJECT_RW_PARAMS))
     {
@@ -1041,7 +1042,7 @@ static int CmdInjectRWShadowEx(const wchar_t* target_name, DWORD alloc_protect, 
 
 static int CmdInjectRWShadow(const wchar_t* target_name, DWORD alloc_protect)
 {
-    return CmdInjectRWShadowEx(target_name, alloc_protect, true);
+    return CmdInjectRWShadowEx(target_name, alloc_protect, false);
 }
 
 static int CmdInjectRWShadow10(const wchar_t* target_name, DWORD alloc_protect)

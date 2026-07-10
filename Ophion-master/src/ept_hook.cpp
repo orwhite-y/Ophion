@@ -763,20 +763,25 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     //
     if (vcpu->nx_timer_restore)
     {
-        PEPT_STEALTH_PAGE_INFO sp = vcpu->nx_timer_restore;
-        if (sp && sp->shadow_cr3_phys && vcpu->nx_timer_real_cr3)
-        {
-            SIZE_T current_cr3 = 0;
-            __vmx_vmread(VMCS_GUEST_CR3, &current_cr3);
+        //
+        // restore the real guest CR3 unconditionally. the shadow window is opened
+        // only by us and only for one instruction (MTF), so by the time MTF fires
+        // we are on shadow and nx_timer_real_cr3 holds the real CR3. the old code
+        // gated the restore on (current_pfn == shadow_pfn) and then cleared the slot
+        // regardless - if the compare failed (nested/mismatched shadow) the real CR3
+        // was lost and the guest was stranded on shadow, running many instructions
+        // on stale shadow tables -> 0x1A. restore whenever a real CR3 is saved;
+        // writing it back while already real is a harmless no-op.
+        //
+        if (vcpu->nx_timer_real_cr3)
+            __vmx_vmwrite(VMCS_GUEST_CR3, vcpu->nx_timer_real_cr3);
 
-            UINT64 current_pfn = (UINT64)current_cr3 & CR3_ADDR_MASK;
-            UINT64 shadow_pfn  = sp->shadow_cr3_phys & CR3_ADDR_MASK;
-            if (current_pfn == shadow_pfn)
-                __vmx_vmwrite(VMCS_GUEST_CR3, vcpu->nx_timer_real_cr3);
-        }
-
-        vcpu->nx_timer_restore = NULL;
+        vcpu->nx_timer_restore  = NULL;
         vcpu->nx_timer_real_cr3 = 0;
+
+        // restore the NX-fetch-only #PF intercept that the shadow swap widened to
+        // "all" for the duration of the window.
+        ept_update_pf_intercept(vcpu);
     }
 
     if (vcpu->mtf_restore_page)

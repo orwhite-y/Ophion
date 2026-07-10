@@ -1737,7 +1737,15 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                 // bit 4 = instruction fetch (I/D flag), bit 1 = write access.
                 // Keep this gate aligned with the known-good 01bc1de path:
                 // ept_stealth_handle_pf() does the precise page/CR3/PID filtering.
-                if (pf_error_code & (0x10 | 0x02))
+                //
+                // also route to the stealth handler whenever a shadow-CR3 window is
+                // open on this vCPU: the shadow swap widens the #PF intercept to "all"
+                // for the one-instruction window, so a data #PF (incl. a read or a
+                // not-present read - which has neither fetch nor write set) also VM-exits
+                // and must reach the handler's mid-window guard to be serviced under the
+                // REAL CR3. without this, such a #PF would be re-injected under the
+                // shadow CR3 and MmAccessFault would run on the stale shadow PT (0x1A).
+                if ((pf_error_code & (0x10 | 0x02)) || vcpu->nx_timer_real_cr3)
                 {
                     UINT64 fault_addr = vcpu->exit_qual;
 

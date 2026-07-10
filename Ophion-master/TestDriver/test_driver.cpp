@@ -128,7 +128,7 @@ typedef struct _TD_STEALTH_PARAM {
     UINT64  pt_page_pfn;        // PFN of guest PT page containing target PTE
     UINT32  pt_pte_index;       // index within PT page (0-511)
     PVOID   pt_page_copy;       // NonPaged buffer with PT page content (4KB)
-    PVOID   pt_page_va;         // system VA of real PT page (for MTF resync)
+    PVOID   pt_page_va;         // shadow mode: shadow PT page VA; else real PT page VA (for MTF resync)
     PVOID   target_page_copy;   // NonPaged buffer with target page content (4KB)
     BOOLEAN pt_precomputed;     // TRUE = caller filled above fields at PASSIVE_LEVEL
     BOOLEAN use_fake_pt;        // TRUE = create fake PT page (NX hiding)
@@ -1518,7 +1518,7 @@ TdStealthAllocPage(
         if (!effective_pt_va)
             effective_pt_va = pt_va;
 
-        req->pt_page_va = effective_pt_va;  // system VA for VMX-root MTF resync / shadow PTE check
+        req->pt_page_va = effective_pt_va;  // shadow mode: shadow PT page VA; else real PT page VA
     }
 
     req->pt_page_copy     = pt_buf;

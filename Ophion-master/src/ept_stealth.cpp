@@ -382,6 +382,34 @@ stealth_fake_pt_resync(PSTEALTH_FAKE_PT fpt)
     }
 }
 
+//
+// abort an open shadow-CR3 window: restore the real guest CR3, drop the MTF
+// single-step, and restore the normal (NX-fetch only) #PF intercept. used when a
+// #PF arrives mid-window that we must let the guest service under its REAL page
+// tables - MmAccessFault must never run on the shadow page tables (it walks/edits
+// stale shadow PTEs and corrupts the PFN database -> 0x1A / 0x61941). no-op if no
+// window is open on this vCPU.
+//
+static VOID
+stealth_pf_abort_shadow_window(VIRTUAL_MACHINE_STATE * vcpu)
+{
+    if (!vcpu->nx_timer_real_cr3)
+        return;
+
+    __vmx_vmwrite(VMCS_GUEST_CR3, vcpu->nx_timer_real_cr3);
+    vcpu->nx_timer_restore  = NULL;
+    vcpu->nx_timer_real_cr3 = 0;
+
+    SIZE_T pc = 0;
+    __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+    pc &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+    __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+
+    // restore the NX-fetch-only #PF intercept that the shadow swap widened to
+    // "all" for the duration of the window.
+    ept_update_pf_intercept(vcpu);
+}
+
 // =========================================================================
 //  VMX-root: ept_stealth_install
 // =========================================================================
@@ -583,7 +611,7 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
         }
 
 #if USE_PRIVATE_HOST_CR3
-        if (sp->pt_page_va)
+        if (sp->intercept_write && sp->pt_page_va)
             hostcr3_map_va(sp->pt_page_va, PAGE_SIZE);
 #endif
 
@@ -805,6 +833,21 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
 {
     if (!g_ept || IsListEmpty(&g_ept->stealth_pages)) return FALSE;
 
+    //
+    // mid shadow window: a non-fetch (data) #PF arrived while this vCPU is already
+    // running on the shadow CR3. it must be serviced under the REAL CR3 - never let
+    // MmAccessFault run on the shadow page tables (it would walk/modify the stale
+    // shadow PT and corrupt the PFN database -> 0x1A / 0x61941). abort the window
+    // (restore real CR3 + normal #PF intercept) and return FALSE so the caller
+    // re-injects this #PF under the real CR3. fetch #PFs mid-window are the legit
+    // case of the target jumping to another alloc page and fall through to handling.
+    //
+    if (vcpu->nx_timer_real_cr3 && !(error_code & PFEC_INSTR_FETCH))
+    {
+        stealth_pf_abort_shadow_window(vcpu);
+        return FALSE;
+    }
+
     if (!(error_code & PFEC_PRESENT) ||
         !(error_code & (PFEC_INSTR_FETCH | PFEC_WRITE)))
         return FALSE;
@@ -821,15 +864,27 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
 
         if (sp->target_pid != 0)
         {
+            // PID is invariant under the shadow-CR3 swap (same process, only
+            // the CR3 value changes), so this stays correct inside the shadow
+            // window and is the authoritative per-process filter.
             UINT64 current_pid = (UINT64)(ULONG_PTR)PsGetCurrentProcessId();
             if (current_pid != sp->target_pid)
                 continue;
         }
         else if (sp->guest_cr3 != 0)
         {
-            UINT64 guest_cr3 = 0;
-            __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
-            if ((guest_cr3 & PFN_MASK) != (sp->guest_cr3 & PFN_MASK))
+            // Fallback (target_pid == 0): identify the process by CR3.
+            // GUEST_CR3 cannot be trusted during the shadow-CR3 window - it
+            // holds the shadow PML4, not the process CR3, so a direct compare
+            // mismatches and drops #PFs/VMCALLs we must handle. If a shadow
+            // swap is in flight on this vCPU, nx_timer_real_cr3 is the real
+            // process CR3; use it. Otherwise GUEST_CR3 is the real CR3.
+            UINT64 cr3_to_check = 0;
+            if (vcpu->nx_timer_real_cr3)
+                cr3_to_check = vcpu->nx_timer_real_cr3;
+            else
+                __vmx_vmread(VMCS_GUEST_CR3, &cr3_to_check);
+            if ((cr3_to_check & PFN_MASK) != (sp->guest_cr3 & PFN_MASK))
                 continue;
         }
 
@@ -846,13 +901,11 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
         if (sp->shadow_cr3_phys)
         {
             _InterlockedIncrement(&g_dbg_shadow_pf_seen);
-            if (!(error_code & PFEC_INSTR_FETCH))
+            if ((error_code & PFEC_WRITE) &&
+                (!sp->intercept_write || !stealth_shadow_pte_allows(sp, error_code)))
             {
-                if (!stealth_shadow_pte_allows(sp, error_code))
-                {
-                    _InterlockedIncrement(&g_dbg_shadow_pf_reject);
-                    return FALSE;
-                }
+                _InterlockedIncrement(&g_dbg_shadow_pf_reject);
+                return FALSE;
             }
             _InterlockedIncrement(&g_dbg_shadow_pf_allowed);
         }
@@ -876,6 +929,7 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             // from MTF. This keeps the shadow window extremely small and avoids
             // letting the guest run for an arbitrary timer interval on shadow CR3.
             //
+
             SIZE_T current_cr3 = 0;
             __vmx_vmread(VMCS_GUEST_CR3, &current_cr3);
 
@@ -894,6 +948,18 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
                 UINT64 shadow_cr3_val = (current_cr3 & ~PFN_MASK) | shadow_pfn;
                 __vmx_vmwrite(VMCS_GUEST_CR3, shadow_cr3_val);
                 _InterlockedIncrement(&g_dbg_shadow_pf_switched);
+
+                //
+                // widen #PF interception to ALL faults for this one-instruction
+                // window. normally only NX-fetch #PFs VM-exit (PRESENT|FETCH), so a
+                // data #PF during the window would reach the guest's MmAccessFault
+                // running UNDER shadow CR3 and corrupt the PFN database (0x1A).
+                // catching every #PF lets the mid-window guard above abort the
+                // window and service the fault under the real CR3 instead. the
+                // window is closed (mask restored) by MTF or the abort path.
+                //
+                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0);
+                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0);
             }
 
             if (error_code & PFEC_WRITE)
@@ -951,6 +1017,12 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
 
         return TRUE;
     }
+
+    // no stealth page matched. if a shadow window is still open, close it first so
+    // the re-injected #PF is serviced under the real CR3. (defensive: the mid-window
+    // guard above already handles data #PFs; this catches a mid-window fetch #PF to
+    // a non-stealth NX page, trading a potential 0x1A for a clean process AV.)
+    stealth_pf_abort_shadow_window(vcpu);
     return FALSE;
 }
 
@@ -985,15 +1057,27 @@ ept_handle_stealth_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         //
         if (sp->target_pid != 0)
         {
+            // PID is invariant under the shadow-CR3 swap (same process, only
+            // the CR3 value changes), so this stays correct inside the shadow
+            // window and is the authoritative per-process filter.
             UINT64 current_pid = (UINT64)(ULONG_PTR)PsGetCurrentProcessId();
             if (current_pid != sp->target_pid)
                 continue;
         }
         else if (sp->guest_cr3 != 0)
         {
-            UINT64 guest_cr3 = 0;
-            __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
-            if ((guest_cr3 & PFN_MASK) != (sp->guest_cr3 & PFN_MASK))
+            // Fallback (target_pid == 0): identify the process by CR3.
+            // GUEST_CR3 cannot be trusted during the shadow-CR3 window - it
+            // holds the shadow PML4, not the process CR3, so a direct compare
+            // mismatches and drops #PFs/VMCALLs we must handle. If a shadow
+            // swap is in flight on this vCPU, nx_timer_real_cr3 is the real
+            // process CR3; use it. Otherwise GUEST_CR3 is the real CR3.
+            UINT64 cr3_to_check = 0;
+            if (vcpu->nx_timer_real_cr3)
+                cr3_to_check = vcpu->nx_timer_real_cr3;
+            else
+                __vmx_vmread(VMCS_GUEST_CR3, &cr3_to_check);
+            if ((cr3_to_check & PFN_MASK) != (sp->guest_cr3 & PFN_MASK))
                 continue;
         }
 

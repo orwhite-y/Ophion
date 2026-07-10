@@ -443,7 +443,7 @@ typedef struct _EPT_STEALTH_PAGE_INFO {
     // --- PT page info ---
     PSTEALTH_FAKE_PT fake_pt;           // shared fake PT page info (NULL = use NX cycle instead)
     UINT64          pt_page_pfn;        // PFN of guest PT page containing our PTE
-    PVOID           pt_page_va;         // system VA of PT page (pre-computed at PASSIVE_LEVEL, VMX-root safe)
+    PVOID           pt_page_va;         // shadow mode: shadow PT page VA; else real PT page VA (VMX-root reads only for write-intercept paths)
     UINT32          pt_pte_index;       // index (0-511) of our PTE in the PT page
 
     // --- shadow CR3 (NX bypass without touching real PTE) ---
@@ -476,7 +476,7 @@ typedef struct _EPT_STEALTH_ALLOC_PARAM {
     UINT64  pt_page_pfn;          // [in] PFN of the guest PT page containing target PTE
     UINT32  pt_pte_index;         // [in] index of target PTE within PT page (0-511)
     PVOID   pt_page_copy;         // [in] NonPaged buffer with PT page content (4KB, caller-allocated)
-    PVOID   pt_page_va;           // [in] system VA of real PT page (hostcr3-mapped, for MTF resync)
+    PVOID   pt_page_va;           // [in] shadow mode: shadow PT page VA; else real PT page VA (mapped only for write-intercept paths)
     PVOID   target_page_copy;     // [in] NonPaged buffer with target page content (4KB, for shadow copy)
     BOOLEAN pt_precomputed;       // [in] TRUE = caller filled above fields at PASSIVE_LEVEL
     BOOLEAN use_fake_pt;          // [in] TRUE = create fake PT page (NX=1 visible to scanners, NX=0 in real PTE)

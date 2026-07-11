@@ -360,6 +360,178 @@ TdMapPhys(UINT64 phys_page)
     return (PUINT64)MmGetVirtualForPhysical(pa);
 }
 
+// ---- option-3: periodic shadow-CR3 intermediate refresh ---------------------
+//
+// TdBuildShadowCR3 snapshots the full PML4->PDPT->PD->PT path to the hidden
+// code range. Every NON-snapshot entry at each level is a copy of the real
+// entry (pointing at the real lower page). Those copies go stale: renderdoc's
+// runtime data allocations live in 1GB/2MB regions that were unmapped (P=0) at
+// snapshot time, so the shadow copy stays P=0 while the real entry later becomes
+// P=1. During a shadow window the CPU walks the shadow PT for data accesses,
+// hits the stale P=0, takes a mid-window #PF, and the abort+reinject path
+// surfaces that as 0xC0000005.
+//
+// This refresh copies the CURRENT real intermediate entries (PDPT/PD levels)
+// back into the shadow so data regions resolve through real, current pages ->
+// no mid-window data #PF, no abort+reinject. Snapshot pages (the NX-cleared
+// code PT path) are detected via this CR3's own page registry and preserved, so
+// NX hiding is untouched. Runs at PASSIVE; the VMX-root #PF handler reads the
+// same 64-bit entries concurrently (atomic, safe).
+//
+// g_refresh_exit_event / g_refresh_thread_obj / g_refresh_exit: worker thread
+//   lifecycle (started in DriverEntry, stopped in TdUnload).
+// g_refresh_pa_set / g_refresh_pa_va: scratch PA->VA table for one walk,
+//   protected by g_shadow_alloc_lock (only one walk at a time).
+static KEVENT        g_refresh_exit_event;
+static PVOID         g_refresh_thread_obj = NULL;
+static volatile LONG g_refresh_exit = 0;
+#define TD_SHADOW_REFRESH_INTERVAL_MS 10
+
+static UINT64        g_refresh_pa_set[MAX_SHADOW_PAGES_PER_CR3];
+static PVOID         g_refresh_pa_va[MAX_SHADOW_PAGES_PER_CR3];
+
+static volatile LONG g_dbg_shadow_refresh_runs   = 0;
+static volatile LONG g_dbg_shadow_refresh_healed = 0;
+
+// linear scan of the PA-set; returns index or -1. (pa_count is small, ~20.)
+static INT32
+TdRefreshFindPa(UINT64 pa, UINT32 pa_count)
+{
+    pa &= PFN_MASK_;
+    for (UINT32 i = 0; i < pa_count; i++)
+        if (g_refresh_pa_set[i] == pa)
+            return (INT32)i;
+    return -1;
+}
+
+static VOID
+TdShadowRefreshIntermediates(UINT64 real_cr3, UINT64 shadow_cr3_phys)
+{
+    if (!real_cr3 || !shadow_cr3_phys)
+        return;
+
+    KIRQL old_irql;
+    KeAcquireSpinLock(&g_shadow_alloc_lock, &old_irql);
+
+    //
+    // re-validate the CR3 is still registered and build the snapshot PA->VA
+    // table from its own pages. if it was freed (process exit / IOCTL free) the
+    // entry is gone - nothing to refresh. holding the lock blocks TdShadowFreeCr3
+    // for the whole walk, so the page VAs stay valid.
+    //
+    TD_SHADOW_CR3_ALLOCATION * entry = NULL;
+    for (UINT32 i = 0; i < MAX_SHADOW_CR3_ALLOCS; i++)
+    {
+        if (g_shadow_allocs[i].active &&
+            g_shadow_allocs[i].shadow_cr3_phys == shadow_cr3_phys)
+        {
+            entry = &g_shadow_allocs[i];
+            break;
+        }
+    }
+    if (!entry)
+    {
+        KeReleaseSpinLock(&g_shadow_alloc_lock, old_irql);
+        return;
+    }
+
+    UINT32 pa_count = 0;
+    for (UINT32 j = 0; j < entry->page_count && j < MAX_SHADOW_PAGES_PER_CR3; j++)
+    {
+        PVOID page = entry->pages[j];
+        if (!page)
+            continue;
+        g_refresh_pa_va[pa_count]  = page;
+        g_refresh_pa_set[pa_count] = MmGetPhysicalAddress(page).QuadPart & PFN_MASK_;
+        pa_count++;
+    }
+
+    INT32 pml4_slot = TdRefreshFindPa(shadow_cr3_phys, pa_count);
+    PUINT64 sh_pml4 = (pml4_slot >= 0) ? (PUINT64)g_refresh_pa_va[pml4_slot] : NULL;
+    PUINT64 real_pml4 = TdMapPhys(real_cr3);
+    if (!sh_pml4 || !real_pml4)
+    {
+        KeReleaseSpinLock(&g_shadow_alloc_lock, old_irql);
+        return;
+    }
+
+    UINT32 healed = 0;
+
+    for (UINT32 i = 0; i < 512; i++)
+    {
+        UINT64 sh_pml4e = sh_pml4[i];
+        if (!(sh_pml4e & 1))
+            continue;
+
+        // only the snapshot PML4 entry (-> this CR3's shadow PDPT) is descended;
+        // non-snapshot PML4 entries are real-PDPT copies and are left untouched.
+        INT32 pdpt_slot = TdRefreshFindPa(sh_pml4e, pa_count);
+        if (pdpt_slot < 0)
+            continue;
+
+        UINT64 real_pml4e = real_pml4[i];
+        if (!(real_pml4e & 1) || (real_pml4e & (1ULL << 7)))
+            continue;   // defensive: code's PML4 must be present, non-large
+        PUINT64 sh_pdpt   = (PUINT64)g_refresh_pa_va[pdpt_slot];
+        PUINT64 real_pdpt = TdMapPhys(real_pml4e);
+        if (!real_pdpt)
+            continue;
+
+        for (UINT32 j = 0; j < 512; j++)
+        {
+            UINT64 sh_pdpe   = sh_pdpt[j];
+            UINT64 real_pdpe = real_pdpt[j];
+
+            // snapshot PD (code's 1GB region) -> descend, do not overwrite.
+            INT32 pd_slot = TdRefreshFindPa(sh_pdpe, pa_count);
+            if ((sh_pdpe & 1) && pd_slot >= 0)
+            {
+                if (!(real_pdpe & 1) || (real_pdpe & (1ULL << 7)))
+                    continue;   // defensive
+                PUINT64 sh_pd   = (PUINT64)g_refresh_pa_va[pd_slot];
+                PUINT64 real_pd = TdMapPhys(real_pdpe);
+                if (!real_pd)
+                    continue;
+
+                for (UINT32 k = 0; k < 512; k++)
+                {
+                    UINT64 sh_pde = sh_pd[k];
+
+                    // snapshot PT (code's 2MB range, NX-cleared) -> preserve.
+                    if ((sh_pde & 1) && TdRefreshFindPa(sh_pde, pa_count) >= 0)
+                        continue;
+
+                    // real PT copy (or 2MB large page) -> refresh from real PD.
+                    if (real_pd[k] != sh_pde)
+                    {
+                        sh_pd[k] = real_pd[k];
+                        healed++;
+                    }
+                }
+                continue;
+            }
+
+            // non-snapshot PDPT entry: real PD copy (or 1GB large page). heal
+            // staleness by copying the current real entry (P=0 -> P=1 for newly
+            // allocated data regions, or unchanged / unmapped).
+            if (real_pdpe != sh_pdpe)
+            {
+                sh_pdpt[j] = real_pdpe;
+                healed++;
+            }
+        }
+    }
+
+    KeReleaseSpinLock(&g_shadow_alloc_lock, old_irql);
+
+    LONG runs = InterlockedIncrement(&g_dbg_shadow_refresh_runs);
+    if (healed)
+        InterlockedAdd(&g_dbg_shadow_refresh_healed, (LONG)healed);
+    if ((runs % 100) == 0)
+        HYPERPLATFORM_LOG_INFO("[td-shadow] refresh runs=%ld healed_total=%ld",
+                               runs, g_dbg_shadow_refresh_healed);
+}
+
 //
 // build shadow CR3 for a VA range [base_va, base_va + size).
 // clears NX for every 4KB page in the range.
@@ -644,7 +816,7 @@ TdFlushAddressRange(UINT64 base_va, SIZE_T size, UINT64 target_cr3, UINT64 shado
 }
 
 // ---- forward declarations ----
-static BOOLEAN TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3);
+static BOOLEAN TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3, UINT64 real_cr3);
 static UINT64 TdStealthTrackRemove(UINT64 pid, PVOID va);
 static BOOLEAN TdStealthTrackFindOverlap(UINT64 pid, PVOID base_va, SIZE_T size, PVOID * out_base, SIZE_T * out_size, UINT64 * out_shadow_cr3);
 static BOOLEAN TdStealthTrackHasPartialOverlap(UINT64 pid, PVOID base_va, SIZE_T size);
@@ -4648,7 +4820,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
 
         // track for process exit cleanup (fake PT removal)
-        if (!TdStealthTrackAdd(p->target_pid, alloc_base, alloc_size, shadow_cr3))
+        if (!TdStealthTrackAdd(p->target_pid, alloc_base, alloc_size, shadow_cr3, caller_cr3))
         {
             HYPERPLATFORM_LOG_ERROR("[td-rw] stealth track table full");
             for (SIZE_T i = 0; i < pages_installed; i++)
@@ -5135,7 +5307,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
             if (NT_SUCCESS(st))
             {
-                if (!TdStealthTrackAdd(p->target_pid, alloc_base, alloc_size, shadow_cr3))
+                if (!TdStealthTrackAdd(p->target_pid, alloc_base, alloc_size, shadow_cr3, caller_cr3))
                 {
                     HYPERPLATFORM_LOG_ERROR("[td-alloc] stealth track table full");
                     st = STATUS_INSUFFICIENT_RESOURCES;
@@ -5436,7 +5608,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 goto ShadowProtectExit;
             }
 
-            if (!TdStealthTrackAdd(p->target_pid, (PVOID)start, protect_size, shadow_cr3))
+            if (!TdStealthTrackAdd(p->target_pid, (PVOID)start, protect_size, shadow_cr3, caller_cr3))
             {
                 for (UINT64 page = start; page < end; page += PAGE_SIZE)
                     TdStealthFreePage((PVOID)page);
@@ -5480,6 +5652,12 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                         p->target_pid, (PVOID)page, *real_pte, *shadow_pte, new_protect);
                 }
             }
+
+            // option-3: also refresh the shadow CR3's intermediate (PDPT/PD)
+            // entries from real so this protect range and any data regions in
+            // the same 1GB/2MB subtree stay current - the per-page PT sync above
+            // only covers this exact range.
+            TdShadowRefreshIntermediates(caller_cr3, shadow_cr3);
 
             BOOLEAN tracked_has_diff = FALSE;
             if (tracked_base && tracked_size)
@@ -5707,13 +5885,15 @@ typedef struct _STEALTH_TRACK_ENTRY {
     PVOID   target_va;
     SIZE_T  alloc_size;
     UINT64  shadow_cr3_phys;
+    UINT64  real_cr3;        // option-3: process CR3 captured at inject time, used by the
+                             // PASSIVE intermediate refresh to walk the REAL page tables.
 } STEALTH_TRACK_ENTRY;
 
 static STEALTH_TRACK_ENTRY g_stealth_tracks[MAX_STEALTH_TRACKS] = {};
 static KSPIN_LOCK g_stealth_track_lock;
 
 static BOOLEAN
-TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3)
+TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3, UINT64 real_cr3)
 {
     BOOLEAN added = FALSE;
     KIRQL old_irql;
@@ -5727,6 +5907,7 @@ TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3)
             g_stealth_tracks[i].target_va   = va;
             g_stealth_tracks[i].alloc_size  = size;
             g_stealth_tracks[i].shadow_cr3_phys = shadow_cr3;
+            g_stealth_tracks[i].real_cr3    = real_cr3;
             g_stealth_tracks[i].active      = TRUE;
             added = TRUE;
             break;
@@ -5830,6 +6011,69 @@ TdStealthTrackHasPartialOverlap(UINT64 pid, PVOID base_va, SIZE_T size)
 
     KeReleaseSpinLock(&g_stealth_track_lock, old_irql);
     return partial;
+}
+
+//
+// option-3: snapshot the tracked (real_cr3, shadow_cr3) pairs under the track
+// lock, then refresh each shadow CR3's intermediates outside the lock. the
+// refresh itself takes g_shadow_alloc_lock and re-validates the CR3 is still
+// live, so a concurrent free (process exit) is handled safely.
+//
+static VOID
+TdRefreshAll(VOID)
+{
+    UINT64 real_cr3_arr[MAX_STEALTH_TRACKS];
+    UINT64 shadow_cr3_arr[MAX_STEALTH_TRACKS];
+    UINT32 count = 0;
+
+    KIRQL old_irql;
+    KeAcquireSpinLock(&g_stealth_track_lock, &old_irql);
+    for (UINT32 i = 0; i < MAX_STEALTH_TRACKS; i++)
+    {
+        STEALTH_TRACK_ENTRY * t = &g_stealth_tracks[i];
+        if (t->active && t->real_cr3 && t->shadow_cr3_phys)
+        {
+            real_cr3_arr[count]   = t->real_cr3;
+            shadow_cr3_arr[count] = t->shadow_cr3_phys;
+            count++;
+        }
+    }
+    KeReleaseSpinLock(&g_stealth_track_lock, old_irql);
+
+    for (UINT32 i = 0; i < count; i++)
+        TdShadowRefreshIntermediates(real_cr3_arr[i], shadow_cr3_arr[i]);
+}
+
+//
+// option-3 worker: periodically refresh every tracked shadow CR3's stale
+// intermediate entries from real. wakes immediately on the exit event (unload)
+// or every TD_SHADOW_REFRESH_INTERVAL_MS to refresh.
+//
+static VOID
+TdRefreshThread(PVOID StartContext)
+{
+    UNREFERENCED_PARAMETER(StartContext);
+
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = -(LONGLONG)(TD_SHADOW_REFRESH_INTERVAL_MS * 10000);  // relative, 100ns units
+
+    HYPERPLATFORM_LOG_INFO("[td-shadow] refresh thread started (interval %ums)",
+                           TD_SHADOW_REFRESH_INTERVAL_MS);
+
+    for (;;)
+    {
+        TdRefreshAll();
+
+        if (g_refresh_exit)
+            break;
+
+        KeWaitForSingleObject(&g_refresh_exit_event, Executive, KernelMode, FALSE, &timeout);
+        if (g_refresh_exit)
+            break;
+    }
+
+    HYPERPLATFORM_LOG_INFO("[td-shadow] refresh thread exiting");
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 //
@@ -5938,6 +6182,17 @@ TdProcessNotifyLegacy(HANDLE ParentId, HANDLE ProcessId, BOOLEAN Create)
 
 static VOID TdUnload(PDRIVER_OBJECT drv)
 {
+    // option-3: stop the shadow-CR3 refresh thread before tearing anything down
+    // so it cannot walk a shadow CR3 that process-exit cleanup is freeing.
+    g_refresh_exit = 1;
+    KeSetEvent(&g_refresh_exit_event, IO_NO_INCREMENT, FALSE);
+    if (g_refresh_thread_obj)
+    {
+        KeWaitForSingleObject(g_refresh_thread_obj, Executive, KernelMode, FALSE, NULL);
+        ObDereferenceObject(g_refresh_thread_obj);
+        g_refresh_thread_obj = NULL;
+    }
+
     if (g_process_notify_registered)
     {
         if (g_process_notify_ex_registered)
@@ -6050,6 +6305,31 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
         else
         {
             HYPERPLATFORM_LOG_ERROR("[td] PsSetCreateProcessNotifyRoutine legacy failed: 0x%08X", legacy_st);
+        }
+    }
+
+    //
+    // option-3: start the periodic shadow-CR3 intermediate refresh thread.
+    // heals stale PDPT/PD copies so renderdoc's runtime data allocations stay
+    // reachable during shadow windows (prevents the mid-window #PF -> 0xC0000005).
+    //
+    KeInitializeEvent(&g_refresh_exit_event, NotificationEvent, FALSE);
+    g_refresh_exit = 0;
+    {
+        HANDLE th = NULL;
+        NTSTATUS thr_st = PsCreateSystemThread(&th, THREAD_ALL_ACCESS, NULL,
+                                               NULL, NULL, TdRefreshThread, NULL);
+        if (NT_SUCCESS(thr_st))
+        {
+            NTSTATUS ref_st = ObReferenceObjectByHandle(th, THREAD_ALL_ACCESS,
+                *PsThreadType, KernelMode, &g_refresh_thread_obj, NULL);
+            ZwClose(th);
+            if (!NT_SUCCESS(ref_st))
+                g_refresh_thread_obj = NULL;
+        }
+        else
+        {
+            HYPERPLATFORM_LOG_WARN("[td-shadow] refresh thread create failed: 0x%08X", thr_st);
         }
     }
 

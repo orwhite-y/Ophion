@@ -41,6 +41,20 @@ volatile LONG g_dbg_shadow_pf_midwin = 0;        // mid-window data #PFs that hi
 volatile LONG g_dbg_shadow_pf_midwin_logged = 0;  // verbose-log cap counter (diagnostic only)
 volatile LONG g_dbg_shadow_pf_synced = 0;         // A2: mid-window data #PFs serviced by in-window shadow PT sync
 volatile LONG g_dbg_shadow_pf_synced_logged = 0;  // verbose-log cap counter for A2 syncs (diagnostic only)
+volatile LONG g_dbg_a2_abort = 0;                 // A2: fallbacks to abort+reinject (any reason)
+volatile LONG g_dbg_a2_spurious = 0;              // A2: SPURIOUS aborts (real state != error code -> the crash class)
+volatile LONG g_dbg_a2_spurious_logged = 0;       // verbose-log cap counter for spurious aborts (diagnostic only)
+volatile LONG g_dbg_nomatch = 0;                  // mid-window FETCH #PF to non-stealth NX page (clobber signal)
+volatile LONG g_dbg_nomatch_logged = 0;           // verbose-log cap counter for nomatch (diagnostic only)
+volatile LONG g_dbg_a2_code_synced = 0;           // NX-open: shadow CODE PTE re-synced from real (repaged code page fix)
+volatile LONG g_dbg_a2_code_synced_logged = 0;    // verbose-log cap counter for code syncs (diagnostic only)
+volatile LONG g_dbg_a2_code_enter = 0;            // NX-open: code-refresh calls total (proves the path is reached)
+volatile LONG g_dbg_a2_code_enter_logged = 0;     // verbose-log cap counter for refresh outcomes (MATCH/BAIL)
+volatile LONG g_dbg_a2_data_synced = 0;           // A2: mid-window data #PFs healed via the data page's own sp->shadow_pte_va
+volatile LONG g_dbg_a2_data_synced_logged = 0;    // verbose-log cap counter for data syncs (diagnostic only)
+volatile LONG g_dbg_a2_ptpage_synced = 0;         // NX-open: code-2MB shadow PT page refreshed (>=1 stale PTE synced)
+volatile LONG g_dbg_a2_ptpage_synced_logged = 0;  // verbose-log cap counter for PT-page syncs (diagnostic only)
+volatile LONG g_dbg_a2_stale_p1_logged = 0;       // verbose-log cap counter for silent P=1/wrong-PFN staleness (the crash cause)
 
 VOID
 ept_update_pf_intercept(VIRTUAL_MACHINE_STATE * vcpu)
@@ -518,26 +532,44 @@ stealth_diag_midwin_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr,
 // MTF path already uses; the install-path deadlock warning does not apply to a
 // single-CPU runtime #PF.
 //
-static __forceinline BOOLEAN
-stealth_pa_in_region(UINT64 pa, UINT64 lo, UINT64 hi)
+// Resolve the system VA of a REAL guest page-table page so the heal can read it.
+// The heal runs under sp->guest_cr3 (the guest KERNEL CR3 -- see vmx_enter_cr3 /
+// the comment block in hv.h). Under the guest kernel CR3, pa_to_va resolves the
+// guest's real page-table pages via the guest kernel PML4's self-map (the user
+// PDPT/PD/PT pages are shared between the guest user/kernel PML4 under KPTI), so
+// pa_to_va is correct for real pages here -- NO MDL map is needed (and none can
+// be created: every MM API that aliases a RAM page-table page into a
+// CR3-independent VA is refused on modern Windows). Returns NULL if pa_to_va
+// cannot resolve the page (the caller bails to abort+reinject). Shadow pages are
+// NOT looked up here -- the heal reads them via pa_to_va directly (NonPaged pool,
+// system PTE, resolved under the kernel CR3's kernel half).
+//
+static __forceinline PVOID
+stealth_real_va(PEPT_STEALTH_PAGE_INFO sp, UINT64 pa)
 {
-    pa &= PFN_MASK;
-    return pa >= lo && pa < hi;
+    UNREFERENCED_PARAMETER(sp);
+    return pa_to_va(pa & PFN_MASK);
 }
 
+//
 // Walk a 4-level guest CR3 for va. Sets *out_pte to the final PTE (P=0 if not
-// present at any level) and returns TRUE. Returns FALSE if the walk hits a NULL
-// pa_to_va or a large page at an intermediate level - the caller must then fall
-// back to abort+reinject rather than guess.
+// present at any level) and returns TRUE. Returns FALSE if the walk hits a real
+// page that pa_to_va cannot resolve (NULL) or a large page at an intermediate
+// level - the caller must then fall back to abort+reinject rather than guess.
+// Real PT pages are read through stealth_real_va (== pa_to_va under the guest
+// kernel CR3 the heal runs in -- see vmx_enter_cr3). The cr3 argument is the
+// guest user CR3; at level 0 pa_to_va of a PML4 PA returns the self-map base VA
+// which, under the kernel host CR3, maps the guest kernel PML4 (shared user
+// entries), so the walk resolves the correct user-space PTEs regardless.
 static BOOLEAN
-stealth_walk_pte(UINT64 cr3, UINT64 va, UINT64 * out_pte)
+stealth_walk_pte(PEPT_STEALTH_PAGE_INFO sp, UINT64 cr3, UINT64 va, UINT64 * out_pte)
 {
     static const UINT32 shift[4] = { 39, 30, 21, 12 };
     UINT64 pa = cr3 & PFN_MASK;
     UINT64 entry = 0;
     for (UINT32 lvl = 0; lvl < 4; lvl++)
     {
-        PUINT64 table = (PUINT64)pa_to_va(pa);
+        PUINT64 table = (PUINT64)stealth_real_va(sp, pa);
         if (!table)
             return FALSE;
         entry = table[(va >> shift[lvl]) & 0x1FF];
@@ -546,10 +578,58 @@ stealth_walk_pte(UINT64 cr3, UINT64 va, UINT64 * out_pte)
         if (lvl == 3)                // PT level: entry is the final PTE
             break;
         if (entry & (1ULL << 7))     // large page at an intermediate level
-            return FALSE;
+        {
+            *out_pte = entry;        // expose the large-page entry so callers can
+            return FALSE;            // distinguish large-page (PS=1) from NULL (0)
+        }
         pa = entry & PFN_MASK;
     }
     *out_pte = entry;
+    return TRUE;
+}
+
+//
+// Walk a 4-level guest CR3 for va, returning BOTH the leaf PTE (*out_pte) and
+// the system VA of the PT page (the 512-PTE leaf table) that contains it
+// (*out_pt_page_va). *out_pt_page_va is NULL if the walk did not reach the PT
+// level (not present at an intermediate level). Returns FALSE on a large page
+// or a NULL pa_to_va at any level (caller falls back). Used by the proactive
+// PT-page refresh to copy all 512 real PTEs into the shadow PT page in one pass.
+//
+static BOOLEAN
+stealth_walk_pt_page(PEPT_STEALTH_PAGE_INFO sp, UINT64 cr3, UINT64 va,
+                     UINT64 * out_pt_page_va, UINT64 * out_pte)
+{
+    static const UINT32 shift[4] = { 39, 30, 21, 12 };
+    UINT64 pa = cr3 & PFN_MASK;
+    UINT64 entry = 0;
+    PUINT64 pt_page = NULL;
+    for (UINT32 lvl = 0; lvl < 4; lvl++)
+    {
+        PUINT64 table = (PUINT64)stealth_real_va(sp, pa);
+        if (!table)
+        {
+            *out_pt_page_va = 0;
+            *out_pte = 0;
+            return FALSE;
+        }
+        if (lvl == 3)
+            pt_page = table;
+        entry = table[(va >> shift[lvl]) & 0x1FF];
+        if (!(entry & 1))            // not present at this level
+            break;
+        if (lvl == 3)                // PT level: entry is the final PTE
+            break;
+        if (entry & (1ULL << 7))     // large page at an intermediate level
+        {
+            *out_pte = entry;
+            *out_pt_page_va = 0;
+            return FALSE;
+        }
+        pa = entry & PFN_MASK;
+    }
+    *out_pte = entry;
+    *out_pt_page_va = (UINT64)pt_page;
     return TRUE;
 }
 
@@ -558,91 +638,158 @@ stealth_sync_data_pte_in_window(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr,
                                 UINT32 error_code)
 {
     PEPT_STEALTH_PAGE_INFO sp = vcpu->nx_timer_restore;
-    if (!sp || !sp->shadow_cr3_phys || !vcpu->nx_timer_real_cr3)
+    if (!sp || !sp->shadow_cr3_phys || !vcpu->nx_timer_real_cr3 || !sp->guest_va)
         return FALSE;
 
-    // only not-present faults are sync candidates. a P=1 data fault is a write-
-    // protect / COW that the guest must service under the real CR3.
-    if (error_code & PFEC_PRESENT)
+    // P=0 data faults are the stale-shadow case we heal below. A P=1 WRITE fault
+    // is also frequently healable: the snapshot captured the page read-only (or
+    // pre-COW) and real has since made it writable, so the shadow's R/W bit is
+    // stale. The old code bailed here and fell to abort+reinject, which re-injects
+    // a P=1/W=1 #PF under real where the page is writable -> MmAccessFault
+    // demand-faults a zero page over live data -> state corruption -> later AV
+    // (the "write to 0" seen in Box_last_crash.dmp). Heal it instead; the real-
+    // walk COW check below still aborts GENUINE COW (real read-only). A P=1 READ
+    // fault (protection/user/pkey) is not a staleness condition - leave to guest.
+    if ((error_code & PFEC_PRESENT) && !(error_code & PFEC_WRITE))
         return FALSE;
 
-    const UINT64  is_write       = (error_code & PFEC_WRITE);
-    const UINT64  real_cr3       = vcpu->nx_timer_real_cr3;
-    const UINT64  shadow_pml4_pa = sp->shadow_cr3_phys & PFN_MASK;
+    const UINT64  is_write   = (error_code & PFEC_WRITE);
+    const UINT64  real_cr3   = vcpu->nx_timer_real_cr3;
+    const UINT64  fault_page = fault_addr & ~0xFFFULL;
 
-    // stealth-region PA bounds: snapshot (shadow) pages live here. this distinguishes
-    // a snapshot pointer (preserve + descend) from a real/stale entry (refresh).
-    // real page-table pages are NEVER written.
-    const STEALTH_REGION * sr = &g_ept->stealth_region;
-    if (!sr->base_pa || !sr->total_pages)
-        return FALSE;                       // stealth region not initialized -> abort
-    const UINT64 sr_lo = sr->base_pa;
-    const UINT64 sr_hi = sr_lo + (UINT64)sr->total_pages * PAGE_SIZE;
+    // Find the DATA page's own stealth page. The old code walked the SHADOW CR3
+    // via pa_to_va to reach the stale shadow PTE, but pa_to_va returns NULL for
+    // NonPaged-pool shadow pages in VMX-root (DIAG: shadow-pml4 va=0 even under
+    // sp->guest_cr3), so it ALWAYS bailed "shadow-null" and every mid-window data
+    // #PF was abort+reinjected. Like the code healer, look up the data page's own
+    // sp (its shadow_pte_va is a NonPaged-pool system VA, valid under any CR3)
+    // and write the leaf PTE directly. Real PTEs are read-only here (A3 preserved).
+    PEPT_STEALTH_PAGE_INFO sp_data = NULL;
+    {
+        PLIST_ENTRY cur2 = g_ept->stealth_pages.Flink;
+        while (cur2 != &g_ept->stealth_pages)
+        {
+            PEPT_STEALTH_PAGE_INFO s = CONTAINING_RECORD(cur2, EPT_STEALTH_PAGE_INFO, stealth_page_list);
+            cur2 = cur2->Flink;
+            if (s->guest_va != fault_page) continue;
+            if (s->shadow_cr3_phys != sp->shadow_cr3_phys) continue;   // different protected range
+            if (s->target_pid != 0)
+            {
+                if ((UINT64)(ULONG_PTR)PsGetCurrentProcessId() != s->target_pid) continue;
+            }
+            else if (s->guest_cr3 != 0 &&
+                     (s->guest_cr3 & PFN_MASK) != (real_cr3 & PFN_MASK))
+                continue;
+            sp_data = s;
+            break;
+        }
+    }
+
+    // Not a DLL stealth page (heap/stack/TLS): these share the REAL PT through
+    // the copied PML4 entry (no shadow PT copy), so a reinject commits them
+    // correctly under the real CR3. Bail without touching anything.
+    if (!sp_data || !sp_data->shadow_pte_va)
+        return FALSE;
+
+    // A write to a write-protected stealth page (intercept_write, shadow W=0)
+    // must stay mediated - do NOT heal it (healing sets W=1 and lets the write
+    // through). Let it reinject so the write-mediation path handles it.
+    if (is_write && sp_data->intercept_write)
+        return FALSE;
+
+    // Under USE_PRIVATE_HOST_CR3, VMX-root runs on a private host CR3 whose
+    // kernel half is a build-time snapshot; the NonPaged-pool shadow pages (and
+    // HV code/stack) are NOT mapped there. Switch to sp->guest_cr3 -- the guest
+    // process's KERNEL CR3 (captured by the TestDriver via __readcr3() in kernel
+    // mode) -- for the walk. Under the guest kernel CR3, the full kernel half
+    // (NonPaged pool, system PTEs, HV code/stack -- shared across all processes)
+    // is mapped, so pa_to_va resolves SHADOW pages (NonPaged pool, system PTE),
+    // AND the self-map resolves the guest's REAL page-table pages (guest kernel
+    // PML4 -> shared user PDPT/PD/PT). No MDL real-page map is needed (and none
+    // can be created -- the MM refuses to alias RAM page-table pages on modern
+    // Windows). Every early exit goes through 'done' so the CR3 is always restored.
+    BOOLEAN result       = FALSE;
+    BOOLEAN real_walk_ok = FALSE;
+    const char * bail_reason = "init";
+    UINT64  saved_cr3 = vmx_enter_cr3(sp->guest_cr3);
 
     // --- 1. walk REAL CR3: confirm the page is committed & accessible there ---
     UINT64 real_pte = 0;
-    if (!stealth_walk_pte(real_cr3, fault_addr, &real_pte))
-        return FALSE;                       // NULL pa_to_va / large page -> abort
-    if (!(real_pte & 1))                    // real P=0 -> genuine demand fault
-        return FALSE;
-    if (is_write && !(real_pte & 0x2))      // real read-only + write -> COW, abort
-        return FALSE;
+    if (!stealth_walk_pte(sp_data, real_cr3, fault_addr, &real_pte))
+    { bail_reason = "real-walk-fail"; goto done; }   // real PT not mapped / large page -> abort
+    real_walk_ok = TRUE;
+    if (!(real_pte & 1))
+    { bail_reason = "real-P0-demand"; goto done; }   // real P=0 -> genuine demand fault
+    if (is_write && !(real_pte & 0x2))
+    { bail_reason = "real-RO-cow"; goto done; }      // real read-only + write -> COW, abort
     // (a real 2MB large page is already rejected by stealth_walk_pte at the PD
     // level; bit 7 of the final 4KB PTE is PAT, not PS, so do NOT test it here.)
 
-    // --- 2. walk SHADOW CR3 in parallel; refresh at most ONE stale entry ---
-    static const UINT32 shift[4] = { 39, 30, 21, 12 };
-    UINT64 sh_pa = shadow_pml4_pa;          // always a snapshot (stealth) page
-    UINT64 r_pa  = real_cr3 & PFN_MASK;
-    for (UINT32 lvl = 0; lvl < 4; lvl++)
+    // --- 2. write the shadow leaf PTE directly from the current real PTE ---
+    // NX is cleared to match the build-time snapshot. W is preserved from the
+    // shadow so write-protected (intercept_write) pages keep W=0; for every other
+    // page the build-time W (== real W at snapshot) is kept. This heals BOTH a
+    // stale P=0 (page allocated/repaged-in after the snapshot) AND a stale P=1
+    // read-only write-protect (page made writable after the snapshot). The write
+    // lands on sp_data->shadow_pte_va, a SHADOW page - real page-table pages are
+    // only read (A3 preserved: real NX stays 1).
+    UINT64 want = real_pte & ~NX_BIT;
+    if (sp_data->intercept_write)
+        want &= ~0x2ULL;                              // keep W=0 for protected pages
+    PUINT64 spte = (PUINT64)sp_data->shadow_pte_va;
+    UINT64  old  = *spte;
+    if (old != want)
     {
-        PUINT64 sh_tab = (PUINT64)pa_to_va(sh_pa);
-        if (!sh_tab)
-            return FALSE;
-        PUINT64 r_tab = (PUINT64)pa_to_va(r_pa);
-        if (!r_tab)
-            return FALSE;
+        *spte = want;
+        _InterlockedIncrement(&g_dbg_a2_data_synced);
+        if (_InterlockedIncrement(&g_dbg_a2_data_synced_logged) <= 64)
+            HYPERPLATFORM_LOG_WARN_SAFE(
+                "[stealth-a2] data-sync fa=%llx ec=%x rip=%llx real_pte=%llx "
+                "shadow_was=%llx want=%llx",
+                fault_addr, error_code, vcpu->vmexit_rip, real_pte, old, want);
+    }
 
-        UINT32 idx = (UINT32)((fault_addr >> shift[lvl]) & 0x1FF);
-        UINT64 s = sh_tab[idx];
-        UINT64 r = r_tab[idx];
+    result = TRUE;
 
-        if (lvl == 3)
+done:
+    vmx_leave_guest_cr3(saved_cr3);
+    if (!result)
+    {
+        // A2 fell back to abort+reinject. Classify it: the crash under
+        // investigation is a SPURIOUS re-injection -- A2 bailed even though the
+        // REAL page state does NOT match the (shadow-derived) error code, so the
+        // re-injected #PF confuses MmAccessFault (demand-faulting a zero page
+        // over live data -> corruption -> the intermittent renderdoc-init AV).
+        // GENUINE cases (real P=0 demand, real read-only COW) re-inject correctly.
+        // Spurious aborts are RARE (only the crash runs produce them) so they are
+        // logged UNCAPPED -- unlike stealth_diag_midwin_pf, whose 32-event cap
+        // saturates on the first (benign) run and hides every later crash run.
+        BOOLEAN spurious = FALSE;
+        if (!real_walk_ok)
+            spurious = TRUE;                                   // real walk failed (large page / NULL): can't heal, re-inject under real-present is spurious
+        else if ((real_pte & 1) && !(error_code & PFEC_PRESENT))
+            spurious = TRUE;                                   // shadow stale P=0, real present -> should have healed
+        else if ((real_pte & 1) && (real_pte & 0x2) &&
+                 (error_code & PFEC_PRESENT) && (error_code & PFEC_WRITE))
+            spurious = TRUE;                                   // shadow stale read-only, real writable -> should have healed
+        _InterlockedIncrement(&g_dbg_a2_abort);
+        if (spurious)
         {
-            // PT level. We only get here by descending through snapshot pages, so
-            // sh_tab is a snapshot PT. Sync a stale PTE from real (NX cleared,
-            // matching the build-time snapshot, which clears NX on every PTE). A
-            // P=1 entry needs no write - the fault was a stale cached walk, which
-            // the invvpid below flushes.
-            if (!(s & 1))
-                sh_tab[idx] = real_pte & ~NX_BIT;
-            break;
+            _InterlockedIncrement(&g_dbg_a2_spurious);
+            if (_InterlockedIncrement(&g_dbg_a2_spurious_logged) <= 64)
+            {
+                HYPERPLATFORM_LOG_WARN_SAFE(
+                    "[stealth-a2] SPURIOUS abort fa=%llx ec=%x (W=%d P=%d F=%d) "
+                    "real_pte=%llx real_walk=%d reason=%s rip=%llx",
+                    fault_addr, error_code,
+                    (error_code & PFEC_WRITE) ? 1 : 0,
+                    (error_code & PFEC_PRESENT) ? 1 : 0,
+                    (error_code & PFEC_INSTR_FETCH) ? 1 : 0,
+                    real_pte, real_walk_ok ? 1 : 0, bail_reason,
+                    vcpu->vmexit_rip);
+            }
         }
-
-        if ((s & 1) && stealth_pa_in_region(s, sr_lo, sr_hi))
-        {
-            // s points to a snapshot lower page: preserve it (NX=0 hiding for any
-            // code in this subtree) and descend through both shadow and real.
-            if (s & (1ULL << 7))            // large snapshot entry -> abort
-                return FALSE;
-            if (!(r & 1) || (r & (1ULL << 7)))
-                return FALSE;               // real unmapped/large -> abort
-            sh_pa = s & PFN_MASK;           // stays on a snapshot (stealth) page
-            r_pa  = r & PFN_MASK;
-        }
-        else
-        {
-            // s is a real-pointing copy or stale (P=0 / repaged): the staleness
-            // point. Refresh the shadow entry to the current real entry (a no-op
-            // if already current); the rest of the shadow walk then follows
-            // current real pages (confirmed P=1 above), so the access succeeds.
-            // The write lands on sh_tab - a SHADOW (stealth-region) page, since we
-            // only ever descend onto snapshots - never on a real page-table page.
-            if (!(r & 1) || (r & (1ULL << 7)))
-                return FALSE;               // real unmapped/large -> abort
-            sh_tab[idx] = r;
-            break;                          // done: lower levels are current real
-        }
+        return FALSE;
     }
 
     // flush any cached (stale P=0) translation for this VA so the retry re-walks
@@ -674,6 +821,241 @@ stealth_sync_data_pte_in_window(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr,
             real_pte);
     }
     return TRUE;
+}
+
+// =========================================================================
+//  VMX-root: NX-open code-PTE re-sync (repaged code page fix)
+// =========================================================================
+//
+// The shadow PT is a build-time deep copy (TdBuildShadowCR3). A CODE page that
+// was repaged after the snapshot (COW during relocation, section re-commit, page
+// reuse) keeps its OLD physical PFN in the shadow PTE, so the one-instruction
+// shadow window fetches STALE bytes -> the CPU executes wrong instructions ->
+// silent state corruption -> the intermittent renderdoc-init AV ("write to 0"
+// at a RIP whose real bytes are an innocent `push rbx`). This is silent: no
+// mid-window data #PF, so A2 (data-reactive) never runs, and the crash run logs
+// 0 SPURIOUS / 0 NOMATCH / 0 synced. Option 3's full passive refresh hides it by
+// re-copying every shadow PTE; A2 does not, so the stale code PFN survives.
+//
+// Fix: on every NX-fetch that opens the shadow window, re-sync the shadow CODE
+// PTE for fault_addr from the CURRENT real PTE (NX cleared to keep the stealth
+// hide) BEFORE swapping to the shadow CR3. sp->guest_va == fault_page (the
+// lookup is exact), so the shadow walk descends the repointed code path down to
+// the snapshot PT and the single write lands on a shadow page - real page-table
+// pages are only read, exactly as in stealth_sync_data_pte_in_window. Real NX
+// stays 1 (stealth preserved; A3 NX-cycle avoided).
+static void
+stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
+                                PEPT_STEALTH_PAGE_INFO sp,
+                                UINT64 fault_addr, UINT64 real_cr3)
+{
+    if (!sp || !sp->shadow_cr3_phys || !sp->guest_va || !real_cr3)
+        return;
+
+    _InterlockedIncrement(&g_dbg_a2_code_enter);
+
+    // Same CR3 discipline as stealth_sync_data_pte_in_window: switch to
+    // sp->guest_cr3 (the guest KERNEL CR3), under which the shadow pages
+    // (NonPaged pool, system PTE) are dereferenceable AND pa_to_va resolves the
+    // guest's real page-table pages via the guest kernel PML4's self-map. Under
+    // g_system_cr3, pa_to_va resolved real PT pages through the System self-map
+    // (PML4[idx]=0 for the code VA) -> sync always bailed -> stale shadow code
+    // PFN -> CPU fetched wrong bytes -> execute AV.
+    UINT64 saved_cr3 = vmx_enter_cr3(sp->guest_cr3);
+
+    // One-shot sanity check: under sp->guest_cr3 (guest kernel CR3), pa_to_va on
+    // the shadow PML4 (a NonPaged-pool page, resolved via system PTE in the kernel
+    // half) must return non-NULL. NULL means the guest kernel CR3 does not map the
+    // kernel half (e.g. wrong CR3 captured) and the heal cannot proceed.
+    static volatile LONG s_shpml4_diag_done = 0;
+    if (!_InterlockedExchange(&s_shpml4_diag_done, 1))
+    {
+        PVOID shpml4_va = pa_to_va(sp->shadow_cr3_phys & PFN_MASK);
+        HYPERPLATFORM_LOG_WARN_SAFE(
+            "[stealth-a2] DIAG shadow-pml4 pa=%llx va=%llx (NULL=kernel-cr3-broken) "
+            "guest_cr3=%llx real_cr3=%llx fa=%llx",
+            sp->shadow_cr3_phys & PFN_MASK, (UINT64)shpml4_va, sp->guest_cr3, real_cr3, fault_addr);
+    }
+
+    UINT64 real_pte = 0;
+    BOOLEAN walk_ok = stealth_walk_pte(sp, real_cr3, fault_addr, &real_pte);
+    if (!walk_ok || !(real_pte & 1))
+    {
+        // real not present / large / NULL: nothing to sync (the existing NX-open
+        // path will handle a genuinely absent page). Dump a level-by-level walk
+        // to localize the failure: 0xDEAD = stealth_real_va NULL at that level
+        // (real page not in the map), 0 = not-present entry, non-zero with bit7
+        // = large page.
+        if (_InterlockedIncrement(&g_dbg_a2_code_enter_logged) <= 200)
+        {
+            static const UINT32 dsh[4] = { 39, 30, 21, 12 };
+            UINT64 dpa = real_cr3 & PFN_MASK;
+            UINT64 e0 = 0, e1 = 0, e2 = 0, e3 = 0;
+            for (UINT32 lvl = 0; lvl < 4; lvl++)
+            {
+                PUINT64 t = (PUINT64)stealth_real_va(sp, dpa);
+                UINT64 ev;
+                if (!t) { ev = 0xDEADULL; }
+                else
+                {
+                    ev = t[(fault_addr >> dsh[lvl]) & 0x1FF];
+                    if (!(ev & 1) || (ev & (1ULL << 7)))
+                    {
+                        if (lvl == 0) e0 = ev;
+                        else if (lvl == 1) e1 = ev;
+                        else if (lvl == 2) e2 = ev;
+                        else e3 = ev;
+                        break;
+                    }
+                    if (lvl == 3) { e3 = ev; break; }
+                    dpa = ev & PFN_MASK;
+                    continue;
+                }
+                if (lvl == 0) e0 = ev;
+                else if (lvl == 1) e1 = ev;
+                else if (lvl == 2) e2 = ev;
+                else e3 = ev;
+                break;
+            }
+            HYPERPLATFORM_LOG_WARN_SAFE(
+                "[stealth-a2] code-refresh BAIL-realwalk fa=%llx rip=%llx cr3=%llx ok=%d pte=%llx pml4=%llx pdpt=%llx pd=%llx pt=%llx",
+                fault_addr, vcpu->vmexit_rip, real_cr3, (int)walk_ok, real_pte,
+                e0, e1, e2, e3);
+        }
+        goto leave;
+    }
+
+    {
+        // Direct shadow-PTE write via the pre-computed NonPaged-pool VA the
+        // TestDriver passed at install (sp->shadow_pte_va). This replaces the
+        // old 4-level pa_to_va walk: MmGetVirtualForPhysical CANNOT resolve
+        // NonPaged-pool pages in VMX-root (returns NULL), so that walk always
+        // bailed (BAIL-shtab) and the stale snapshot PTE - whose PFN predates
+        // LdrLoadDll's repage - survived -> CPU fetched wrong bytes -> execute
+        // AV (run 2). The pool VA is valid under any CR3 (system PTE), so we
+        // write the leaf PTE directly. Each stealth page covers one 4KB page,
+        // so fault_addr's PT index == guest_va's PT index and shadow_pte_va is
+        // exactly this fault's leaf PTE. The intermediate shadow PML4/PDPT/PD
+        // chain is a stable snapshot (built at TdBuildShadowCR3); only leaf PT
+        // entries go stale on repage, and only the leaf needs refresh. The real
+        // PTE is read-only here (A3 preserved: real NX stays 1).
+        PUINT64 spte = (PUINT64)sp->shadow_pte_va;
+        UINT64 want = real_pte & ~NX_BIT;
+
+        if (!spte)
+        {
+            if (_InterlockedIncrement(&g_dbg_a2_code_enter_logged) <= 200)
+                HYPERPLATFORM_LOG_WARN_SAFE(
+                    "[stealth-a2] code-refresh BAIL-noshadowpteva fa=%llx rip=%llx",
+                    fault_addr, vcpu->vmexit_rip);
+            goto leave;
+        }
+
+        UINT64 s = *spte;
+        if (s != want)
+        {
+            *spte = want;
+            // flush any cached translation for this VA (stale real NX=1 entry
+            // from the #PF, or a stale shadow entry from a prior window) so the
+            // post-swap fetch re-walks the refreshed PTE.
+            INVVPID_DESCRIPTOR desc = {0};
+            desc.Vpid = VPID_TAG;
+            if (g_ept->invvpid_individual_addr)
+            {
+                desc.LinearAddress = fault_addr;
+                asm_invvpid(InvvpidIndividualAddress, &desc);
+            }
+            else
+                asm_invvpid(InvvpidSingleContext, &desc);
+
+            _InterlockedIncrement(&g_dbg_a2_code_synced);
+            if (_InterlockedIncrement(&g_dbg_a2_code_synced_logged) <= 64)
+            {
+                HYPERPLATFORM_LOG_WARN_SAFE(
+                    "[stealth-a2] code-sync fa=%llx rip=%llx "
+                    "real_pte=%llx shadow_was=%llx want=%llx sh_pml4=%llx",
+                    fault_addr, vcpu->vmexit_rip, real_pte, s, want,
+                    sp->shadow_cr3_phys);
+            }
+        }
+        else
+        {
+            // shadow PTE already matches real PFN (NX cleared): no staleness
+            // detectable by PFN compare. Logging this proves the refresh
+            // path IS reached and the comparison ran.
+            if (_InterlockedIncrement(&g_dbg_a2_code_enter_logged) <= 200)
+                HYPERPLATFORM_LOG_WARN_SAFE(
+                    "[stealth-a2] code-refresh MATCH fa=%llx rip=%llx "
+                    "real_pte=%llx shadow_pte=%llx",
+                    fault_addr, vcpu->vmexit_rip, real_pte, s);
+        }
+    }
+
+    // --- proactive full-PT-page refresh: sync all 512 shadow PTEs in this 2MB ---
+    // Repage (working-set trim) changes real data PFNs; the shadow PT page is a
+    // build-time snapshot, so a stale P=1/wrong-PFN data PTE returns wrong bytes
+    // SILENTLY (no #PF) -> bad pointer -> AV / illegal-instruction (the residual
+    // intermittent crash). The code PTE above is healed on its own #PF, but data
+    // PTEs do not fault, so they are never healed reactively. Refresh every stale
+    // PTE in the code's 2MB shadow PT page from the current real PT page on each
+    // code #PF, so data in this 2MB reads current bytes. NX is cleared (matches
+    // TdBuildShadowCR3); W is preserved from the shadow so intercept_write pages
+    // keep W=0. Only shadow PT pages are written (A3 preserved: real NX stays 1).
+    // Cross-2MB data is not covered here (the data healer handles P=0/write-
+    // protect #PFs there; P=1/wrong-PFN cross-2MB is the known residual gap).
+    {
+        PUINT64 sh_pt = (PUINT64)((UINT64)sp->shadow_pte_va & ~0xFFFULL);
+        UINT64  real_pt_va = 0;
+        UINT64  dummy_pte  = 0;
+        if (sh_pt && stealth_walk_pt_page(sp, real_cr3, fault_addr, &real_pt_va, &dummy_pte) && real_pt_va)
+        {
+            PUINT64 r_pt = (PUINT64)real_pt_va;
+            UINT32  changed  = 0;
+            UINT32  stale_p1 = 0;
+            for (UINT32 i = 0; i < 512; i++)
+            {
+                UINT64 r = r_pt[i];
+                UINT64 s = sh_pt[i];
+                // fresh = same PFN and same present-bit; skip (preserves build-time NX/W).
+                if ((((s ^ r) & PFN_MASK) == 0) && (((s ^ r) & 1ULL) == 0))
+                    continue;
+                // diagnostic: P=1 in both, PFN differs = the silent crash cause
+                if ((s & 1) && (r & 1) && ((s & PFN_MASK) != (r & PFN_MASK)))
+                {
+                    stale_p1++;
+                    if (_InterlockedIncrement(&g_dbg_a2_stale_p1_logged) <= 64)
+                    {
+                        UINT64 va_i = (fault_addr & ~0x1FFFFFULL) | ((UINT64)i << 12);
+                        HYPERPLATFORM_LOG_WARN_SAFE(
+                            "[stealth-a2] STALE-P1 idx=%u va=%llx shadow=%llx real=%llx (silent wrong-PFN)",
+                            i, va_i, s, r);
+                    }
+                }
+                UINT64 want_i = (r & 1) ? (r & ~NX_BIT) : 0ULL;
+                want_i &= ~0x2ULL;                       // drop W, re-apply from shadow below
+                want_i |= (s & 0x2ULL);                  // preserve shadow W (intercept_write stays W=0)
+                sh_pt[i] = want_i;
+                changed++;
+            }
+            if (changed)
+            {
+                // flush cached translations for this context so post-swap data
+                // accesses re-walk the refreshed shadow PTEs. Per-VA INVVPID for
+                // up to 512 entries is too costly; one single-context flush.
+                INVVPID_DESCRIPTOR desc = {0};
+                desc.Vpid = VPID_TAG;
+                asm_invvpid(InvvpidSingleContext, &desc);
+                _InterlockedIncrement(&g_dbg_a2_ptpage_synced);
+                if (_InterlockedIncrement(&g_dbg_a2_ptpage_synced_logged) <= 32)
+                    HYPERPLATFORM_LOG_WARN_SAFE(
+                        "[stealth-a2] ptpage-sync fa=%llx rip=%llx changed=%u stale-P1=%u",
+                        fault_addr, vcpu->vmexit_rip, changed, stale_p1);
+            }
+        }
+    }
+
+leave:
+    vmx_leave_guest_cr3(saved_cr3);
 }
 
 // =========================================================================
@@ -865,6 +1247,16 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     sp->shadow_cr3_phys = req->shadow_cr3_phys;
     sp->no_ept_split    = req->no_ept_split;
     sp->intercept_write = req->intercept_write;
+    sp->shadow_pte_va   = req->shadow_pte_va;
+    // MDL-mapped real page-table pages (PML4+PDPT+PDs+PTs along the alloc
+    // path), built by TdBuildShadowCR3 in the guest driver and passed up here.
+    // VMX-root reads real page-table entries through stealth_real_va(sp, pa)
+    // (NOT pa_to_va, which under g_system_cr3 resolves them via the System
+    // self-map -> PML4[idx]=0). Shadow PTEs are written through sp->shadow_pte_va
+    // (the NonPaged-pool VA passed per page): pa_to_va CANNOT resolve NonPaged
+    // pool in VMX-root (returns NULL), so the old shadow walk always bailed.
+    sp->real_page_map   = (PSTEALTH_REAL_PAGE_ENTRY)req->real_page_map;
+    sp->real_page_count = req->real_page_count;
 
     if (sp->no_ept_split)
     {
@@ -1214,6 +1606,17 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             UINT64 shadow_pfn  = sp->shadow_cr3_phys & PFN_MASK;
             BOOLEAN already_on_shadow = (current_pfn == shadow_pfn);
 
+            // Re-sync the shadow CODE PTE from the current real PTE before opening
+            // the window. The shadow PT is a build-time snapshot; a code page
+            // repaged after the snapshot keeps a stale PFN and the window would
+            // fetch wrong bytes -> silent corruption (the renderdoc-init AV).
+            // sp->guest_va == fault_page, so this refreshes exactly the faulting
+            // code page. Skipped on already-on-shadow (mid-window re-fetch): the
+            // real CR3 is nx_timer_real_cr3 there, not current_cr3, and the first
+            // NX-open already refreshed it.
+            if (!already_on_shadow)
+                stealth_refresh_shadow_code_pte(vcpu, sp, fault_addr, current_cr3);
+
             if (!already_on_shadow)
                 vcpu->nx_timer_real_cr3 = current_cr3;
 
@@ -1244,6 +1647,28 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
                 INVVPID_DESCRIPTOR desc = {0};
                 desc.Vpid = VPID_TAG;
                 asm_invvpid(InvvpidSingleContext, &desc);
+            }
+            else
+            {
+                // NX-fetch open: with VPID the CR3 swap above does NOT flush the
+                // TLB, so a cached entry for the faulting code VA survives. If
+                // that entry is the real-PT NX=1 translation, the post-swap fetch
+                // re-#PFs instead of executing; if it is a stale wrong-PFN entry
+                // (cached from before a repage the guest INVLPG missed, or carried
+                // over from a prior shadow window), the fetch reads wrong bytes ->
+                // silent corruption (the renderdoc-init AV). Flush just fault_addr
+                // (individual-address when available): only that VA is fetched in
+                // this one-instruction window, so the post-swap fetch re-walks the
+                // refreshed shadow PT and reads the correct PFN.
+                INVVPID_DESCRIPTOR desc = {0};
+                desc.Vpid = VPID_TAG;
+                if (g_ept->invvpid_individual_addr)
+                {
+                    desc.LinearAddress = fault_addr;
+                    asm_invvpid(InvvpidIndividualAddress, &desc);
+                }
+                else
+                    asm_invvpid(InvvpidSingleContext, &desc);
             }
 
             SIZE_T pc = 0;
@@ -1298,11 +1723,42 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
     // no stealth page matched. if a shadow window is still open, close it first so
     // the re-injected #PF is serviced under the real CR3. (defensive: the mid-window
     // guard above already handles data #PFs; this catches a mid-window fetch #PF to
-    // a non-stealth NX page, trading a potential 0x1A for a clean process AV.)
+    // a non-stealth NX page, trading a potential 0x1A for a clean process AV.) A
+    // mid-window FETCH #PF here is the signature of a clobbered code 2MB: A2's
+    // code-path heuristic only protects sp->guest_va's path, so a data fault whose
+    // path crosses a SIBLING code 2MB (renderdoc .text spans >2MB) can refresh that
+    // sibling's shadow PD to real, re-exposing NX=1 -> this fetch #PF. That is a
+    // crash-causing event, so log it UNCAPPED (the 32-cap hides later runs).
     if (vcpu->nx_timer_real_cr3)
-        stealth_diag_midwin_pf(vcpu, fault_addr, error_code, "nomatch",
-                               vcpu->nx_timer_restore);
-    stealth_pf_abort_shadow_window(vcpu);
+    {
+        _InterlockedIncrement(&g_dbg_nomatch);
+        if (_InterlockedIncrement(&g_dbg_nomatch_logged) <= 64)
+        {
+            PEPT_STEALTH_PAGE_INFO sp = vcpu->nx_timer_restore;
+            UINT64 fault_pml4_idx = (fault_addr >> 39) & 0x1FF;
+            UINT64 fault_pdpt_idx = (fault_addr >> 30) & 0x1FF;
+            UINT64 fault_pd_idx   = (fault_addr >> 21) & 0x1FF;
+            UINT64 code_pml4_idx  = sp ? ((sp->guest_va >> 39) & 0x1FF) : 0;
+            UINT64 code_pdpt_idx  = sp ? ((sp->guest_va >> 30) & 0x1FF) : 0;
+            UINT64 code_pd_idx    = sp ? ((sp->guest_va >> 21) & 0x1FF) : 0;
+            HYPERPLATFORM_LOG_WARN_SAFE(
+                "[stealth-a2] NOMATCH midwin fetch fa=%llx ec=%x (W=%d P=%d F=%d) "
+                "rip=%llx idx[pml4 f=%llx/%llx pdpt f=%llx/%llx pd f=%llx/%llx]",
+                fault_addr, error_code,
+                (error_code & PFEC_WRITE) ? 1 : 0,
+                (error_code & PFEC_PRESENT) ? 1 : 0,
+                (error_code & PFEC_INSTR_FETCH) ? 1 : 0,
+                vcpu->vmexit_rip,
+                fault_pml4_idx, code_pml4_idx,
+                fault_pdpt_idx, code_pdpt_idx,
+                fault_pd_idx, code_pd_idx);
+        }
+        stealth_pf_abort_shadow_window(vcpu);
+    }
+    else
+    {
+        stealth_pf_abort_shadow_window(vcpu);
+    }
     return FALSE;
 }
 

@@ -50,6 +50,53 @@ vmx_enter_guest_cr3(VOID)
 #endif
 }
 
+//
+// The reactive shadow-CR3 heal (stealth_refresh_shadow_code_pte /
+// stealth_sync_data_pte_in_window) must walk the guest's REAL page tables and the
+// NonPaged-pool SHADOW pages in VMX-root. pa_to_va (MmGetVirtualForPhysical)
+// resolves REGISTERED page-table pages through the CURRENT CR3's self-map, so the
+// CR3 the heal runs under determines whose tables pa_to_va sees.
+//
+// g_system_cr3 (System's kernel CR3) is WRONG: its self-map resolves the System
+// process's tables (PML4[idx]=0 for any user VA), so the guest's real PT walk is
+// broken. The guest's USER CR3 (captured at the user-mode #PF VM-exit) is also
+// WRONG: under KVA-shadow/KPTI the user CR3 strips kernel space, so the
+// NonPaged-pool shadow pages become inaccessible AND the self-map is stripped.
+//
+// The fix: run the heal under the guest process's KERNEL CR3 (sp->guest_cr3,
+// captured by the TestDriver via __readcr3() in the IOCTL handler -- kernel mode
+// = kernel CR3 under KPTI). The kernel CR3 has the FULL kernel half (NonPaged
+// pool, HV code/stack, system PTEs -- shared across all processes) PLUS the
+// process's user half. So under sp->guest_cr3, pa_to_va resolves BOTH the guest's
+// real page-table pages (self-map -> guest kernel PML4 -> shared user PDPT/PD/PT)
+// AND the shadow pages (NonPaged pool, system PTE). No real-page mapping is
+// needed -- which is essential, because every MM API that could map a RAM
+// page-table page into a CR3-independent VA is REFUSED on modern Windows
+// (MmMapIoSpace MmCached/MmNonCached, manual-PFN MDL MmMapLockedPagesSpecifyCache
+// with or without MDL_IO_SPACE -- all return NULL for the PML4 page; the MM
+// protects page-table pages from aliasing). This also matches the original design
+// request: do NOT map shadow/real page VAs.
+//
+// vmx_enter_cr3(cr3) saves the live CR3 and switches to `cr3` for the heal;
+// vmx_leave_guest_cr3(saved) restores it. The walk's CR3 argument (the guest user
+// CR3) is irrelevant at level 0: pa_to_va of a PML4 PA returns the self-map base
+// VA, which under the kernel host CR3 maps the guest kernel PML4 (shared user
+// entries) -- so the walk resolves the correct user-space PTEs regardless.
+//
+static __forceinline UINT64
+vmx_enter_cr3(UINT64 cr3)
+{
+#if USE_PRIVATE_HOST_CR3
+    UINT64 saved = __readcr3();
+    __writecr3(cr3);
+    _mm_mfence();
+    return saved;
+#else
+    UNREFERENCED_PARAMETER(cr3);
+    return 0;
+#endif
+}
+
 static __forceinline VOID
 vmx_leave_guest_cr3(UINT64 saved)
 {

@@ -422,6 +422,31 @@ typedef struct _STEALTH_FAKE_PT {
 // shadow page and fake PT page are in the contiguous region (not embedded).
 // fake PT page is shared among stealth pages in the same physical PT page.
 //
+
+//
+// Real page-table page map entry. The HV's reactive heal
+// (stealth_refresh_shadow_code_pte / stealth_sync_data_pte_in_window) must walk
+// the guest's REAL page tables in VMX-root. pa_to_va (MmGetVirtualForPhysical)
+// resolves REGISTERED page-table pages through the current CR3's self-map, so
+// under g_system_cr3 it reads the System process's tables (PML4[idx]=0) -- the
+// real walk is broken. The TestDriver therefore maps each real PT page along the
+// protected range's path (PML4/PDPT/PD/PT) at PASSIVE and passes the resulting
+// system VAs here; they are valid under g_system_cr3 (system space, mapped in
+// every address space). Mapping uses an MDL + MmMapLockedPagesSpecifyCache(MmCached)
+// -- NOT MmMapIoSpace, which returns NULL for system-RAM page-table pages on
+// modern Windows (MM refuses to double-map RAM as I/O space). MmCached matches
+// the WB attribute of RAM, so a persistent mapping is safe (no cache conflict).
+// Shadow pages are NonPaged pool (NOT registered page tables) so pa_to_va still
+// resolves THEM under g_system_cr3 -- no map entry needed for shadow pages.
+//
+typedef struct _STEALTH_REAL_PAGE_ENTRY {
+    UINT64  pa;     // physical address (page-aligned) of a real guest PT page
+    PVOID   va;     // MmMapLockedPagesSpecifyCache system VA, valid under g_system_cr3
+    PVOID   mdl;    // PMDL (opaque to the HV; TestDriver stores it for MmUnmapLockedPages)
+} STEALTH_REAL_PAGE_ENTRY, *PSTEALTH_REAL_PAGE_ENTRY;
+
+#define MAX_REAL_PAGES_PER_SHADOW  64   // PML4 + PDPT + PDs + PTs along the range
+
 typedef struct _EPT_STEALTH_PAGE_INFO {
     LIST_ENTRY      stealth_page_list;
 
@@ -449,6 +474,13 @@ typedef struct _EPT_STEALTH_PAGE_INFO {
     // --- shadow CR3 (NX bypass without touching real PTE) ---
     UINT64          shadow_cr3_phys;    // physical address of shadow PML4 (0 = not used)
     UINT64          real_cr3_value;     // saved real guest CR3 during shadow switch
+    PVOID           shadow_pte_va;      // VA of this page's shadow PTE (NonPaged pool, valid under any CR3); HV writes *shadow_pte_va=(real_pte&~NX) on #PF. NULL = legacy pa_to_va walk (broken in VMX-root).
+
+    // --- real page-table page map (MDL-mapped, valid under g_system_cr3) ---
+    // shared across all stealth pages of the same shadow CR3 (same protected
+    // range). NULL = no map (real walk via pa_to_va, broken under g_system_cr3).
+    PSTEALTH_REAL_PAGE_ENTRY real_page_map;
+    UINT32          real_page_count;
 
 } EPT_STEALTH_PAGE_INFO, *PEPT_STEALTH_PAGE_INFO;
 
@@ -482,6 +514,9 @@ typedef struct _EPT_STEALTH_ALLOC_PARAM {
     BOOLEAN use_fake_pt;          // [in] TRUE = create fake PT page (NX=1 visible to scanners, NX=0 in real PTE)
     UINT64  shadow_cr3_phys;      // [in] physical address of shadow PML4 (0 = no shadow CR3)
     BOOLEAN no_ept_split;         // [in] TRUE = shadow CR3 only, keep target EPT mapping unchanged
+    PVOID   shadow_pte_va;        // [in] VA of this page's shadow PTE (NonPaged pool, computed by caller via TdResolveShadowPte); HV writes *shadow_pte_va=(real_pte&~NX) on #PF without pa_to_va (NULL = legacy walk)
+    PVOID   real_page_map;        // [in] ptr to STEALTH_REAL_PAGE_ENTRY[real_page_count]: MDL-mapped real PT pages (NULL = none)
+    UINT32  real_page_count;      // [in] number of entries in real_page_map
     volatile LONG installed;      // [internal] 0→1 by first CPU
     BOOLEAN result;               // [out]
 } EPT_STEALTH_ALLOC_PARAM, *PEPT_STEALTH_ALLOC_PARAM;

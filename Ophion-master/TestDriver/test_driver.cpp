@@ -134,6 +134,9 @@ typedef struct _TD_STEALTH_PARAM {
     BOOLEAN use_fake_pt;        // TRUE = create fake PT page (NX hiding)
     UINT64  shadow_cr3_phys;    // physical address of shadow PML4 (0 = no shadow CR3)
     BOOLEAN no_ept_split;       // TRUE = shadow CR3 only, keep target EPT mapping unchanged
+    PVOID   shadow_pte_va;      // VA of this page's shadow PTE (NonPaged pool, computed via TdResolveShadowPte at PASSIVE); HV writes it directly on #PF (NULL = none)
+    PVOID   real_page_map;      // ptr to STEALTH_REAL_PAGE_ENTRY[real_page_count] (MDL-mapped real PT pages, NULL = none)
+    UINT32  real_page_count;    // number of entries in real_page_map
     volatile LONG installed;
     BOOLEAN result;
 } TD_STEALTH_PARAM;
@@ -158,9 +161,28 @@ extern "C" {
 #define MAX_SHADOW_PAGES_PER_CR3 256
 #define MAX_SHADOW_CR3_ALLOCS    64
 
+//
+// Real page-table page map entry -- MUST match hv_types.h STEALTH_REAL_PAGE_ENTRY.
+// The HV walks the guest's REAL page tables in VMX-root under g_system_cr3 where
+// pa_to_va is broken (reads System's self-map); the TestDriver maps each real PT
+// page along the protected range's path (MDL + MmMapLockedPagesSpecifyCache) and
+// passes the system VAs. MmMapIoSpace is NOT used: it returns NULL for system-RAM
+// page-table pages on modern Windows. MmCached matches the WB attribute of RAM so
+// a persistent mapping is safe (no cache conflict).
+//
+typedef struct _STEALTH_REAL_PAGE_ENTRY {
+    UINT64  pa;     // physical address (page-aligned) of a real guest PT page
+    PVOID   va;     // MmMapLockedPagesSpecifyCache system VA, valid under g_system_cr3
+    PVOID   mdl;    // PMDL for this page (TestDriver-only; HV ignores it)
+} STEALTH_REAL_PAGE_ENTRY, *PSTEALTH_REAL_PAGE_ENTRY;
+
+#define MAX_REAL_PAGES_PER_SHADOW  64   // PML4 + PDPT + PDs + PTs along the range
+
 typedef struct _TD_SHADOW_BUILD_CONTEXT {
     PVOID  pages[MAX_SHADOW_PAGES_PER_CR3];
     UINT32 page_count;
+    STEALTH_REAL_PAGE_ENTRY real_pages[MAX_REAL_PAGES_PER_SHADOW];
+    UINT32 real_page_count;
 } TD_SHADOW_BUILD_CONTEXT;
 
 typedef struct _TD_SHADOW_CR3_ALLOCATION {
@@ -168,6 +190,8 @@ typedef struct _TD_SHADOW_CR3_ALLOCATION {
     UINT64  shadow_cr3_phys;
     UINT32  page_count;
     PVOID   pages[MAX_SHADOW_PAGES_PER_CR3];
+    PSTEALTH_REAL_PAGE_ENTRY real_page_map;  // NonPaged buffer shared with HV (NULL = none)
+    UINT32  real_page_count;
 } TD_SHADOW_CR3_ALLOCATION;
 
 static KSPIN_LOCK g_shadow_alloc_lock;
@@ -193,6 +217,16 @@ TdShadowAllocPage(TD_SHADOW_BUILD_CONTEXT * ctx)
     if (!ctx || ctx->page_count >= MAX_SHADOW_PAGES_PER_CR3)
         return NULL;
 
+    //
+    // NonPaged pool. The HV accesses shadow pages in VMX-root under g_system_cr3
+    // via pa_to_va(): shadow pages are NOT registered page-table pages in the PFN
+    // database (they are plain pool pages used as page tables only by the shadow
+    // CR3), so pa_to_va resolves them through their system PTE -- CR3-independent,
+    // and the returned system VA is in kernel space which g_system_cr3 maps. This
+    // is the asymmetry that lets us map ONLY the real page-table pages (which ARE
+    // registered, so pa_to_va resolves them through the CR3 self-map and reads the
+    // wrong tables under g_system_cr3) and leave the shadow pages to pa_to_va.
+    //
     PVOID page = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'wdhS');
     if (!page) return NULL;
     RtlZeroMemory(page, PAGE_SIZE);
@@ -200,11 +234,145 @@ TdShadowAllocPage(TD_SHADOW_BUILD_CONTEXT * ctx)
     return page;
 }
 
+//
+// Map a REAL guest page-table page (PML4/PDPT/PD/PT) into system space so the HV
+// can read it in VMX-root under g_system_cr3. pa_to_va (MmGetVirtualForPhysical)
+// resolves registered page-table pages through the current CR3's self-map, so
+// under g_system_cr3 it reads the System process's tables -- unusable for the
+// guest's real PT walk. We need a CR3-independent system VA for the page.
+//
+// Technique: manual-PFN MDL with the MDL_IO_SPACE flag (the "winpmem" technique
+// for full-RAM dumps on modern Windows). MDL_IO_SPACE tells the MM "these are
+// I/O pages, do NOT touch the PFN DB" -- which is the key, because:
+//   * MmMapIoSpace (any cache type) returns NULL for system-RAM page-table pages
+//     on modern Windows 10+ -- it has a RAM pre-check that refuses to alias RAM
+//     as I/O space. (This is why stealth_read_phys64's pattern is NOT a working
+//     reference -- it was never exercised on RAM PT pages at runtime.)
+//   * A manual-PFN MDL WITHOUT MDL_IO_SPACE fails because the MM tries to manage
+//     the PFN DB (PteAddress / cache-attribute chain) for a page-table page and
+//     refuses -- the earlier MmMapLockedPagesSpecifyCache(MmCached) NULL failure.
+//   * WITH MDL_IO_SPACE, the MM skips PFN DB management entirely and creates a
+//     pure system-PTE alias valid under ANY CR3. This maps ARBITRARY physical
+//     pages, including page-table pages.
+//
+// Cache type: try UC (MmNonCached) first, fall back to WB (MmCached). MDL_IO_SPACE
+// skips PFN cache-attribute tracking, so neither triggers a conflict/bugcheck. x64
+// keeps UC reads coherent with the OS's WB self-map writes (MESI snoop), and the HV
+// only ever READS real pages (writes go to shadow pages), so a persistent mapping
+// of either type is correct.
+//
+// Refcount: MDL_IO_SPACE + manual-PFN means no PFN refcount was touched (the MM
+// treated the PFN as I/O). MmUnmapLockedPages only frees the system PTEs -- there
+// is no MmUnlockPages to call (no MmProbeAndLockPages to balance). Pure alias.
+//
+// Context: this runs at PASSIVE in the guest (TdBuildShadowCR3, Box.exe context).
+// No MM calls happen in VMX-root (MmMapLockedPages deadlocks there per
+// ept_stealth.cpp); only the resulting system VA is dereferenced in VMX-root.
+//
+// Dedupes by PA (PML4/PDPT/PD visited once; PTs once per 2MB). Released via
+// TdShadowUnmapRealPage (MmUnmapLockedPages + IoFreeMdl, NO MmUnlockPages).
+//
+static VOID
+TdShadowUnmapRealPage(STEALTH_REAL_PAGE_ENTRY * e)
+{
+    if (!e || !e->va || !e->mdl)
+        return;
+    MmUnmapLockedPages(e->va, (PMDL)e->mdl);
+    // NO MmUnlockPages: MDL_IO_SPACE + manual-PFN touched no PFN refcount. The
+    // page-table page's refcount is untouched (pure read-only alias).
+    IoFreeMdl((PMDL)e->mdl);
+    e->va  = NULL;
+    e->mdl = NULL;
+}
+
+static BOOLEAN
+TdShadowMapRealPage(TD_SHADOW_BUILD_CONTEXT * ctx, UINT64 pa)
+{
+    if (!ctx || !pa)
+        return FALSE;
+    UINT64 page_pa = pa & PFN_MASK_;
+
+    for (UINT32 i = 0; i < ctx->real_page_count; i++)
+    {
+        if ((ctx->real_pages[i].pa & PFN_MASK_) == page_pa)
+            return TRUE;  // already mapped (dedup)
+    }
+    if (ctx->real_page_count >= MAX_REAL_PAGES_PER_SHADOW)
+    {
+        HYPERPLATFORM_LOG_ERROR("[td-rw] real-page map FAIL pa=%llx: map full (%u)",
+                                page_pa, ctx->real_page_count);
+        return FALSE;
+    }
+
+    PMDL mdl = IoAllocateMdl(NULL, PAGE_SIZE, FALSE, FALSE, NULL);
+    if (!mdl)
+    {
+        HYPERPLATFORM_LOG_ERROR("[td-rw] real-page map FAIL pa=%llx: IoAllocateMdl NULL",
+                                page_pa);
+        return FALSE;
+    }
+    mdl->StartVa    = NULL;
+    mdl->ByteOffset = 0;
+    mdl->ByteCount  = PAGE_SIZE;
+    mdl->MdlFlags  |= MDL_PAGES_LOCKED | MDL_IO_SPACE;
+    PPFN_NUMBER pfns = MmGetMdlPfnArray(mdl);
+    pfns[0] = (PFN_NUMBER)(page_pa >> PAGE_SHIFT);
+
+    // UC first (winpmem default); fall back to WB. MDL_IO_SPACE skips PFN
+    // cache-attribute tracking, so neither conflicts/bugchecks.
+    PVOID va = MmMapLockedPagesSpecifyCache(
+        mdl, KernelMode, MmNonCached, NULL, FALSE, NormalPagePriority);
+    if (!va)
+    {
+        va = MmMapLockedPagesSpecifyCache(
+            mdl, KernelMode, MmCached, NULL, FALSE, NormalPagePriority);
+    }
+    if (!va)
+    {
+        HYPERPLATFORM_LOG_ERROR(
+            "[td-rw] real-page map FAIL pa=%llx pfn=%llx: MDL_IO_SPACE map NULL (UC+WB)",
+            page_pa, (UINT64)pfns[0]);
+        IoFreeMdl(mdl);
+        return FALSE;
+    }
+
+    // one-shot confirmation that the MDL_IO_SPACE path works at runtime.
+    static volatile LONG s_first_log = 0;
+    if (!_InterlockedExchange(&s_first_log, 1))
+    {
+        HYPERPLATFORM_LOG_INFO(
+            "[td-rw] real-page MDL_IO_SPACE map ok: pa=%llx va=%llx",
+            page_pa, (UINT64)va);
+    }
+
+    ctx->real_pages[ctx->real_page_count].pa  = page_pa;
+    ctx->real_pages[ctx->real_page_count].va  = va;
+    ctx->real_pages[ctx->real_page_count].mdl = mdl;
+    ctx->real_page_count++;
+    return TRUE;
+}
+
 static BOOLEAN
 TdShadowRegisterCr3(UINT64 shadow_cr3_phys, TD_SHADOW_BUILD_CONTEXT * ctx)
 {
     if (!shadow_cr3_phys || !ctx || !ctx->page_count)
         return FALSE;
+
+    //
+    // allocate the shared real-page map buffer (passed to the HV by pointer) at
+    // PASSIVE OUTSIDE the spinlock -- ExAllocatePool2 must not run at DISPATCH.
+    //
+    PSTEALTH_REAL_PAGE_ENTRY map_buf = NULL;
+    UINT32 map_count = ctx->real_page_count;
+    if (map_count)
+    {
+        map_buf = (PSTEALTH_REAL_PAGE_ENTRY)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, sizeof(STEALTH_REAL_PAGE_ENTRY) * map_count, 'lmrS');
+        if (!map_buf)
+            return FALSE;
+        RtlCopyMemory(map_buf, ctx->real_pages,
+                      sizeof(STEALTH_REAL_PAGE_ENTRY) * map_count);
+    }
 
     KIRQL old_irql;
     KeAcquireSpinLock(&g_shadow_alloc_lock, &old_irql);
@@ -226,13 +394,18 @@ TdShadowRegisterCr3(UINT64 shadow_cr3_phys, TD_SHADOW_BUILD_CONTEXT * ctx)
         slot->page_count = ctx->page_count;
         for (UINT32 i = 0; i < ctx->page_count; i++)
             slot->pages[i] = ctx->pages[i];
+        slot->real_page_map  = map_buf;
+        slot->real_page_count = map_count;
         slot->active = TRUE;
     }
 
     KeReleaseSpinLock(&g_shadow_alloc_lock, old_irql);
 
     if (!slot)
+    {
+        if (map_buf) ExFreePoolWithTag(map_buf, 'lmrS');
         return FALSE;
+    }
 
     RtlZeroMemory(ctx, sizeof(*ctx));
     return TRUE;
@@ -324,6 +497,8 @@ TdShadowFreeCr3(UINT64 shadow_cr3_phys)
 
     PVOID pages[MAX_SHADOW_PAGES_PER_CR3] = {};
     UINT32 page_count = 0;
+    PSTEALTH_REAL_PAGE_ENTRY map_buf = NULL;
+    UINT32 map_count = 0;
 
     KIRQL old_irql;
     KeAcquireSpinLock(&g_shadow_alloc_lock, &old_irql);
@@ -336,6 +511,8 @@ TdShadowFreeCr3(UINT64 shadow_cr3_phys)
             page_count = entry->page_count;
             for (UINT32 j = 0; j < page_count; j++)
                 pages[j] = entry->pages[j];
+            map_buf   = entry->real_page_map;
+            map_count = entry->real_page_count;
             RtlZeroMemory(entry, sizeof(*entry));
             break;
         }
@@ -347,9 +524,49 @@ TdShadowFreeCr3(UINT64 shadow_cr3_phys)
         return FALSE;
 
     TdShadowFreePageList(pages, page_count);
-    HYPERPLATFORM_LOG_INFO("[td-rw] shadow CR3 freed: PA=0x%llX pages=%u",
-               shadow_cr3_phys, page_count);
+
+    // release the MDL-mapped real page-table page mappings (PASSIVE here:
+    // TdShadowFreeCr3 runs at PASSIVE from the process-exit / teardown path).
+    if (map_buf)
+    {
+        for (UINT32 i = 0; i < map_count; i++)
+            TdShadowUnmapRealPage(&map_buf[i]);
+        ExFreePoolWithTag(map_buf, 'lmrS');
+    }
+
+    HYPERPLATFORM_LOG_INFO("[td-rw] shadow CR3 freed: PA=0x%llX pages=%u real=%u",
+               shadow_cr3_phys, page_count, map_count);
     return TRUE;
+}
+
+//
+// look up the shared real-page map for a shadow CR3 (for filling the VMCALL
+// param). returns the buffer pointer + count; *out_map is NULL if none.
+//
+static VOID
+TdShadowGetRealMap(UINT64 shadow_cr3_phys,
+                   PVOID * out_map, UINT32 * out_count)
+{
+    if (out_map)  *out_map  = NULL;
+    if (out_count) *out_count = 0;
+    if (!shadow_cr3_phys)
+        return;
+
+    KIRQL old_irql;
+    KeAcquireSpinLock(&g_shadow_alloc_lock, &old_irql);
+
+    for (UINT32 i = 0; i < MAX_SHADOW_CR3_ALLOCS; i++)
+    {
+        TD_SHADOW_CR3_ALLOCATION * entry = &g_shadow_allocs[i];
+        if (entry->active && entry->shadow_cr3_phys == shadow_cr3_phys)
+        {
+            if (out_map)  *out_map  = entry->real_page_map;
+            if (out_count) *out_count = entry->real_page_count;
+            break;
+        }
+    }
+
+    KeReleaseSpinLock(&g_shadow_alloc_lock, old_irql);
 }
 
 static PUINT64
@@ -382,6 +599,8 @@ TdBuildShadowCR3(UINT64 cr3, UINT64 base_va, SIZE_T size)
     // --- shadow PML4 ---
     PUINT64 real_pml4 = TdMapPhys(cr3);
     if (!real_pml4) goto Fail;
+    // No real-page MDL map: the HV heals under sp->guest_cr3 (this kernel CR3),
+    // where pa_to_va resolves the guest's real PT pages directly. See vmx_enter_cr3.
 
     PUINT64 shadow_pml4 = (PUINT64)TdShadowAllocPage(&ctx);
     if (!shadow_pml4) goto Fail;
@@ -463,7 +682,12 @@ TdBuildShadowCR3(UINT64 cr3, UINT64 base_va, SIZE_T size)
     return shadow_pml4_pa;
 
 Fail:
+    HYPERPLATFORM_LOG_ERROR(
+        "[td-rw] TdBuildShadowCR3 FAIL (va=%p size=0x%llx cr3=%llx)",
+        (PVOID)base_va, (UINT64)size, cr3);
     TdShadowFreePageList(ctx.pages, ctx.page_count);
+    for (UINT32 i = 0; i < ctx.real_page_count; i++)
+        TdShadowUnmapRealPage(&ctx.real_pages[i]);
     return 0;
 }
 
@@ -1440,6 +1664,7 @@ TdStealthAllocPage(
     UINT64 effective_pt_pfn = pt_pfn;
     UINT32 effective_pt_idx = pt_idx;
     PVOID effective_pt_va = NULL;
+    PVOID shadow_pte_va = NULL;
 
     if (no_ept_split && shadow_cr3_phys)
     {
@@ -1449,6 +1674,15 @@ TdStealthAllocPage(
             ExFreePoolWithTag(req, TD_STEALTH_REQ_TAG);
             return STATUS_UNSUCCESSFUL;
         }
+        // shadow PT page VA is a system-global NonPaged-pool VA (the original
+        // ExAllocatePool2 VA tracked in g_shadow_allocs by TdShadowVaFromPhys).
+        // Pass the exact shadow PTE VA so the HV writes *shadow_pte_va =
+        // (real_pte & ~NX) on #PF WITHOUT pa_to_va: MmGetVirtualForPhysical
+        // returns NULL for these NonPaged-pool pages in VMX-root, so the old
+        // HV shadow-walk always bailed and the stale snapshot PTE (pre-DLL-load
+        // PFN) survived -> CPU fetched wrong bytes -> execute AV.
+        if (effective_pt_va)
+            shadow_pte_va = &((PUINT64)effective_pt_va)[effective_pt_idx];
     }
 
     req->caller_cr3       = caller_cr3;
@@ -1464,7 +1698,13 @@ TdStealthAllocPage(
     req->use_fake_pt      = use_fake_pt;
     req->shadow_cr3_phys  = shadow_cr3_phys;
     req->no_ept_split     = no_ept_split;
+    req->shadow_pte_va    = shadow_pte_va;
     req->intercept_write  = intercept_write;
+
+    // pass the shared real-page map (MDL-mapped real PT pages) so the HV can
+    // walk the guest's real page tables under g_system_cr3 without pa_to_va.
+    // (NULL/0 when no shadow CR3 or map build failed -- HV falls back to pa_to_va.)
+    TdShadowGetRealMap(shadow_cr3_phys, &req->real_page_map, &req->real_page_count);
 
     //
     // copy PT page and target page content into NonPaged kernel buffers.

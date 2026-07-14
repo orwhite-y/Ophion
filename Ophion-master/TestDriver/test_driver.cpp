@@ -2904,6 +2904,7 @@ typedef struct _TD_TRIGGER_JUMP_PARAMS {
     UINT64 trigger_va;      // [in/out] 0 = auto ntdll trigger
     UINT64 jump_to_va;      // [in] destination RIP for VMCALL hook
     UINT64 flags;           // [in] bit1=oneshot, 0 uses default oneshot
+    UINT64 target_tid;      // [in] 0 = any thread, non-0 = only this TID
     UINT64 status;          // [out] NTSTATUS
 } TD_TRIGGER_JUMP_PARAMS;
 #pragma pack(pop)
@@ -5893,7 +5894,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             UINT64 flags = p->flags ? p->flags : 2;
 
             st = TdInstallTriggerHookAllCpus(
-                trigger_fn, (PVOID)p->jump_to_va, caller_cr3, flags, 0, &dummy_origin, NULL);
+                trigger_fn, (PVOID)p->jump_to_va, caller_cr3, flags, p->target_tid, &dummy_origin, NULL);
 
             HYPERPLATFORM_LOG_INFO("[td-trigger] hook %s trigger=%p jump=%p flags=0x%llX st=0x%08X",
                        NT_SUCCESS(st) ? "OK" : "FAILED",

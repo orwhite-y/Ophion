@@ -271,7 +271,19 @@ stealth_shadow_pte_allows(PEPT_STEALTH_PAGE_INFO sp, UINT32 error_code)
         return (pte_value & NX_BIT) == 0;
 
     if (error_code & PFEC_WRITE)
-        return (pte_value & (1ULL << 1)) != 0;
+    {
+        BOOLEAN allows = (pte_value & (1ULL << 1)) != 0;
+        if (!allows)
+        {
+            static volatile LONG s_wr_reject_logged = 0;
+            if (_InterlockedIncrement(&s_wr_reject_logged) <= 16)
+                HYPERPLATFORM_LOG_WARN_SAFE(
+                    "[stealth-a2] write-check REJECT va=%llx pte=%llx W=0 pt_page=%p idx=%u shadow_cr3=%llx",
+                    (UINT64)sp->guest_va, pte_value, sp->pt_page_va, sp->pt_pte_index,
+                    sp->shadow_cr3_phys);
+        }
+        return allows;
+    }
 
     return TRUE;
 }
@@ -672,7 +684,7 @@ stealth_sync_data_pte_in_window(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr,
             PEPT_STEALTH_PAGE_INFO s = CONTAINING_RECORD(cur2, EPT_STEALTH_PAGE_INFO, stealth_page_list);
             cur2 = cur2->Flink;
             if (s->guest_va != fault_page) continue;
-            if (s->shadow_cr3_phys != sp->shadow_cr3_phys) continue;   // different protected range
+            if (s->shadow_cr3_phys != sp->shadow_cr3_phys) continue;   // different process / shadow CR3 (multi-range: all ranges of a process share one shadow_cr3)
             if (s->target_pid != 0)
             {
                 if ((UINT64)(ULONG_PTR)PsGetCurrentProcessId() != s->target_pid) continue;

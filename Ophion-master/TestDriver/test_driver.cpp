@@ -192,6 +192,7 @@ typedef struct _TD_SHADOW_CR3_ALLOCATION {
     PVOID   pages[MAX_SHADOW_PAGES_PER_CR3];
     PSTEALTH_REAL_PAGE_ENTRY real_page_map;  // NonPaged buffer shared with HV (NULL = none)
     UINT32  real_page_count;
+    LONG    refcount;     // #tracked ranges sharing this CR3 (multi-range per process); freed at 0
 } TD_SHADOW_CR3_ALLOCATION;
 
 static KSPIN_LOCK g_shadow_alloc_lock;
@@ -397,6 +398,7 @@ TdShadowRegisterCr3(UINT64 shadow_cr3_phys, TD_SHADOW_BUILD_CONTEXT * ctx)
         slot->real_page_map  = map_buf;
         slot->real_page_count = map_count;
         slot->active = TRUE;
+        slot->refcount = 0;     // TdStealthTrackAdd AddRef's each tracked range
     }
 
     KeReleaseSpinLock(&g_shadow_alloc_lock, old_irql);
@@ -409,6 +411,54 @@ TdShadowRegisterCr3(UINT64 shadow_cr3_phys, TD_SHADOW_BUILD_CONTEXT * ctx)
 
     RtlZeroMemory(ctx, sizeof(*ctx));
     return TRUE;
+}
+
+// AddRef the shared shadow CR3 (one per tracked range). Callers may hold
+// g_stealth_track_lock; this acquires g_shadow_alloc_lock => lock order: track then alloc.
+static VOID
+TdShadowCr3AddRef(UINT64 shadow_cr3_phys)
+{
+    if (!shadow_cr3_phys) return;
+    KIRQL old_irql;
+    KeAcquireSpinLock(&g_shadow_alloc_lock, &old_irql);
+    for (UINT32 i = 0; i < MAX_SHADOW_CR3_ALLOCS; i++)
+    {
+        TD_SHADOW_CR3_ALLOCATION * e = &g_shadow_allocs[i];
+        if (e->active && e->shadow_cr3_phys == shadow_cr3_phys)
+        {
+            e->refcount++;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_shadow_alloc_lock, old_irql);
+}
+
+// Decrement refcount. If this was the last reference, set *out_to_free to the
+// shadow_cr3_phys so the caller can TdShadowFreeCr3 it (outside any held lock).
+// Returns TRUE if the shadow_cr3 was found.
+static BOOLEAN
+TdShadowCr3Release(UINT64 shadow_cr3_phys, UINT64 * out_to_free)
+{
+    if (out_to_free) *out_to_free = 0;
+    if (!shadow_cr3_phys) return FALSE;
+    BOOLEAN found = FALSE;
+    KIRQL old_irql;
+    KeAcquireSpinLock(&g_shadow_alloc_lock, &old_irql);
+    for (UINT32 i = 0; i < MAX_SHADOW_CR3_ALLOCS; i++)
+    {
+        TD_SHADOW_CR3_ALLOCATION * e = &g_shadow_allocs[i];
+        if (e->active && e->shadow_cr3_phys == shadow_cr3_phys)
+        {
+            found = TRUE;
+            if (e->refcount > 0)
+                e->refcount--;
+            if (e->refcount == 0 && out_to_free)
+                *out_to_free = shadow_cr3_phys;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_shadow_alloc_lock, old_irql);
+    return found;
 }
 
 static PVOID
@@ -691,6 +741,156 @@ Fail:
     return 0;
 }
 
+// Add the freshly-forked shadow pages collected in ctx to an EXISTING shadow
+// CR3's g_shadow_allocs slot (so TdShadowVaFromPhys/TdResolveShadowPte can find
+// them, and they are freed when the CR3 is freed). Used by TdExtendShadowCR3.
+static BOOLEAN
+TdShadowExtendCr3Pages(UINT64 shadow_cr3_phys, TD_SHADOW_BUILD_CONTEXT * ctx)
+{
+    if (!shadow_cr3_phys || !ctx) return FALSE;
+    if (!ctx->page_count) return TRUE;   // nothing to add; CR3 already covers the range
+    KIRQL old_irql;
+    KeAcquireSpinLock(&g_shadow_alloc_lock, &old_irql);
+    BOOLEAN ok = FALSE;
+    for (UINT32 i = 0; i < MAX_SHADOW_CR3_ALLOCS; i++)
+    {
+        TD_SHADOW_CR3_ALLOCATION * e = &g_shadow_allocs[i];
+        if (e->active && e->shadow_cr3_phys == shadow_cr3_phys)
+        {
+            if ((UINT64)e->page_count + ctx->page_count > MAX_SHADOW_PAGES_PER_CR3)
+            {
+                HYPERPLATFORM_LOG_ERROR("[td-rw] extend FAIL: CR3 page cap overflow %u+%u > %u",
+                                        e->page_count, ctx->page_count, MAX_SHADOW_PAGES_PER_CR3);
+                break;
+            }
+            for (UINT32 j = 0; j < ctx->page_count; j++)
+                e->pages[e->page_count++] = ctx->pages[j];
+            ok = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_shadow_alloc_lock, old_irql);
+    return ok;
+}
+
+//
+// Extend an EXISTING shadow CR3 to cover an additional VA range [base_va, +size).
+// Walks the REAL page tables (cr3) for the CURRENT PDEs -- the shadow PD/PT pages
+// are snapshots from build time and may be stale (the range may have been allocated
+// AFTER the shadow CR3 was first built, so a shadow PD entry could be not-present).
+// At each level, if the shadow already has a forked page (TdShadowVaFromPhys finds
+// it) it is reused; otherwise the current real page is forked and the parent shadow
+// entry repointed. Clears NX on each PTE (matches TdBuildShadowCR3).
+// Must be called at PASSIVE_LEVEL while attached to the target process.
+// Returns shadow_cr3_phys on success, 0 on failure.
+//
+static UINT64
+TdExtendShadowCR3(UINT64 shadow_cr3_phys, UINT64 cr3, UINT64 base_va, SIZE_T size)
+{
+    TD_SHADOW_BUILD_CONTEXT ctx = {};
+    UINT64 va_start = base_va & ~0xFFFULL;
+    UINT64 va_end   = (base_va + size + 0xFFF) & ~0xFFFULL;
+    if (va_end <= va_start)
+        return 0;
+
+    PUINT64 shadow_pml4 = (PUINT64)TdShadowVaFromPhys(shadow_cr3_phys);
+    if (!shadow_pml4) return 0;
+
+    PUINT64 real_pml4 = TdMapPhys(cr3);
+    if (!real_pml4) goto Fail;
+
+    UINT32 pml4_idx = (UINT32)((va_start >> 39) & 0x1FF);
+    UINT64 pml4e_real = real_pml4[pml4_idx];
+    if (!(pml4e_real & 1)) goto Fail;
+
+    // PDPT: reuse if already forked, else fork from the CURRENT real PDPT.
+    PUINT64 shadow_pdpt = (PUINT64)TdShadowVaFromPhys(shadow_pml4[pml4_idx]);
+    if (!shadow_pdpt)
+    {
+        PUINT64 real_pdpt = TdMapPhys(pml4e_real);
+        if (!real_pdpt) goto Fail;
+        shadow_pdpt = (PUINT64)TdShadowAllocPage(&ctx);
+        if (!shadow_pdpt) goto Fail;
+        RtlCopyMemory(shadow_pdpt, real_pdpt, PAGE_SIZE);
+        shadow_pml4[pml4_idx] = (pml4e_real & ~PFN_MASK_) | MmGetPhysicalAddress(shadow_pdpt).QuadPart;
+    }
+
+    UINT32 last_pdpt_idx = 0xFFFFFFFF;
+    UINT32 last_pd_idx   = 0xFFFFFFFF;
+    PUINT64 shadow_pd = NULL;
+    PUINT64 shadow_pt = NULL;
+
+    for (UINT64 va = va_start; va < va_end; va += PAGE_SIZE)
+    {
+        UINT32 pdpt_idx = (UINT32)((va >> 30) & 0x1FF);
+        UINT32 pd_idx   = (UINT32)((va >> 21) & 0x1FF);
+
+        if (pdpt_idx != last_pdpt_idx)
+        {
+            // Read the CURRENT real PDPT (the shadow PDPT is a stale snapshot).
+            PUINT64 real_pdpt = TdMapPhys(pml4e_real);
+            if (!real_pdpt) goto Fail;
+            UINT64 pdpe_real = real_pdpt[pdpt_idx];
+            if (!(pdpe_real & 1) || (pdpe_real & (1ULL << 7))) goto Fail;  // 1GB large page
+            shadow_pd = (PUINT64)TdShadowVaFromPhys(shadow_pdpt[pdpt_idx]);
+            if (!shadow_pd)
+            {
+                PUINT64 real_pd = TdMapPhys(pdpe_real);
+                if (!real_pd) goto Fail;
+                shadow_pd = (PUINT64)TdShadowAllocPage(&ctx);
+                if (!shadow_pd) goto Fail;
+                RtlCopyMemory(shadow_pd, real_pd, PAGE_SIZE);
+                shadow_pdpt[pdpt_idx] = (pdpe_real & ~PFN_MASK_) | MmGetPhysicalAddress(shadow_pd).QuadPart;
+            }
+            last_pdpt_idx = pdpt_idx;
+            last_pd_idx = 0xFFFFFFFF;
+        }
+
+        if (pd_idx != last_pd_idx)
+        {
+            // Read the CURRENT real PD (shadow PD may be stale; the range may
+            // have been allocated after the shadow CR3 was first built).
+            PUINT64 real_pdpt = TdMapPhys(pml4e_real);
+            if (!real_pdpt) goto Fail;
+            UINT64 pdpe_real = real_pdpt[pdpt_idx];
+            PUINT64 real_pd = TdMapPhys(pdpe_real);
+            if (!real_pd) goto Fail;
+            UINT64 pde_real = real_pd[pd_idx];
+            if (!(pde_real & 1) || (pde_real & (1ULL << 7))) goto Fail;  // 2MB large page
+            shadow_pt = (PUINT64)TdShadowVaFromPhys(shadow_pd[pd_idx]);
+            if (!shadow_pt)
+            {
+                PUINT64 real_pt = TdMapPhys(pde_real);
+                if (!real_pt) goto Fail;
+                shadow_pt = (PUINT64)TdShadowAllocPage(&ctx);
+                if (!shadow_pt) goto Fail;
+                RtlCopyMemory(shadow_pt, real_pt, PAGE_SIZE);
+                shadow_pd[pd_idx] = (pde_real & ~PFN_MASK_) | MmGetPhysicalAddress(shadow_pt).QuadPart;
+            }
+            last_pd_idx = pd_idx;
+        }
+        // Clear NX on this PTE (matches TdBuildShadowCR3). need_execute allocs
+        // require the range executable in the shadow CR3; the HV's code-PTE
+        // refresh preserves the NX bit, so it must be cleared here. The protect
+        // handler's tracked block overwrites with new_protect afterwards, so
+        // this is a no-op for the protect path.
+        shadow_pt[(va >> 12) & 0x1FF] &= ~NX_BIT_;
+    }
+
+    if (!TdShadowExtendCr3Pages(shadow_cr3_phys, &ctx))
+        goto Fail;
+
+    HYPERPLATFORM_LOG_INFO("[td-rw] shadow CR3 extended: PA=0x%llX (VA=%p size=0x%llx, %u new pages)",
+               shadow_cr3_phys, (PVOID)base_va, (UINT64)size, ctx.page_count);
+    return shadow_cr3_phys;
+
+Fail:
+    HYPERPLATFORM_LOG_ERROR("[td-rw] TdExtendShadowCR3 FAIL (va=%p size=0x%llx shadow=0x%llX)",
+               (PVOID)base_va, (UINT64)size, shadow_cr3_phys);
+    TdShadowFreePageList(ctx.pages, ctx.page_count);
+    return 0;
+}
+
 //
 // walk guest page tables at PASSIVE/DISPATCH level (safe, no VMX-root).
 // returns FALSE if the VA is not mapped or uses large pages.
@@ -872,6 +1072,7 @@ static BOOLEAN TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shado
 static UINT64 TdStealthTrackRemove(UINT64 pid, PVOID va);
 static BOOLEAN TdStealthTrackFindOverlap(UINT64 pid, PVOID base_va, SIZE_T size, PVOID * out_base, SIZE_T * out_size, UINT64 * out_shadow_cr3);
 static BOOLEAN TdStealthTrackHasPartialOverlap(UINT64 pid, PVOID base_va, SIZE_T size);
+static UINT64 TdStealthFindShadowCr3ForPid(UINT64 pid);
 static BOOLEAN TdStealthFreePage(PVOID target_va);
 static BOOLEAN g_process_notify_registered = FALSE;
 static BOOLEAN g_process_notify_ex_registered = FALSE;
@@ -1245,6 +1446,7 @@ TdCloseCreatedThreadHandle(HANDLE thread_h, BOOLEAN thread_started)
 #define IOCTL_EPT_HOOK_R3 CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 3, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_EPT_UNHOOK_R3 CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 4, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_RESOLVE_EXPORT CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 12, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GET_MODULE_BASE CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 13, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #pragma pack(push, 8)
 typedef struct _TD_RESOLVE_EXPORT_PARAMS {
@@ -1253,6 +1455,14 @@ typedef struct _TD_RESOLVE_EXPORT_PARAMS {
     UINT64 sleepex_va;          // [out] kernel32!SleepEx VA in target process
     UINT64 status;              // [out] NTSTATUS
 } TD_RESOLVE_EXPORT_PARAMS;
+
+typedef struct _TD_GET_MODULE_BASE_PARAMS {
+    UINT64 target_pid;          // [in]  target process PID
+    char   module_name[256];    // [in]  module name (e.g. "user32.dll"), ASCII, null-terminated
+    UINT64 module_base;         // [out] base address of the module (0 = not found)
+    UINT64 module_size;         // [out] size of image in bytes
+    UINT64 status;              // [out] NTSTATUS
+} TD_GET_MODULE_BASE_PARAMS;
 
 typedef struct _TD_INJECT_PARAMS {
     UINT64 target_pid;
@@ -2973,8 +3183,11 @@ TdAsciiStartsWithI(const char * text, const char * prefix)
 // must be called while attached to the target process.
 //
 static PVOID
-TdFindModuleBaseA(const char * name_ascii)
+TdFindModuleBaseA(const char * name_ascii, ULONG * out_size)
 {
+    if (out_size)
+        *out_size = 0;
+
     PPEB peb = PsGetProcessPeb(PsGetCurrentProcess());
     if (!peb) return NULL;
 
@@ -2988,7 +3201,7 @@ TdFindModuleBaseA(const char * name_ascii)
     if (name_len >= 4)
     {
         const char * ext = name_ascii + name_len - 4;
-        if ((ext[0] == '.' || ext[0] == '.') &&
+        if ((ext[0] == '.') &&
             (ext[1] == 'd' || ext[1] == 'D') &&
             (ext[2] == 'l' || ext[2] == 'L') &&
             (ext[3] == 'l' || ext[3] == 'L'))
@@ -3072,7 +3285,11 @@ TdFindModuleBaseA(const char * name_ascii)
                 }
 
                 if (match && e->DllBase)
+                {
+                    if (out_size)
+                        *out_size = e->SizeOfImage;
                     return e->DllBase;
+                }
             }
             cur = cur->Flink;
         }
@@ -3169,12 +3386,12 @@ TdFindExportByNameEx(PVOID module_base, const char * func_name, ULONG depth)
                     if (!saw_dot || !saw_null || !dll_len || !export_len)
                         return NULL;
 
-                    PVOID forward_base = TdFindModuleBaseA(dll_name);
+                    PVOID forward_base = TdFindModuleBaseA(dll_name, NULL);
                     if (!forward_base &&
                         (TdAsciiStartsWithI(dll_name, "api-") ||
                          TdAsciiStartsWithI(dll_name, "ext-")))
                     {
-                        forward_base = TdFindModuleBaseA("kernelbase.dll");
+                        forward_base = TdFindModuleBaseA("kernelbase.dll", NULL);
                     }
                     if (!forward_base)
                         return NULL;
@@ -3250,9 +3467,9 @@ TdResolveUserSyscallIndex(const char * export_name, PULONG index_out)
     if (!export_name || !index_out)
         return FALSE;
 
-    PVOID ntdll_base = TdFindModuleBaseA("ntdll");
+    PVOID ntdll_base = TdFindModuleBaseA("ntdll", NULL);
     if (!ntdll_base)
-        ntdll_base = TdFindModuleBaseA("ntdll.dll");
+        ntdll_base = TdFindModuleBaseA("ntdll.dll", NULL);
     if (!ntdll_base)
         return FALSE;
 
@@ -3552,7 +3769,7 @@ TdPeResolveImports(PVOID mapped_base)
         while (imp->Name)
         {
             const char * dll_name = (const char *)((PUINT8)mapped_base + imp->Name);
-            PVOID mod_base = TdFindModuleBaseA(dll_name);
+            PVOID mod_base = TdFindModuleBaseA(dll_name, NULL);
 
             if (!mod_base)
             {
@@ -4805,7 +5022,9 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
         // build shadow CR3: copies page tables with NX=0 for shellcode page.
         // never modifies real PTEs 鈥?no conflict with MiAgeWorkingSet.
-        UINT64 shadow_cr3 = TdBuildShadowCR3(caller_cr3, (UINT64)alloc_base, alloc_size);
+        UINT64 existing = TdStealthFindShadowCr3ForPid(p->target_pid);
+        UINT64 shadow_cr3 = existing ? TdExtendShadowCR3(existing, caller_cr3, (UINT64)alloc_base, alloc_size)
+                                      : TdBuildShadowCR3(caller_cr3, (UINT64)alloc_base, alloc_size);
         if (!shadow_cr3)
         {
             HYPERPLATFORM_LOG_ERROR("[td-rw] shadow CR3 build failed");
@@ -4862,7 +5081,8 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             {
                 for (SIZE_T i = 0; i < pages_installed; i++)
                     TdStealthFreePage((PUINT8)alloc_base + (i * PAGE_SIZE));
-                TdShadowFreeCr3(shadow_cr3);
+                if (!existing)
+                    TdShadowFreeCr3(shadow_cr3);
                 ZwFreeVirtualMemory(ZwCurrentProcess(), &alloc_base, &alloc_size, MEM_RELEASE);
             }
             KeUnstackDetachProcess(&apc_state);
@@ -4894,7 +5114,8 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             HYPERPLATFORM_LOG_ERROR("[td-rw] stealth track table full");
             for (SIZE_T i = 0; i < pages_installed; i++)
                 TdStealthFreePage((PUINT8)alloc_base + (i * PAGE_SIZE));
-            TdShadowFreeCr3(shadow_cr3);
+            if (!existing)
+                TdShadowFreeCr3(shadow_cr3);
             ZwFreeVirtualMemory(ZwCurrentProcess(), &alloc_base, &alloc_size, MEM_RELEASE);
             KeUnstackDetachProcess(&apc_state);
             ObDereferenceObject(proc);
@@ -5321,10 +5542,15 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                        p->target_pid, alloc_base, (UINT64)alloc_size, need_execute, alloc_protect);
         }
 
+        UINT64 existing = 0;
         if (NT_SUCCESS(st) && need_execute)
         {
             UINT64 caller_cr3 = __readcr3();
-            shadow_cr3 = TdBuildShadowCR3(caller_cr3, (UINT64)alloc_base, alloc_size);
+            existing = TdStealthFindShadowCr3ForPid(p->target_pid);
+            if (existing)
+                shadow_cr3 = TdExtendShadowCR3(existing, caller_cr3, (UINT64)alloc_base, alloc_size);
+            else
+                shadow_cr3 = TdBuildShadowCR3(caller_cr3, (UINT64)alloc_base, alloc_size);
             if (!shadow_cr3)
             {
                 HYPERPLATFORM_LOG_ERROR("[td-alloc] shadow CR3 build failed VA=%p size=0x%llX",
@@ -5388,7 +5614,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         {
             for (SIZE_T i = 0; i < pages_installed; i++)
                 TdStealthFreePage((PUINT8)alloc_base + (i * PAGE_SIZE));
-            if (shadow_cr3)
+            if (shadow_cr3 && !existing)
                 TdShadowFreeCr3(shadow_cr3);
             ZwFreeVirtualMemory(ZwCurrentProcess(), &alloc_base, &alloc_size, MEM_RELEASE);
             alloc_base = NULL;
@@ -5478,8 +5704,11 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             for (UINT64 page = tracked_start; page < tracked_end; page += PAGE_SIZE)
                 TdStealthFreePage((PVOID)page);
 
-            TdStealthTrackRemove(p->target_pid, tracked_base);
-            TdShadowFreeCr3(shadow_cr3);
+            {
+                UINT64 to_free = TdStealthTrackRemove(p->target_pid, tracked_base);
+                if (to_free)
+                    TdShadowFreeCr3(to_free);
+            }
             freed_shadow_cr3 = shadow_cr3;
         }
 
@@ -5624,7 +5853,11 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 goto ShadowProtectExit;
             }
 
-            shadow_cr3 = TdBuildShadowCR3(caller_cr3, start, protect_size);
+            UINT64 existing = TdStealthFindShadowCr3ForPid(p->target_pid);
+            if (existing)
+                shadow_cr3 = TdExtendShadowCR3(existing, caller_cr3, start, protect_size);
+            else
+                shadow_cr3 = TdBuildShadowCR3(caller_cr3, start, protect_size);
             flush_shadow_cr3 = shadow_cr3;
             if (!shadow_cr3)
             {
@@ -5672,7 +5905,8 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             {
                 for (SIZE_T i = 0; i < pages_installed; i++)
                     TdStealthFreePage((PVOID)(start + (i * PAGE_SIZE)));
-                TdShadowFreeCr3(shadow_cr3);
+                if (!existing)
+                    TdShadowFreeCr3(shadow_cr3);
                 shadow_cr3 = 0;
                 goto ShadowProtectExit;
             }
@@ -5681,7 +5915,8 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             {
                 for (UINT64 page = start; page < end; page += PAGE_SIZE)
                     TdStealthFreePage((PVOID)page);
-                TdShadowFreeCr3(shadow_cr3);
+                if (!existing)
+                    TdShadowFreeCr3(shadow_cr3);
                 shadow_cr3 = 0;
                 st = STATUS_INSUFFICIENT_RESOURCES;
                 goto ShadowProtectExit;
@@ -5715,10 +5950,19 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 else
                     *shadow_pte = wanted;
 
+                // Data pages (non-executable): also write the REAL PTE. renderdoc
+                // often runs the write instruction on the REAL CR3 (its instruction
+                // fetch is cached from a prior shadow-CR3 window -> no fetch #PF ->
+                // no shadow swap), so the write lands on the REAL PTE. Without this
+                // the IAT write AVs on real RO despite the shadow PTE being W=1.
+                // Code pages (PAGE_EXECUTE_*) keep the real PTE (NX) for stealth.
+                if (new_protect == PAGE_READWRITE || new_protect == PAGE_READONLY)
+                    *real_pte = wanted;
+
                 if (page == start)
                 {
-                    HYPERPLATFORM_LOG_INFO("[td-protect] applied: pid=%llu va=%p real=0x%llX shadow=0x%llX new=0x%X",
-                        p->target_pid, (PVOID)page, *real_pte, *shadow_pte, new_protect);
+                    HYPERPLATFORM_LOG_INFO("[td-protect] applied: pid=%llu va=%p real=0x%llX shadow=0x%llX new=0x%X spte=%p",
+                        p->target_pid, (PVOID)page, *real_pte, *shadow_pte, new_protect, shadow_pte);
                 }
             }
 
@@ -5755,8 +5999,13 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                      page += PAGE_SIZE)
                     TdStealthFreePage((PVOID)page);
 
-                TdStealthTrackRemove(p->target_pid, tracked_base);
-                TdShadowFreeCr3(shadow_cr3);
+                {
+                    // Refcount-aware: free the shared CR3 only if this was the
+                    // last tracked range for the process.
+                    UINT64 to_free = TdStealthTrackRemove(p->target_pid, tracked_base);
+                    if (to_free)
+                        TdShadowFreeCr3(to_free);
+                }
                 shadow_cr3 = 0;
                 flush_shadow_cr3 = 0;
             }
@@ -5815,8 +6064,8 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         PVOID kernel32_base = NULL;
 
         __try {
-            user32_base = TdFindModuleBaseA("user32.dll");
-            kernel32_base = TdFindModuleBaseA("kernel32.dll");
+            user32_base = TdFindModuleBaseA("user32.dll", NULL);
+            kernel32_base = TdFindModuleBaseA("kernel32.dll", NULL);
 
             if (user32_base)
                 pMsgBox = (UINT64)TdFindExportByName(user32_base, "MessageBoxA");
@@ -5911,6 +6160,67 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         break;
     }
 
+    case IOCTL_GET_MODULE_BASE:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_GET_MODULE_BASE_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_GET_MODULE_BASE_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_GET_MODULE_BASE_PARAMS * p = (TD_GET_MODULE_BASE_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+        p->module_base = 0;
+        p->module_size = 0;
+
+        // ensure null-termination
+        p->module_name[sizeof(p->module_name) - 1] = '\0';
+
+        if (!p->target_pid || !p->module_name[0])
+        {
+            st = STATUS_INVALID_PARAMETER;
+            p->status = (UINT64)(ULONG)st;
+            irp->IoStatus.Information = sizeof(TD_GET_MODULE_BASE_PARAMS);
+            break;
+        }
+
+        PEPROCESS proc = NULL;
+        st = PsLookupProcessByProcessId((HANDLE)p->target_pid, &proc);
+        if (!NT_SUCCESS(st))
+        {
+            p->status = (UINT64)(ULONG)st;
+            irp->IoStatus.Information = sizeof(TD_GET_MODULE_BASE_PARAMS);
+            break;
+        }
+
+        KAPC_STATE apc_state;
+        KeStackAttachProcess(proc, &apc_state);
+
+        __try {
+            ULONG img_size = 0;
+            PVOID base = TdFindModuleBaseA(p->module_name, &img_size);
+            if (base)
+            {
+                p->module_base = (UINT64)base;
+                p->module_size = img_size;
+            }
+            else
+            {
+                st = STATUS_NOT_FOUND;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            HYPERPLATFORM_LOG_ERROR("[td] get module base: exception walking PEB");
+            st = STATUS_UNSUCCESSFUL;
+        }
+
+        p->status = (UINT64)(ULONG)st;
+        irp->IoStatus.Information = sizeof(TD_GET_MODULE_BASE_PARAMS);
+
+        HYPERPLATFORM_LOG_INFO("[td] get module base: pid=%llu name=%s base=0x%llX size=0x%llX",
+                   p->target_pid, p->module_name, p->module_base, p->module_size);
+
+        KeUnstackDetachProcess(&apc_state);
+        ObDereferenceObject(proc);
+        break;
+    }
+
     default:
         st = STATUS_INVALID_DEVICE_REQUEST;
         break;
@@ -5974,6 +6284,12 @@ TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3)
         }
     }
 
+    // AddRef the shared CR3 while still holding the track lock (matches Remove's
+    // Release-under-lock) so a concurrent Remove on another range cannot drop the
+    // refcount to 0 and free the CR3 before this range's ref is recorded.
+    if (added)
+        TdShadowCr3AddRef(shadow_cr3);
+
     KeReleaseSpinLock(&g_stealth_track_lock, old_irql);
     return added;
 }
@@ -5982,6 +6298,7 @@ static UINT64
 TdStealthTrackRemove(UINT64 pid, PVOID va)
 {
     UINT64 shadow_cr3 = 0;
+    UINT64 to_free = 0;
     KIRQL old_irql;
     KeAcquireSpinLock(&g_stealth_track_lock, &old_irql);
 
@@ -5997,6 +6314,35 @@ TdStealthTrackRemove(UINT64 pid, PVOID va)
         }
     }
 
+    // Release the shared CR3's refcount under the track lock. If this was the
+    // last range, to_free is set and the caller frees via TdShadowFreeCr3
+    // OUTSIDE the lock (it does PASSIVE page/MDL freeing).
+    if (shadow_cr3)
+        TdShadowCr3Release(shadow_cr3, &to_free);
+
+    KeReleaseSpinLock(&g_stealth_track_lock, old_irql);
+    return to_free;
+}
+
+// Find the (shared) shadow CR3 for a process, if any range is already tracked.
+// All ranges of a process share one shadow CR3 (multi-range per process).
+// NOTE: returns the cr3 without AddRef'ing; callers must not race a concurrent
+// remove on the same pid (renderdoc's protect/restore is single-threaded per
+// process). Hardening for concurrent multi-threaded range ops is a follow-up.
+static UINT64
+TdStealthFindShadowCr3ForPid(UINT64 pid)
+{
+    UINT64 shadow_cr3 = 0;
+    KIRQL old_irql;
+    KeAcquireSpinLock(&g_stealth_track_lock, &old_irql);
+    for (int i = 0; i < MAX_STEALTH_TRACKS; i++)
+    {
+        if (g_stealth_tracks[i].active && g_stealth_tracks[i].target_pid == pid)
+        {
+            shadow_cr3 = g_stealth_tracks[i].shadow_cr3_phys;
+            break;
+        }
+    }
     KeReleaseSpinLock(&g_stealth_track_lock, old_irql);
     return shadow_cr3;
 }
@@ -6107,7 +6453,6 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
     {
         PVOID va = NULL;
         SIZE_T sz = 0;
-        UINT64 shadow_cr3 = 0;
 
         KIRQL old_irql;
         KeAcquireSpinLock(&g_stealth_track_lock, &old_irql);
@@ -6115,9 +6460,7 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
         if (g_stealth_tracks[i].active && g_stealth_tracks[i].target_pid == pid)
         {
             va = g_stealth_tracks[i].target_va;
-            sz = g_stealth_tracks[i].alloc_size;
-            shadow_cr3 = g_stealth_tracks[i].shadow_cr3_phys;
-            RtlZeroMemory(&g_stealth_tracks[i], sizeof(g_stealth_tracks[i]));
+            sz  = g_stealth_tracks[i].alloc_size;
         }
 
         KeReleaseSpinLock(&g_stealth_track_lock, old_irql);
@@ -6128,6 +6471,11 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
         HYPERPLATFORM_LOG_INFO("[td-rw] process exit cleanup: pid=%llu va=%p size=0x%llX",
                    pid, va, (UINT64)sz);
 
+        // Remove the tracked range. TdStealthTrackRemove decrements the shared
+        // CR3's refcount and returns the CR3 only if this was the last range for
+        // the process, so the shared shadow CR3 is freed once per process.
+        UINT64 to_free = TdStealthTrackRemove(pid, va);
+
         // attach to the exiting process to free stealth pages
         KAPC_STATE apc;
         KeStackAttachProcess(Process, &apc);
@@ -6137,8 +6485,8 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
         for (UINT64 page = base; page < end; page += PAGE_SIZE)
             TdStealthFreePage((PVOID)page);
 
-        if (shadow_cr3)
-            TdShadowFreeCr3(shadow_cr3);
+        if (to_free)
+            TdShadowFreeCr3(to_free);
 
         KeUnstackDetachProcess(&apc);
 

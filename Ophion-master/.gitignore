@@ -370,3 +370,12 @@ FodyWeavers.xsdhv.rar
 /article_forum.txt
 /logo.png
 /README.md
+
+# Independent git repos (sibling directories) - not part of this project
+/Box/
+/MemoryModulePP-master/
+/renderdoc-1.36/
+/Injector/
+/Output/
+/ophion_diff.txt
+/renderdoc_diff.txt

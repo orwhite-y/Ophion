@@ -32,6 +32,7 @@
 #define IOCTL_FREE_SHADOW_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 10, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_SHADOW_PROTECT_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 11, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_RESOLVE_EXPORT CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 12, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GET_MODULE_BASE CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 13, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // ---- shared structs (must match TestDriver) ----
 
@@ -42,6 +43,14 @@ typedef struct _TD_RESOLVE_EXPORT_PARAMS {
     UINT64 sleepex_va;          // [out] kernel32!SleepEx VA in target process
     UINT64 status;              // [out] NTSTATUS
 } TD_RESOLVE_EXPORT_PARAMS;
+
+typedef struct _TD_GET_MODULE_BASE_PARAMS {
+    UINT64 target_pid;          // [in]  target process PID
+    char   module_name[256];    // [in]  module name (e.g. "user32.dll"), ASCII, null-terminated
+    UINT64 module_base;         // [out] base address of the module (0 = not found)
+    UINT64 module_size;         // [out] size of image in bytes
+    UINT64 status;              // [out] NTSTATUS
+} TD_GET_MODULE_BASE_PARAMS;
 
 typedef struct _TD_INJECT_PARAMS {
     UINT64 target_pid;

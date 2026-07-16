@@ -226,6 +226,26 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
                     efi->expected_tid = req->expected_tid;
                     efi->hook_type = req->hook_type;
                     efi->external_fired = req->external_fired;
+
+                    // R3 hook: 更新 trampoline 地址给新进程
+                    if (is_r3 && req->user_trampoline && req->origin_function)
+                    {
+                        SIZE_T min_sz = (req->hook_type == 1) ? 3 : (req->hook_type == 2) ? 1 : 14;
+                        SIZE_T ow = 0;
+                        while (ow < min_sz) ow += LDE((PUINT8)req->target_function + ow, 64);
+                        RtlCopyMemory((PUINT8)req->user_trampoline, req->target_function, ow);
+                        hook_write_absolute_jump((PUINT8)req->user_trampoline + ow,
+                                                 (UINT64)req->target_function + ow);
+                        efi->first_trampoline_address = (PUINT8)req->user_trampoline;
+                        efi->hook_size = ow;
+                        efi->user_trampoline = TRUE;
+                        *req->origin_function = efi->first_trampoline_address;
+                    }
+                    else if (req->origin_function)
+                    {
+                        *req->origin_function = efi->first_trampoline_address;
+                    }
+
                     func_exists = TRUE;
                     break;
                 }
@@ -234,8 +254,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
 
             if (func_exists)
             {
-                // 这个函数已经 hook 了 (其他 CPU 的重复调用)
-                // 只做 split + PTE + invept
+                // 重新设置 EPT: target page X=0 (触发 EPT violation 走 VMCALL handler)
                 PEPT_PML2_ENTRY p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)phys_addr);
                 if (p2 && p2->LargePage)
                     ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)phys_addr);
@@ -247,6 +266,21 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
                     p1->ReadAccess    = 1;
                     p1->WriteAccess   = 1;
                 }
+
+                // fake page 的 EPT 重新设为 X-only (R=0, W=0, X=1)
+                // 确保 EPT violation 在第二次 hook 后能再次触发
+                {
+                    SIZE_T fake_phys = (SIZE_T)(existing->pfn_of_fake_page_contents << 12);
+                    PEPT_PML2_ENTRY fp2 = ept_get_pml2(vcpu->ept_page_table, fake_phys);
+                    if (fp2 && fp2->LargePage)
+                        ept_split_large_page_pool(vcpu->ept_page_table, fake_phys);
+                    PEPT_PML1_ENTRY fp1 = ept_get_pml1(vcpu->ept_page_table, fake_phys);
+                    if (fp1) { fp1->ReadAccess = 0; fp1->WriteAccess = 0; fp1->ExecuteAccess = 1; }
+                }
+
+                // 更新 target_cr3 以匹配新的目标进程
+                existing->target_cr3 = req->target_cr3 & CR3_ADDR_MASK;
+
                 _mm_mfence();
                 ept_invept_single(vcpu->ept_pointer);
                 HOOK_RESTORE_CR3_AND_RETURN(TRUE);

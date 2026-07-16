@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__ida__ida_get_function_decompiled_by_name",
+      "mcp__ida__ida_get_function_decompiled_by_address",
+      "mcp__ida__ida_get_function_assembly_by_name",
+      "mcp__ida__ida_get_function_assembly_by_address",
+      "mcp__ida__ida_get_current_function_decompiled",
+      "mcp__ida__ida_get_current_function_assembly",
+      "mcp__ida__ida_get_global_variable_by_name",
+      "mcp__ida__ida_get_global_variable_by_address",
+      "mcp__ida__ida_execute_script",
+      "mcp__ida__ida_execute_script_from_file"
+    ]
+  }
+}

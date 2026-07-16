@@ -4063,6 +4063,11 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
     PIO_STACK_LOCATION io = IoGetCurrentIrpStackLocation(irp);
     irp->IoStatus.Information = 0;
 
+    HYPERPLATFORM_LOG_INFO("[td-ioctl] enter: code=0x%08X in=%u out=%u",
+        io->Parameters.DeviceIoControl.IoControlCode,
+        io->Parameters.DeviceIoControl.InputBufferLength,
+        io->Parameters.DeviceIoControl.OutputBufferLength);
+
     switch (io->Parameters.DeviceIoControl.IoControlCode)
     {
     case IOCTL_INJECT:
@@ -5473,6 +5478,9 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         TD_ALLOC_SHADOW_MEMORY_PARAMS * p =
             (TD_ALLOC_SHADOW_MEMORY_PARAMS *)irp->AssociatedIrp.SystemBuffer;
 
+        HYPERPLATFORM_LOG_INFO("[td-alloc] ENTER: pid=%llu size=%llu exec=%u prot=0x%llX",
+            p->target_pid, p->size, p->need_execute, p->alloc_protect);
+
         p->base_va = 0;
         p->shadow_cr3 = 0;
 
@@ -5741,10 +5749,15 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
     {
         if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_SHADOW_PROTECT_PARAMS) ||
             io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_SHADOW_PROTECT_PARAMS))
-        { st = STATUS_BUFFER_TOO_SMALL; break; }
+        { st = STATUS_BUFFER_TOO_SMALL; HYPERPLATFORM_LOG_ERROR("[td-protect] EXIT: buffer too small in=%u out=%u",
+            io->Parameters.DeviceIoControl.InputBufferLength,
+            io->Parameters.DeviceIoControl.OutputBufferLength); break; }
 
         TD_SHADOW_PROTECT_PARAMS * p =
             (TD_SHADOW_PROTECT_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+
+        HYPERPLATFORM_LOG_INFO("[td-protect] ENTER: pid=%llu base=0x%llX size=%llu newProt=0x%llX",
+            p->target_pid, p->base_va, p->size, p->new_protect);
 
         if (!p->target_pid || !p->base_va || !p->size)
         {
@@ -5819,12 +5832,56 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             TdResolveGuestPte(caller_cr3, start);
         if (!old_view_pte || !(*old_view_pte & 1))
         {
-            HYPERPLATFORM_LOG_ERROR("[td-protect] old view PTE not found: pid=%llu va=%p tracked=%u cr3=0x%llX shadow=0x%llX pte=%p",
-                p->target_pid, (PVOID)start, tracked, caller_cr3, shadow_cr3, old_view_pte);
-            st = STATUS_NOT_FOUND;
-            goto ShadowProtectExit;
+            // Shadow PTE not present — the real PTE may have been lazy-allocated
+            // after TdExtendShadowCR3 copied it.  Re-sync from the real PTE.
+            if (tracked && old_view_pte)
+            {
+                PUINT64 real_pte = TdResolveGuestPte(caller_cr3, start);
+                if (real_pte && (*real_pte & 1))
+                {
+                    *old_view_pte = *real_pte;
+                    HYPERPLATFORM_LOG_INFO("[td-protect] re-synced shadow PTE from real: pid=%llu va=%p real=0x%llX shadow_pte=%p",
+                        p->target_pid, (PVOID)start, *real_pte, old_view_pte);
+                    p->old_protect = TdProtectFromPte(*old_view_pte);
+                }
+                else
+                {
+                    HYPERPLATFORM_LOG_ERROR("[td-protect] re-sync FAILED: pid=%llu va=%p tracked=%u cr3=0x%llX shadow=0x%llX real_pte=%p",
+                        p->target_pid, (PVOID)start, tracked, caller_cr3, shadow_cr3, real_pte);
+                    st = STATUS_NOT_FOUND;
+                    goto ShadowProtectExit;
+                }
+            }
+            else
+            {
+                HYPERPLATFORM_LOG_ERROR("[td-protect] old view PTE not found: pid=%llu va=%p tracked=%u cr3=0x%llX shadow=0x%llX pte=%p",
+                    p->target_pid, (PVOID)start, tracked, caller_cr3, shadow_cr3, old_view_pte);
+                if (old_view_pte)
+                    HYPERPLATFORM_LOG_ERROR("[td-protect] old view PTE present but !Present bit: *pte=0x%llX", *old_view_pte);
+                else
+                {
+                    if (tracked)
+                    {
+                        HYPERPLATFORM_LOG_ERROR("[td-protect] tracked=true but TdResolveShadowPte returned NULL: shadow_cr3=0x%llX start=%p",
+                            shadow_cr3, (PVOID)start);
+                        UINT64 cr3_va = (UINT64)(ULONG_PTR)TdShadowVaFromPhys(shadow_cr3);
+                        HYPERPLATFORM_LOG_ERROR("[td-protect] shadow_cr3_phys=0x%llX -> kernelVA=%p", shadow_cr3, (PVOID)cr3_va);
+                        if (cr3_va)
+                        {
+                            UINT64 pml4e = *(PUINT64)cr3_va;
+                            HYPERPLATFORM_LOG_ERROR("[td-protect] shadow PML4E[0]=0x%llX", pml4e);
+                        }
+                    }
+                    else
+                    {
+                        HYPERPLATFORM_LOG_ERROR("[td-protect] tracked=false but TdResolveGuestPte returned NULL: caller_cr3=0x%llX start=%p",
+                            caller_cr3, (PVOID)start);
+                    }
+                }
+                st = STATUS_NOT_FOUND;
+                goto ShadowProtectExit;
+            }
         }
-        p->old_protect = TdProtectFromPte(*old_view_pte);
 
         BOOLEAN all_same_as_real = TRUE;
         for (UINT64 page = start; page < end; page += PAGE_SIZE)
@@ -5934,13 +5991,29 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             {
                 PUINT64 real_pte = TdResolveGuestPte(caller_cr3, page);
                 PUINT64 shadow_pte = TdResolveShadowPte(shadow_cr3, page);
-                if (!real_pte || !shadow_pte || !(*real_pte & 1) || !(*shadow_pte & 1))
+                if (!real_pte || !(*real_pte & 1))
                 {
-                    HYPERPLATFORM_LOG_ERROR("[td-protect] tracked PTE not found while applying: pid=%llu va=%p real=%p shadow=%p realv=0x%llX shadowv=0x%llX",
-                        p->target_pid, (PVOID)page, real_pte, shadow_pte,
-                        real_pte ? *real_pte : 0, shadow_pte ? *shadow_pte : 0);
+                    HYPERPLATFORM_LOG_ERROR("[td-protect] real PTE gone while applying: pid=%llu va=%p real=%p realv=0x%llX",
+                        p->target_pid, (PVOID)page, real_pte, real_pte ? *real_pte : 0);
                     st = STATUS_NOT_FOUND;
                     goto ShadowProtectExit;
+                }
+                // Re-sync shadow PTE on the fly if it's not present (lazy PTE).
+                if (!shadow_pte || !(*shadow_pte & 1))
+                {
+                    if (shadow_pte)
+                    {
+                        *shadow_pte = *real_pte;
+                        HYPERPLATFORM_LOG_INFO("[td-protect] re-synced shadow PTE on-the-fly: pid=%llu va=%p real=0x%llX",
+                            p->target_pid, (PVOID)page, *real_pte);
+                    }
+                    else
+                    {
+                        HYPERPLATFORM_LOG_ERROR("[td-protect] shadow PTE NULL while applying: pid=%llu va=%p shadow_cr3=0x%llX",
+                            p->target_pid, (PVOID)page, shadow_cr3);
+                        st = STATUS_NOT_FOUND;
+                        goto ShadowProtectExit;
+                    }
                 }
 
                 UINT64 wanted = *real_pte;
@@ -5974,13 +6047,28 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 {
                     PUINT64 real_pte = TdResolveGuestPte(caller_cr3, page);
                     PUINT64 shadow_pte = TdResolveShadowPte(shadow_cr3, page);
-                    if (!real_pte || !shadow_pte || !(*real_pte & 1) || !(*shadow_pte & 1))
+                    if (!real_pte || !(*real_pte & 1))
                     {
-                        HYPERPLATFORM_LOG_ERROR("[td-protect] tracked PTE not found while checking diff: pid=%llu va=%p real=%p shadow=%p realv=0x%llX shadowv=0x%llX",
-                            p->target_pid, (PVOID)page, real_pte, shadow_pte,
-                            real_pte ? *real_pte : 0, shadow_pte ? *shadow_pte : 0);
+                        HYPERPLATFORM_LOG_ERROR("[td-protect] real PTE gone while checking diff: pid=%llu va=%p real=%p realv=0x%llX",
+                            p->target_pid, (PVOID)page, real_pte, real_pte ? *real_pte : 0);
                         st = STATUS_NOT_FOUND;
                         goto ShadowProtectExit;
+                    }
+                    if (!shadow_pte || !(*shadow_pte & 1))
+                    {
+                        if (shadow_pte)
+                        {
+                            *shadow_pte = *real_pte;
+                            HYPERPLATFORM_LOG_INFO("[td-protect] re-synced shadow PTE in diff: pid=%llu va=%p real=0x%llX",
+                                p->target_pid, (PVOID)page, *real_pte);
+                        }
+                        else
+                        {
+                            HYPERPLATFORM_LOG_ERROR("[td-protect] shadow PTE NULL while checking diff: pid=%llu va=%p shadow_cr3=0x%llX",
+                                p->target_pid, (PVOID)page, shadow_cr3);
+                            st = STATUS_NOT_FOUND;
+                            goto ShadowProtectExit;
+                        }
                     }
 
                     if (TdProtectFromPte(*shadow_pte) != TdProtectFromPte(*real_pte))
@@ -6223,8 +6311,13 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
     default:
         st = STATUS_INVALID_DEVICE_REQUEST;
+        HYPERPLATFORM_LOG_ERROR("[td-ioctl] unhandled IOCTL code=0x%08X", io->Parameters.DeviceIoControl.IoControlCode);
         break;
     }
+
+    HYPERPLATFORM_LOG_INFO("[td-ioctl] exit: code=0x%08X st=0x%08lX info=%llu",
+        io->Parameters.DeviceIoControl.IoControlCode,
+        (ULONG)st, (ULONGLONG)irp->IoStatus.Information);
 
     irp->IoStatus.Status = st;
     IoCompleteRequest(irp, IO_NO_INCREMENT);
@@ -6449,6 +6542,40 @@ TdStealthFreePage(PVOID target_va)
 static VOID
 TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
 {
+    //
+    // 1. clean up R3 EPT hooks for this process (unlock MDL pages, free trampoline)
+    //
+    for (int i = 0; i < MAX_R3_HOOKS; i++)
+    {
+        if (!g_r3_hooks[i].active || g_r3_hooks[i].target_pid != pid)
+            continue;
+
+        HYPERPLATFORM_LOG_INFO("[td-rw] process exit cleanup R3 hook: pid=%llu target=%p",
+                   pid, g_r3_hooks[i].target_va);
+
+        // for real R3 hooks (target_mdl != NULL): unlock + free
+        if (g_r3_hooks[i].target_mdl != NULL)
+        {
+            MmUnlockPages(g_r3_hooks[i].target_mdl);
+            IoFreeMdl(g_r3_hooks[i].target_mdl);
+        }
+
+        // free trampoline in target process
+        if (g_r3_hooks[i].trampoline_va != NULL && g_r3_hooks[i].trampoline_size > 0)
+        {
+            KAPC_STATE apc;
+            KeStackAttachProcess(Process, &apc);
+            ZwFreeVirtualMemory(ZwCurrentProcess(),
+                &g_r3_hooks[i].trampoline_va, &g_r3_hooks[i].trampoline_size, MEM_RELEASE);
+            KeUnstackDetachProcess(&apc);
+        }
+
+        RtlZeroMemory(&g_r3_hooks[i], sizeof(g_r3_hooks[i]));
+    }
+
+    //
+    // 2. clean up stealth tracks (shadow memory)
+    //
     for (int i = 0; i < MAX_STEALTH_TRACKS; i++)
     {
         PVOID va = NULL;

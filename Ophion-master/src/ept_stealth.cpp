@@ -55,6 +55,40 @@ volatile LONG g_dbg_a2_data_synced_logged = 0;    // verbose-log cap counter for
 volatile LONG g_dbg_a2_ptpage_synced = 0;         // NX-open: code-2MB shadow PT page refreshed (>=1 stale PTE synced)
 volatile LONG g_dbg_a2_ptpage_synced_logged = 0;  // verbose-log cap counter for PT-page syncs (diagnostic only)
 volatile LONG g_dbg_a2_stale_p1_logged = 0;       // verbose-log cap counter for silent P=1/wrong-PFN staleness (the crash cause)
+volatile LONG g_dbg_a2_stale_p1_total = 0;         // A2: total silent P=1/wrong-PFN staleness detected (UNBOUNDED; overlay-killer / crash class)
+volatile LONG g_dbg_a2_dump_tick = 0;              // A2: periodic counter-dump tick (diagnostic)
+volatile LONG g_dbg_a2_already_on_shadow = 0;      // A2: mid-window NX-fetch #PF hitting the already_on_shadow branch (stale-gap suspect)
+
+//
+// DIAG: capture the first distinct renderdoc code RIPs that open an NX-fetch
+// shadow window. Correlate against renderdoc.pdb (RIP - renderdoc_base, where
+// renderdoc_base comes from T.log "shadow CR3 extended VA=...") to see WHICH
+// renderdoc code actually runs: overlay/Present draw (per-frame) vs one-time
+// init. Bounded, lock-free, best-effort -- a duplicate race only double-logs.
+//
+#define DBG_RIP_SLOTS 96
+static volatile UINT64 g_dbg_rip_slots[DBG_RIP_SLOTS];
+
+static void
+dbg_log_distinct_rip(UINT64 rip)
+{
+    if (!rip) return;
+    for (UINT32 i = 0; i < DBG_RIP_SLOTS; i++)
+    {
+        if (g_dbg_rip_slots[i] == rip)
+            return;                                 // already captured
+    }
+    for (UINT32 i = 0; i < DBG_RIP_SLOTS; i++)
+    {
+        if (g_dbg_rip_slots[i] == 0)
+        {
+            g_dbg_rip_slots[i] = rip;               // x64: aligned 64-bit store is atomic
+            HYPERPLATFORM_LOG_WARN_SAFE("[stealth-diag] code-rip#%u rip=%llx", i, rip);
+            return;
+        }
+    }
+    // table full -- hottest paths already logged
+}
 
 VOID
 ept_update_pf_intercept(VIRTUAL_MACHINE_STATE * vcpu)
@@ -866,6 +900,31 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
 
     _InterlockedIncrement(&g_dbg_a2_code_enter);
 
+    //
+    // DIAG: periodic counter dump + distinct renderdoc code-RIP capture.
+    //   code_enter rate  -> is renderdoc code running per-frame? (swapchain wrapped => overlay draw attempted)
+    //   stale_p1_total   -> silent wrong-PFN corruption active? (overlay-killer / crash class)
+    //   spurious         -> spurious abort+reinject? (crash class)
+    //   distinct RIPs    -> which renderdoc functions execute (overlay/Present vs init)
+    // The dump fires every 65536 code-enters. If it never fires, code_enter is
+    // barely growing = renderdoc code is NOT running per-frame = swapchain not
+    // wrapped (the no-overlay cause would be the hook, not the overlay draw).
+    //
+    if ((_InterlockedIncrement(&g_dbg_a2_dump_tick) & 65535) == 0)
+    {
+        HYPERPLATFORM_LOG_WARN_SAFE(
+            "[stealth-diag] DUMP code_enter=%llu code_synced=%llu ptpage_synced=%llu "
+            "stale_p1=%llu data_synced=%llu abort=%llu spurious=%llu nomatch=%llu "
+            "pf_seen=%llu pf_switched=%llu a2shadow=%llu",
+            (UINT64)g_dbg_a2_code_enter, (UINT64)g_dbg_a2_code_synced,
+            (UINT64)g_dbg_a2_ptpage_synced, (UINT64)g_dbg_a2_stale_p1_total,
+            (UINT64)g_dbg_a2_data_synced, (UINT64)g_dbg_a2_abort,
+            (UINT64)g_dbg_a2_spurious, (UINT64)g_dbg_nomatch,
+            (UINT64)g_dbg_shadow_pf_seen, (UINT64)g_dbg_shadow_pf_switched,
+            (UINT64)g_dbg_a2_already_on_shadow);
+    }
+    dbg_log_distinct_rip(vcpu->vmexit_rip);
+
     // Same CR3 discipline as stealth_sync_data_pte_in_window: switch to
     // sp->guest_cr3 (the guest KERNEL CR3), under which the shadow pages
     // (NonPaged pool, system PTE) are dereferenceable AND pa_to_va resolves the
@@ -1035,6 +1094,7 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
                 if ((s & 1) && (r & 1) && ((s & PFN_MASK) != (r & PFN_MASK)))
                 {
                     stale_p1++;
+                    _InterlockedIncrement(&g_dbg_a2_stale_p1_total);
                     if (_InterlockedIncrement(&g_dbg_a2_stale_p1_logged) <= 64)
                     {
                         UINT64 va_i = (fault_addr & ~0x1FFFFFULL) | ((UINT64)i << 12);
@@ -1626,8 +1686,23 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             // code page. Skipped on already-on-shadow (mid-window re-fetch): the
             // real CR3 is nx_timer_real_cr3 there, not current_cr3, and the first
             // NX-open already refreshed it.
-            if (!already_on_shadow)
+            if (already_on_shadow)
+            {
+                // Mid-window NX-fetch #PF (the shadow window stayed open >1 insn,
+                // e.g. an interrupt was delivered during the one-instruction window
+                // and the next renderdoc insn faulted on a DIFFERENT page). The
+                // first NX-open refreshed only the ORIGINAL faulting page -- this
+                // one's shadow PTE may still be stale -> wrong bytes -> AV. Re-sync
+                // it. current_cr3 is the shadow CR3 here (walking it would read
+                // back the stale shadow PTE), so walk the real CR3 saved at open.
+                _InterlockedIncrement(&g_dbg_a2_already_on_shadow);
+                if (vcpu->nx_timer_real_cr3)
+                    stealth_refresh_shadow_code_pte(vcpu, sp, fault_addr, vcpu->nx_timer_real_cr3);
+            }
+            else
+            {
                 stealth_refresh_shadow_code_pte(vcpu, sp, fault_addr, current_cr3);
+            }
 
             if (!already_on_shadow)
                 vcpu->nx_timer_real_cr3 = current_cr3;

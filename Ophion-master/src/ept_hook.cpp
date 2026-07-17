@@ -45,6 +45,63 @@ hook_lock_acquire(VOID)
     }
 }
 
+//
+// DIAG: track which EPT-hooked R3 functions (VMCALL type-1) actually fire a
+// redirect to the renderdoc proxy, and how often. Answers:
+//   - do CreateDXGIFactory1 / D3D12CreateDevice fire at init?  => creation hooked, factory+device wrapped
+//   - does any hooked export fire per-frame?                   => wrapper still active
+// Correlate va/proxy against T.log "[td-r3] target=... proxy=..." install lines.
+// Bounded, lock-free, best-effort (diagnostic only).
+//
+#define HOOK_FIRE_SLOTS 32
+static volatile UINT64 g_hook_fire_va[HOOK_FIRE_SLOTS];
+static volatile UINT64 g_hook_fire_proxy[HOOK_FIRE_SLOTS];
+static volatile LONG   g_hook_fire_count[HOOK_FIRE_SLOTS];
+static volatile LONG   g_hook_fire_total = 0;
+
+static void
+ept_hook_fire_record(UINT64 va, UINT64 proxy)
+{
+    if (!va) return;
+
+    BOOLEAN found = FALSE;
+    for (UINT32 i = 0; i < HOOK_FIRE_SLOTS; i++)
+    {
+        if (g_hook_fire_va[i] == va)
+        {
+            _InterlockedIncrement(&g_hook_fire_count[i]);
+            found = TRUE;
+            break;
+        }
+    }
+
+    if (!found)
+    {
+        for (UINT32 i = 0; i < HOOK_FIRE_SLOTS; i++)
+        {
+            if (g_hook_fire_va[i] == 0)
+            {
+                g_hook_fire_va[i] = va;                 // x64: aligned 64-bit store is atomic
+                g_hook_fire_proxy[i] = proxy;
+                _InterlockedExchange(&g_hook_fire_count[i], 1);
+                HYPERPLATFORM_LOG_WARN_SAFE("[hook-fire] FIRST va=%llx proxy=%llx", va, proxy);
+                found = TRUE;
+                break;
+            }
+        }
+    }
+
+    if ((_InterlockedIncrement(&g_hook_fire_total) & 4095) == 0)
+    {
+        for (UINT32 i = 0; i < HOOK_FIRE_SLOTS; i++)
+        {
+            if (g_hook_fire_va[i])
+                HYPERPLATFORM_LOG_WARN_SAFE("[hook-fire] va=%llx proxy=%llx count=%llu",
+                    g_hook_fire_va[i], g_hook_fire_proxy[i], (UINT64)g_hook_fire_count[i]);
+        }
+    }
+}
+
 // ---- helpers ----
 
 static VOID
@@ -1178,6 +1235,7 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                         fi->retiring = TRUE;
                         if (fi->external_fired)
                             _InterlockedExchange(fi->external_fired, 1);
+                        ept_hook_fire_record((UINT64)fi->virtual_address, (UINT64)fi->handler_function);
                         __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
                         return TRUE;
                     }
@@ -1198,6 +1256,7 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                     // don't change RIP — CPU re-executes same VA from original code
                     return TRUE;
                 }
+                ept_hook_fire_record((UINT64)fi->virtual_address, (UINT64)fi->handler_function);
                 __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
                 return TRUE;
             }

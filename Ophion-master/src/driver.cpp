@@ -21,6 +21,35 @@ DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
     LogTermination();
 }
 
+// DKOM: unlink this driver from PsLoadedModuleList (same technique as
+// test_driver's TdHideFromPsLoadedModuleList, with a local minimal LDR struct).
+#ifndef HV_HIDE_DRIVER
+#define HV_HIDE_DRIVER 1
+#endif
+#if HV_HIDE_DRIVER
+typedef struct _HV_LDR_ENTRY {
+    LIST_ENTRY InLoadOrderLinks;
+    LIST_ENTRY InMemoryOrderLinks;
+    LIST_ENTRY InInitializationOrderLinks;
+} HV_LDR_ENTRY;
+
+static VOID HvHideFromPsLoadedModuleList(PDRIVER_OBJECT drv)
+{
+    HV_LDR_ENTRY* ldr = (HV_LDR_ENTRY*)drv->DriverSection;
+    if (!ldr) return;
+    // PsLoadedModuleList links kernel modules ONLY via InLoadOrderLinks.
+    // InMemoryOrderLinks / InInitializationOrderLinks are NOT initialized by
+    // MiLoadSystemImage for kernel modules - they contain stale pool data
+    // (freelist pointers), so unlinking them dereferences garbage and BSODs
+    // (seen: InMemoryOrderLinks.Blink == 0x720 -> AV write at +0).
+    // Only unlink InLoadOrderLinks, then self-link it so a later
+    // RemoveEntryList (e.g. on unload) is a no-op.
+    PLIST_ENTRY e = &ldr->InLoadOrderLinks;
+    e->Blink->Flink = e->Flink; e->Flink->Blink = e->Blink;
+    e->Flink = e; e->Blink = e;
+}
+#endif
+
 NTSTATUS
 DriverEntry(
     _In_ PDRIVER_OBJECT  driver_obj,
@@ -59,6 +88,11 @@ DriverEntry(
 
     if (log_reinit_needed)
         LogRegisterReinitialization(driver_obj);
+
+#if HV_HIDE_DRIVER
+    // DKOM: hide this driver from PsLoadedModuleList (after all init).
+    HvHideFromPsLoadedModuleList(driver_obj);
+#endif
 
     HYPERPLATFORM_LOG_INFO("[hv] Hypervisor loaded and active on all cores!");
     return STATUS_SUCCESS;

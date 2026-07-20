@@ -58,37 +58,7 @@ volatile LONG g_dbg_a2_stale_p1_logged = 0;       // verbose-log cap counter for
 volatile LONG g_dbg_a2_stale_p1_total = 0;         // A2: total silent P=1/wrong-PFN staleness detected (UNBOUNDED; overlay-killer / crash class)
 volatile LONG g_dbg_a2_dump_tick = 0;              // A2: periodic counter-dump tick (diagnostic)
 volatile LONG g_dbg_a2_already_on_shadow = 0;      // A2: mid-window NX-fetch #PF hitting the already_on_shadow branch (stale-gap suspect)
-
-//
-// DIAG: capture the first distinct renderdoc code RIPs that open an NX-fetch
-// shadow window. Correlate against renderdoc.pdb (RIP - renderdoc_base, where
-// renderdoc_base comes from T.log "shadow CR3 extended VA=...") to see WHICH
-// renderdoc code actually runs: overlay/Present draw (per-frame) vs one-time
-// init. Bounded, lock-free, best-effort -- a duplicate race only double-logs.
-//
-#define DBG_RIP_SLOTS 96
-static volatile UINT64 g_dbg_rip_slots[DBG_RIP_SLOTS];
-
-static void
-dbg_log_distinct_rip(UINT64 rip)
-{
-    if (!rip) return;
-    for (UINT32 i = 0; i < DBG_RIP_SLOTS; i++)
-    {
-        if (g_dbg_rip_slots[i] == rip)
-            return;                                 // already captured
-    }
-    for (UINT32 i = 0; i < DBG_RIP_SLOTS; i++)
-    {
-        if (g_dbg_rip_slots[i] == 0)
-        {
-            g_dbg_rip_slots[i] = rip;               // x64: aligned 64-bit store is atomic
-            HYPERPLATFORM_LOG_WARN_SAFE("[stealth-diag] code-rip#%u rip=%llx", i, rip);
-            return;
-        }
-    }
-    // table full -- hottest paths already logged
-}
+volatile LONG g_dbg_a2_shadow_pt_created_logged = 0; // verbose-log cap counter for on-the-fly shadow PT creation (diagnostic only)
 
 VOID
 ept_update_pf_intercept(VIRTUAL_MACHINE_STATE * vcpu)
@@ -508,6 +478,7 @@ stealth_diag_midwin_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr,
                        PEPT_STEALTH_PAGE_INFO sp)
 {
     _InterlockedIncrement(&g_dbg_shadow_pf_midwin);
+
     if (_InterlockedIncrement(&g_dbg_shadow_pf_midwin_logged) > 32)
         return;
 
@@ -734,8 +705,295 @@ stealth_sync_data_pte_in_window(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr,
     // Not a DLL stealth page (heap/stack/TLS): these share the REAL PT through
     // the copied PML4 entry (no shadow PT copy), so a reinject commits them
     // correctly under the real CR3. Bail without touching anything.
+    //
+    // UPDATE: This is WRONG for the case where the page table itself was COPIED
+    // (same PML4 index as the DLL) and the shadow PT page is a build-time snapshot.
+    // Heap pages allocated during DllMain have no EPT_STEALTH_PAGE_INFO entry, so
+    // sp_data is NULL here. But the shadow PT page for this PD is a stale copy from
+    // TdExtendShadowCR3 — entries beyond the extended range (beyond PT index 166
+    // in the case of PD 405) are P=0 snapshots from before the heap was allocated.
+    // The real PTE is P=1, so abort+reinject restores real CR3 with NX=1 and the
+    // renderdoc NX-hidden code crashes on the next instruction.
+    //
+    // Fix: walk the SHADOW CR3 directly to find the shadow PT page, walk the REAL
+    // CR3 for the real PTE, and write (real_pte & ~NX) into the shadow PT page.
+    // This is a "mini CR3 extension" done in VMX-root without driver involvement.
     if (!sp_data || !sp_data->shadow_pte_va)
-        return FALSE;
+    {
+        // --- NULL sp_data: heap/stack/TLS page, attempt shadow walk ---
+        UINT64  shadow_pt_va  = 0;
+        UINT64  shadow_dummy  = 0;
+        UINT64  saved_cr3     = vmx_enter_cr3(sp->guest_cr3);
+
+        // Walk the SHADOW CR3 to find the shadow PT page VA for this fault address.
+        // stealth_walk_pt_page uses pa_to_va which is valid under sp->guest_cr3.
+        if (!stealth_walk_pt_page(sp, sp->shadow_cr3_phys, fault_addr,
+                                  &shadow_pt_va, &shadow_dummy) || !shadow_pt_va)
+        {
+            // shadow CR3 doesn't have a PT page for this PD. We must create one
+            // on-the-fly in VMX-root: allocate a page from the stealth region,
+            // copy all 512 real PT entries (clearing NX), and link it into the
+            // shadow CR3 hierarchy. This is safe because the contiguous stealth
+            // region is pre-allocated (stealth_region_alloc_page is a lock-free
+            // bump -- no OS API calls).
+            //
+            // Steps:
+            //   1. Walk shadow CR3 to find the PDPT page (must exist since PML4 idx=4 is shared)
+            //   2. Walk shadow PDPT to find the PD entry for this fault's PDPT index
+            //   3. If shadow PD entry is P=0, allocate a shadow PD page, copy real PD entries
+            //   4. Walk shadow PD to find the PT entry for this fault's PD index
+            //   5. If shadow PT entry is P=0, allocate a shadow PT page, copy real PT entries
+            //   6. Continue to heal the PTE (the existing code below the walk)
+
+            UINT64 sh_pml4e = 0, sh_pdpe = 0, sh_pde = 0;
+            UINT64 real_pdpe = 0, real_pde = 0;
+            UINT64 shadow_pd_va = 0, shadow_pdp_va = 0;
+            BOOLEAN created = FALSE;
+
+            // --- Step 1: walk shadow PML4 ---
+            PUINT64 pml4_saved = (PUINT64)stealth_real_va(sp, sp->shadow_cr3_phys);
+            if (!pml4_saved) { vmx_leave_guest_cr3(saved_cr3); return FALSE; }
+            UINT32 pml4_idx = (UINT32)((fault_addr >> 39) & 0x1FF);
+            sh_pml4e = pml4_saved[pml4_idx];
+            if (!(sh_pml4e & 1)) { vmx_leave_guest_cr3(saved_cr3); return FALSE; }
+
+            // --- Step 2: walk shadow PDPT ---
+            {
+                PUINT64 pdpt = (PUINT64)stealth_real_va(sp, sh_pml4e);
+                if (!pdpt) { vmx_leave_guest_cr3(saved_cr3); return FALSE; }
+                UINT32 pdp_idx = (UINT32)((fault_addr >> 30) & 0x1FF);
+                sh_pdpe = pdpt[pdp_idx];
+                shadow_pdp_va = (UINT64)pdpt;
+
+                // If shadow PDPT entry is P=0, allocate a shadow PD page, copy from real
+                if (!(sh_pdpe & 1))
+                {
+                    // Walk REAL CR3 to get the real PDPT entry
+                    UINT64 real_pdpe = 0;
+                    if (!stealth_walk_pte(sp, real_cr3, fault_addr, &real_pdpe))
+                    {
+                        // real walk failed -- can't copy, bail
+                        vmx_leave_guest_cr3(saved_cr3);
+                        return FALSE;
+                    }
+                    // We need to walk the real CR3 step by step to get the real PD page PFN
+                    // real_pdpe from stealth_walk_pte is the leaf PTE, not the intermediate PDPT entry.
+                    // Walk real CR3 manually to get the real PD page.
+                    {
+                        PUINT64 real_pml4 = (PUINT64)stealth_real_va(sp, real_cr3);
+                        if (!real_pml4) { vmx_leave_guest_cr3(saved_cr3); return FALSE; }
+                        UINT64 r_pml4e = real_pml4[pml4_idx];
+                        if (!(r_pml4e & 1)) { vmx_leave_guest_cr3(saved_cr3); return FALSE; }
+                        PUINT64 real_pdpt = (PUINT64)stealth_real_va(sp, r_pml4e);
+                        if (!real_pdpt) { vmx_leave_guest_cr3(saved_cr3); return FALSE; }
+                        UINT32 pdp_idx_r = (UINT32)((fault_addr >> 30) & 0x1FF);
+                        real_pdpe = real_pdpt[pdp_idx_r];
+                    }
+
+                    if (!(real_pdpe & 1) || (real_pdpe & (1ULL << 7)))
+                    {
+                        // real PD entry not present or is a 1GB large page -- bail
+                        vmx_leave_guest_cr3(saved_cr3);
+                        return FALSE;
+                    }
+
+                    // Allocate shadow PD page from stealth region
+                    UINT64 sh_pd_pfn = 0;
+                    PUINT64 sh_pd = (PUINT64)stealth_region_alloc_page(&sh_pd_pfn);
+                    if (!sh_pd)
+                    {
+                        vmx_leave_guest_cr3(saved_cr3);
+                        return FALSE;
+                    }
+
+                    // Copy real PD entries into shadow PD, clearing NX
+                    PUINT64 real_pd = (PUINT64)stealth_real_va(sp, real_pdpe);
+                    if (!real_pd)
+                    {
+                        // can't map real PD -- zero-initialize (all P=0, safe fail)
+                        RtlZeroMemory(sh_pd, PAGE_SIZE);
+                    }
+                    else
+                    {
+                        for (UINT32 i = 0; i < 512; i++)
+                        {
+                            UINT64 r_entry = real_pd[i];
+                            if (r_entry & 1)
+                                sh_pd[i] = r_entry & ~NX_BIT;
+                            else
+                                sh_pd[i] = 0;
+                        }
+                    }
+
+                    // Link shadow PD into shadow PDPT
+                    sh_pdpe = (sh_pd_pfn << 12) | (real_pdpe & 0xFFF); // preserve flags from real PDPT entry
+                    sh_pdpe &= ~NX_BIT;                                // clear NX
+                    sh_pdpe |= 1;                                       // ensure P=1
+                    ((PUINT64)shadow_pdp_va)[pdp_idx] = sh_pdpe;
+                    created = TRUE;
+                }
+            }
+
+            // --- Step 3: walk shadow PD ---
+            {
+                PUINT64 pd = (PUINT64)stealth_real_va(sp, sh_pdpe);
+                if (!pd) { vmx_leave_guest_cr3(saved_cr3); return FALSE; }
+                UINT32 pd_idx = (UINT32)((fault_addr >> 21) & 0x1FF);
+                sh_pde = pd[pd_idx];
+                shadow_pd_va = (UINT64)pd;
+
+                if (!(sh_pde & 1))
+                {
+                    // Walk REAL CR3 to get the real PD entry
+                    {
+                        PUINT64 real_pml4 = (PUINT64)stealth_real_va(sp, real_cr3);
+                        if (!real_pml4) { vmx_leave_guest_cr3(saved_cr3); return FALSE; }
+                        UINT32 pml4_idx = (UINT32)((fault_addr >> 39) & 0x1FF);
+                        UINT64 r_pml4e = real_pml4[pml4_idx];
+                        if (!(r_pml4e & 1)) { vmx_leave_guest_cr3(saved_cr3); return FALSE; }
+                        PUINT64 real_pdpt = (PUINT64)stealth_real_va(sp, r_pml4e);
+                        if (!real_pdpt) { vmx_leave_guest_cr3(saved_cr3); return FALSE; }
+                        UINT32 pdp_idx = (UINT32)((fault_addr >> 30) & 0x1FF);
+                        UINT64 r_pdpe = real_pdpt[pdp_idx];
+                        if (!(r_pdpe & 1) || (r_pdpe & (1ULL << 7))) { vmx_leave_guest_cr3(saved_cr3); return FALSE; }
+                        PUINT64 real_pd = (PUINT64)stealth_real_va(sp, r_pdpe);
+                        if (!real_pd) { vmx_leave_guest_cr3(saved_cr3); return FALSE; }
+                        UINT32 pd_idx_r = (UINT32)((fault_addr >> 21) & 0x1FF);
+                        real_pde = real_pd[pd_idx_r];
+                    }
+
+                    if (!(real_pde & 1) || (real_pde & (1ULL << 7)))
+                    {
+                        // real PT entry not present or is a 2MB large page -- bail
+                        vmx_leave_guest_cr3(saved_cr3);
+                        return FALSE;
+                    }
+
+                    // Allocate shadow PT page from stealth region
+                    UINT64 sh_pt_pfn = 0;
+                    PUINT64 sh_pt = (PUINT64)stealth_region_alloc_page(&sh_pt_pfn);
+                    if (!sh_pt)
+                    {
+                        vmx_leave_guest_cr3(saved_cr3);
+                        return FALSE;
+                    }
+
+                    // Copy real PT entries into shadow PT, clearing NX
+                    PUINT64 real_pt = (PUINT64)stealth_real_va(sp, real_pde);
+                    if (!real_pt)
+                    {
+                        RtlZeroMemory(sh_pt, PAGE_SIZE);
+                    }
+                    else
+                    {
+                        for (UINT32 i = 0; i < 512; i++)
+                        {
+                            UINT64 r_entry = real_pt[i];
+                            if (r_entry & 1)
+                                sh_pt[i] = r_entry & ~NX_BIT;
+                            else
+                                sh_pt[i] = 0;
+                        }
+                    }
+
+                    // Link shadow PT into shadow PD
+                    sh_pde = (sh_pt_pfn << 12) | (real_pde & 0xFFF);
+                    sh_pde &= ~NX_BIT;
+                    sh_pde |= 1;
+                    sh_pde &= ~(1ULL << 7); // ensure PS=0 (4KB page)
+                    ((PUINT64)shadow_pd_va)[pd_idx] = sh_pde;
+                    created = TRUE;
+                }
+
+                // Now walk again to get the shadow PT VA for the PTE write below
+                if (!stealth_walk_pt_page(sp, sp->shadow_cr3_phys, fault_addr,
+                                          &shadow_pt_va, &shadow_dummy) || !shadow_pt_va)
+                {
+                    // Should not happen after creation above, but handle gracefully
+                    vmx_leave_guest_cr3(saved_cr3);
+                    return FALSE;
+                }
+            }
+
+            if (created)
+            {
+                _InterlockedIncrement(&g_dbg_a2_data_synced);
+                if (_InterlockedIncrement(&g_dbg_a2_shadow_pt_created_logged) <= 64)
+                    HYPERPLATFORM_LOG_WARN_SAFE(
+                        "[stealth-a2] shadow-pt-created fa=%llx ec=%x "
+                        "real_cr3=%llx sh_pml4=%llx rip=%llx",
+                        fault_addr, error_code, real_cr3, sp->shadow_cr3_phys,
+                        vcpu->vmexit_rip);
+            }
+        }
+
+        // Walk the REAL CR3 to get the current real PTE
+        UINT64 real_pte = 0;
+        if (!stealth_walk_pte(sp, real_cr3, fault_addr, &real_pte))
+        {
+            vmx_leave_guest_cr3(saved_cr3);
+            _InterlockedIncrement(&g_dbg_a2_abort);
+            if (_InterlockedIncrement(&g_dbg_a2_spurious_logged) <= 64)
+                HYPERPLATFORM_LOG_WARN_SAFE(
+                    "[stealth-a2] NULL-sp-data-real-walk-fail fa=%llx ec=%x "
+                    "real_cr3=%llx rip=%llx",
+                    fault_addr, error_code, real_cr3, vcpu->vmexit_rip);
+            return FALSE;
+        }
+
+        if (!(real_pte & 1))
+        {
+            // Real P=0: genuine demand fault, re-inject is correct
+            vmx_leave_guest_cr3(saved_cr3);
+            return FALSE;
+        }
+
+        // Write (real_pte & ~NX) into the shadow PT page at the fault address's PT index
+        UINT32 pt_idx = (fault_addr >> 12) & 0x1FF;
+        PUINT64 shadow_spte = (PUINT64)shadow_pt_va + pt_idx;
+        UINT64  want       = real_pte & ~NX_BIT;
+        UINT64  old        = *shadow_spte;
+        if (old != want)
+        {
+            *shadow_spte = want;
+            _InterlockedIncrement(&g_dbg_a2_data_synced);
+            if (_InterlockedIncrement(&g_dbg_a2_data_synced_logged) <= 64)
+                HYPERPLATFORM_LOG_WARN_SAFE(
+                    "[stealth-a2] data-sync-heap fa=%llx ec=%x rip=%llx "
+                    "real_pte=%llx shadow_was=%llx want=%llx pt_idx=%u",
+                    fault_addr, error_code, vcpu->vmexit_rip,
+                    real_pte, old, want, pt_idx);
+        }
+
+        vmx_leave_guest_cr3(saved_cr3);
+
+        // Flush cached translation
+        INVVPID_DESCRIPTOR desc = {0};
+        desc.Vpid = VPID_TAG;
+        if (g_ept->invvpid_individual_addr)
+        {
+            desc.LinearAddress = fault_addr;
+            asm_invvpid(InvvpidIndividualAddress, &desc);
+        }
+        else
+        {
+            asm_invvpid(InvvpidSingleContext, &desc);
+        }
+
+        _InterlockedIncrement(&g_dbg_shadow_pf_synced);
+        if (_InterlockedIncrement(&g_dbg_shadow_pf_synced_logged) <= 32)
+        {
+            HYPERPLATFORM_LOG_WARN_SAFE(
+                "[stealth-a2] synced-heap fa=%llx ec=%x (W=%d P=%d) rip=%llx "
+                "real_cr3=%llx sh_pml4=%llx real_pte=%llx",
+                fault_addr, error_code,
+                (error_code & PFEC_WRITE) ? 1 : 0,
+                (error_code & PFEC_PRESENT) ? 1 : 0,
+                vcpu->vmexit_rip, vcpu->nx_timer_real_cr3,
+                sp->shadow_cr3_phys, real_pte);
+        }
+        return TRUE;
+    }
 
     // A write to a write-protected stealth page (intercept_write, shadow W=0)
     // must stay mediated - do NOT heal it (healing sets W=1 and lets the write
@@ -901,7 +1159,7 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
     _InterlockedIncrement(&g_dbg_a2_code_enter);
 
     //
-    // DIAG: periodic counter dump + distinct renderdoc code-RIP capture.
+    // DIAG: periodic counter dump.
     //   code_enter rate  -> is renderdoc code running per-frame? (swapchain wrapped => overlay draw attempted)
     //   stale_p1_total   -> silent wrong-PFN corruption active? (overlay-killer / crash class)
     //   spurious         -> spurious abort+reinject? (crash class)
@@ -915,15 +1173,18 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
         HYPERPLATFORM_LOG_WARN_SAFE(
             "[stealth-diag] DUMP code_enter=%llu code_synced=%llu ptpage_synced=%llu "
             "stale_p1=%llu data_synced=%llu abort=%llu spurious=%llu nomatch=%llu "
-            "pf_seen=%llu pf_switched=%llu a2shadow=%llu",
+            "pf_seen=%llu pf_switched=%llu a2shadow=%llu "
+            "hot_rip=%llx hot_cnt=%d midwin=%llu hot_fault=%llx hot_fault_cnt=%d",
             (UINT64)g_dbg_a2_code_enter, (UINT64)g_dbg_a2_code_synced,
             (UINT64)g_dbg_a2_ptpage_synced, (UINT64)g_dbg_a2_stale_p1_total,
             (UINT64)g_dbg_a2_data_synced, (UINT64)g_dbg_a2_abort,
             (UINT64)g_dbg_a2_spurious, (UINT64)g_dbg_nomatch,
             (UINT64)g_dbg_shadow_pf_seen, (UINT64)g_dbg_shadow_pf_switched,
-            (UINT64)g_dbg_a2_already_on_shadow);
+            (UINT64)g_dbg_a2_already_on_shadow,
+            (UINT64)0, (LONG)0,
+            (UINT64)g_dbg_shadow_pf_midwin,
+            (UINT64)0, (LONG)0);
     }
-    dbg_log_distinct_rip(vcpu->vmexit_rip);
 
     // Same CR3 discipline as stealth_sync_data_pte_in_window: switch to
     // sp->guest_cr3 (the guest KERNEL CR3), under which the shadow pages

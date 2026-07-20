@@ -261,7 +261,6 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
             //
             // 页面已 hook — 检查这个具体函数是否已经 hook
             //
-            BOOLEAN func_exists = FALSE;
             PLIST_ENTRY fc = existing->hooked_functions_list.Flink;
             while (fc != &existing->hooked_functions_list)
             {
@@ -283,138 +282,113 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
                     efi->expected_tid = req->expected_tid;
                     efi->hook_type = req->hook_type;
                     efi->external_fired = req->external_fired;
+                    efi->proxy_range_start = (UINT64)req->proxy_function;
+                    efi->proxy_range_end = req->proxy_range_end
+                        ? req->proxy_range_end
+                        : ((UINT64)req->proxy_function + PAGE_SIZE);
 
-                    // R3 hook: 更新 trampoline 地址给新进程
-                    if (is_r3 && req->user_trampoline && req->origin_function)
+                    // update shadow_cr3_phys for the existing page (may be a new process)
+                    if (existing->target_cr3 == 0 && req->target_cr3 != 0)
                     {
-                        SIZE_T min_sz = (req->hook_type == 1) ? 3 : (req->hook_type == 2) ? 1 : 14;
-                        SIZE_T ow = 0;
-                        while (ow < min_sz) ow += LDE((PUINT8)req->target_function + ow, 64);
-                        RtlCopyMemory((PUINT8)req->user_trampoline, req->target_function, ow);
-                        hook_write_absolute_jump((PUINT8)req->user_trampoline + ow,
-                                                 (UINT64)req->target_function + ow);
-                        efi->first_trampoline_address = (PUINT8)req->user_trampoline;
-                        efi->hook_size = ow;
-                        efi->user_trampoline = TRUE;
-                        *req->origin_function = efi->first_trampoline_address;
+                        existing->shadow_cr3_phys = 0;
+                        PLIST_ENTRY sc = g_ept->stealth_pages.Flink;
+                        while (sc != &g_ept->stealth_pages)
+                        {
+                            PEPT_STEALTH_PAGE_INFO sp = CONTAINING_RECORD(sc, EPT_STEALTH_PAGE_INFO, stealth_page_list);
+                            sc = sc->Flink;
+                            if ((sp->guest_cr3 & CR3_ADDR_MASK) == (req->target_cr3 & CR3_ADDR_MASK) && sp->shadow_cr3_phys)
+                            {
+                                existing->shadow_cr3_phys = sp->shadow_cr3_phys;
+                                break;
+                            }
+                        }
                     }
-                    else if (req->origin_function)
-                    {
-                        *req->origin_function = efi->first_trampoline_address;
-                    }
-
-                    func_exists = TRUE;
-                    break;
-                }
-                fc = fc->Flink;
-            }
-
-            if (func_exists)
-            {
-                // 重新设置 EPT: target page X=0 (触发 EPT violation 走 VMCALL handler)
-                PEPT_PML2_ENTRY p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)phys_addr);
-                if (p2 && p2->LargePage)
-                    ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)phys_addr);
-
-                PEPT_PML1_ENTRY p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)phys_addr);
-                if (p1)
-                {
-                    p1->ExecuteAccess = 0;
-                    p1->ReadAccess    = 1;
-                    p1->WriteAccess   = 1;
-                }
-
-                // fake page 的 EPT 重新设为 X-only (R=0, W=0, X=1)
-                // 确保 EPT violation 在第二次 hook 后能再次触发
-                {
-                    SIZE_T fake_phys = (SIZE_T)(existing->pfn_of_fake_page_contents << 12);
-                    PEPT_PML2_ENTRY fp2 = ept_get_pml2(vcpu->ept_page_table, fake_phys);
-                    if (fp2 && fp2->LargePage)
-                        ept_split_large_page_pool(vcpu->ept_page_table, fake_phys);
-                    PEPT_PML1_ENTRY fp1 = ept_get_pml1(vcpu->ept_page_table, fake_phys);
-                    if (fp1) { fp1->ReadAccess = 0; fp1->WriteAccess = 0; fp1->ExecuteAccess = 1; }
-                }
-
-                // 更新 target_cr3 以匹配新的目标进程
-                existing->target_cr3 = req->target_cr3 & CR3_ADDR_MASK;
+                    existing->target_cr3 = req->target_cr3 & CR3_ADDR_MASK;
 
                 _mm_mfence();
                 ept_invept_single(vcpu->ept_pointer);
                 HOOK_RESTORE_CR3_AND_RETURN(TRUE);
             }
 
-            //
-            // 同页面不同函数 — 添加新 hook 到已有的 fake page
-            // lock protects concurrent InsertHeadList on the per-page function list
-            //
-            hook_lock_acquire();
-
-            PEPT_HOOKED_FUNCTION_INFO fi = (PEPT_HOOKED_FUNCTION_INFO)
-                pool_manager_request(POOL_TAG_HOOKED_FUNC, sizeof(EPT_HOOKED_FUNCTION_INFO));
-            if (!fi) { _InterlockedExchange(&g_hook_list_lock, 0); HOOK_RESTORE_CR3_AND_RETURN(FALSE); }
-            RtlZeroMemory(fi, sizeof(*fi));
-
-            //
-            // trampoline: R3 hook 用 caller 提供的用户态可执行内存, R0 hook 用 kernel pool
-            //
-            if (is_r3 && req->user_trampoline)
-            {
-                fi->first_trampoline_address = (PUINT8)req->user_trampoline;
-                fi->user_trampoline = TRUE;
-            }
-            else
-            {
-                fi->first_trampoline_address = (PUINT8)pool_manager_request(POOL_TAG_TRAMPOLINE, 128);
-                fi->user_trampoline = FALSE;
-            }
-            if (!fi->first_trampoline_address) { pool_manager_release(fi); _InterlockedExchange(&g_hook_list_lock, 0); HOOK_RESTORE_CR3_AND_RETURN(FALSE); }
-
-            fi->virtual_address    = req->target_function;
-            fi->fake_page_contents = existing->fake_page_va;
-            fi->handler_function   = req->proxy_function;
-            fi->oneshot            = req->oneshot;
-            fi->expected_tid       = req->expected_tid;
-            fi->hook_type          = req->hook_type;
-            fi->external_fired     = req->external_fired;
-
-            UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
-            PUINT8 fake  = &existing->fake_page_va[off];
-            SIZE_T min_sz = (req->hook_type == 1) ? 3 : (req->hook_type == 2) ? 1 : 14;
-            SIZE_T ow = 0;
-            while (ow < min_sz) ow += LDE((PUINT8)req->target_function + ow, 64);
-            fi->hook_size = ow;
-
-            RtlCopyMemory(fi->first_trampoline_address, req->target_function, ow);
-            hook_write_absolute_jump(&fi->first_trampoline_address[ow],
-                                     (UINT64)req->target_function + ow);
-
-            if (req->origin_function)
-                *req->origin_function = fi->first_trampoline_address;
-
-            switch (req->hook_type) {
-            case 0: hook_write_absolute_jump(fake, (UINT64)req->proxy_function); break;
-            case 1: fake[0]=0x0F; fake[1]=0x01; fake[2]=0xC1; break;
-            case 2: fake[0]=0xCC; break;
-            }
-
-            InsertHeadList(&existing->hooked_functions_list, &fi->hooked_function_list);
-            _InterlockedExchange(&g_hook_list_lock, 0);
-
-            _mm_mfence();
-            ept_invept_single(vcpu->ept_pointer);
-            HOOK_RESTORE_CR3_AND_RETURN(TRUE);
+            fc = fc->Flink;
         }
+
+        //
+        // 同页面不同函数 — 添加新 hook 到已有的 fake page
+        // lock protects concurrent InsertHeadList on the per-page function list
+        //
+        hook_lock_acquire();
+
+        PEPT_HOOKED_FUNCTION_INFO fi = (PEPT_HOOKED_FUNCTION_INFO)
+            pool_manager_request(POOL_TAG_HOOKED_FUNC, sizeof(EPT_HOOKED_FUNCTION_INFO));
+        if (!fi) { _InterlockedExchange(&g_hook_list_lock, 0); HOOK_RESTORE_CR3_AND_RETURN(FALSE); }
+        RtlZeroMemory(fi, sizeof(*fi));
+
+        //
+        // trampoline: R3 hook 用 caller 提供的用户态可执行内存, R0 hook 用 kernel pool
+        //
+        if (is_r3 && req->user_trampoline)
+        {
+            fi->first_trampoline_address = (PUINT8)req->user_trampoline;
+            fi->user_trampoline = TRUE;
+        }
+        else
+        {
+            fi->first_trampoline_address = (PUINT8)pool_manager_request(POOL_TAG_TRAMPOLINE, 128);
+            fi->user_trampoline = FALSE;
+        }
+        if (!fi->first_trampoline_address) { pool_manager_release(fi); _InterlockedExchange(&g_hook_list_lock, 0); HOOK_RESTORE_CR3_AND_RETURN(FALSE); }
+
+        fi->virtual_address    = req->target_function;
+        fi->fake_page_contents = existing->fake_page_va;
+        fi->handler_function   = req->proxy_function;
+        fi->oneshot            = req->oneshot;
+        fi->expected_tid       = req->expected_tid;
+        fi->hook_type          = req->hook_type;
+        fi->external_fired     = req->external_fired;
+        fi->proxy_range_start  = (UINT64)req->proxy_function;
+        fi->proxy_range_end    = req->proxy_range_end
+            ? req->proxy_range_end
+            : ((UINT64)req->proxy_function + PAGE_SIZE);
+
+        UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
+        PUINT8 fake  = &existing->fake_page_va[off];
+        SIZE_T min_sz = (req->hook_type == 1) ? 3 : (req->hook_type == 2) ? 1 : 14;
+        SIZE_T ow = 0;
+        while (ow < min_sz) ow += LDE((PUINT8)req->target_function + ow, 64);
+        fi->hook_size = ow;
+
+        RtlCopyMemory(fi->first_trampoline_address, req->target_function, ow);
+        hook_write_absolute_jump(&fi->first_trampoline_address[ow],
+                                 (UINT64)req->target_function + ow);
+
+        if (req->origin_function)
+            *req->origin_function = fi->first_trampoline_address;
+
+        switch (req->hook_type) {
+        case 0: hook_write_absolute_jump(fake, (UINT64)req->proxy_function); break;
+        case 1: fake[0]=0x0F; fake[1]=0x01; fake[2]=0xC1; break;
+        case 2: fake[0]=0xCC; break;
+        }
+
+        InsertHeadList(&existing->hooked_functions_list, &fi->hooked_function_list);
+        _InterlockedExchange(&g_hook_list_lock, 0);
+
+        _mm_mfence();
+        ept_invept_single(vcpu->ept_pointer);
+        HOOK_RESTORE_CR3_AND_RETURN(TRUE);
     }
+}
 
-    //
-    // page not found — need full install. acquire lock to prevent
-    // concurrent InsertHeadList corruption from multiple CPUs.
-    //
-    hook_lock_acquire();
+//
+// page not found — need full install. acquire lock to prevent
+// concurrent InsertHeadList corruption from multiple CPUs.
+//
+hook_lock_acquire();
 
-    //
-    // double-check after lock: another CPU may have installed while we waited
-    //
+//
+// double-check after lock: another CPU may have installed while we waited
+//
     for (hcur = g_ept->hooked_pages.Flink; hcur != &g_ept->hooked_pages; hcur = hcur->Flink)
     {
         PEPT_HOOKED_PAGE_INFO existing2 = CONTAINING_RECORD(hcur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
@@ -495,6 +469,28 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     hp->entry_address = pte;
     hp->target_cr3 = req->target_cr3 & CR3_ADDR_MASK;
 
+    //
+    // Resolve shadow CR3 for this process (if stealth pages exist).
+    // The proxy function is in shadow CR3 memory (NX=0) — the VMCALL handler
+    // must switch to shadow CR3 before redirecting RIP to the proxy.
+    // Search g_ept->stealth_pages for a page with matching guest_cr3.
+    //
+    hp->shadow_cr3_phys = 0;
+    if (hp->target_cr3 != 0)
+    {
+        PLIST_ENTRY sc = g_ept->stealth_pages.Flink;
+        while (sc != &g_ept->stealth_pages)
+        {
+            PEPT_STEALTH_PAGE_INFO sp = CONTAINING_RECORD(sc, EPT_STEALTH_PAGE_INFO, stealth_page_list);
+            sc = sc->Flink;
+            if ((sp->guest_cr3 & CR3_ADDR_MASK) == hp->target_cr3 && sp->shadow_cr3_phys)
+            {
+                hp->shadow_cr3_phys = sp->shadow_cr3_phys;
+                break;
+            }
+        }
+    }
+
     // 拷贝原始页面到 fake page (stealth region)
     RtlCopyMemory(hp->fake_page_va, PAGE_ALIGN(req->target_function), PAGE_SIZE);
 
@@ -506,6 +502,10 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     fi->expected_tid       = req->expected_tid;
     fi->hook_type          = req->hook_type;
     fi->external_fired     = req->external_fired;
+    fi->proxy_range_start  = (UINT64)req->proxy_function;
+    fi->proxy_range_end    = req->proxy_range_end
+        ? req->proxy_range_end
+        : ((UINT64)req->proxy_function + PAGE_SIZE);
 
     UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
     PUINT8 fake  = &hp->fake_page_va[off];
@@ -661,6 +661,41 @@ ept_unhook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_UNHOOK_VMCALL_PARAM req)
     // (不能只恢复当前 CPU，其他 CPU 的 EPT PTE 也需要恢复)
     //
     return FALSE;
+}
+
+//
+// unhook all functions whose page's target_cr3 matches the given CR3.
+// restores EPT entries for pages that become fully inactive.
+// safe to call from DPC context (no pool allocations).
+//
+VOID
+ept_unhook_all_by_cr3(VIRTUAL_MACHINE_STATE * vcpu, UINT64 target_cr3)
+{
+    if (!g_ept) return;
+
+    PLIST_ENTRY cur = g_ept->hooked_pages.Flink;
+    while (cur != &g_ept->hooked_pages)
+    {
+        PEPT_HOOKED_PAGE_INFO hp = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
+        cur = cur->Flink;
+
+        // skip pages not targeting this CR3
+        if (hp->target_cr3 != target_cr3)
+            continue;
+
+        // mark all functions on this page as retiring
+        PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
+        while (fc != &hp->hooked_functions_list)
+        {
+            PEPT_HOOKED_FUNCTION_INFO fn = CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
+            fc = fc->Flink;
+            fn->retiring = TRUE;
+        }
+
+        // restore EPT entry if no active functions remain
+        if (!ept_hook_page_has_active_function(hp))
+            ept_hook_restore_current_vcpu(vcpu, hp);
+    }
 }
 
 //
@@ -828,6 +863,12 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
                         return TRUE;
                     }
                 }
+
+                // DIAGNOSTIC: target thread (CR3+TID match) execute-violated the
+                // hooked page -> about to swap to fake (VMCALL) page. Signal
+                // viol=2 (fire=1, vmcall=3, viol=2, nothing=0).
+                if (fi->external_fired)
+                    _InterlockedExchange(fi->external_fired, 2);
 
                 break;
             }
@@ -1228,6 +1269,12 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                     return TRUE;
                 }
 
+                // DIAGNOSTIC: target thread (CR3+TID match) reached the VMCALL
+                // exit at the hooked VA (fake page served). Signal vmcall=3
+                // (fire=1, vmcall=3, viol=2, nothing=0).
+                if (fi->external_fired)
+                    _InterlockedExchange(fi->external_fired, 3);
+
                 if (fi->oneshot)
                 {
                     if (_InterlockedCompareExchange(&fi->oneshot_fired, 1, 0) == 0)
@@ -1236,6 +1283,50 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                         if (fi->external_fired)
                             _InterlockedExchange(fi->external_fired, 1);
                         ept_hook_fire_record((UINT64)fi->virtual_address, (UINT64)fi->handler_function);
+                        HYPERPLATFORM_LOG_INFO("[hv-ept] oneshot FIRED: va=%p handler=%p tid=%llu",
+                            (PVOID)fi->virtual_address, (PVOID)fi->handler_function,
+                            (UINT64)(ULONG_PTR)PsGetCurrentThreadId());
+
+                        //
+                        // oneshot: switch to shadow CR3 so the proxy (in shadow
+                        // CR3 memory) is executable. NtTestAlert's oneshot handler
+                        // already does this via its own shellcode — D3D12/DXGI
+                        // oneshot hooks need it here.
+                        //
+                        UINT64 saved_hook_cr3 = 0;
+                        if (hp->shadow_cr3_phys)
+                        {
+                            __vmx_vmread(VMCS_GUEST_CR3, &saved_hook_cr3);
+                            // Save real CR3 for midwin guard — the shadow window lasts
+                            // for the entire loader DllMain execution, not just one
+                            // instruction. Any data #PF during this window must be
+                            // serviced under the real CR3; without nx_timer_real_cr3
+                            // the midwin guard at ept_stealth.cpp:1836 is a no-op and
+                            // MmAccessFault runs on stale shadow page tables -> PFN
+                            // database corruption -> CRITICAL_PROCESS_DIED (0xEF).
+                            vcpu->nx_timer_real_cr3 = saved_hook_cr3;
+
+                            UINT64 shadow_pfn = hp->shadow_cr3_phys & CR3_ADDR_MASK;
+                            UINT64 shadow_cr3_val = (saved_hook_cr3 & ~CR3_ADDR_MASK) | shadow_pfn;
+                            __vmx_vmwrite(VMCS_GUEST_CR3, shadow_cr3_val);
+
+                            // Flush this vCPU's guest TLB for VPID 1. The shadow CR3
+                            // shares the global VPID with the real CR3 (and with every
+                            // other process), so stale real-CR3 translations -- or
+                            // wrong-PFN entries carried over from a prior shadow window
+                            // or a repage the guest INVLPG missed -- would alias under
+                            // the same VPID and silently fetch wrong bytes (the
+                            // renderdoc-init AV). INVVPID single-context forces a fresh
+                            // walk of the shadow PT. (The loader thread is pinned to
+                            // this CPU, so a local flush is sufficient -- no broadcast.)
+                            INVVPID_DESCRIPTOR iv_desc = {0};
+                            iv_desc.Vpid = VPID_TAG;
+                            if (g_ept->invvpid_single_context)
+                                asm_invvpid(InvvpidSingleContext, &iv_desc);
+                            else
+                                asm_invvpid(InvvpidAllContexts, &iv_desc);
+                        }
+
                         __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
                         return TRUE;
                     }
@@ -1256,7 +1347,107 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                     // don't change RIP — CPU re-executes same VA from original code
                     return TRUE;
                 }
+
+                //
+                // non-oneshot VMCALL: check if the CALLER (return address on stack)
+                // is inside proxy range, NOT the current RIP (which is the hooked
+                // function VA — e.g. d3d12!D3D12CreateDevice at 0x00007FF8DE6270D0).
+                //
+                // The proxy function CALLs the original address, which hits the EPT
+                // VMCALL hook again. The return address pushed by that CALL is in
+                // the proxy module (e.g. 0x000001A1F2ED61D0). Compare [RSP] against
+                // proxy_range to detect this recursive call and pass through.
+                //
+                // When proxy_range recursion is detected AND we switched to shadow
+                // CR3 for the proxy, we must restore the real CR3 before the MTF
+                // pass-through — the original function runs under real CR3.
+                //
+                // saved_hook_cr3 tracks the real CR3 (saved before shadow switch).
+                // 0 = no shadow CR3 switch was performed.
+                //
+                UINT64 saved_hook_cr3 = 0;  // real CR3 saved before shadow switch (0 = no switch)
+
+                if (fi->proxy_range_start && fi->proxy_range_end)
+                {
+                    UINT64 guest_rsp = 0;
+                    __vmx_vmread(VMCS_GUEST_RSP, &guest_rsp);
+
+                    //
+                    // switch to guest CR3 to read user-mode stack memory.
+                    // in VMX-root with private host CR3, we can't access user VAs
+                    // directly — need guest CR3 to resolve the process address space.
+                    //
+                    UINT64 saved_cr3 = vmx_enter_guest_cr3();
+                    UINT64 return_addr = 0;
+                    //
+                    // read return address from stack: proxy's CALL pushed it at [RSP].
+                    // the stack is in user-mode memory, which is accessible under
+                    // guest CR3 (SMAP is handled by AC flag in VMCALL handler).
+                    // we probe first to avoid #PF in VMX-root.
+                    //
+                    __try
+                    {
+                        ProbeForRead((PVOID)guest_rsp, sizeof(UINT64), sizeof(UINT64));
+                        return_addr = *(volatile UINT64*)guest_rsp;
+                    }
+                    __except (EXCEPTION_EXECUTE_HANDLER)
+                    {
+                        return_addr = 0;
+                    }
+                    vmx_leave_guest_cr3(saved_cr3);
+
+                    if (return_addr >= fi->proxy_range_start && return_addr < fi->proxy_range_end)
+                    {
+                        //
+                        // proxy calling original function → pass through via MTF.
+                        // if we switched to shadow CR3 for the proxy, restore the
+                        // real CR3 so the original function runs under its real
+                        // page tables (not shadow CR3).
+                        //
+                        if (saved_hook_cr3)
+                        {
+                            __vmx_vmwrite(VMCS_GUEST_CR3, saved_hook_cr3);
+                            saved_hook_cr3 = 0;
+                        }
+
+                        PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,
+                            (SIZE_T)(hp->pfn_of_hooked_page << 12));
+                        if (my_pte)
+                        {
+                            EPT_PML1_ENTRY passthrough = hp->original_entry;
+                            passthrough.ExecuteAccess = 1;
+                            ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
+                            vcpu->mtf_restore_page = hp;
+                            SIZE_T pc = 0;
+                            __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+                            pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+                            __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+                        }
+                        return TRUE;
+                    }
+                }
+
+                //
+                // non-oneshot, RIP not in proxy range → redirect to proxy (normal behavior).
+                // if this process has shadow CR3, switch to it so the proxy function
+                // (in shadow CR3 memory) is executable. the real CR3 is saved in
+                // saved_hook_cr3 — the recursive call handler above restores it when
+                // the proxy calls the original function and the hook fires again.
+                //
+                // without this switch, the proxy is in shadow CR3 memory but the guest
+                // runs under real CR3 → real PTE has NX=1 → #PF on instruction fetch
+                // → crash before the proxy executes a single instruction.
+                //
                 ept_hook_fire_record((UINT64)fi->virtual_address, (UINT64)fi->handler_function);
+
+                if (hp->shadow_cr3_phys && !saved_hook_cr3)
+                {
+                    __vmx_vmread(VMCS_GUEST_CR3, &saved_hook_cr3);
+                    UINT64 shadow_pfn = hp->shadow_cr3_phys & CR3_ADDR_MASK;
+                    UINT64 shadow_cr3_val = (saved_hook_cr3 & ~CR3_ADDR_MASK) | shadow_pfn;
+                    __vmx_vmwrite(VMCS_GUEST_CR3, shadow_cr3_val);
+                }
+
                 __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
                 return TRUE;
             }

@@ -182,6 +182,7 @@ VOID vpid_invvpid_single(UINT16 vpid);
 BOOLEAN ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req);
 BOOLEAN ept_unhook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_UNHOOK_VMCALL_PARAM req);
 VOID    ept_unhook_all(VOID);
+VOID    ept_unhook_all_by_cr3(VIRTUAL_MACHINE_STATE * vcpu, UINT64 target_cr3);
 
 // VMX-root safe EPT 2MB→4KB split (uses pre-allocated pool, NOT ExAllocatePool2)
 PVMM_EPT_DYNAMIC_SPLIT ept_split_large_page_pool(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);

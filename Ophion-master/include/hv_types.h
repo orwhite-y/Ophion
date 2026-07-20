@@ -100,6 +100,22 @@ typedef struct _EPT_HOOKED_FUNCTION_INFO {
     volatile LONG * external_fired;       // optional NonPaged signal set on first oneshot hit
     UINT64      expected_tid;             // 0 = any thread, non-0 = only this TID may redirect
     BOOLEAN     retiring;                 // TRUE = unhook requested; per-vCPU paths restore lazily
+    //
+    // proxy range: when a non-oneshot VMCALL fires, the VMCALL handler reads
+    // the RETURN ADDRESS from the guest stack [RSP] (pushed by the CALL from
+    // the proxy function) and checks it against [proxy_range_start, proxy_range_end).
+    // if the return address falls in the proxy module range, we pass through to
+    // original code instead of re-redirecting to the proxy. this breaks the
+    // infinite VMCALL loop when the proxy function calls the original function
+    // address (which is behind the same EPT VMCALL hook).
+    //
+    // set to 0 to disable (default). the range is populated from the proxy
+    // function VA and the EPT hook page's fake page contents — all proxy
+    // functions for a given page share the same module, so one range covers
+    // all hooks on the same page.
+    //
+    UINT64      proxy_range_start;        // 0 = disabled
+    UINT64      proxy_range_end;          // exclusive upper bound
 } EPT_HOOKED_FUNCTION_INFO, *PEPT_HOOKED_FUNCTION_INFO;
 
 //
@@ -137,6 +153,15 @@ typedef struct _EPT_HOOKED_PAGE_INFO {
     UINT64           exec_pt_pfn;       // PFN of exec_pt_page
     EPT_PML1_ENTRY   pt_exec_entry;     // EPT entry pointing to exec_pt_page
     volatile LONG *  dbg_pf_counter;    // debug: #PF handler writes here (kernel NonPaged)
+
+    //
+    // shadow CR3 physical address for this process's shadow page tables.
+    // set during ept_hook_install() by searching g_ept->stealth_pages for
+    // matching guest_cr3. used in ept_handle_vmcall_hook() to switch CR3
+    // before redirecting RIP to proxy functions in shadow CR3 memory.
+    // 0 = no shadow CR3 (legacy behavior, proxy in EPT X-only region).
+    //
+    UINT64           shadow_cr3_phys;
 } EPT_HOOKED_PAGE_INFO, *PEPT_HOOKED_PAGE_INFO;
 
 //
@@ -308,6 +333,8 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_STEALTH_FREE     0x00000007
 #define VMCALL_EPT_HOOK_INJECT  0x00000008
 #define VMCALL_EPT_SET_EXTERNAL_FIRED 0x00000009
+#define VMCALL_EPT_UNHOOK_BY_CR3  0x0000000A
+#define VMCALL_RESTORE_REAL_CR3  0x0000000B
 
 //
 // VMCALL identifier in rax — like UnrealVTDbg's VMCALL_IDENTIFIER
@@ -352,6 +379,7 @@ typedef struct _EPT_HOOK_VMCALL_PARAM {
     BOOLEAN oneshot;              // [in] TRUE = redirect to proxy once, then pass-through to trampoline
     UINT64  expected_tid;         // [in] 0 = any thread, non-0 = only this TID may redirect
     volatile LONG * external_fired; // [in] optional kernel NonPaged signal set to 1 on first oneshot hit
+    UINT64  proxy_range_end;      // [in] exclusive upper bound of proxy module (0 = auto: proxy_function + PAGE_SIZE)
 } EPT_HOOK_VMCALL_PARAM, *PEPT_HOOK_VMCALL_PARAM;
 
 //

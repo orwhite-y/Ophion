@@ -78,6 +78,7 @@ typedef struct _TD_PEB_LDR_DATA {
 #define VMCALL_STEALTH_FREE     0x00000007
 #define VMCALL_EPT_HOOK_INJECT  0x00000008
 #define VMCALL_EPT_SET_EXTERNAL_FIRED 0x00000009
+#define VMCALL_RESTORE_REAL_CR3 0x0000000B
 
 //
 // EPT hook inject param 鈥?pre-built at PASSIVE_LEVEL, passed to VMX-root.
@@ -718,8 +719,20 @@ TdBuildShadowCR3(UINT64 cr3, UINT64 base_va, SIZE_T size)
         }
 
         // --- clear NX for this PTE ---
-        shadow_pt[pt_idx] = shadow_pt[pt_idx] & ~NX_BIT_;
+        UINT64 old_pte = shadow_pt[pt_idx];
+        shadow_pt[pt_idx] = old_pte & ~NX_BIT_;
         nx_cleared++;
+
+        // 每 256 页或第一次打印 shadow PTE 详情，确认 PFN 正确
+        if ((nx_cleared & 0xFF) == 1 || nx_cleared == 1)
+        {
+            UINT64 shadow_pfn = (shadow_pt[pt_idx] & PFN_MASK_);
+            UINT64 real_pfn   = (old_pte & PFN_MASK_);
+            HYPERPLATFORM_LOG_INFO("[td-rw] shadow PTE[%u]: va=%p real_pfn=0x%llX shadow_pfn=0x%llX NX=%s->%s",
+                pt_idx, (PVOID)va, real_pfn, shadow_pfn,
+                (old_pte & NX_BIT_) ? "1" : "0",
+                (shadow_pt[pt_idx] & NX_BIT_) ? "1" : "0");
+        }
     }
 
     UINT64 shadow_pml4_pa = MmGetPhysicalAddress(shadow_pml4).QuadPart;
@@ -874,7 +887,21 @@ TdExtendShadowCR3(UINT64 shadow_cr3_phys, UINT64 cr3, UINT64 base_va, SIZE_T siz
         // refresh preserves the NX bit, so it must be cleared here. The protect
         // handler's tracked block overwrites with new_protect afterwards, so
         // this is a no-op for the protect path.
-        shadow_pt[(va >> 12) & 0x1FF] &= ~NX_BIT_;
+        UINT64 old_pte_ext = shadow_pt[(va >> 12) & 0x1FF];
+        shadow_pt[(va >> 12) & 0x1FF] = old_pte_ext & ~NX_BIT_;
+        {
+            static LONG ext_log_count = 0;
+            LONG c = _InterlockedIncrement(&ext_log_count);
+            if ((c & 0xFF) == 1 || c == 1)
+            {
+                UINT64 pfn_shadow = (shadow_pt[(va >> 12) & 0x1FF] & PFN_MASK_);
+                UINT64 pfn_real   = (old_pte_ext & PFN_MASK_);
+                HYPERPLATFORM_LOG_INFO("[td-rw-ext] shadow PTE[%u]: va=%p real_pfn=0x%llX shadow_pfn=0x%llX NX=%s->%s",
+                    (UINT32)((va >> 12) & 0x1FF), (PVOID)va, pfn_real, pfn_shadow,
+                    (old_pte_ext & NX_BIT_) ? "1" : "0",
+                    (shadow_pt[(va >> 12) & 0x1FF] & NX_BIT_) ? "1" : "0");
+            }
+        }
     }
 
     if (!TdShadowExtendCr3Pages(shadow_cr3_phys, &ctx))
@@ -1453,6 +1480,7 @@ extern BOOLEAN g_device_hidden;
 #define IOCTL_RESOLVE_EXPORT CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 12, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_GET_MODULE_BASE CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 13, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_HIDE_DEVICE     CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 14, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define TD_IOCTL_RESTORE_REAL_CR3 CTL_CODE(FILE_DEVICE_UNKNOWN, 0x915, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #pragma pack(push, 8)
 typedef struct _TD_RESOLVE_EXPORT_PARAMS {
@@ -2090,6 +2118,8 @@ TdStealthInjectPages(
 
 #define VMCALL_EPT_HOOK     0x00000003
 #define VMCALL_EPT_UNHOOK   0x00000004
+#define VMCALL_EPT_UNHOOK_BY_CR3 0x0000000A
+#define VMCALL_RESTORE_REAL_CR3  0x0000000B
 
 //
 // original NtCreateFile pointer (set by hook install, used by proxy)
@@ -2211,6 +2241,25 @@ DpcEptUnhook(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
     KeSignalCallDpcDone(A1);
 }
 
+static VOID
+DpcEptUnhookByCr3(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
+{
+    UNREFERENCED_PARAMETER(Dpc);
+
+    struct _UNHOOK_CR3_CTX {
+        UINT64   target_cr3;
+        NTSTATUS result;
+    } * ctx = (struct _UNHOOK_CR3_CTX *)Ctx;
+
+    ctx->result = hv_vmcall_ex(
+        VMCALL_EPT_UNHOOK_BY_CR3,
+        ctx->target_cr3,
+        0, 0, 0, 0, 0, 0, 0, 0);
+
+    KeSignalCallDpcSynchronize(A2);
+    KeSignalCallDpcDone(A1);
+}
+
 static NTSTATUS
 TdEptHookNtCreateFile(VOID)
 {
@@ -2288,7 +2337,7 @@ TdEptUnhookNtCreateFile(VOID)
 }
 
 // =========================================================================
-//  R3 EPT Hook 鈥?per-process, user-mode trampoline, MDL-locked
+//  R3 EPT Hook — per-process, user-mode trampoline, MDL-locked
 // =========================================================================
 
 //
@@ -3425,6 +3474,116 @@ TdFindExportByName(PVOID module_base, const char * func_name)
     return TdFindExportByNameEx(module_base, func_name, 0);
 }
 
+//
+// TdFindExportRvaToVaRaw -- parse exports from raw PE file bytes (not mapped),
+// find a named export, and return its VA as if loaded at 'mapped_base'.
+// This is needed because TdManualMapInProcess overwrites the PE header at base+0
+// with a DllMain stub, making the normal export table unreadable from the mapped image.
+//
+static PVOID
+TdFindExportRvaToVaRaw(PUINT8 raw_dll, PVOID mapped_base, const char * func_name)
+{
+    if (!raw_dll || !mapped_base || !func_name)
+        return NULL;
+
+    __try {
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)raw_dll;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+
+        PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(raw_dll + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
+
+        ULONG exp_rva  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        ULONG exp_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        if (!exp_rva || exp_size < sizeof(IMAGE_EXPORT_DIRECTORY)) return NULL;
+
+        // Convert export directory RVA to raw file offset via section headers
+        PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+        USHORT num_sec = nt->FileHeader.NumberOfSections;
+        ULONG exp_raw = 0;
+        for (USHORT i = 0; i < num_sec; i++)
+        {
+            if (exp_rva >= sec[i].VirtualAddress &&
+                exp_rva < sec[i].VirtualAddress + sec[i].Misc.VirtualSize)
+            {
+                exp_raw = exp_rva - sec[i].VirtualAddress + sec[i].PointerToRawData;
+                break;
+            }
+        }
+        if (!exp_raw) return NULL;
+
+        PIMAGE_EXPORT_DIRECTORY exp_dir = (PIMAGE_EXPORT_DIRECTORY)(raw_dll + exp_raw);
+        if (!exp_dir->NumberOfNames || !exp_dir->NumberOfFunctions ||
+            exp_dir->NumberOfNames > 0x10000 ||
+            exp_dir->NumberOfFunctions > 0x10000 ||
+            !exp_dir->AddressOfNames || !exp_dir->AddressOfNameOrdinals ||
+            !exp_dir->AddressOfFunctions)
+            return NULL;
+
+        // Convert AddressOfNames/AddressOfNameOrdinals/AddressOfFunctions from RVA to raw
+        // This is a simplification: we assume the entire export directory is in one section
+        // and that AddressOf* fields are within the same section as the export dir.
+        // For simplicity, compute the offset from export dir start to each field.
+        ULONG names_raw = 0, ords_raw = 0, funcs_raw = 0;
+        // Find the section containing AddressOfNames
+        for (USHORT i = 0; i < num_sec; i++)
+        {
+            ULONG va = exp_dir->AddressOfNames;
+            if (va >= sec[i].VirtualAddress && va < sec[i].VirtualAddress + sec[i].Misc.VirtualSize)
+            {
+                names_raw = va - sec[i].VirtualAddress + sec[i].PointerToRawData;
+            }
+            va = exp_dir->AddressOfNameOrdinals;
+            if (va >= sec[i].VirtualAddress && va < sec[i].VirtualAddress + sec[i].Misc.VirtualSize)
+            {
+                ords_raw = va - sec[i].VirtualAddress + sec[i].PointerToRawData;
+            }
+            va = exp_dir->AddressOfFunctions;
+            if (va >= sec[i].VirtualAddress && va < sec[i].VirtualAddress + sec[i].Misc.VirtualSize)
+            {
+                funcs_raw = va - sec[i].VirtualAddress + sec[i].PointerToRawData;
+            }
+        }
+        if (!names_raw || !ords_raw || !funcs_raw) return NULL;
+
+        PULONG  names = (PULONG)(raw_dll + names_raw);
+        PUSHORT ords  = (PUSHORT)(raw_dll + ords_raw);
+        PULONG  funcs = (PULONG)(raw_dll + funcs_raw);
+
+        for (ULONG i = 0; i < exp_dir->NumberOfNames; i++)
+        {
+            // Convert name pointer RVA to raw
+            ULONG name_rva = names[i];
+            ULONG name_raw = 0;
+            for (USHORT s = 0; s < num_sec; s++)
+            {
+                if (name_rva >= sec[s].VirtualAddress && name_rva < sec[s].VirtualAddress + sec[s].Misc.VirtualSize)
+                {
+                    name_raw = name_rva - sec[s].VirtualAddress + sec[s].PointerToRawData;
+                    break;
+                }
+            }
+            if (!name_raw) continue;
+
+            const char * fn = (const char *)(raw_dll + name_raw);
+            if (TdAsciiEqualIBounded(fn, func_name, 256))
+            {
+                USHORT ord = ords[i];
+                if (ord >= exp_dir->NumberOfFunctions) return NULL;
+                ULONG func_rva = funcs[ord];
+                if (!func_rva) return NULL;
+
+                // Return the VA as if loaded at mapped_base
+                return (PUINT8)mapped_base + func_rva;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        HYPERPLATFORM_LOG_WARN("[td-map] exception in TdFindExportRvaToVaRaw");
+    }
+
+    return NULL;
+}
+
 static BOOLEAN
 TdExtractSyscallIndexFromStub(PVOID stub, PULONG index_out)
 {
@@ -3843,13 +4002,39 @@ TdPeResolveImports(PVOID mapped_base)
 //   ret
 //
 static UINT32
-TdBuildDllMainStub(PVOID stub_addr, UINT64 image_base, UINT64 entry_point)
+TdBuildDllMainStub(PVOID stub_addr, UINT64 image_base, UINT64 entry_point,
+                   UINT64 rtl_add_function_table_va, UINT64 exc_table_va, UINT32 exc_count)
 {
     PUINT8 s = (PUINT8)stub_addr;
     UINT32 off = 0;
 
     // sub rsp, 28h
     s[off++] = 0x48; s[off++] = 0x83; s[off++] = 0xEC; s[off++] = 0x28;
+
+    // Register the DLL's exception table BEFORE _DllMainCRTStartup so x64 SEH
+    // (__try/__except) works inside the manually-mapped DLL. Without this,
+    // RtlLookupFunctionEntry can't find RUNTIME_FUNCTION entries for the DLL ->
+    // __except never fires -> an AV in DllMain leaks the shadow CR3 window
+    // (vmcall_restore_real_cr3 never runs) -> leaked #PF intercept mis-handles
+    // other threads -> shell instability.
+    // RtlAddFunctionTable(exc_table_va, exc_count, image_base)
+    if (rtl_add_function_table_va && exc_count && exc_table_va)
+    {
+        // mov rcx, exc_table_va (imm64)
+        s[off++] = 0x48; s[off++] = 0xB9;
+        *(PUINT64)(s + off) = exc_table_va; off += 8;
+        // mov edx, exc_count (imm32)
+        s[off++] = 0xBA;
+        *(PUINT32)(s + off) = exc_count; off += 4;
+        // mov r8, image_base (imm64)
+        s[off++] = 0x49; s[off++] = 0xB8;
+        *(PUINT64)(s + off) = image_base; off += 8;
+        // mov rax, rtl_add_function_table_va (imm64)
+        s[off++] = 0x48; s[off++] = 0xB8;
+        *(PUINT64)(s + off) = rtl_add_function_table_va; off += 8;
+        // call rax
+        s[off++] = 0xFF; s[off++] = 0xD0;
+    }
 
     // mov rcx, IMAGE_BASE (imm64)
     s[off++] = 0x48; s[off++] = 0xB9;
@@ -3899,8 +4084,6 @@ TdManualMapInProcess(
     PVOID *   out_base,
     PVOID *   out_entry)
 {
-    UNREFERENCED_PARAMETER(proc);
-
     if (!raw_dll || dll_size < sizeof(IMAGE_DOS_HEADER) + sizeof(IMAGE_NT_HEADERS64))
         return STATUS_INVALID_PARAMETER;
 
@@ -3982,10 +4165,32 @@ TdManualMapInProcess(
         if (nt->OptionalHeader.AddressOfEntryPoint)
         {
             UINT64 entry_point_va = (UINT64)base + nt->OptionalHeader.AddressOfEntryPoint;
-            UINT32 stub_size = TdBuildDllMainStub(base, (UINT64)base, entry_point_va);
 
-            HYPERPLATFORM_LOG_INFO("[td-map] DllMain stub: base=%p entry=0x%llX stub_size=%u",
-                       base, entry_point_va, stub_size);
+            // Resolve ntdll!RtlAddFunctionTable + the DLL's exception directory so
+            // the stub registers the exception table before _DllMainCRTStartup
+            // (enables SEH __try/__except in the manually-mapped DLL). Without
+            // this, an AV in DllMain can't be caught -> vmcall_restore skipped
+            // -> shadow CR3 window leaks.
+            UINT64 rtl_add_ft = 0;
+            UINT64 exc_table_va = 0;
+            UINT32 exc_count = 0;
+            PVOID ntdll_b = TdFindModuleBaseA("ntdll.dll", NULL);
+            if (!ntdll_b) ntdll_b = TdFindModuleBaseA("ntdll", NULL);
+            if (ntdll_b)
+                rtl_add_ft = (UINT64)TdFindExportByName(ntdll_b, "RtlAddFunctionTable");
+            IMAGE_DATA_DIRECTORY excd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+            if (excd.VirtualAddress && excd.Size)
+            {
+                exc_count = excd.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
+                exc_table_va = (UINT64)base + excd.VirtualAddress;
+            }
+
+            UINT32 stub_size = TdBuildDllMainStub(base, (UINT64)base, entry_point_va,
+                                                   rtl_add_ft, exc_table_va, exc_count);
+
+            HYPERPLATFORM_LOG_INFO("[td-map] DllMain stub: base=%p entry=0x%llX stub_size=%u rtl_add_ft=%p exc=%llu@0x%llX",
+                       base, entry_point_va, stub_size, (PVOID)rtl_add_ft,
+                       (UINT64)exc_count, (UINT64)exc_table_va);
 
             // 8. zero from stub end to SizeOfHeaders (clear remaining PE header data)
             ULONG hdr_size = nt->OptionalHeader.SizeOfHeaders;
@@ -4006,7 +4211,85 @@ TdManualMapInProcess(
         *out_base  = base;
         *out_entry = entry;
 
-        // 9. change protection for executable sections
+        // 9. shadow CR3 NX-bypass -- make the image executable via a shadow CR3
+        // (real PT stays NX => NO PAGE_EXECUTE_* allocation => stealth). The
+        // driver-created thread runs the DllMain stub (at base+0) through this
+        // shadow view. Mirrors IOCTL_ALLOC_SHADOW_MEMORY (need_execute=1).
+        // NOTE: no RtlAddFunctionTable here -- RtlAddFunctionTable is a user-mode
+        // ntdll API (not ntoskrnl-exported). We bet the load path is exception-
+        // free (happy path: x64 SEH only needs RUNTIME_FUNCTION on unwind). If a
+        // fault occurs during MemoryModule/CRT SEH, revisit via a stub that
+        // calls ntdll!RtlAddFunctionTable before _DllMainCRTStartup.
+        if (g_process_notify_registered)
+        {
+            UINT64 caller_cr3 = __readcr3();
+            HANDLE pid = PsGetProcessId(proc);
+            UINT64 existing = TdStealthFindShadowCr3ForPid((UINT64)pid);
+            UINT64 shadow_cr3 = 0;
+            if (existing)
+                shadow_cr3 = TdExtendShadowCR3(existing, caller_cr3, (UINT64)base, image_size);
+            else
+                shadow_cr3 = TdBuildShadowCR3(caller_cr3, (UINT64)base, image_size);
+            if (!shadow_cr3)
+            {
+                HYPERPLATFORM_LOG_ERROR("[td-map] shadow CR3 build failed base=%p size=0x%llX",
+                    base, (UINT64)image_size);
+                ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &image_size, MEM_RELEASE);
+                *out_base = NULL; *out_entry = NULL;
+                return STATUS_UNSUCCESSFUL;
+            }
+
+            SIZE_T pages_installed = 0;
+            BOOLEAN fail = FALSE;
+            for (SIZE_T off = 0; off < image_size; off += PAGE_SIZE)
+            {
+                PVOID page_va = (PUINT8)base + off;
+                UINT64 page_phys = MmGetPhysicalAddress(page_va).QuadPart;
+                UINT64 pt_pfn = 0;
+                UINT32 pt_idx = 0;
+                if (!page_phys || !TdResolveGuestPT(caller_cr3, (UINT64)page_va, &pt_pfn, &pt_idx))
+                {
+                    HYPERPLATFORM_LOG_ERROR("[td-map] PT/PA resolve failed VA=%p", page_va);
+                    fail = TRUE; break;
+                }
+                NTSTATUS stealth_st = TdStealthAllocPage(
+                    caller_cr3, page_va, page_phys, NULL, 0, TRUE,
+                    pt_pfn, pt_idx, FALSE, shadow_cr3, TRUE, FALSE);
+                if (!NT_SUCCESS(stealth_st))
+                {
+                    HYPERPLATFORM_LOG_ERROR("[td-map] stealth page failed VA=%p st=0x%08X", page_va, stealth_st);
+                    fail = TRUE; break;
+                }
+                pages_installed++;
+            }
+
+            if (!fail && !TdStealthTrackAdd((UINT64)pid, base, image_size, shadow_cr3))
+            {
+                HYPERPLATFORM_LOG_ERROR("[td-map] stealth track table full");
+                fail = TRUE;
+            }
+
+            if (fail)
+            {
+                for (SIZE_T i = 0; i < pages_installed; i++)
+                    TdStealthFreePage((PUINT8)base + (i * PAGE_SIZE));
+                if (!existing && shadow_cr3)
+                    TdShadowFreeCr3(shadow_cr3);
+                ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &image_size, MEM_RELEASE);
+                *out_base = NULL; *out_entry = NULL;
+                return STATUS_UNSUCCESSFUL;
+            }
+
+            HYPERPLATFORM_LOG_INFO("[td-map] shadow CR3 installed: base=%p size=0x%llX (%llu pages)",
+                base, (UINT64)image_size, (UINT64)pages_installed);
+        }
+        else
+        {
+            HYPERPLATFORM_LOG_WARN("[td-map] process notify not registered -- shadow CR3 skipped");
+        }
+
+        // 10. (legacy) section protection -- now no-op: pages stay PAGE_READWRITE
+        // and execute via the shadow CR3 NX-bypass above (no PAGE_EXECUTE_*).
         // re-parse the mapped image headers (we need section headers which are
         // after the optional header, so they survive the stub overwrite at offset 0)
         {
@@ -4028,7 +4311,7 @@ TdManualMapInProcess(
                     ULONG old_prot = 0;
                     st = ZwProtectVirtualMemory(
                         ZwCurrentProcess(), &sec_base, &sec_size,
-                        PAGE_EXECUTE_READ, &old_prot);
+                        PAGE_READWRITE, &old_prot);
 
                     if (NT_SUCCESS(st))
                         HYPERPLATFORM_LOG_INFO("[td-map] section %u (%.8s) 鈫?PAGE_EXECUTE_READ", i, sec[i].Name);
@@ -4045,7 +4328,7 @@ TdManualMapInProcess(
                 ULONG old_prot = 0;
                 st = ZwProtectVirtualMemory(
                     ZwCurrentProcess(), &hdr_base, &hdr_prot_size,
-                    PAGE_EXECUTE_READ, &old_prot);
+                    PAGE_READWRITE, &old_prot);
 
                 if (NT_SUCCESS(st))
                     HYPERPLATFORM_LOG_INFO("[td-map] header page 鈫?PAGE_EXECUTE_READ");
@@ -4061,6 +4344,474 @@ TdManualMapInProcess(
         HYPERPLATFORM_LOG_ERROR("[td-map] exception in TdManualMapInProcess");
         return STATUS_UNSUCCESSFUL;
     }
+}
+
+// =========================================================================
+//  kernel-side MemoryModule (full kernel reimplementation, no Detours)
+//
+//  Phase 0: parse renderdoc's TLS directory + exception table from the raw PE,
+//  rebasing VAs to the mapped base. Foundation for TLS index alloc, per-thread
+//  TLS, RtlAddFunctionTable, and DllMain invocation (later phases).
+// =========================================================================
+
+// RVA -> raw file offset via the section table (headers read from raw, intact)
+static PUINT8 TdPeRvaToRaw(PUINT8 raw_dll, SIZE_T dll_size, UINT32 rva)
+{
+    if (!raw_dll) return NULL;
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)raw_dll;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+    PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(raw_dll + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
+    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+    USHORT n = nt->FileHeader.NumberOfSections;
+    for (USHORT i = 0; i < n; i++)
+    {
+        UINT32 va = sec[i].VirtualAddress;
+        UINT32 vsz = sec[i].Misc.VirtualSize ? sec[i].Misc.VirtualSize : sec[i].SizeOfRawData;
+        if (rva >= va && rva < va + vsz)
+        {
+            UINT32 off = sec[i].PointerToRawData + (rva - va);
+            if ((SIZE_T)off + 8 > dll_size) return NULL;
+            return raw_dll + off;
+        }
+    }
+    return NULL;
+}
+
+typedef struct _TD_RD_IMAGE_INFO {
+    PVOID  base;
+    SIZE_T image_size;
+    PVOID  entry_va;          // DllMain (base + AddressOfEntryPoint)
+    // TLS
+    BOOLEAN has_tls;
+    PVOID   tls_index_va;     // VA of DWORD the mapper fills with allocated index
+    PVOID   tls_template_va;  // VA of TLS template (StartAddressOfRawData)
+    SIZE_T  tls_template_size;// EndAddressOfRawData - StartAddressOfRawData
+    PVOID   tls_callbacks_va; // VA of null-terminated callback ptr array
+    ULONG   tls_zero_fill;
+    // Exception table
+    PVOID   exc_table_va;     // VA of RUNTIME_FUNCTION[]
+    ULONG   exc_table_count;
+} TD_RD_IMAGE_INFO;
+
+// Parse TLS + exception dirs from the raw PE; VAs rebased to the mapped `base`.
+static NTSTATUS TdParseRenderdocImage(PUINT8 raw_dll, SIZE_T dll_size, PVOID base, TD_RD_IMAGE_INFO * info)
+{
+    RtlZeroMemory(info, sizeof(*info));
+    info->base = base;
+    if (!raw_dll || dll_size < sizeof(IMAGE_DOS_HEADER) + sizeof(IMAGE_NT_HEADERS64))
+        return STATUS_INVALID_PARAMETER;
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)raw_dll;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return STATUS_INVALID_IMAGE_FORMAT;
+    PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(raw_dll + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return STATUS_INVALID_IMAGE_FORMAT;
+
+    info->image_size = nt->OptionalHeader.SizeOfImage;
+    info->entry_va = (PUINT8)base + nt->OptionalHeader.AddressOfEntryPoint;
+    UINT64 imgbase = nt->OptionalHeader.ImageBase;
+
+    // TLS directory (IMAGE_DIRECTORY_ENTRY_TLS = 9). Fields are absolute VAs
+    // (ImageBase-relative in the raw file); rebase to the mapped base.
+    IMAGE_DATA_DIRECTORY tlsd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (tlsd.VirtualAddress && tlsd.Size >= sizeof(IMAGE_TLS_DIRECTORY64))
+    {
+        PIMAGE_TLS_DIRECTORY64 tls = (PIMAGE_TLS_DIRECTORY64)TdPeRvaToRaw(raw_dll, dll_size, tlsd.VirtualAddress);
+        if (tls)
+        {
+            info->has_tls = TRUE;
+            info->tls_index_va     = (PVOID)((UINT64)base + (tls->AddressOfIndex - imgbase));
+            info->tls_template_va  = (PVOID)((UINT64)base + (tls->StartAddressOfRawData - imgbase));
+            info->tls_template_size = tls->EndAddressOfRawData - tls->StartAddressOfRawData;
+            info->tls_callbacks_va = (PVOID)((UINT64)base + (tls->AddressOfCallBacks - imgbase));
+            info->tls_zero_fill = tls->SizeOfZeroFill;
+        }
+    }
+
+    // Exception table (IMAGE_DIRECTORY_ENTRY_EXCEPTION = 3). RVAs -> base.
+    IMAGE_DATA_DIRECTORY excd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (excd.VirtualAddress && excd.Size)
+    {
+        info->exc_table_va = (PVOID)((UINT64)base + excd.VirtualAddress);
+        info->exc_table_count = excd.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
+    }
+
+    HYPERPLATFORM_LOG_INFO("[td-kmm] parse: base=%p entry=%p tls=%u tpl=%zu idx=%p cb=%p exc=%u@%p",
+        base, info->entry_va, info->has_tls, info->tls_template_size, info->tls_index_va,
+        info->tls_callbacks_va, info->exc_table_count, info->exc_table_va);
+    return STATUS_SUCCESS;
+}
+
+// =========================================================================
+//  Phase 1: TLS index allocation + existing-thread TLS extension.
+//
+//  renderdoc uses loader static TLS via TEB->ThreadLocalStoragePointer (TEB+0x50
+//  on x64). That pointer references a PVOID[] array (ModuleTlsData); a ULONG
+//  Length precedes it at (ptr - 8) [TLS_VECTOR layout, same as MemoryModule].
+//  We append renderdoc's slot at index = current Length, write *AddressOfIndex,
+//  and replace every existing thread's ThreadLocalStoragePointer with an
+//  extended array (old slots copied + renderdoc per-thread data = template copy
+//  + zero-fill). Must be called attached to the target (PASSIVE_LEVEL).
+// =========================================================================
+
+#define TD_TEB_TLS_POINTER_OFFSET  0x50   // TEB->ThreadLocalStoragePointer (x64)
+
+// ZwQuerySystemInformation + SYSTEM_PROCESS_INFORMATION are not declared in this
+// WDK's kernel headers; declare them ourselves (ntoskrnl exports ZwQuerySystemInformation).
+#define TD_SystemProcessInformation 5
+typedef struct _TD_SYS_THREAD_INFO {
+    LARGE_INTEGER KernelTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER CreateTime;
+    ULONG WaitTime;
+    PVOID StartAddress;
+    CLIENT_ID ClientId;
+    KPRIORITY Priority;
+    LONG BasePriority;
+    ULONG ContextSwitches;
+    ULONG ThreadState;
+    KWAIT_REASON WaitReason;
+} TD_SYS_THREAD_INFO;
+typedef struct _TD_SYS_PROCESS_INFO {
+    ULONG NextEntryOffset;
+    ULONG NumberOfThreads;
+    LARGE_INTEGER WorkingSetPrivateSize;
+    LARGE_INTEGER HardFaultCount;
+    LARGE_INTEGER NumberOfThreadsHighWatermark;
+    ULONGLONG CycleTime;
+    LARGE_INTEGER CreateTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER KernelTime;
+    UNICODE_STRING ImageName;
+    KPRIORITY BasePriority;
+    HANDLE UniqueProcessId;
+    HANDLE InheritedFromUniqueProcessId;
+    ULONG HandleCount;
+    ULONG SessionId;
+    ULONG_PTR UniqueProcessKey;
+    SIZE_T PeakVirtualSize;
+    SIZE_T VirtualSize;
+    ULONG PageFaultCount;
+    SIZE_T PeakWorkingSetSize;
+    SIZE_T WorkingSetSize;
+    SIZE_T QuotaPeakPagedPoolUsage;
+    SIZE_T QuotaPagedPoolUsage;
+    SIZE_T QuotaPeakNonPagedPoolUsage;
+    SIZE_T QuotaNonPagedPoolUsage;
+    SIZE_T PagefileUsage;
+    SIZE_T PeakPagefileUsage;
+    SIZE_T PrivatePageCount;
+    LARGE_INTEGER ReadOperationCount;
+    LARGE_INTEGER WriteOperationCount;
+    LARGE_INTEGER OtherOperationCount;
+    LARGE_INTEGER ReadTransferCount;
+    LARGE_INTEGER WriteTransferCount;
+    LARGE_INTEGER OtherTransferCount;
+    TD_SYS_THREAD_INFO Threads[1];
+} TD_SYS_PROCESS_INFO;
+// ZwQuerySystemInformation / ZwOpenThread / ZwQueryInformationThread are not in
+// this WDK's headers nor ntoskrnl.lib (removed in 26100). Resolve at runtime via
+// MmGetSystemRoutineAddress (ntoskrnl still exports them). Use fn pointers.
+typedef NTSTATUS (NTAPI *fn_ZwQuerySystemInformation)(ULONG, PVOID, ULONG, PULONG);
+typedef NTSTATUS (NTAPI *fn_ZwOpenThread)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
+typedef NTSTATUS (NTAPI *fn_ZwQueryInformationThread)(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG);
+static fn_ZwQuerySystemInformation  g_pZwQuerySystemInformation  = NULL;
+static fn_ZwOpenThread              g_pZwOpenThread              = NULL;
+static fn_ZwQueryInformationThread  g_pZwQueryInformationThread  = NULL;
+
+#define TD_THREAD_QUERY_INFORMATION  0x0040
+typedef struct _TD_THREAD_BASIC_INFORMATION {
+    NTSTATUS ExitStatus;
+    PVOID    TebBaseAddress;   // PTEB (opaque; treat as VA)
+    CLIENT_ID ClientId;
+    KAFFINITY AffinityMask;
+    KPRIORITY Priority;
+    KPRIORITY BasePriority;
+} TD_THREAD_BASIC_INFORMATION;
+
+static NTSTATUS TdSetupRenderdocTls(const TD_RD_IMAGE_INFO * info, ULONG * out_index)
+{
+    if (out_index) *out_index = 0;
+    if (!info->has_tls || !info->tls_index_va || !info->tls_template_va)
+        return STATUS_INVALID_PARAMETER;
+    if (!g_pZwQuerySystemInformation || !g_pZwOpenThread || !g_pZwQueryInformationThread) {
+        HYPERPLATFORM_LOG_ERROR("[td-kmm] TLS setup: Zw* APIs not resolved");
+        return STATUS_NOT_FOUND;
+    }
+
+    ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();   // target pid (attached)
+
+    // enumerate target threads via g_pZwQuerySystemInformation(SystemProcessInformation)
+    ULONG bufLen = 0x10000;
+    PVOID buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, bufLen, 'psT');
+    if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
+    NTSTATUS st;
+    for (;;) {
+        st = g_pZwQuerySystemInformation(TD_SystemProcessInformation, buf, bufLen, &bufLen);
+        if (st == STATUS_INFO_LENGTH_MISMATCH) {
+            ExFreePoolWithTag(buf, 'psT');
+            buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, bufLen, 'psT');
+            if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
+            continue;
+        }
+        break;
+    }
+    if (!NT_SUCCESS(st)) { ExFreePoolWithTag(buf, 'psT'); return st; }
+
+    TD_SYS_PROCESS_INFO * p = (TD_SYS_PROCESS_INFO *)buf;
+    TD_SYS_PROCESS_INFO * target_pi = NULL;
+    for (;;) {
+        if (p->UniqueProcessId == (HANDLE)(ULONG_PTR)pid) { target_pi = p; break; }
+        if (!p->NextEntryOffset) break;
+        p = (TD_SYS_PROCESS_INFO *)((PUINT8)p + p->NextEntryOffset);
+    }
+    if (!target_pi) { ExFreePoolWithTag(buf, 'psT'); return STATUS_NOT_FOUND; }
+
+    // pass 1: determine tls_index = first thread's TLS Length (append renderdoc)
+    ULONG tls_index = 0;
+    BOOLEAN found = FALSE;
+    for (ULONG i = 0; i < target_pi->NumberOfThreads; i++) {
+        CLIENT_ID cid = target_pi->Threads[i].ClientId;
+        HANDLE hT = NULL;
+        OBJECT_ATTRIBUTES oa; InitializeObjectAttributes(&oa, NULL, 0, NULL, NULL);
+        if (NT_SUCCESS(g_pZwOpenThread(&hT, TD_THREAD_QUERY_INFORMATION, &oa, &cid))) {
+            TD_THREAD_BASIC_INFORMATION tbi;
+            if (NT_SUCCESS(g_pZwQueryInformationThread(hT, ThreadBasicInformation, &tbi, sizeof(tbi), NULL))) {
+                __try {
+                    PVOID tlsp = *(PVOID *)((PUINT8)tbi.TebBaseAddress + TD_TEB_TLS_POINTER_OFFSET);
+                    if (tlsp) {
+                        tls_index = *(ULONG *)((PUINT8)tlsp - 8);
+                        found = TRUE;
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            }
+            ZwClose(hT);
+        }
+        if (found) break;
+    }
+    if (!found) tls_index = 0;
+
+    // set *AddressOfIndex (the DWORD renderdoc reads to find its slot)
+    __try { *(ULONG *)info->tls_index_va = tls_index; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    // pass 2: extend each thread's ThreadLocalStoragePointer
+    SIZE_T slot_size = info->tls_template_size + info->tls_zero_fill;
+    ULONG extended = 0;
+    for (ULONG i = 0; i < target_pi->NumberOfThreads; i++) {
+        CLIENT_ID cid = target_pi->Threads[i].ClientId;
+        HANDLE hT = NULL;
+        OBJECT_ATTRIBUTES oa; InitializeObjectAttributes(&oa, NULL, 0, NULL, NULL);
+        if (!NT_SUCCESS(g_pZwOpenThread(&hT, TD_THREAD_QUERY_INFORMATION, &oa, &cid))) continue;
+        TD_THREAD_BASIC_INFORMATION tbi;
+        if (!NT_SUCCESS(g_pZwQueryInformationThread(hT, ThreadBasicInformation, &tbi, sizeof(tbi), NULL))) {
+            ZwClose(hT); continue;
+        }
+        PUINT8 teb = (PUINT8)tbi.TebBaseAddress;
+
+        __try {
+            PVOID old_tlsp = *(PVOID *)(teb + TD_TEB_TLS_POINTER_OFFSET);
+            ULONG old_len = 0;
+            if (old_tlsp) old_len = *(ULONG *)((PUINT8)old_tlsp - 8);
+
+            // new TLS_VECTOR: [Length(4)+pad(4)] + (tls_index+1) PVOID slots
+            SIZE_T new_arr_size = 8 + (tls_index + 1) * sizeof(PVOID);
+            PVOID new_arr = NULL;
+            SIZE_T alloc_sz = new_arr_size;
+            if (!NT_SUCCESS(ZwAllocateVirtualMemory(ZwCurrentProcess(), &new_arr, 0, &alloc_sz,
+                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)))
+                continue;
+
+            // renderdoc per-thread slot (template + zero-fill)
+            PVOID rd_slot = NULL;
+            SIZE_T rd_alloc = slot_size ? slot_size : 8;
+            if (!NT_SUCCESS(ZwAllocateVirtualMemory(ZwCurrentProcess(), &rd_slot, 0, &rd_alloc,
+                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) {
+                PVOID f = new_arr; SIZE_T fs = 0;
+                ZwFreeVirtualMemory(ZwCurrentProcess(), &f, &fs, MEM_RELEASE);
+                continue;
+            }
+            if (info->tls_template_size)
+                RtlCopyMemory(rd_slot, info->tls_template_va, info->tls_template_size);
+            // zero-fill region already zeroed by ZwAllocateVirtualMemory
+
+            *(ULONG *)new_arr = tls_index + 1;              // Length
+            PVOID * slots = (PVOID *)((PUINT8)new_arr + 8); // ModuleTlsData[]
+            ULONG copy_n = (old_len < tls_index) ? old_len : tls_index;
+            if (old_tlsp && copy_n)
+                RtlCopyMemory(slots, old_tlsp, copy_n * sizeof(PVOID));
+            for (ULONG k = old_len; k < tls_index; k++) slots[k] = NULL;  // gap pad
+            slots[tls_index] = rd_slot;                      // renderdoc slot
+
+            // point TEB at the new ModuleTlsData[]
+            *(PVOID *)(teb + TD_TEB_TLS_POINTER_OFFSET) = slots;
+            extended++;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        ZwClose(hT);
+    }
+
+    ExFreePoolWithTag(buf, 'psT');
+    if (out_index) *out_index = tls_index;
+    HYPERPLATFORM_LOG_INFO("[td-kmm] TLS setup: index=%lu threads=%lu extended=%lu",
+        tls_index, target_pi->NumberOfThreads, extended);
+    return STATUS_SUCCESS;
+}
+
+// Extend ONE thread's ThreadLocalStoragePointer with renderdoc's TLS slot.
+// teb = the thread's TEB VA (target address space; caller attached). Used for
+// the created trigger thread (not covered by TdSetupRenderdocTls's existing-set).
+static BOOLEAN TdExtendThreadTls(PUINT8 teb, const TD_RD_IMAGE_INFO * info, ULONG tls_index)
+{
+    if (!teb || !info) return FALSE;
+    __try {
+        PVOID old_tlsp = *(PVOID *)(teb + TD_TEB_TLS_POINTER_OFFSET);
+        ULONG old_len = 0;
+        if (old_tlsp) old_len = *(ULONG *)((PUINT8)old_tlsp - 8);
+
+        SIZE_T slot_size = info->tls_template_size + info->tls_zero_fill;
+        SIZE_T new_arr_size = 8 + (tls_index + 1) * sizeof(PVOID);
+        PVOID new_arr = NULL; SIZE_T alloc_sz = new_arr_size;
+        if (!NT_SUCCESS(ZwAllocateVirtualMemory(ZwCurrentProcess(), &new_arr, 0, &alloc_sz,
+                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) return FALSE;
+
+        PVOID rd_slot = NULL; SIZE_T rd_alloc = slot_size ? slot_size : 8;
+        if (!NT_SUCCESS(ZwAllocateVirtualMemory(ZwCurrentProcess(), &rd_slot, 0, &rd_alloc,
+                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) {
+            PVOID f = new_arr; SIZE_T fs = 0; ZwFreeVirtualMemory(ZwCurrentProcess(), &f, &fs, MEM_RELEASE);
+            return FALSE;
+        }
+        if (info->tls_template_size)
+            RtlCopyMemory(rd_slot, info->tls_template_va, info->tls_template_size);
+
+        *(ULONG *)new_arr = tls_index + 1;
+        PVOID * slots = (PVOID *)((PUINT8)new_arr + 8);
+        ULONG copy_n = (old_len < tls_index) ? old_len : tls_index;
+        if (old_tlsp && copy_n) RtlCopyMemory(slots, old_tlsp, copy_n * sizeof(PVOID));
+        for (ULONG k = old_len; k < tls_index; k++) slots[k] = NULL;
+        slots[tls_index] = rd_slot;
+        *(PVOID *)(teb + TD_TEB_TLS_POINTER_OFFSET) = slots;
+        return TRUE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return FALSE; }
+}
+
+// Build the CreateWindowExW handler shellcode:
+//   RtlAddFunctionTable(exc_table, count, base)   ; register renderdoc exception table
+//   DllMain(base, DLL_PROCESS_ATTACH, NULL)        ; renderdoc entry
+//   jmp original_CreateWindowExW                   ; via trampoline (restore 4 reg args + stack args untouched)
+// Kernel patches VAs as immediates. Returns stub byte length.
+static ULONG TdBuildCwExHandlerStub(PUINT8 stub, const TD_RD_IMAGE_INFO * info,
+    UINT64 rtl_add_function_table_va, UINT64 original_cw_va)
+{
+    ULONG s = 0;
+    // save the 4 register args (rcx..r9) that CreateWindowExW passed to us.
+    // stack args are untouched below our frame.
+    stub[s++]=0x48; stub[s++]=0x83; stub[s++]=0xEC; stub[s++]=0x38;  // sub rsp, 38h (shadow space + alignment)
+    stub[s++]=0x48; stub[s++]=0x89; stub[s++]=0x4C; stub[s++]=0x24; stub[s++]=0x20;  // mov [rsp+20h], rcx  (arg1: dwExStyle)
+    stub[s++]=0x48; stub[s++]=0x89; stub[s++]=0x54; stub[s++]=0x24; stub[s++]=0x28;  // mov [rsp+28h], rdx  (arg2: lpClassName)
+    stub[s++]=0x4C; stub[s++]=0x89; stub[s++]=0x44; stub[s++]=0x24; stub[s++]=0x30;  // mov [rsp+30h], r8   (arg3: lpWindowName)
+    stub[s++]=0x4C; stub[s++]=0x89; stub[s++]=0x4C; stub[s++]=0x24; stub[s++]=0x38;  // mov [rsp+38h], r9   (arg4: dwStyle)
+
+    // RtlAddFunctionTable(exc_table, count, base)
+    stub[s++]=0x48; stub[s++]=0xB9; *(UINT64*)(stub+s)=(UINT64)info->exc_table_va; s+=8;  // mov rcx, exc_table
+    stub[s++]=0xBA; *(UINT32*)(stub+s)=info->exc_table_count; s+=4;            // mov edx, count
+    stub[s++]=0x49; stub[s++]=0xB8; *(UINT64*)(stub+s)=(UINT64)info->base; s+=8;          // mov r8, base
+    stub[s++]=0x48; stub[s++]=0xB8; *(UINT64*)(stub+s)=rtl_add_function_table_va; s+=8;   // mov rax, RtlAddFunctionTable
+    stub[s++]=0xFF; stub[s++]=0xD0;                                            // call rax
+
+    // DllMain(base, DLL_PROCESS_ATTACH, NULL)
+    stub[s++]=0x48; stub[s++]=0xB9; *(UINT64*)(stub+s)=(UINT64)info->base; s+=8;          // mov rcx, base
+    stub[s++]=0xBA; *(UINT32*)(stub+s)=1; s+=4;                                // mov edx, 1 (DLL_PROCESS_ATTACH)
+    stub[s++]=0x45; stub[s++]=0x31; stub[s++]=0xC0;                            // xor r8d, r8d
+    stub[s++]=0x48; stub[s++]=0xB8; *(UINT64*)(stub+s)=(UINT64)info->entry_va; s+=8;       // mov rax, DllMain
+    stub[s++]=0xFF; stub[s++]=0xD0;                                            // call rax
+
+    // restore arg registers before calling original
+    stub[s++]=0x48; stub[s++]=0x8B; stub[s++]=0x4C; stub[s++]=0x24; stub[s++]=0x20;  // mov rcx, [rsp+20h]  (arg1)
+    stub[s++]=0x48; stub[s++]=0x8B; stub[s++]=0x54; stub[s++]=0x24; stub[s++]=0x28;  // mov rdx, [rsp+28h]  (arg2)
+    stub[s++]=0x4C; stub[s++]=0x8B; stub[s++]=0x44; stub[s++]=0x24; stub[s++]=0x30;  // mov r8,  [rsp+30h]  (arg3)
+    stub[s++]=0x4C; stub[s++]=0x8B; stub[s++]=0x4C; stub[s++]=0x24; stub[s++]=0x38;  // mov r9,  [rsp+38h]  (arg4)
+    // r10/r11 are volatile but not arg regs; stack args are untouched
+    stub[s++]=0x48; stub[s++]=0x83; stub[s++]=0xC4; stub[s++]=0x38;            // add rsp, 38h
+
+    // absolute jmp to trampoline (saved bytes + jmp to CreateWindowExW after hook bytes)
+    stub[s++]=0x48; stub[s++]=0xB8; *(UINT64*)(stub+s)=original_cw_va; s+=8;   // mov rax, trampoline_va
+    stub[s++]=0xFF; stub[s++]=0xE0;                                            // jmp rax
+    return s;
+}
+
+// End-to-end kernel renderdoc injection. Caller has NOT attached; this attaches.
+// raw_rd = renderdoc.dll raw bytes. Steps logged [td-kmm] stepN for diagnosis.
+// Uses CreateWindowExW EPT hook (oneshot, sync) instead of NtTestAlert trigger.
+static NTSTATUS TdInjectRenderdocKernel(PEPROCESS proc, PUINT8 raw_rd, SIZE_T rd_size)
+{
+    HYPERPLATFORM_LOG_INFO("[td-kmm] === inject start: pid=%llu size=0x%llX ===",
+        (UINT64)PsGetProcessId(proc), (UINT64)rd_size);
+    KAPC_STATE apc; KeStackAttachProcess(proc, &apc);
+
+    // 1. map renderdoc (shadow CR3, no exec mem)
+    PVOID base = NULL, entry = NULL;
+    NTSTATUS st = TdManualMapInProcess(proc, raw_rd, rd_size, &base, &entry);
+    if (!NT_SUCCESS(st) || !base) { HYPERPLATFORM_LOG_ERROR("[td-kmm] step1 map FAIL 0x%08X", st); KeUnstackDetachProcess(&apc); return st; }
+    HYPERPLATFORM_LOG_INFO("[td-kmm] step1 map OK: base=%p", base);
+
+    // 2. parse TLS + exception table
+    TD_RD_IMAGE_INFO info;
+    st = TdParseRenderdocImage(raw_rd, rd_size, base, &info);
+    if (!NT_SUCCESS(st)) { HYPERPLATFORM_LOG_ERROR("[td-kmm] step2 parse FAIL 0x%08X", st); KeUnstackDetachProcess(&apc); return st; }
+    HYPERPLATFORM_LOG_INFO("[td-kmm] step2 parse OK: entry=%p tls=%u tpl=%zu idx=%p exc=%u@%p",
+        info.entry_va, info.has_tls, info.tls_template_size, info.tls_index_va, info.exc_table_count, info.exc_table_va);
+
+    // 3. TLS index + existing threads
+    ULONG tls_index = 0;
+    if (info.has_tls) {
+        st = TdSetupRenderdocTls(&info, &tls_index);
+        HYPERPLATFORM_LOG_INFO("[td-kmm] step3 TLS setup: st=0x%08X index=%lu", st, tls_index);
+    } else {
+        HYPERPLATFORM_LOG_INFO("[td-kmm] step3 no TLS, skip");
+    }
+
+    // 4. resolve ntdll!RtlAddFunctionTable + user32!CreateWindowExW
+    PVOID ntdll = TdFindModuleBaseA("ntdll.dll", NULL);
+    if (!ntdll) ntdll = TdFindModuleBaseA("ntdll", NULL);
+    UINT64 rtl_add_ft = (UINT64)(ntdll ? TdFindExportByName(ntdll, "RtlAddFunctionTable") : NULL);
+    UINT64 nt_test_alert = (UINT64)(ntdll ? TdFindExportByName(ntdll, "NtTestAlert") : NULL);
+    HYPERPLATFORM_LOG_INFO("[td-kmm] step4 resolve: ntdll=%p RtlAddFunctionTable=0x%llX NtTestAlert=0x%llX",
+        ntdll, rtl_add_ft, nt_test_alert);
+    if (!rtl_add_ft) { HYPERPLATFORM_LOG_ERROR("[td-kmm] step4 resolve FAIL: no RtlAddFunctionTable"); KeUnstackDetachProcess(&apc); return STATUS_NOT_FOUND; }
+
+    // resolve user32!CreateWindowExW
+    PVOID user32 = TdFindModuleBaseA("user32.dll", NULL);
+    UINT64 create_window_ex_w = (UINT64)(user32 ? TdFindExportByName(user32, "CreateWindowExW") : NULL);
+    HYPERPLATFORM_LOG_INFO("[td-kmm] step4 user32=%p CreateWindowExW=0x%llX", user32, create_window_ex_w);
+    if (!create_window_ex_w) { HYPERPLATFORM_LOG_ERROR("[td-kmm] step4 resolve FAIL: no CreateWindowExW"); KeUnstackDetachProcess(&apc); return STATUS_NOT_FOUND; }
+
+    // 5. build handler shellcode + alloc shadow page
+    // handler does: RtlAddFunctionTable + DllMain + jmp original CreateWindowExW
+    // We use TdEptHookR3 which needs a proxy VA (handler) and allocates a trampoline.
+    // The handler shellcode goes in a shadow page (zero exec mem).
+    // For now, allocate PAGE_READWRITE target page (shadow will be set up in step6).
+    PVOID stub_page = NULL; SIZE_T stub_sz = 0x1000;
+    st = ZwAllocateVirtualMemory(ZwCurrentProcess(), &stub_page, 0, &stub_sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!NT_SUCCESS(st) || !stub_page) { HYPERPLATFORM_LOG_ERROR("[td-kmm] step5 handler alloc FAIL 0x%08X", st); KeUnstackDetachProcess(&apc); return st; }
+    ULONG stub_len = TdBuildCwExHandlerStub((PUINT8)stub_page, &info, rtl_add_ft, create_window_ex_w);
+    HYPERPLATFORM_LOG_INFO("[td-kmm] step5 handler built: page=%p len=%lu", stub_page, stub_len);
+
+    // 6. EPT hook CreateWindowExW -> handler (persistent, no oneshot).
+    // TdEptHookR3 creates a trampoline (saved bytes + jmp back) and installs the EPT hook.
+    // hook_type=1 (VMCALL). The handler will RtlAddFunctionTable + DllMain then jmp to trampoline.
+    // Persistent is fine: after DllMain returns, CreateWindowExW proceeds normally via handler->trampoline.
+    // TODO: TdEptHookR3 allocates PAGE_EXECUTE_READWRITE for trampoline -- needs shadow fix.
+    PVOID trampoline = NULL;
+    st = TdEptHookR3((UINT64)PsGetProcessId(proc), (PVOID)create_window_ex_w, stub_page, 1, &trampoline);
+    HYPERPLATFORM_LOG_INFO("[td-kmm] step6 EPT hook: st=0x%08X trampoline=%p", st, trampoline);
+    if (!NT_SUCCESS(st)) { HYPERPLATFORM_LOG_ERROR("[td-kmm] step6 EPT hook FAIL 0x%08X", st); KeUnstackDetachProcess(&apc); return st; }
+
+    // Rebuild handler with actual trampoline VA (handler jumps to trampoline to reach original)
+    RtlZeroMemory(stub_page, 0x1000);
+    stub_len = TdBuildCwExHandlerStub((PUINT8)stub_page, &info, rtl_add_ft, (UINT64)trampoline);
+    HYPERPLATFORM_LOG_INFO("[td-kmm] step6 handler rebuilt with trampoline=%p len=%lu", trampoline, stub_len);
+
+    KeUnstackDetachProcess(&apc);
+    HYPERPLATFORM_LOG_INFO("[td-kmm] === inject done (CreateWindowExW hook pending) ===");
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
@@ -6349,6 +7100,27 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         break;
     }
 
+    case TD_IOCTL_RESTORE_REAL_CR3:
+    {
+        //
+        // Restore real CR3 after shadow CR3 window.
+        // Called by ophion_loader DllMain after renderdoc loading completes.
+        // The oneshot EPT handler switched to shadow CR3 for the loader DllMain;
+        // without this restore, the target process runs its entire lifetime under
+        // shadow CR3, and on process exit the kernel's TLB flush IPI hangs the CPU
+        // -> CLOCK_WATCHDOG_TIMEOUT (0x101).
+        //
+        // This IOCTL issues VMCALL_RESTORE_REAL_CR3 to the hypervisor, which
+        // restores the real CR3 saved in nx_timer_real_cr3 and clears both
+        // nx_timer_real_cr3 and nx_timer_restore.
+        //
+        HYPERPLATFORM_LOG_INFO("[td] TD_IOCTL_RESTORE_REAL_CR3: issuing VMCALL...");
+        hv_vmcall_simple(VMCALL_RESTORE_REAL_CR3, 0, 0, 0);
+        HYPERPLATFORM_LOG_INFO("[td] TD_IOCTL_RESTORE_REAL_CR3: VMCALL done.");
+        st = STATUS_SUCCESS;
+        break;
+    }
+
     default:
         st = STATUS_INVALID_DEVICE_REQUEST;
         HYPERPLATFORM_LOG_ERROR("[td-ioctl] unhandled IOCTL code=0x%08X", io->Parameters.DeviceIoControl.IoControlCode);
@@ -6583,7 +7355,36 @@ static VOID
 TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
 {
     //
-    // 1. clean up R3 EPT hooks for this process (unlock MDL pages, free trampoline)
+    // 0. hypervisor-side unhook-by-CR3 FIRST, before touching process state.
+    //    This catches hooks not tracked in g_r3_hooks[] (e.g. renderdoc IOCTL
+    //    hooks that had their entries overwritten).  Must run FIRST because
+    //    the g_r3_hooks[] unhook path (TdEptUnhookR3) attaches to the process
+    //    and frees trampoline memory -- after that the process may be in a
+    //    partially torn-down state where KeStackAttachProcess hangs.
+    //
+    {
+        KAPC_STATE apc;
+        KeStackAttachProcess(Process, &apc);
+        UINT64 caller_cr3 = __readcr3();
+        KeUnstackDetachProcess(&apc);
+
+        if (caller_cr3)
+        {
+            struct _UNHOOK_CR3_CTX {
+                UINT64   target_cr3;
+                NTSTATUS result;
+            } unhook_ctx = {};
+            // mask to PFN only, matching how ept_hook_install stores target_cr3
+            // (CR3_ADDR_MASK = 0x000FFFFFFFFFF000)
+            unhook_ctx.target_cr3 = caller_cr3 & 0x000FFFFFFFFFF000ULL;
+            KeGenericCallDpc(DpcEptUnhookByCr3, &unhook_ctx);
+            HYPERPLATFORM_LOG_INFO("[td-rw] process exit unhook-by-CR3: pid=%llu cr3=%p st=0x%08X",
+                       pid, caller_cr3, unhook_ctx.result);
+        }
+    }
+
+    //
+    // 1. clean up R3 EPT hooks for this process (unhook EPT + free resources)
     //
     for (int i = 0; i < MAX_R3_HOOKS; i++)
     {
@@ -6593,24 +7394,12 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
         HYPERPLATFORM_LOG_INFO("[td-rw] process exit cleanup R3 hook: pid=%llu target=%p",
                    pid, g_r3_hooks[i].target_va);
 
-        // for real R3 hooks (target_mdl != NULL): unlock + free
-        if (g_r3_hooks[i].target_mdl != NULL)
-        {
-            MmUnlockPages(g_r3_hooks[i].target_mdl);
-            IoFreeMdl(g_r3_hooks[i].target_mdl);
-        }
-
-        // free trampoline in target process
-        if (g_r3_hooks[i].trampoline_va != NULL && g_r3_hooks[i].trampoline_size > 0)
-        {
-            KAPC_STATE apc;
-            KeStackAttachProcess(Process, &apc);
-            ZwFreeVirtualMemory(ZwCurrentProcess(),
-                &g_r3_hooks[i].trampoline_va, &g_r3_hooks[i].trampoline_size, MEM_RELEASE);
-            KeUnstackDetachProcess(&apc);
-        }
-
-        RtlZeroMemory(&g_r3_hooks[i], sizeof(g_r3_hooks[i]));
+        // Call TdEptUnhookR3 which: (1) sends DPC broadcast to restore EPT entry
+        // (Execute bit), (2) frees trampoline in target process, (3) unlocks MDL,
+        // (4) zeros the hook entry. This is critical: without step 1, the EPT
+        // page stays NX and the second process instance crashes with
+        // STATUS_ILLEGAL_INSTRUCTION when it hits the same shared-image page.
+        TdEptUnhookR3(pid, g_r3_hooks[i].target_va);
     }
 
     //
@@ -6661,11 +7450,498 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
     }
 }
 
+// =========================================================================
+//  driver-side renderdoc injection (no DLL hijack) -- option A
+//
+//  Flow:
+//    TdProcessNotify (create) matches the target exe name -> record
+//      {pid, loader_nt_path}.
+//    TdLoadImageNotify fires when kernel32.dll loads in a recorded target
+//      -> read ophion_loader.dll from disk (ZwReadFile) -> TdManualMapInProcess
+//      (shadow CR3, no exec mem) -> create a suspended thread at ntdll!NtTestAlert
+//      -> install ONE oneshot EPT trigger (NtTestAlert -> DllMain stub, TID-
+//      filtered to the new thread) -> resume. The new thread fires NtTestAlert,
+//      the hook redirects to the loader's DllMain, which DIRECTLY calls
+//      LdrLoadDllMemoryExW(renderdoc) (no second trigger). One trigger total,
+//      no PAGE_EXECUTE_* anywhere.
+// =========================================================================
+
+#ifndef TD_INJECT_TARGET_NAME
+#define TD_INJECT_TARGET_NAME   L"Box.exe"
+#endif
+#ifndef TD_INJECT_LOADER_NAME
+// Both the old kernelmm path (TdInjectRenderdocKernel) and the new
+// ophion_loader+EPT path (TdInjectLoaderInProcess) load ophion_loader.dll.
+// ophion_loader's DllMain then memory-loads renderdoc.dll.
+#define TD_INJECT_LOADER_NAME   L"ophion_loader.dll"
+#endif
+#ifndef MAX_PATH
+#define MAX_PATH 260
+#endif
+
+#define TD_MAX_INJECT_TARGETS 16
+typedef struct _TD_INJECT_TARGET {
+    HANDLE  pid;
+    BOOLEAN active;     // slot occupied
+    BOOLEAN injected;   // injection already kicked off (one-shot)
+    WCHAR   loader_nt_path[MAX_PATH];  // NT path for ZwReadFile
+} TD_INJECT_TARGET;
+
+static TD_INJECT_TARGET g_inject_targets[TD_MAX_INJECT_TARGETS];
+static KSPIN_LOCK g_inject_target_lock;
+static BOOLEAN g_inject_target_lock_init = FALSE;
+static BOOLEAN g_loadimage_registered = FALSE;
+
+// match the basename of a full image path against a wide name (case-insensitive)
+static BOOLEAN TdInjectMatchBasename(PCUNICODE_STRING image, const WCHAR * target, USHORT target_chars)
+{
+    if (!image || !image->Buffer || !target) return FALSE;
+    const WCHAR * buf = image->Buffer;
+    USHORT len = image->Length / sizeof(WCHAR);
+    USHORT base_off = 0;
+    for (USHORT i = 0; i < len; i++)
+        if (buf[i] == L'\\') base_off = (USHORT)(i + 1);
+    USHORT base_len = (USHORT)(len - base_off);
+    if (base_len != target_chars) return FALSE;
+    const WCHAR * b = buf + base_off;
+    for (USHORT i = 0; i < target_chars; i++)
+    {
+        WCHAR ca = b[i], cb = target[i];
+        if (ca >= L'a' && ca <= L'z') ca -= 32;
+        if (cb >= L'a' && cb <= L'z') cb -= 32;
+        if (ca != cb) return FALSE;
+    }
+    return TRUE;
+}
+
+// Build the loader NT path from the target exe full path:
+//   "\??\C:\dir\Box.exe" -> "\??\C:\dir\ophion_loader.dll"
+// (Keeps the NT prefix; ZwCreateFile accepts \??\ and \Device\ forms.)
+static BOOLEAN TdInjectBuildLoaderPath(PCUNICODE_STRING exe_path, WCHAR * out, ULONG out_chars)
+{
+    if (!exe_path || !exe_path->Buffer || !out || out_chars < 8) return FALSE;
+    const WCHAR * src = exe_path->Buffer;
+    USHORT src_chars = exe_path->Length / sizeof(WCHAR);
+    if (src_chars == 0 || src_chars >= out_chars) return FALSE;
+    USHORT last_slash = 0;
+    for (USHORT i = 0; i < src_chars; i++)
+    {
+        out[i] = src[i];
+        if (src[i] == L'\\') last_slash = (USHORT)(i + 1);
+    }
+    static const WCHAR loader[] = TD_INJECT_LOADER_NAME;
+    USHORT loader_chars = (USHORT)((sizeof(loader) / sizeof(WCHAR)) - 1);
+    if ((ULONG)last_slash + loader_chars + 1 > out_chars) return FALSE;
+    for (USHORT i = 0; i < loader_chars; i++) out[last_slash + i] = loader[i];
+    out[last_slash + loader_chars] = L'\0';
+    return TRUE;
+}
+
+static void TdInjectTargetAdd(HANDLE pid, PCUNICODE_STRING exe_path)
+{
+    KIRQL old;
+    KeAcquireSpinLock(&g_inject_target_lock, &old);
+    for (ULONG i = 0; i < TD_MAX_INJECT_TARGETS; i++)
+    {
+        if (!g_inject_targets[i].active)
+        {
+            g_inject_targets[i].pid = pid;
+            g_inject_targets[i].injected = FALSE;
+            if (TdInjectBuildLoaderPath(exe_path, g_inject_targets[i].loader_nt_path, MAX_PATH))
+                g_inject_targets[i].active = TRUE;
+            KeReleaseSpinLock(&g_inject_target_lock, old);
+            HYPERPLATFORM_LOG_INFO("[td-inj] target recorded: pid=%llu loader=%ws",
+                (UINT64)pid, g_inject_targets[i].loader_nt_path);
+            return;
+        }
+    }
+    KeReleaseSpinLock(&g_inject_target_lock, old);
+}
+
+static void TdInjectTargetRemove(HANDLE pid)
+{
+    KIRQL old;
+    KeAcquireSpinLock(&g_inject_target_lock, &old);
+    for (ULONG i = 0; i < TD_MAX_INJECT_TARGETS; i++)
+    {
+        if (g_inject_targets[i].active && g_inject_targets[i].pid == pid)
+        {
+            g_inject_targets[i].active = FALSE;
+            g_inject_targets[i].injected = FALSE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_inject_target_lock, old);
+}
+
+// claim a not-yet-injected target; copies loader path out under the lock.
+// returns TRUE if claimed (caller must inject).
+static BOOLEAN TdInjectTargetClaim(HANDLE pid, WCHAR * out_path, ULONG path_chars)
+{
+    BOOLEAN claimed = FALSE;
+    KIRQL old;
+    KeAcquireSpinLock(&g_inject_target_lock, &old);
+    for (ULONG i = 0; i < TD_MAX_INJECT_TARGETS; i++)
+    {
+        if (g_inject_targets[i].active && !g_inject_targets[i].injected && g_inject_targets[i].pid == pid)
+        {
+            g_inject_targets[i].injected = TRUE;
+            if (out_path && path_chars)
+            {
+                ULONG j = 0;
+                for (; j < path_chars - 1 && g_inject_targets[i].loader_nt_path[j]; j++)
+                    out_path[j] = g_inject_targets[i].loader_nt_path[j];
+                out_path[j] = L'\0';
+            }
+            claimed = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_inject_target_lock, old);
+    return claimed;
+}
+
+// Read a file from kernel into a NonPaged buffer (for ZwReadFile / VMX-root safety).
+static NTSTATUS TdReadFileKernel(PCUNICODE_STRING nt_path, PUINT8 * out_buf, SIZE_T * out_size)
+{
+    *out_buf = NULL; *out_size = 0;
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, (PUNICODE_STRING)nt_path,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    IO_STATUS_BLOCK iosb = {};
+    HANDLE h = NULL;
+    NTSTATUS st = ZwCreateFile(&h, GENERIC_READ | SYNCHRONIZE, &oa, &iosb, NULL,
+        FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OPEN,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, NULL, 0);
+    if (!NT_SUCCESS(st)) return st;
+
+    FILE_STANDARD_INFORMATION fsi = {};
+    st = ZwQueryInformationFile(h, &iosb, &fsi, sizeof(fsi), FileStandardInformation);
+    if (!NT_SUCCESS(st)) { ZwClose(h); return st; }
+
+    SIZE_T size = (SIZE_T)fsi.EndOfFile.QuadPart;
+    if (size == 0 || size > 64 * 1024 * 1024) { ZwClose(h); return STATUS_FILE_TOO_LARGE; }
+
+    PUINT8 buf = (PUINT8)ExAllocatePool2(POOL_FLAG_NON_PAGED, size, 'fRdO');
+    if (!buf) { ZwClose(h); return STATUS_INSUFFICIENT_RESOURCES; }
+
+    LARGE_INTEGER off = {};
+    iosb = {};
+    st = ZwReadFile(h, NULL, NULL, NULL, &iosb, buf, (ULONG)size, &off, NULL);
+    ZwClose(h);
+    if (!NT_SUCCESS(st)) { ExFreePoolWithTag(buf, 'fRdO'); return st; }
+
+    *out_buf = buf;
+    *out_size = (SIZE_T)iosb.Information;
+    return STATUS_SUCCESS;
+}
+
+// ---- trigger diagnostic (deferred) ----
+// The LoadImage callback holds LdrpLoaderLock; the trigger thread's init APC
+// waits for it, so the thread cannot execute NtTestAlert until the callback
+// returns. Reading the diag inside the callback always yields 0. This work item
+// runs 2s after the callback returns (loader lock released, trigger thread has
+// run NtTestAlert) and reads the real diag value.
+static volatile LONG g_td_trigger_fired = 0;
+
+typedef struct _TD_DIAG_CTX {
+    PIO_WORKITEM work_item;
+    UINT64       tid;
+} TD_DIAG_CTX;
+
+static VOID TdTriggerDiagWorker(PDEVICE_OBJECT dev, PVOID ctx)
+{
+    UNREFERENCED_PARAMETER(dev);
+    TD_DIAG_CTX * d = (TD_DIAG_CTX *)ctx;
+    LARGE_INTEGER delay = { 0 };
+    delay.QuadPart = -20000000LL; // 2s (100ns units, negative = relative)
+    KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    HYPERPLATFORM_LOG_INFO("[td-inj] trigger diag (deferred 2s)=%d tid=%llu -- 0=NtTestAlert not executed, 2=viol(swap-fake), 3=vmcall(no fire), 1=FIRE",
+        (LONG)g_td_trigger_fired, d->tid);
+    IoFreeWorkItem(d->work_item);
+    ExFreePoolWithTag(d, 'gdiT');
+}
+
+// Map the loader DLL into the target + create a thread at NtTestAlert whose
+// oneshot EPT trigger redirects to the loader's DllMain stub. Must be called at
+// PASSIVE_LEVEL. Caller has NOT attached; this attaches internally.
+static NTSTATUS TdInjectLoaderInProcess(PEPROCESS proc, PUINT8 loader_bytes, SIZE_T loader_size)
+{
+    NTSTATUS st;
+    KAPC_STATE apc;
+    KeStackAttachProcess(proc, &apc);
+    UINT64 caller_cr3 = __readcr3();
+
+    PVOID base = NULL, entry = NULL;
+    st = TdManualMapInProcess(proc, loader_bytes, loader_size, &base, &entry);
+    if (!NT_SUCCESS(st) || !base || !entry)
+    {
+        HYPERPLATFORM_LOG_ERROR("[td-inj] TdManualMapInProcess failed: 0x%08X", st);
+        KeUnstackDetachProcess(&apc);
+        return st;
+    }
+    HYPERPLATFORM_LOG_INFO("[td-inj] loader mapped: base=%p entry=%p", base, entry);
+
+    // ---- resolve the 3 proxy function VAs from the raw loader file ----
+    // The EPT hooks redirect to these instead of the real ntdll functions.
+    // We parse exports from raw file bytes because the mapped image's header
+    // is overwritten by TdBuildDllMainStub. Use a helper that works on raw PE data.
+    UINT64 pid = (UINT64)PsGetProcessId(proc);
+
+    PVOID ept_proxy_RtlUserThreadStart = TdFindExportRvaToVaRaw(loader_bytes, base, "EptHookRtlUserThreadStart");
+    PVOID ept_proxy_LdrShutdownThread   = TdFindExportRvaToVaRaw(loader_bytes, base, "EptHookLdrShutdownThread");
+    PVOID ept_proxy_NtSetInformationProcess = TdFindExportRvaToVaRaw(loader_bytes, base, "EptHookNtSetInformationProcess");
+
+    if (!ept_proxy_RtlUserThreadStart || !ept_proxy_LdrShutdownThread || !ept_proxy_NtSetInformationProcess)
+    {
+        HYPERPLATFORM_LOG_ERROR("[td-inj] EPT proxy exports not found: %p %p %p",
+            ept_proxy_RtlUserThreadStart, ept_proxy_LdrShutdownThread, ept_proxy_NtSetInformationProcess);
+        KeUnstackDetachProcess(&apc);
+        return STATUS_NOT_FOUND;
+    }
+    HYPERPLATFORM_LOG_INFO("[td-inj] EPT proxies: RtlUserThreadStart=%p LdrShutdownThread=%p NtSetInformationProcess=%p",
+        ept_proxy_RtlUserThreadStart, ept_proxy_LdrShutdownThread, ept_proxy_NtSetInformationProcess);
+
+    // ---- resolve the 3 trampoline storage variables from the raw loader file ----
+    // The driver writes trampoline VAs here after EPT hook installation.
+    // These are data exports (variables), not functions. Use the raw file parser.
+    PVOID tramp_RtlUserThreadStart_ptr = TdFindExportRvaToVaRaw(loader_bytes, base, "EptHookRtlUserThreadStartTrampoline");
+    PVOID tramp_LdrShutdownThread_ptr   = TdFindExportRvaToVaRaw(loader_bytes, base, "EptHookLdrShutdownThreadTrampoline");
+    PVOID tramp_NtSetInformationProcess_ptr = TdFindExportRvaToVaRaw(loader_bytes, base, "EptHookNtSetInformationProcessTrampoline");
+
+    if (!tramp_RtlUserThreadStart_ptr || !tramp_LdrShutdownThread_ptr || !tramp_NtSetInformationProcess_ptr)
+    {
+        HYPERPLATFORM_LOG_ERROR("[td-inj] trampoline storage exports not found: %p %p %p",
+            tramp_RtlUserThreadStart_ptr, tramp_LdrShutdownThread_ptr, tramp_NtSetInformationProcess_ptr);
+        KeUnstackDetachProcess(&apc);
+        return STATUS_NOT_FOUND;
+    }
+    HYPERPLATFORM_LOG_INFO("[td-inj] trampoline storage: RtlUserThreadStart=%p LdrShutdownThread=%p NtSetInformationProcess=%p",
+        tramp_RtlUserThreadStart_ptr, tramp_LdrShutdownThread_ptr, tramp_NtSetInformationProcess_ptr);
+
+    // ---- resolve ntdll functions from PEB ----
+    PVOID ntdll_base = NULL;
+    PPEB peb = PsGetProcessPeb(proc);
+    if (peb)
+    {
+        __try {
+            TD_PEB_LDR_DATA* ldr = *(TD_PEB_LDR_DATA**)((PUINT8)peb + 0x18);
+            if (ldr)
+            {
+                PLIST_ENTRY head = &ldr->InMemoryOrderModuleList;
+                for (PLIST_ENTRY cur = head->Flink; cur != head; cur = cur->Flink)
+                {
+                    TD_LDR_ENTRY* ldr_e = CONTAINING_RECORD(cur, TD_LDR_ENTRY, InMemoryOrderLinks);
+                    if (ldr_e->BaseDllName.Buffer &&
+                        TdMatchDllName(ldr_e->BaseDllName.Buffer, ldr_e->BaseDllName.Length,
+                                       g_ntdll_name, 9))
+                    {
+                        ntdll_base = ldr_e->DllBase;
+                        break;
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    if (!ntdll_base)
+    {
+        HYPERPLATFORM_LOG_ERROR("[td-inj] cannot find ntdll base");
+        KeUnstackDetachProcess(&apc);
+        return STATUS_NOT_FOUND;
+    }
+
+    PVOID fn_RtlUserThreadStart = TdFindExportByName(ntdll_base, "RtlUserThreadStart");
+    PVOID fn_LdrShutdownThread   = TdFindExportByName(ntdll_base, "LdrShutdownThread");
+    PVOID fn_NtSetInformationProcess = TdFindExportByName(ntdll_base, "NtSetInformationProcess");
+
+    if (!fn_RtlUserThreadStart || !fn_LdrShutdownThread || !fn_NtSetInformationProcess)
+    {
+        HYPERPLATFORM_LOG_ERROR("[td-inj] ntdll exports not found: %p %p %p",
+            fn_RtlUserThreadStart, fn_LdrShutdownThread, fn_NtSetInformationProcess);
+        KeUnstackDetachProcess(&apc);
+        return STATUS_NOT_FOUND;
+    }
+    HYPERPLATFORM_LOG_INFO("[td-inj] ntdll: base=%p (skip persistent EPT hooks -- MMPP_NO_DETOURS)",
+        ntdll_base);
+
+    // NOTE: 3 persistent EPT hooks (RtlUserThreadStart, LdrShutdownThread,
+    // NtSetInformationProcess) are SKIPPED because:
+    //   1. MMPP_NO_DETOURS is defined -> Hook* functions absent in MemoryModule.lib
+    //   2. EPT proxy functions just jump to trampoline, making hooks no-ops
+    //   3. They caused CRITICAL_PROCESS_DIED (0xef) in services.exe via global
+    //      EPT page interception when non-target processes hit the hooked ntdll page
+    //
+    // The oneshot NtTestAlert trigger is sufficient for ophion_loader DllMain entry.
+
+    // ---- resolve ntdll!NtTestAlert (trigger) ----
+    PVOID trigger_fn = TdResolveDefaultTrigger(proc, "td-inj");
+    if (!trigger_fn)
+    {
+        HYPERPLATFORM_LOG_ERROR("[td-inj] cannot resolve NtTestAlert");
+        KeUnstackDetachProcess(&apc);
+        return STATUS_NOT_FOUND;
+    }
+
+    // create a suspended thread at NtTestAlert (RtlUserThreadStart -> NtTestAlert)
+    HANDLE thr_h = NULL;
+    CLIENT_ID cid = {};
+    st = RtlCreateUserThread(
+        ZwCurrentProcess(), NULL, TRUE /*suspended*/, 0, 0, 0,
+        trigger_fn, NULL, &thr_h, &cid);
+    if (!NT_SUCCESS(st) || !thr_h)
+    {
+        HYPERPLATFORM_LOG_ERROR("[td-inj] RtlCreateUserThread failed: 0x%08X", st);
+        KeUnstackDetachProcess(&apc);
+        return st;
+    }
+    UINT64 tid = (UINT64)(ULONG_PTR)cid.UniqueThread;
+
+    // NOTE: do NOT pin the loader DllMain thread to CPU0 (BSP). The heavy
+    // shadow-CR3 load (map 8MB renderdoc + LoadLibrary deps + renderdoc DllMain
+    // + EPT hook installs) saturates the pinned CPU in VMX root; pinning to the
+    // BSP (CPU0) froze the whole machine -- the BSP stopped servicing system
+    // interrupts and the box hard-hung with NO blue screen (no other CPU could
+    // bugcheck). Leave affinity unset for now. Phase 2's per-vCPU long-window
+    // flag will be paired with pinning to a NON-BSP CPU instead.
+
+    // install ONE oneshot EPT trigger: NtTestAlert -> DllMain stub, TID-filtered
+    // to the new thread. Path A (TdInstallTriggerHookAllCpus) correctly encodes
+    // oneshot (flags=2) + expected_tid (NOT the buggy direct hv_vmcall_ex path).
+    PVOID dummy_origin = NULL;
+    // fired_signal (g_td_trigger_fired): the hypervisor writes 2/3/1 as the
+    // trigger chain progresses (viol -> vmcall -> fire). Read by the deferred
+    // work item (TdTriggerDiagWorker) 2s after this callback returns, because
+    // the loader lock held by this callback blocks the trigger thread's init
+    // until we return.
+    InterlockedExchange(&g_td_trigger_fired, 0);
+    NTSTATUS hook_st = TdInstallTriggerHookAllCpus(
+        trigger_fn, entry, caller_cr3, 2 /*oneshot*/, tid, &dummy_origin, &g_td_trigger_fired);
+    if (!NT_SUCCESS(hook_st))
+    {
+        HYPERPLATFORM_LOG_ERROR("[td-inj] trigger hook failed: 0x%08X", hook_st);
+        TdCloseCreatedThreadHandle(thr_h, FALSE);
+        KeUnstackDetachProcess(&apc);
+        return hook_st;
+    }
+
+    // resume -> thread runs NtTestAlert -> hook -> DllMain stub -> loader DllMain
+    // -> LdrLoadDllMemoryExW(renderdoc). Async unhook is handled at driver
+    // unload (TdEptUnhookAllR3); oneshot+TID-filter makes it benign until then.
+    ULONG prev = 0;
+    NTSTATUS resume_st = TdResumeThreadHandle(thr_h, &prev);
+    HYPERPLATFORM_LOG_INFO("[td-inj] thread resumed: tid=%llu trigger=%p entry=%p resume=0x%08X",
+        tid, trigger_fn, entry, resume_st);
+
+    // Defer the diag check to a work item. This LoadImage callback holds the
+    // loader lock (LdrpLoaderLock); the trigger thread's init APC waits for it,
+    // so the thread CANNOT execute NtTestAlert until this callback returns.
+    // Reading the diag here would always yield 0. The work item runs 2s later
+    // (after this callback returns, loader lock released) and reads the real
+    // diag. Return now so the loader lock is released and the trigger thread
+    // can run NtTestAlert.
+    {
+        TD_DIAG_CTX * d = (TD_DIAG_CTX *)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(TD_DIAG_CTX), 'gdiT');
+        if (d)
+        {
+            d->work_item = IoAllocateWorkItem(g_dev_obj);
+            if (d->work_item)
+            {
+                d->tid = tid;
+                IoQueueWorkItem(d->work_item, TdTriggerDiagWorker, DelayedWorkQueue, d);
+            }
+            else
+            {
+                ExFreePoolWithTag(d, 'gdiT');
+            }
+        }
+    }
+
+    // NOTE: do NOT unhook the NtTestAlert trigger here. The system-wide EPT hook
+    // is already causing heavy VMX exits (every system thread's NtTestAlert call
+    // EPT-violates); if a CPU is stuck in VMX root, TdUnhookTriggerAllCpus's
+    // per-CPU DPC deadlocks waiting for it -> hard hang (this is what hung the
+    // 09:46 run). 08:47 (no unhook) survived. Leave the hook; it's oneshot and
+    // benign once the target thread has passed through NtTestAlert.
+
+    TdCloseCreatedThreadHandle(thr_h, TRUE);
+    KeUnstackDetachProcess(&apc);
+    return STATUS_SUCCESS;
+}
+
+// PsSetLoadImageNotifyRoutine callback. Fires for every image load in every
+// process; we act only when kernel32.dll loads in a recorded target.
+static VOID NTAPI TdLoadImageNotify(
+    PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo)
+{
+    UNREFERENCED_PARAMETER(ImageInfo);
+    if (!FullImageName || !FullImageName->Buffer) return;
+
+    // Trigger on user32.dll load: by then kernel32/gdi32/advapi32 are loaded,
+    // renderdoc's static imports mostly resolvable, and CreateWindowExW is
+    // the hook target for synchronous injection. d3d12 was too early (imports
+    // missing for some targets) and unreliable for manually-mapped DLLs.
+    static const WCHAR k_trigger[] = L"user32.dll";
+    if (!TdInjectMatchBasename(FullImageName, k_trigger, (USHORT)((sizeof(k_trigger)/sizeof(WCHAR))-1)))
+        return;
+
+    WCHAR loader_path[MAX_PATH] = {};
+    if (!TdInjectTargetClaim(ProcessId, loader_path, MAX_PATH))
+        return;
+
+    HYPERPLATFORM_LOG_INFO("[td-inj] user32 loaded in target pid=%llu -- injecting ophion_loader",
+        (UINT64)ProcessId);
+
+    // read ophion_loader.dll from disk (NT path)
+    UNICODE_STRING loader_us = {};
+    RtlInitUnicodeString(&loader_us, loader_path);
+    PUINT8 loader_bytes = NULL;
+    SIZE_T loader_size = 0;
+    NTSTATUS rst = TdReadFileKernel(&loader_us, &loader_bytes, &loader_size);
+    if (!NT_SUCCESS(rst) || !loader_bytes)
+    {
+        HYPERPLATFORM_LOG_ERROR("[td-inj] read loader '%ws' failed: 0x%08X", loader_path, rst);
+        return;
+    }
+    HYPERPLATFORM_LOG_INFO("[td-inj] read loader: %ws size=0x%llX", loader_path, (UINT64)loader_size);
+
+    PEPROCESS proc = NULL;
+    NTSTATUS pst = PsLookupProcessByProcessId(ProcessId, &proc);
+    if (!NT_SUCCESS(pst))
+    {
+        ExFreePoolWithTag(loader_bytes, 'fRdO');
+        return;
+    }
+
+// Always use the ophion_loader + EPT hook route (TdInjectLoaderInProcess).
+    // The old USE_KERNEL_MEMORYMODULE path (TdInjectRenderdocKernel) is replaced.
+    TdInjectLoaderInProcess(proc, loader_bytes, loader_size);
+
+    ObDereferenceObject(proc);
+    ExFreePoolWithTag(loader_bytes, 'fRdO');
+}
+
 static VOID
 TdProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo)
 {
-    if (CreateInfo != NULL) return;
+    if (CreateInfo != NULL)
+    {
+        // process CREATE: detect target by image name, record pid + loader path
+        if (CreateInfo->ImageFileName && g_inject_target_lock_init)
+        {
+            static const WCHAR k_target[] = TD_INJECT_TARGET_NAME;
+            if (TdInjectMatchBasename(CreateInfo->ImageFileName, k_target,
+                    (USHORT)((sizeof(k_target)/sizeof(WCHAR))-1)))
+            {
+                TdInjectTargetAdd(ProcessId, CreateInfo->ImageFileName);
+            }
+        }
+        return;
+    }
+    // process EXIT: stealth cleanup + remove target record
     TdCleanupStealthForProcess(Process, (UINT64)ProcessId);
+    if (g_inject_target_lock_init)
+        TdInjectTargetRemove(ProcessId);
 }
 
 static VOID
@@ -6705,6 +7981,12 @@ static VOID TdUnload(PDRIVER_OBJECT drv)
             PsSetCreateProcessNotifyRoutine(TdProcessNotifyLegacy, TRUE);
         g_process_notify_registered = FALSE;
         g_process_notify_ex_registered = FALSE;
+    }
+
+    if (g_loadimage_registered)
+    {
+        PsRemoveLoadImageNotifyRoutine(TdLoadImageNotify);
+        g_loadimage_registered = FALSE;
     }
 
     if (g_hooked_target)
@@ -6758,6 +8040,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     UNREFERENCED_PARAMETER(reg);
     KeInitializeSpinLock(&g_shadow_alloc_lock);
     KeInitializeSpinLock(&g_stealth_track_lock);
+    KeInitializeSpinLock(&g_inject_target_lock);
+    g_inject_target_lock_init = TRUE;
 
     //
     // init log system 鈥?file output, truncate on load
@@ -6777,11 +8061,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
         g_pZwCreateThreadEx = (fn_ZwCreateThreadEx)MmGetSystemRoutineAddress(&fn);
     }
     // resolve ZwResumeThread via MmGetSystemRoutineAddress (exported)
-    RtlInitUnicodeString(&fn, L"NtResumeThread");
+    RtlInitUnicodeString(&fn, L"ZwResumeThread");
     g_pZwResumeThread = (fn_ZwResumeThread)MmGetSystemRoutineAddress(&fn);
     if (!g_pZwResumeThread)
     {
-        RtlInitUnicodeString(&fn, L"ZwResumeThread");
+        RtlInitUnicodeString(&fn, L"NtResumeThread");
         g_pZwResumeThread = (fn_ZwResumeThread)MmGetSystemRoutineAddress(&fn);
     }
     if (!g_pZwResumeThread)
@@ -6793,6 +8077,17 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     // (Blackbone-style 鈥?these are not in MmGetSystemRoutineAddress's table)
     g_pPsResumeThread = (fn_PsResumeThread)TdResolveNtoskrnlExport("PsResumeThread");
     g_pKeResumeThread = (fn_KeResumeThread)TdResolveNtoskrnlExport("KeResumeThread");
+
+    // resolve thread/system-info APIs (not in WDK 26100 headers/lib) for kernel
+    // MemoryModule TLS thread enumeration.
+    RtlInitUnicodeString(&fn, L"ZwQuerySystemInformation");
+    g_pZwQuerySystemInformation = (fn_ZwQuerySystemInformation)MmGetSystemRoutineAddress(&fn);
+    RtlInitUnicodeString(&fn, L"ZwOpenThread");
+    g_pZwOpenThread = (fn_ZwOpenThread)MmGetSystemRoutineAddress(&fn);
+    RtlInitUnicodeString(&fn, L"ZwQueryInformationThread");
+    g_pZwQueryInformationThread = (fn_ZwQueryInformationThread)MmGetSystemRoutineAddress(&fn);
+    HYPERPLATFORM_LOG_INFO("[td] kmm Zw* resolved: QSI=%p OpenThread=%p QIT=%p",
+        g_pZwQuerySystemInformation, g_pZwOpenThread, g_pZwQueryInformationThread);
 
     HYPERPLATFORM_LOG_INFO("[td] thread APIs: create=%p zw_resume=%p ps_resume=%p ke_resume=%p",
         g_pZwCreateThreadEx, g_pZwResumeThread, g_pPsResumeThread, g_pKeResumeThread);
@@ -6839,6 +8134,25 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
         else
         {
             HYPERPLATFORM_LOG_ERROR("[td] PsSetCreateProcessNotifyRoutine legacy failed: 0x%08X", legacy_st);
+        }
+    }
+
+    //
+    // register load-image notification for driver-side renderdoc injection.
+    // fires on every image load; we act when kernel32.dll loads in a recorded
+    // target process (TdLoadImageNotify). Requires the process notify above.
+    //
+    if (g_process_notify_registered)
+    {
+        NTSTATUS li_st = PsSetLoadImageNotifyRoutine(TdLoadImageNotify);
+        if (NT_SUCCESS(li_st))
+        {
+            g_loadimage_registered = TRUE;
+            HYPERPLATFORM_LOG_INFO("[td] LoadImage notify registered (driver-side injection armed).");
+        }
+        else
+        {
+            HYPERPLATFORM_LOG_ERROR("[td] PsSetLoadImageNotifyRoutine failed: 0x%08X", li_st);
         }
     }
 

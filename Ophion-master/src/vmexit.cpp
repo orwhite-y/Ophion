@@ -797,6 +797,13 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             local_req.force_read_access  = (flags & 1) ? TRUE : FALSE;
             local_req.oneshot            = (flags & 2) ? TRUE : FALSE;
             local_req.expected_tid       = expected_tid;
+            //
+            // proxy_range_end: packed into high 32 bits of expected_tid when
+            // expected_tid is 0 (which is the common case for renderdoc hooks).
+            // if expected_tid is non-zero, the caller must pass proxy_range_end
+            // separately. for now, the hypervisor defaults to proxy_function + PAGE_SIZE.
+            //
+            local_req.proxy_range_end    = 0;  // hypervisor defaults to proxy_function + PAGE_SIZE
             if (origin_va)
                 local_req.origin_function = (PVOID *)origin_va;
 
@@ -852,6 +859,19 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             ept_unhook_all();
             regs->rax = (UINT64)STATUS_SUCCESS;
             break;
+
+        case VMCALL_EPT_UNHOOK_BY_CR3:
+        {
+            UINT64 target_cr3 = regs->rdx;
+            if (!target_cr3)
+            {
+                regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
+                break;
+            }
+            ept_unhook_all_by_cr3(vcpu, target_cr3);
+            regs->rax = (UINT64)STATUS_SUCCESS;
+            break;
+        }
 
         case VMCALL_STEALTH_ALLOC:
         {
@@ -1164,6 +1184,44 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         case VMCALL_TEST:
             regs->rax = (UINT64)STATUS_SUCCESS;
             break;
+
+        case VMCALL_RESTORE_REAL_CR3:
+        {
+            //
+            // Restore real CR3 after a oneshot handler's shadow CR3 window.
+            // The loader DllMain runs entirely under shadow CR3 — if it never
+            // restores real CR3, the target process leaks its lifetime into
+            // shadow CR3 and any kernel TLB flush IPI (e.g. during process exit)
+            // hangs the CPU -> CLOCK_WATCHDOG_TIMEOUT (0x101).
+            //
+            // nx_timer_real_cr3 holds the real CR3 saved by the oneshot handler.
+            // If non-zero, swap back to it and clear both restore marks.
+            //
+            if (vcpu->nx_timer_real_cr3)
+            {
+                __vmx_vmwrite(VMCS_GUEST_CR3, vcpu->nx_timer_real_cr3);
+
+                // Flush this vCPU's guest TLB for VPID 1 so stale shadow-CR3
+                // translations (NX=0 for hidden code) do not persist after we
+                // return to the real CR3. Otherwise NX-hidden code would keep
+                // executing under the real (NX=1) CR3 -- a stealth leak -- and
+                // wrong-PFN shadow entries could corrupt subsequent real-CR3
+                // accesses. The loader thread is pinned to this CPU, so a local
+                // INVVPID single-context is sufficient.
+                INVVPID_DESCRIPTOR iv_desc = {0};
+                iv_desc.Vpid = VPID_TAG;
+                if (g_ept->invvpid_single_context)
+                    asm_invvpid(InvvpidSingleContext, &iv_desc);
+                else
+                    asm_invvpid(InvvpidAllContexts, &iv_desc);
+
+                vcpu->nx_timer_real_cr3 = 0;
+                vcpu->nx_timer_restore  = NULL;
+                ept_update_pf_intercept(vcpu);
+            }
+            regs->rax = (UINT64)STATUS_SUCCESS;
+            break;
+        }
 
         case VMCALL_EPT_SET_EXTERNAL_FIRED:
         {

@@ -106,7 +106,7 @@
       <PreprocessorDefinitions>_AMD64_;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </MASM>
     <PostBuildEvent>
-      <Command>vmp_debug1.bat</Command>
+      <Command>vmp_debug1.bat </Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <!-- Source Files -->

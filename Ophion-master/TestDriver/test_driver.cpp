@@ -25,6 +25,7 @@
 // ---- undocumented PEB structures for user-mode module walk ----
 
 extern "C" NTKERNELAPI PPEB PsGetProcessPeb(PEPROCESS Process);
+extern "C" NTKERNELAPI NTSTATUS PsGetProcessExitStatus(PEPROCESS Process);
 extern "C" NTSYSAPI NTSTATUS NTAPI ZwProtectVirtualMemory(
     HANDLE ProcessHandle, PVOID * BaseAddress, PSIZE_T RegionSize,
     ULONG NewProtect, PULONG OldProtect);
@@ -1077,6 +1078,269 @@ static BOOLEAN TdStealthFreePage(PVOID target_va);
 static BOOLEAN g_process_notify_registered = FALSE;
 static BOOLEAN g_process_notify_ex_registered = FALSE;
 
+// =========================================================================
+//  inject target tracking (for LoadImage callback)
+// =========================================================================
+
+#ifndef TD_INJECT_TARGET_NAME
+#define TD_INJECT_TARGET_NAME   L"Box.exe"
+#endif
+#ifndef TD_INJECT_LOADER_NAME
+#define TD_INJECT_LOADER_NAME   L"ophion_loader.dll"
+#endif
+#ifndef MAX_PATH
+#define MAX_PATH 260
+#endif
+
+#define TD_MAX_INJECT_TARGETS 16
+typedef struct _TD_INJECT_TARGET {
+    HANDLE  pid;
+    BOOLEAN active;
+    BOOLEAN injected;
+    WCHAR   loader_nt_path[MAX_PATH];
+} TD_INJECT_TARGET;
+
+static TD_INJECT_TARGET g_inject_targets[TD_MAX_INJECT_TARGETS];
+static KSPIN_LOCK g_inject_target_lock;
+static BOOLEAN g_inject_target_lock_init = FALSE;
+static BOOLEAN g_loadimage_registered = FALSE;
+
+// match the basename of a full image path against a wide name (case-insensitive)
+static BOOLEAN TdInjectMatchBasename(PCUNICODE_STRING image, const WCHAR * target, USHORT target_chars)
+{
+    if (!image || !image->Buffer || !target) return FALSE;
+    const WCHAR * buf = image->Buffer;
+    USHORT len = image->Length / sizeof(WCHAR);
+    USHORT base_off = 0;
+    for (USHORT i = 0; i < len; i++)
+        if (buf[i] == L'\\') base_off = (USHORT)(i + 1);
+    USHORT base_len = (USHORT)(len - base_off);
+    if (base_len != target_chars) return FALSE;
+    const WCHAR * b = buf + base_off;
+    for (USHORT i = 0; i < target_chars; i++)
+    {
+        WCHAR ca = b[i], cb = target[i];
+        if (ca >= L'a' && ca <= L'z') ca -= 32;
+        if (cb >= L'a' && cb <= L'z') cb -= 32;
+        if (ca != cb) return FALSE;
+    }
+    return TRUE;
+}
+
+// Build the loader NT path from the target exe full path:
+//   "\??\C:\dir\Box.exe" -> "\??\C:\dir\ophion_loader.dll"
+static BOOLEAN TdInjectBuildLoaderPath(PCUNICODE_STRING exe_path, WCHAR * out, ULONG out_chars)
+{
+    if (!exe_path || !exe_path->Buffer || !out || out_chars < 8) return FALSE;
+    const WCHAR * src = exe_path->Buffer;
+    USHORT src_chars = exe_path->Length / sizeof(WCHAR);
+    if (src_chars == 0 || src_chars >= out_chars) return FALSE;
+    USHORT last_slash = 0;
+    for (USHORT i = 0; i < src_chars; i++)
+    {
+        out[i] = src[i];
+        if (src[i] == L'\\') last_slash = (USHORT)(i + 1);
+    }
+    static const WCHAR loader[] = TD_INJECT_LOADER_NAME;
+    USHORT loader_chars = (USHORT)((sizeof(loader) / sizeof(WCHAR)) - 1);
+    if ((ULONG)last_slash + loader_chars + 1 > out_chars) return FALSE;
+    for (USHORT i = 0; i < loader_chars; i++) out[last_slash + i] = loader[i];
+    out[last_slash + loader_chars] = L'\0';
+    return TRUE;
+}
+
+static void TdInjectTargetAdd(HANDLE pid, PCUNICODE_STRING exe_path)
+{
+    KIRQL old;
+    KeAcquireSpinLock(&g_inject_target_lock, &old);
+    for (ULONG i = 0; i < TD_MAX_INJECT_TARGETS; i++)
+    {
+        if (!g_inject_targets[i].active)
+        {
+            g_inject_targets[i].pid = pid;
+            g_inject_targets[i].injected = FALSE;
+            if (TdInjectBuildLoaderPath(exe_path, g_inject_targets[i].loader_nt_path, MAX_PATH))
+                g_inject_targets[i].active = TRUE;
+            KeReleaseSpinLock(&g_inject_target_lock, old);
+            HYPERPLATFORM_LOG_INFO("[td-inj] target recorded: pid=%llu loader=%ws",
+                (UINT64)pid, g_inject_targets[i].loader_nt_path);
+            return;
+        }
+    }
+    KeReleaseSpinLock(&g_inject_target_lock, old);
+}
+
+static void TdInjectTargetRemove(HANDLE pid)
+{
+    KIRQL old;
+    KeAcquireSpinLock(&g_inject_target_lock, &old);
+    for (ULONG i = 0; i < TD_MAX_INJECT_TARGETS; i++)
+    {
+        if (g_inject_targets[i].active && g_inject_targets[i].pid == pid)
+        {
+            g_inject_targets[i].active = FALSE;
+            g_inject_targets[i].injected = FALSE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_inject_target_lock, old);
+}
+
+// claim a not-yet-injected target; copies loader path out under the lock.
+static BOOLEAN TdInjectTargetClaim(HANDLE pid, WCHAR * out_path, ULONG path_chars)
+{
+    BOOLEAN claimed = FALSE;
+    KIRQL old;
+    KeAcquireSpinLock(&g_inject_target_lock, &old);
+    for (ULONG i = 0; i < TD_MAX_INJECT_TARGETS; i++)
+    {
+        if (g_inject_targets[i].active && !g_inject_targets[i].injected && g_inject_targets[i].pid == pid)
+        {
+            g_inject_targets[i].injected = TRUE;
+            if (out_path && path_chars)
+            {
+                ULONG j = 0;
+                for (; j < path_chars - 1 && g_inject_targets[i].loader_nt_path[j]; j++)
+                    out_path[j] = g_inject_targets[i].loader_nt_path[j];
+                out_path[j] = L'\0';
+            }
+            claimed = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_inject_target_lock, old);
+    return claimed;
+}
+
+// ---------------------------------------------------------------------------
+// Per-process cached PE info for manually-mapped renderdoc.
+// TdManualMapInProcess caches the resource + export directory RVAs (read from
+// the intact raw_dll NT headers) before the mapped image's headers are erased.
+// R3 queries it via IOCTL_GET_SELF_PE_INFO to walk .rsrc / resolve exports
+// post-erasure. Freed at process exit (TdCleanupSelfPeInfo).
+// ---------------------------------------------------------------------------
+#define TD_SELF_PE_INFO_MAX 16
+typedef struct _TD_SELF_PE_INFO_ENTRY {
+    UINT64 pid;
+    UINT64 module_base;
+    UINT64 rsrc_rva;
+    UINT64 rsrc_size;
+    UINT64 export_dir_rva;
+    UINT64 export_dir_size;
+    UINT64 size_of_image;
+} TD_SELF_PE_INFO_ENTRY;
+
+static TD_SELF_PE_INFO_ENTRY g_SelfPeInfoCache[TD_SELF_PE_INFO_MAX];
+static KSPIN_LOCK g_SelfPeInfoLock;
+static BOOLEAN g_SelfPeInfoLockInit = FALSE;
+
+// Cache PE info (read from intact raw_dll NT headers) for (pid, mapped base).
+// Called from TdManualMapInProcess before header erasure.
+static void TdCacheSelfPeInfo(UINT64 pid, UINT64 module_base, PIMAGE_NT_HEADERS64 nt)
+{
+    if (!pid || !module_base || !nt) return;
+    KIRQL old;
+    KeAcquireSpinLock(&g_SelfPeInfoLock, &old);
+    // Overwrite an existing entry for (pid, module_base); else take first free slot.
+    ULONG slot = TD_SELF_PE_INFO_MAX;
+    for (ULONG i = 0; i < TD_SELF_PE_INFO_MAX; i++)
+    {
+        if (g_SelfPeInfoCache[i].pid == pid &&
+            g_SelfPeInfoCache[i].module_base == module_base)
+        {
+            slot = i;
+            break;
+        }
+        if (slot == TD_SELF_PE_INFO_MAX && g_SelfPeInfoCache[i].pid == 0)
+            slot = i;
+    }
+    if (slot < TD_SELF_PE_INFO_MAX)
+    {
+        g_SelfPeInfoCache[slot].pid = pid;
+        g_SelfPeInfoCache[slot].module_base = module_base;
+        g_SelfPeInfoCache[slot].rsrc_rva =
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress;
+        g_SelfPeInfoCache[slot].rsrc_size =
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].Size;
+        g_SelfPeInfoCache[slot].export_dir_rva =
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        g_SelfPeInfoCache[slot].export_dir_size =
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        g_SelfPeInfoCache[slot].size_of_image = nt->OptionalHeader.SizeOfImage;
+    }
+    KeReleaseSpinLock(&g_SelfPeInfoLock, old);
+}
+
+// Look up cached PE info for (pid, module_base). Returns TRUE and fills *out.
+static BOOLEAN TdLookupSelfPeInfo(UINT64 pid, UINT64 module_base, TD_SELF_PE_INFO_ENTRY * out)
+{
+    if (!pid || !module_base || !out) return FALSE;
+    BOOLEAN found = FALSE;
+    KIRQL old;
+    KeAcquireSpinLock(&g_SelfPeInfoLock, &old);
+    for (ULONG i = 0; i < TD_SELF_PE_INFO_MAX; i++)
+    {
+        if (g_SelfPeInfoCache[i].pid == pid &&
+            g_SelfPeInfoCache[i].module_base == module_base)
+        {
+            *out = g_SelfPeInfoCache[i];
+            found = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_SelfPeInfoLock, old);
+    return found;
+}
+
+// Free all cached entries for a process (called at process exit).
+static void TdCleanupSelfPeInfo(UINT64 pid)
+{
+    if (!pid) return;
+    KIRQL old;
+    KeAcquireSpinLock(&g_SelfPeInfoLock, &old);
+    for (ULONG i = 0; i < TD_SELF_PE_INFO_MAX; i++)
+    {
+        if (g_SelfPeInfoCache[i].pid == pid)
+            g_SelfPeInfoCache[i].pid = 0;
+    }
+    KeReleaseSpinLock(&g_SelfPeInfoLock, old);
+}
+
+// Read a file from kernel into a NonPaged buffer.
+static NTSTATUS TdReadFileKernel(PCUNICODE_STRING nt_path, PUINT8 * out_buf, SIZE_T * out_size)
+{
+    *out_buf = NULL; *out_size = 0;
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, (PUNICODE_STRING)nt_path,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    IO_STATUS_BLOCK iosb = {};
+    HANDLE h = NULL;
+    NTSTATUS st = ZwCreateFile(&h, GENERIC_READ | SYNCHRONIZE, &oa, &iosb, NULL,
+        FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OPEN,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, NULL, 0);
+    if (!NT_SUCCESS(st)) return st;
+
+    FILE_STANDARD_INFORMATION fsi = {};
+    st = ZwQueryInformationFile(h, &iosb, &fsi, sizeof(fsi), FileStandardInformation);
+    if (!NT_SUCCESS(st)) { ZwClose(h); return st; }
+
+    SIZE_T size = (SIZE_T)fsi.EndOfFile.QuadPart;
+    if (size == 0 || size > 64 * 1024 * 1024) { ZwClose(h); return STATUS_FILE_TOO_LARGE; }
+
+    PUINT8 buf = (PUINT8)ExAllocatePool2(POOL_FLAG_NON_PAGED, size, 'fRdO');
+    if (!buf) { ZwClose(h); return STATUS_INSUFFICIENT_RESOURCES; }
+
+    LARGE_INTEGER off = {};
+    iosb = {};
+    st = ZwReadFile(h, NULL, NULL, NULL, &iosb, buf, (ULONG)size, &off, NULL);
+    ZwClose(h);
+    if (!NT_SUCCESS(st)) { ExFreePoolWithTag(buf, 'fRdO'); return st; }
+
+    *out_buf = buf;
+    *out_size = (SIZE_T)iosb.Information;
+    return STATUS_SUCCESS;
+}
+
 // ---- assembly VMCALL (vmcall.asm) ----
 
 extern "C" {
@@ -1437,7 +1701,7 @@ TdCloseCreatedThreadHandle(HANDLE thread_h, BOOLEAN thread_started)
 // ---- device / IOCTL ----
 
 // forward declarations for globals defined at driver entry / unload section.
-// NOT static — extern matches the non-static definitions below.
+// NOT static - extern matches the non-static definitions below.
 extern PDEVICE_OBJECT g_dev_obj;
 extern BOOLEAN g_device_hidden;
 
@@ -1453,6 +1717,7 @@ extern BOOLEAN g_device_hidden;
 #define IOCTL_RESOLVE_EXPORT CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 12, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_GET_MODULE_BASE CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 13, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_HIDE_DEVICE     CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 14, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GET_SELF_PE_INFO CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 15, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #pragma pack(push, 8)
 typedef struct _TD_RESOLVE_EXPORT_PARAMS {
@@ -1469,6 +1734,20 @@ typedef struct _TD_GET_MODULE_BASE_PARAMS {
     UINT64 module_size;         // [out] size of image in bytes
     UINT64 status;              // [out] NTSTATUS
 } TD_GET_MODULE_BASE_PARAMS;
+
+// Query cached PE info for a manually-mapped renderdoc module whose headers
+// were erased after mapping. The driver caches this at map time (before
+// erasure); R3 queries it to walk .rsrc / resolve exports post-erasure.
+typedef struct _TD_GET_SELF_PE_INFO_PARAMS {
+    UINT64 target_pid;          // [in]  caller process PID
+    UINT64 module_base;         // [in]  renderdoc mapped base
+    UINT64 rsrc_rva;            // [out] DataDirectory[RESOURCE].VirtualAddress
+    UINT64 rsrc_size;           // [out] DataDirectory[RESOURCE].Size
+    UINT64 export_dir_rva;      // [out] DataDirectory[EXPORT].VirtualAddress
+    UINT64 export_dir_size;     // [out] DataDirectory[EXPORT].Size
+    UINT64 size_of_image;       // [out] OptionalHeader.SizeOfImage
+    UINT64 status;              // [out] NTSTATUS (0 = ok)
+} TD_GET_SELF_PE_INFO_PARAMS;
 
 typedef struct _TD_INJECT_PARAMS {
     UINT64 target_pid;
@@ -3848,20 +4127,20 @@ TdBuildDllMainStub(PVOID stub_addr, UINT64 image_base, UINT64 entry_point)
     PUINT8 s = (PUINT8)stub_addr;
     UINT32 off = 0;
 
-    // sub rsp, 28h
+    // sub rsp, 28h  (align stack for call)
     s[off++] = 0x48; s[off++] = 0x83; s[off++] = 0xEC; s[off++] = 0x28;
 
-    // mov rcx, IMAGE_BASE (imm64)
+    // mov rcx, image_base  (hinstDLL)
     s[off++] = 0x48; s[off++] = 0xB9;
     *(PUINT64)(s + off) = image_base; off += 8;
 
-    // mov edx, 1
+    // mov edx, 1  (DLL_PROCESS_ATTACH)
     s[off++] = 0xBA; s[off++] = 0x01; s[off++] = 0x00; s[off++] = 0x00; s[off++] = 0x00;
 
-    // xor r8d, r8d
+    // xor r8d, r8d  (lpvReserved = 0)
     s[off++] = 0x45; s[off++] = 0x31; s[off++] = 0xC0;
 
-    // mov rax, ENTRY_POINT (imm64)
+    // mov rax, entry_point
     s[off++] = 0x48; s[off++] = 0xB8;
     *(PUINT64)(s + off) = entry_point; off += 8;
 
@@ -3871,7 +4150,7 @@ TdBuildDllMainStub(PVOID stub_addr, UINT64 image_base, UINT64 entry_point)
     // add rsp, 28h
     s[off++] = 0x48; s[off++] = 0x83; s[off++] = 0xC4; s[off++] = 0x28;
 
-    // xor eax, eax
+    // xor eax, eax  (return TRUE)
     s[off++] = 0x31; s[off++] = 0xC0;
 
     // ret
@@ -3899,7 +4178,8 @@ TdManualMapInProcess(
     PVOID *   out_base,
     PVOID *   out_entry)
 {
-    UNREFERENCED_PARAMETER(proc);
+    // `proc` is used below to cache per-process PE info (TdCacheSelfPeInfo)
+    // before header erasure, so R3 can recover the resource/export RVAs.
 
     if (!raw_dll || dll_size < sizeof(IMAGE_DOS_HEADER) + sizeof(IMAGE_NT_HEADERS64))
         return STATUS_INVALID_PARAMETER;
@@ -3976,6 +4256,14 @@ TdManualMapInProcess(
         {
             HYPERPLATFORM_LOG_WARN("[td-map] TdPeResolveImports had errors (continuing)");
         }
+
+        // 6.5 cache PE info (resource + export dir RVAs) for this mapped image
+        // BEFORE header erasure below. R3 queries it via IOCTL_GET_SELF_PE_INFO
+        // to walk .rsrc / resolve exports after the headers are erased. `nt`
+        // points into raw_dll (intact on-disk headers), so the DataDirectory
+        // reads are always valid; key by the mapped `base` so R3 (which only
+        // knows g_renderdoc_hModule == base) can look it up.
+        TdCacheSelfPeInfo((UINT64)(ULONG_PTR)PsGetProcessId(proc), (UINT64)base, nt);
 
         // 7. build DllMain stub at base+0 (overwrites DOS header)
         PVOID entry = NULL;
@@ -4061,6 +4349,472 @@ TdManualMapInProcess(
         HYPERPLATFORM_LOG_ERROR("[td-map] exception in TdManualMapInProcess");
         return STATUS_UNSUCCESSFUL;
     }
+}
+
+// =========================================================================
+//  TdInjectRenderdocShadow 鈥?automated renderdoc injection via LoadImage callback
+// =========================================================================
+//
+// Called from TdLoadImageNotify when user32.dll loads in a recorded target.
+// Must be called at PASSIVE_LEVEL with proc referenced (not yet attached).
+// Flow:
+//   1. attach, read renderdoc.dll from disk
+//   2. TdManualMapInProcess (alloc RW, copy sections, reloc, imports, DllMain stub)
+//   3. build shadow CR3 for the mapped image range (NX cleared)
+//   4. EPT stealth per page + track for process-exit cleanup
+//   5. create SUSPENDED thread at mapped_base (DllMain stub entry, no trigger)
+//   6. resume thread -> direct DllMain execution (shadow CR3 via stealth #PF)
+//   7. async cleanup: release thread handle, keep inject resident
+//
+static NTSTATUS
+TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const char * log_prefix)
+{
+    NTSTATUS st = STATUS_SUCCESS;
+    KAPC_STATE apc_state;
+    UINT64 caller_cr3 = 0;
+    SIZE_T image_size = 0;
+    PUINT8 raw_dll = NULL;
+    SIZE_T dll_size = 0;
+    PVOID mapped_base = NULL;
+    PVOID mapped_entry = NULL;
+    UINT64 shadow_cr3 = 0;
+    BOOLEAN thread_started = FALSE;
+    BOOLEAN stealth_tracked = FALSE;
+    SIZE_T pages_installed = 0;
+    SIZE_T total_pages = 0;
+    UINT64 target_pid = (UINT64)PsGetProcessId(proc);
+    PVOID trigger_fn = NULL;
+    HANDLE cleanup_thr_h = NULL;
+    UINT64 expected_tid = 0;
+    BOOLEAN trigger_hooked = FALSE;
+
+    // 1. attach to target
+    KeStackAttachProcess(proc, &apc_state);
+    caller_cr3 = __readcr3();
+
+    // 2. read renderdoc.dll from disk
+    st = TdReadFileKernel(renderdoc_path, &raw_dll, &dll_size);
+    if (!NT_SUCCESS(st))
+    {
+        HYPERPLATFORM_LOG_ERROR("[%s] TdReadFileKernel failed: 0x%08X", log_prefix, st);
+        KeUnstackDetachProcess(&apc_state);
+        return st;
+    }
+    HYPERPLATFORM_LOG_INFO("[%s] read renderdoc: %wZ size=0x%llX", log_prefix, renderdoc_path, (UINT64)dll_size);
+
+    // 3. manual map in target process (alloc RW, copy sections, reloc, imports, DllMain stub)
+    st = TdManualMapInProcess(proc, raw_dll, dll_size, &mapped_base, &mapped_entry);
+    if (!NT_SUCCESS(st) || !mapped_base)
+    {
+        HYPERPLATFORM_LOG_ERROR("[%s] TdManualMapInProcess failed: 0x%08X", log_prefix, st);
+        ExFreePoolWithTag(raw_dll, 'fRdO');
+        KeUnstackDetachProcess(&apc_state);
+        return st;
+    }
+
+    // compute image size from raw PE headers
+    {
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)raw_dll;
+        PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(raw_dll + dos->e_lfanew);
+        image_size = nt->OptionalHeader.SizeOfImage;
+    }
+
+    HYPERPLATFORM_LOG_INFO("[%s] manual map complete: base=%p entry=%p size=0x%llX",
+        log_prefix, mapped_base, mapped_entry, (UINT64)image_size);
+
+    // 4. build shadow CR3 for the mapped image range (NX cleared)
+    //    image_size is already page-aligned from ZwAllocateVirtualMemory
+    total_pages = (image_size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    UINT64 existing = TdStealthFindShadowCr3ForPid(target_pid);
+    shadow_cr3 = existing
+        ? TdExtendShadowCR3(existing, caller_cr3, (UINT64)mapped_base, image_size)
+        : TdBuildShadowCR3(caller_cr3, (UINT64)mapped_base, image_size);
+
+    if (!shadow_cr3)
+    {
+        HYPERPLATFORM_LOG_ERROR("[%s] shadow CR3 build failed", log_prefix);
+        ExFreePoolWithTag(raw_dll, 'fRdO');
+        ZwFreeVirtualMemory(ZwCurrentProcess(), &mapped_base, &image_size, MEM_RELEASE);
+        KeUnstackDetachProcess(&apc_state);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    // 5. EPT stealth: shadow page = original (no zeroing needed since shadow CR3 handles NX)
+    //    We need to set up per-page stealth so the shadow CR3 pages are recognized.
+    for (SIZE_T off = 0; off < image_size; off += PAGE_SIZE)
+    {
+        PVOID page_va = (PUINT8)mapped_base + off;
+        UINT64 page_phys = MmGetPhysicalAddress(page_va).QuadPart;
+        UINT64 pt_pfn = 0;
+        UINT32 pt_idx = 0;
+
+        if (!page_phys || !TdResolveGuestPT(caller_cr3, (UINT64)page_va, &pt_pfn, &pt_idx))
+        {
+            HYPERPLATFORM_LOG_ERROR("[%s] PT/PA resolve failed VA=%p at off=0x%llX",
+                log_prefix, page_va, (UINT64)off);
+            break;
+        }
+
+        NTSTATUS ss = TdStealthAllocPage(
+            caller_cr3, page_va, page_phys,
+            NULL, 0, TRUE, pt_pfn, pt_idx,
+            FALSE, shadow_cr3, TRUE, FALSE);
+
+        if (!NT_SUCCESS(ss))
+        {
+            HYPERPLATFORM_LOG_ERROR("[%s] stealth setup failed VA=%p st=0x%08X", log_prefix, page_va, ss);
+            break;
+        }
+        pages_installed++;
+    }
+
+    if (pages_installed != total_pages)
+    {
+        HYPERPLATFORM_LOG_ERROR("[%s] stealth setup incomplete: %llu/%llu pages",
+            log_prefix, (UINT64)pages_installed, (UINT64)total_pages);
+        for (SIZE_T i = 0; i < pages_installed; i++)
+            TdStealthFreePage((PUINT8)mapped_base + (i * PAGE_SIZE));
+        if (!existing)
+            TdShadowFreeCr3(shadow_cr3);
+        ZwFreeVirtualMemory(ZwCurrentProcess(), &mapped_base, &image_size, MEM_RELEASE);
+        ExFreePoolWithTag(raw_dll, 'fRdO');
+        KeUnstackDetachProcess(&apc_state);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    // 6. track for process exit cleanup
+    if (!TdStealthTrackAdd(target_pid, mapped_base, image_size, shadow_cr3))
+    {
+        HYPERPLATFORM_LOG_ERROR("[%s] stealth track table full", log_prefix);
+        for (SIZE_T i = 0; i < pages_installed; i++)
+            TdStealthFreePage((PUINT8)mapped_base + (i * PAGE_SIZE));
+        if (!existing)
+            TdShadowFreeCr3(shadow_cr3);
+        ZwFreeVirtualMemory(ZwCurrentProcess(), &mapped_base, &image_size, MEM_RELEASE);
+        ExFreePoolWithTag(raw_dll, 'fRdO');
+        KeUnstackDetachProcess(&apc_state);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    stealth_tracked = TRUE;
+
+    HYPERPLATFORM_LOG_INFO("[%s] shadow CR3 built: PA=0x%llX (VA=%p size=0x%llX, %llu pages NX cleared)",
+        log_prefix, shadow_cr3, mapped_base, (UINT64)image_size, (UINT64)total_pages);
+
+    // 7. resolve NtTestAlert (ntdll export) - the CFG-valid thread entry point.
+    //    thread is created SUSPENDED at NtTestAlert, then EPT-hooked to redirect
+    //    to mapped_base (DllMain stub), bypassing CFG on the manual-mapped image.
+    {
+        PPEB peb = PsGetProcessPeb(proc);
+        if (peb)
+        {
+            __try {
+                TD_PEB_LDR_DATA * ldr = *(TD_PEB_LDR_DATA **)((PUINT8)peb + 0x18);
+                if (ldr)
+                {
+                    PLIST_ENTRY ldr_head = &ldr->InMemoryOrderModuleList;
+                    PLIST_ENTRY ldr_cur = ldr_head->Flink;
+                    while (ldr_cur != ldr_head)
+                    {
+                        TD_LDR_ENTRY * ldr_e = CONTAINING_RECORD(ldr_cur, TD_LDR_ENTRY, InMemoryOrderLinks);
+                        if (ldr_e->BaseDllName.Buffer &&
+                            TdMatchDllName(ldr_e->BaseDllName.Buffer, ldr_e->BaseDllName.Length,
+                                           g_ntdll_name, 9))
+                        {
+                            trigger_fn = TdFindExportByName(ldr_e->DllBase, "NtTestAlert");
+                            if (trigger_fn)
+                                HYPERPLATFORM_LOG_INFO("[%s] NtTestAlert=%p (ntdll=%p)",
+                                    log_prefix, trigger_fn, ldr_e->DllBase);
+                            break;
+                        }
+                        ldr_cur = ldr_cur->Flink;
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                HYPERPLATFORM_LOG_WARN("[%s] exception resolving NtTestAlert", log_prefix);
+            }
+        }
+    }
+
+    if (!trigger_fn)
+    {
+        HYPERPLATFORM_LOG_ERROR("[%s] cannot resolve NtTestAlert", log_prefix);
+        st = STATUS_NOT_FOUND;
+    }
+
+    // 8. create thread at trigger (SUSPENDED) - before hook, no race
+    if (NT_SUCCESS(st))
+    {
+        if (g_pZwCreateThreadEx)
+        {
+            HANDLE thr_proc_h = NULL;
+            NTSTATUS oh_st = ObOpenObjectByPointer(
+                proc, OBJ_KERNEL_HANDLE, NULL,
+                PROCESS_ALL_ACCESS, *PsProcessType, KernelMode, &thr_proc_h);
+
+            if (NT_SUCCESS(oh_st))
+            {
+                HANDLE thr_h = NULL;
+                NTSTATUS thr_st = g_pZwCreateThreadEx(
+                    &thr_h, THREAD_ALL_ACCESS, NULL, thr_proc_h,
+                    trigger_fn, NULL,
+                    THREAD_CREATE_FLAGS_CREATE_SUSPENDED,
+                    0, 0, 0, NULL);
+
+                if (NT_SUCCESS(thr_st) && thr_h)
+                {
+                    HANDLE kernel_thr_h = NULL;
+                    NTSTATUS kh_st = TdMakeKernelThreadHandle(thr_h, &kernel_thr_h, &expected_tid);
+                    ZwClose(thr_h);
+
+                    if (!NT_SUCCESS(kh_st) || !kernel_thr_h || !expected_tid)
+                    {
+                        HYPERPLATFORM_LOG_ERROR("[%s] cannot convert created thread handle: st=0x%08X tid=%llu",
+                            log_prefix, kh_st, expected_tid);
+                        if (kernel_thr_h)
+                            ZwClose(kernel_thr_h);
+                        st = NT_SUCCESS(kh_st) ? STATUS_UNSUCCESSFUL : kh_st;
+                    }
+                    else
+                    {
+                        cleanup_thr_h = kernel_thr_h;
+                        HYPERPLATFORM_LOG_INFO("[%s] thread SUSPENDED trigger=%p tid=%llu",
+                            log_prefix, trigger_fn, expected_tid);
+                    }
+                }
+                else
+                {
+                    HYPERPLATFORM_LOG_ERROR("[%s] ZwCreateThreadEx failed: 0x%08X", log_prefix, thr_st);
+                    st = thr_st;
+                }
+                ZwClose(thr_proc_h);
+            }
+            else
+            {
+                HYPERPLATFORM_LOG_ERROR("[%s] ObOpenObjectByPointer failed: 0x%08X", log_prefix, oh_st);
+                st = oh_st;
+            }
+        }
+        else
+        {
+            // fallback: RtlCreateUserThread (suspended)
+            KAPC_STATE thr_apc;
+            KeStackAttachProcess(proc, &thr_apc);
+
+            HANDLE thr_h = NULL;
+            CLIENT_ID cid = {};
+            NTSTATUS thr_st = RtlCreateUserThread(
+                ZwCurrentProcess(), NULL, TRUE, 0, 0, 0,
+                trigger_fn, NULL, &thr_h, &cid);
+
+            if (NT_SUCCESS(thr_st) && thr_h)
+            {
+                expected_tid = (UINT64)(ULONG_PTR)cid.UniqueThread;
+
+                HANDLE kernel_thr_h = NULL;
+                UINT64 resolved_tid = expected_tid;
+                NTSTATUS kh_st = TdMakeKernelThreadHandle(thr_h, &kernel_thr_h, &resolved_tid);
+                ZwClose(thr_h);
+                if (!expected_tid)
+                    expected_tid = resolved_tid;
+
+                if (!NT_SUCCESS(kh_st) || !kernel_thr_h || !expected_tid)
+                {
+                    HYPERPLATFORM_LOG_ERROR("[%s] cannot convert fallback thread handle: st=0x%08X tid=%llu",
+                        log_prefix, kh_st, expected_tid);
+                    if (kernel_thr_h)
+                        ZwClose(kernel_thr_h);
+                    st = !expected_tid ? STATUS_UNSUCCESSFUL : kh_st;
+                }
+                else
+                {
+                    cleanup_thr_h = kernel_thr_h;
+                }
+            }
+            else
+            {
+                st = thr_st;
+            }
+
+            KeUnstackDetachProcess(&thr_apc);
+            HYPERPLATFORM_LOG_INFO("[%s] fallback RtlCreateUserThread trigger=%p tid=%llu st=0x%08X",
+                       log_prefix, trigger_fn, expected_tid, thr_st);
+        }
+    }
+
+    // 9. prepare cleanup ctx before resume so we can signal immediate unhook
+    struct _RW_CLEANUP_CTX {
+        HANDLE          thread_handle;
+        PVOID           trigger_fn;
+        PVOID           shellcode_va;
+        UINT64          target_cr3;
+        UINT64          target_pid;
+        PIO_WORKITEM    work_item;
+        volatile LONG   fired_signal;
+    };
+
+    PIO_WORKITEM wi = NULL;
+    struct _RW_CLEANUP_CTX * cleanup_ctx = NULL;
+
+    if (cleanup_thr_h && NT_SUCCESS(st))
+    {
+        wi = IoAllocateWorkItem(g_dev_obj);
+        if (wi)
+        {
+            cleanup_ctx = (struct _RW_CLEANUP_CTX *)
+                ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(struct _RW_CLEANUP_CTX), 'wRcI');
+        }
+    }
+
+    if (cleanup_ctx)
+    {
+        cleanup_ctx->thread_handle = cleanup_thr_h;
+        cleanup_ctx->trigger_fn    = trigger_fn;
+        cleanup_ctx->shellcode_va  = mapped_base;
+        cleanup_ctx->target_cr3    = caller_cr3;
+        cleanup_ctx->target_pid    = target_pid;
+        cleanup_ctx->work_item     = wi;
+        cleanup_ctx->fired_signal  = 0;
+    }
+    else if (cleanup_thr_h && NT_SUCCESS(st))
+    {
+        st = STATUS_INSUFFICIENT_RESOURCES;
+        TdCloseCreatedThreadHandle(cleanup_thr_h, FALSE);
+        cleanup_thr_h = NULL;
+        if (wi)
+        {
+            IoFreeWorkItem(wi);
+            wi = NULL;
+        }
+    }
+
+    // 10. EPT hook trigger -> mapped_base (DllMain stub) (TID-filtered, oneshot)
+    if (NT_SUCCESS(st) && expected_tid)
+    {
+        PVOID dummy_origin = NULL;
+        volatile LONG * fired_ptr = cleanup_ctx ? &cleanup_ctx->fired_signal : NULL;
+        NTSTATUS hook_st = TdInstallTriggerHookAllCpus(
+            trigger_fn, mapped_base, caller_cr3, 2, expected_tid, &dummy_origin, fired_ptr);
+
+        HYPERPLATFORM_LOG_INFO("[%s] trigger hook %s trigger=%p sc=%p tid=%llu st=0x%08X",
+                   log_prefix, NT_SUCCESS(hook_st) ? "OK" : "FAILED",
+                   trigger_fn, mapped_base, expected_tid, hook_st);
+
+        if (!NT_SUCCESS(hook_st))
+            st = hook_st;
+        else
+            trigger_hooked = TRUE;
+    }
+
+    KeUnstackDetachProcess(&apc_state);
+
+    // 11. resume thread (now hook is active with correct TID)
+    if (NT_SUCCESS(st) && cleanup_thr_h)
+    {
+        ULONG prev_count = 0;
+        NTSTATUS resume_st = TdResumeThreadHandle(cleanup_thr_h, &prev_count);
+        if (NT_SUCCESS(resume_st))
+        {
+            HYPERPLATFORM_LOG_INFO("[%s] thread RESUMED trigger=%p tid=%llu prev=%u",
+                log_prefix, trigger_fn, expected_tid, prev_count);
+            thread_started = TRUE;
+        }
+        else
+        {
+            HYPERPLATFORM_LOG_ERROR("[%s] thread resume failed: 0x%08X", log_prefix, resume_st);
+            st = resume_st;
+            TdCloseCreatedThreadHandle(cleanup_thr_h, FALSE);
+            cleanup_thr_h = NULL;
+            if (cleanup_ctx)
+            {
+                cleanup_ctx->fired_signal = 1;
+                cleanup_ctx->thread_handle = NULL;
+            }
+        }
+    }
+
+    // 12. async cleanup - unhook trigger immediately after first hit
+    if (cleanup_ctx && NT_SUCCESS(st) && thread_started)
+    {
+        IoQueueWorkItem(wi, [](PDEVICE_OBJECT, PVOID context) {
+            auto * c = (struct _RW_CLEANUP_CTX *)context;
+
+            LARGE_INTEGER poll_interval;
+            poll_interval.QuadPart = -1LL * 10000LL;
+
+            for (ULONG i = 0; i < 10000 && c->fired_signal == 0; i++)
+            {
+                if (KeDelayExecutionThread(KernelMode, FALSE, &poll_interval) != STATUS_SUCCESS)
+                    break;
+            }
+
+            if (c->thread_handle)
+                TdCloseCreatedThreadHandle(c->thread_handle, TRUE);
+
+            HYPERPLATFORM_LOG_INFO("[td-inj-shadow] cleanup: unhooking trigger (fired=%ld), inject stays resident",
+                c->fired_signal);
+
+            PEPROCESS proc2 = NULL;
+            if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)c->target_pid, &proc2)))
+            {
+                KAPC_STATE apc2;
+                KeStackAttachProcess(proc2, &apc2);
+
+                TdUnhookTriggerAllCpus(c->trigger_fn, c->target_cr3);
+                KeUnstackDetachProcess(&apc2);
+                ObDereferenceObject(proc2);
+
+                HYPERPLATFORM_LOG_INFO("[td-inj-shadow] cleanup: trigger unhook=%p, inject RESIDENT=%p",
+                    c->trigger_fn, c->shellcode_va);
+            }
+
+            IoFreeWorkItem(c->work_item);
+            ExFreePoolWithTag(c, 'wRcI');
+        }, DelayedWorkQueue, cleanup_ctx);
+
+        cleanup_thr_h = NULL;
+    }
+    else
+    {
+        if (cleanup_ctx)
+        {
+            if (cleanup_ctx->thread_handle)
+                TdCloseCreatedThreadHandle(cleanup_ctx->thread_handle, thread_started ? TRUE : FALSE);
+            ExFreePoolWithTag(cleanup_ctx, 'wRcI');
+            cleanup_ctx = NULL;
+            cleanup_thr_h = NULL;
+        }
+        if (wi)
+        {
+            IoFreeWorkItem(wi);
+            wi = NULL;
+        }
+    }
+
+    if (cleanup_thr_h)
+        TdCloseCreatedThreadHandle(cleanup_thr_h, thread_started ? TRUE : FALSE);
+
+    if (NT_SUCCESS(st) && !thread_started)
+        st = STATUS_UNSUCCESSFUL;
+
+    if (!NT_SUCCESS(st) && stealth_tracked && !thread_started)
+    {
+        KAPC_STATE cleanup_apc;
+        KeStackAttachProcess(proc, &cleanup_apc);
+        if (trigger_hooked)
+            TdUnhookTriggerAllCpus(trigger_fn, caller_cr3);
+        UINT64 cleanup_shadow_cr3 = TdStealthTrackRemove(target_pid, mapped_base);
+        for (SIZE_T i = 0; i < pages_installed; i++)
+            TdStealthFreePage((PUINT8)mapped_base + (i * PAGE_SIZE));
+        if (cleanup_shadow_cr3)
+            TdShadowFreeCr3(cleanup_shadow_cr3);
+        ZwFreeVirtualMemory(ZwCurrentProcess(), &mapped_base, &image_size, MEM_RELEASE);
+        KeUnstackDetachProcess(&cleanup_apc);
+        stealth_tracked = FALSE;
+    }
+
+    ExFreePoolWithTag(raw_dll, 'fRdO');
+    return st;
 }
 
 static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
@@ -5838,7 +6592,7 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             TdResolveGuestPte(caller_cr3, start);
         if (!old_view_pte || !(*old_view_pte & 1))
         {
-            // Shadow PTE not present — the real PTE may have been lazy-allocated
+            // Shadow PTE not present - the real PTE may have been lazy-allocated
             // after TdExtendShadowCR3 copied it.  Re-sync from the real PTE.
             if (tracked && old_view_pte)
             {
@@ -6315,11 +7069,51 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         break;
     }
 
+    case IOCTL_GET_SELF_PE_INFO:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_GET_SELF_PE_INFO_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_GET_SELF_PE_INFO_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_GET_SELF_PE_INFO_PARAMS * p = (TD_GET_SELF_PE_INFO_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+        p->rsrc_rva = 0;
+        p->rsrc_size = 0;
+        p->export_dir_rva = 0;
+        p->export_dir_size = 0;
+        p->size_of_image = 0;
+        p->status = (UINT64)(ULONG)STATUS_INVALID_PARAMETER;
+
+        // No attach needed: the cache is global driver state keyed by (pid, base).
+        if (p->target_pid && p->module_base)
+        {
+            TD_SELF_PE_INFO_ENTRY entry;
+            if (TdLookupSelfPeInfo(p->target_pid, p->module_base, &entry))
+            {
+                p->rsrc_rva = entry.rsrc_rva;
+                p->rsrc_size = entry.rsrc_size;
+                p->export_dir_rva = entry.export_dir_rva;
+                p->export_dir_size = entry.export_dir_size;
+                p->size_of_image = entry.size_of_image;
+                p->status = 0;
+            }
+            else
+            {
+                p->status = (UINT64)(ULONG)STATUS_NOT_FOUND;
+            }
+        }
+
+        HYPERPLATFORM_LOG_INFO("[td] get self pe info: pid=%llu base=0x%llX rsrc=0x%llX exp=0x%llX st=%llu",
+                   p->target_pid, p->module_base, p->rsrc_rva, p->export_dir_rva, p->status);
+
+        irp->IoStatus.Information = sizeof(TD_GET_SELF_PE_INFO_PARAMS);
+        break;
+    }
+
     case IOCTL_HIDE_DEVICE:
     {
         //
         // Hides the device & symlink from user-mode enumeration.
-        // Called by version.dll after all init is done — the device is no longer
+        // Called by version.dll after all init is done - the device is no longer
         // needed (EPT hooks are already installed). TdUnload checks g_device_hidden
         // and skips IoDeleteSymbolicLink / IoDeleteDevice when already torn down.
         //
@@ -6661,11 +7455,109 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
     }
 }
 
+// =========================================================================
+//  TdLoadImageNotify 鈥?fires when a DLL is loaded in any process
+// =========================================================================
+//
+// When user32.dll loads in a recorded target (Box.exe), we inject renderdoc.dll
+// directly using the NtTestAlert EPT trigger + shadow CR3 mechanism.
+//
+static VOID
+TdLoadImageNotify(PUNICODE_STRING ImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo)
+{
+    UNREFERENCED_PARAMETER(ImageInfo);
+
+    if (!ImageName || !ImageName->Buffer || !g_loadimage_registered || !g_inject_target_lock_init)
+        return;
+
+    // extract basename
+    const WCHAR * buf = ImageName->Buffer;
+    USHORT len = ImageName->Length / sizeof(WCHAR);
+    USHORT base_off = 0;
+    for (USHORT i = 0; i < len; i++)
+        if (buf[i] == L'\\') base_off = (USHORT)(i + 1);
+    USHORT base_len = (USHORT)(len - base_off);
+
+    // check if it's "d3d12.dll" (late enough that renderdoc's imports
+    // user32/gdi32/ole32/dxgi/d3d11/dbghelp/etc. are all already in the PEB
+    // LDR, so TdPeResolveImports can fill the whole IAT before DllMain runs)
+    static const WCHAR kD3d12[] = L"d3d12.dll";
+    static const USHORT kD3d12Len = (USHORT)((sizeof(kD3d12) / sizeof(WCHAR)) - 1);
+    if (base_len != kD3d12Len) return;
+    for (USHORT i = 0; i < kD3d12Len; i++)
+    {
+        WCHAR ca = buf[base_off + i], cb = kD3d12[i];
+        if (ca >= L'a' && ca <= L'z') ca -= 32;
+        if (cb >= L'a' && cb <= L'z') cb -= 32;
+        if (ca != cb) return;
+    }
+
+    // claim target and get stored exe path
+    WCHAR exe_path_buf[MAX_PATH];
+    if (!TdInjectTargetClaim(ProcessId, exe_path_buf, MAX_PATH))
+        return;
+
+    // build renderdoc path from the exe path:
+    //   "\??\C:\dir\Box.exe" -> "\??\C:\dir\renderdoc.dll"
+    WCHAR renderdoc_path_buf[MAX_PATH];
+    USHORT last_slash = 0;
+    USHORT src_chars = 0;
+    for (; src_chars < MAX_PATH && exe_path_buf[src_chars]; src_chars++)
+    {
+        renderdoc_path_buf[src_chars] = exe_path_buf[src_chars];
+        if (exe_path_buf[src_chars] == L'\\') last_slash = (USHORT)(src_chars + 1);
+    }
+    static const WCHAR kRenderdoc[] = L"renderdoc.dll";
+    USHORT rd_chars = (USHORT)((sizeof(kRenderdoc) / sizeof(WCHAR)) - 1);
+    if ((ULONG)last_slash + rd_chars + 1 > MAX_PATH) return;
+    for (USHORT i = 0; i < rd_chars; i++)
+        renderdoc_path_buf[last_slash + i] = kRenderdoc[i];
+    renderdoc_path_buf[last_slash + rd_chars] = L'\0';
+
+    UNICODE_STRING renderdoc_nt;
+    RtlInitUnicodeString(&renderdoc_nt, renderdoc_path_buf);
+
+    HYPERPLATFORM_LOG_INFO("[td-inj] d3d12 loaded in target pid=%llu -- injecting renderdoc directly (shadow CR3)",
+        (UINT64)ProcessId);
+
+    // lookup process
+    PEPROCESS proc = NULL;
+    NTSTATUS st = PsLookupProcessByProcessId(ProcessId, &proc);
+    if (!NT_SUCCESS(st) || !proc)
+    {
+        HYPERPLATFORM_LOG_ERROR("[td-inj] PsLookupProcessByProcessId failed: 0x%08X", st);
+        return;
+    }
+
+    // inject
+    st = TdInjectRenderdocShadow(proc, &renderdoc_nt, "td-inj-shadow");
+    if (!NT_SUCCESS(st))
+    {
+        HYPERPLATFORM_LOG_ERROR("[td-inj] TdInjectRenderdocShadow failed: 0x%08X", st);
+    }
+
+    ObDereferenceObject(proc);
+}
+
 static VOID
 TdProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo)
 {
-    if (CreateInfo != NULL) return;
+    if (CreateInfo != NULL)
+    {
+        // process creation -- record target for later injection
+        if (g_inject_target_lock_init && CreateInfo->ImageFileName)
+        {
+            if (TdInjectMatchBasename(CreateInfo->ImageFileName, L"Box.exe", 7))
+                TdInjectTargetAdd(ProcessId, CreateInfo->ImageFileName);
+        }
+        return;
+    }
+    // process exit -- cleanup stealth
+    NTSTATUS exit_st = PsGetProcessExitStatus(Process);
+    HYPERPLATFORM_LOG_INFO("[td-rw] process exit: pid=%llu exit_status=0x%08X",
+        (UINT64)ProcessId, (UINT32)exit_st);
     TdCleanupStealthForProcess(Process, (UINT64)ProcessId);
+    TdCleanupSelfPeInfo((UINT64)ProcessId);
 }
 
 static VOID
@@ -6684,7 +7576,12 @@ TdProcessNotifyLegacy(HANDLE ParentId, HANDLE ProcessId, BOOLEAN Create)
         return;
     }
 
+    NTSTATUS exit_st = PsGetProcessExitStatus(proc);
+    HYPERPLATFORM_LOG_INFO("[td-rw] legacy process exit: pid=%llu exit_status=0x%08X",
+        (UINT64)ProcessId, (UINT32)exit_st);
+
     TdCleanupStealthForProcess(proc, (UINT64)ProcessId);
+    TdCleanupSelfPeInfo((UINT64)ProcessId);
     ObDereferenceObject(proc);
 }
 
@@ -6705,6 +7602,12 @@ static VOID TdUnload(PDRIVER_OBJECT drv)
             PsSetCreateProcessNotifyRoutine(TdProcessNotifyLegacy, TRUE);
         g_process_notify_registered = FALSE;
         g_process_notify_ex_registered = FALSE;
+    }
+
+    if (g_loadimage_registered)
+    {
+        PsRemoveLoadImageNotifyRoutine(TdLoadImageNotify);
+        g_loadimage_registered = FALSE;
     }
 
     if (g_hooked_target)
@@ -6758,6 +7661,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     UNREFERENCED_PARAMETER(reg);
     KeInitializeSpinLock(&g_shadow_alloc_lock);
     KeInitializeSpinLock(&g_stealth_track_lock);
+    KeInitializeSpinLock(&g_inject_target_lock);
+    g_inject_target_lock_init = TRUE;
+    KeInitializeSpinLock(&g_SelfPeInfoLock);
+    g_SelfPeInfoLockInit = TRUE;
 
     //
     // init log system 鈥?file output, truncate on load
@@ -6839,6 +7746,17 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
         else
         {
             HYPERPLATFORM_LOG_ERROR("[td] PsSetCreateProcessNotifyRoutine legacy failed: 0x%08X", legacy_st);
+        }
+    }
+
+    // register LoadImage notify for automated renderdoc injection
+    if (g_process_notify_registered)
+    {
+        NTSTATUS li_st = PsSetLoadImageNotifyRoutine(TdLoadImageNotify);
+        if (NT_SUCCESS(li_st))
+        {
+            g_loadimage_registered = TRUE;
+            HYPERPLATFORM_LOG_INFO("[td] LoadImage notify registered (driver-side injection armed).");
         }
     }
 

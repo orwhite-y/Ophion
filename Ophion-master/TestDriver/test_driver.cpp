@@ -2893,13 +2893,17 @@ TdEptHookR3(
     }
 
     //
-    // 2. allocate R3 executable trampoline in target process
+    // 2. allocate R3 trampoline in target process as PAGE_READWRITE (NX=1).
+    // Stealth: no executable memory in the real PTE. The trampoline is made
+    // executable only in the shadow CR3 (step 2.5 below), so scanners reading
+    // the real CR3 see a non-executable private page. The proxy calls it under
+    // the shadow CR3.
     //
     PVOID tramp_va = NULL;
     SIZE_T tramp_size = PAGE_SIZE;
     st = ZwAllocateVirtualMemory(
         ZwCurrentProcess(), &tramp_va, 0, &tramp_size,
-        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
     if (!NT_SUCCESS(st) || !tramp_va)
     {
@@ -2916,6 +2920,89 @@ TdEptHookR3(
 
     HYPERPLATFORM_LOG_INFO("[td-r3] target=%p proxy=%p tramp=%p(PA=%llx) cr3=%llx pid=%llu type=%u",
                target_va, proxy_va, tramp_va, tramp_pa, target_cr3, target_pid, hook_type);
+
+    //
+    // 2.5 shadow the trampoline page: clear NX in the process shadow CR3 so
+    // the proxy can execute it, while the real PTE stays PAGE_READWRITE (NX=1)
+    // for stealth. Done BEFORE the EPT-hook install so a shadow failure can
+    // abort cleanly without leaving an installed hook. The HV writes the
+    // trampoline content (saved bytes + jump) to the real page during the
+    // VMCALL below; the shadow PTE aliases the same physical page, so the
+    // content is visible under the shadow CR3.
+    //
+    {
+        UINT64 existing_shadow = TdStealthFindShadowCr3ForPid(target_pid);
+        UINT64 tramp_shadow = existing_shadow
+            ? TdExtendShadowCR3(existing_shadow, caller_cr3, (UINT64)tramp_va, tramp_size)
+            : TdBuildShadowCR3(caller_cr3, (UINT64)tramp_va, tramp_size);
+        if (!tramp_shadow)
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-r3] trampoline shadow CR3 failed (tramp=%p) - aborting hook",
+                tramp_va);
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
+            MmUnlockPages(mdl);
+            IoFreeMdl(mdl);
+            KeUnstackDetachProcess(&apc);
+            ObDereferenceObject(proc);
+            return STATUS_UNSUCCESSFUL;
+        }
+        HYPERPLATFORM_LOG_INFO("[td-r3] trampoline shadowed: tramp=%p shadow=0x%llX (%s)",
+            tramp_va, tramp_shadow, existing_shadow ? "extended" : "built");
+
+        //
+        // 2.6 register the trampoline as a stealth page (sp) so the HV #PF
+        // handler (ept_stealth_handle_pf) activates the shadow CR3 window for
+        // it. TdExtendShadowCR3/TdBuildShadowCR3 only fork the shadow PT and
+        // clear NX on the shadow PTE -- they do NOT register an sp. The shadow
+        // CR3 is per-instruction-on-demand, triggered by a #PF on a registered
+        // sp (vmexit #PF -> ept_stealth_handle_pf -> sp match -> swap shadow
+        // CR3 + MTF restore). Without an sp, the trampoline's NX-fetch #PF
+        // (real PTE is PAGE_READWRITE, NX=1) is injected to the guest -> AV at
+        // the trampoline (execute violation, op=8). The image pages work because
+        // they go through TdStealthAllocPage (sp registered -> HV re-syncs the
+        // shadow PTE via stealth_refresh_shadow_code_pte on #PF). Match that
+        // here. no_ept_split=TRUE + shadow_cr3 -> TdResolveShadowPT computes
+        // shadow_pte_va, which the HV writes (real_pte & ~NX) into on #PF.
+        //
+        {
+            UINT64 pt_pfn = 0;
+            UINT32 pt_idx = 0;
+            if (!TdResolveGuestPT(caller_cr3, (UINT64)tramp_va, &pt_pfn, &pt_idx))
+            {
+                HYPERPLATFORM_LOG_ERROR(
+                    "[td-r3] trampoline stealth PT resolve failed (tramp=%p) - aborting hook",
+                    tramp_va);
+                ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
+                MmUnlockPages(mdl);
+                IoFreeMdl(mdl);
+                KeUnstackDetachProcess(&apc);
+                ObDereferenceObject(proc);
+                return STATUS_UNSUCCESSFUL;
+            }
+            NTSTATUS sp_st = TdStealthAllocPage(
+                caller_cr3,
+                (PVOID)((UINT64)tramp_va & ~0xFFFULL),
+                tramp_pa,
+                NULL, 0, TRUE,
+                pt_pfn, pt_idx,
+                FALSE, tramp_shadow, TRUE, FALSE);
+            if (!NT_SUCCESS(sp_st))
+            {
+                HYPERPLATFORM_LOG_ERROR(
+                    "[td-r3] trampoline stealth page register failed (tramp=%p st=0x%08X) - aborting hook",
+                    tramp_va, sp_st);
+                ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
+                MmUnlockPages(mdl);
+                IoFreeMdl(mdl);
+                KeUnstackDetachProcess(&apc);
+                ObDereferenceObject(proc);
+                return STATUS_UNSUCCESSFUL;
+            }
+            HYPERPLATFORM_LOG_INFO(
+                "[td-r3] trampoline stealth page registered: tramp=%p shadow=0x%llX",
+                tramp_va, tramp_shadow);
+        }
+    }
 
     //
     // 3. DPC broadcast VMCALL to install hook on all CPUs
@@ -4294,53 +4381,16 @@ TdManualMapInProcess(
         *out_base  = base;
         *out_entry = entry;
 
-        // 9. change protection for executable sections
-        // re-parse the mapped image headers (we need section headers which are
-        // after the optional header, so they survive the stub overwrite at offset 0)
-        {
-            // use the RAW dll headers to get section info (mapped headers partially overwritten)
-            PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
-            USHORT num_sec = nt->FileHeader.NumberOfSections;
-
-            for (USHORT i = 0; i < num_sec; i++)
-            {
-                if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)
-                {
-                    PVOID sec_base = (PUINT8)base + sec[i].VirtualAddress;
-                    SIZE_T sec_size = sec[i].Misc.VirtualSize;
-                    if (sec_size == 0) continue;
-
-                    // round up to page
-                    sec_size = (sec_size + 0xFFF) & ~(SIZE_T)0xFFF;
-
-                    ULONG old_prot = 0;
-                    st = ZwProtectVirtualMemory(
-                        ZwCurrentProcess(), &sec_base, &sec_size,
-                        PAGE_EXECUTE_READ, &old_prot);
-
-                    if (NT_SUCCESS(st))
-                        HYPERPLATFORM_LOG_INFO("[td-map] section %u (%.8s) 鈫?PAGE_EXECUTE_READ", i, sec[i].Name);
-                    else
-                        HYPERPLATFORM_LOG_WARN("[td-map] section %u protect failed: 0x%08X", i, st);
-                }
-            }
-
-            // header page (contains our stub) 鈫?PAGE_EXECUTE_READ
-            if (entry)
-            {
-                PVOID hdr_base = base;
-                SIZE_T hdr_prot_size = PAGE_SIZE;
-                ULONG old_prot = 0;
-                st = ZwProtectVirtualMemory(
-                    ZwCurrentProcess(), &hdr_base, &hdr_prot_size,
-                    PAGE_EXECUTE_READ, &old_prot);
-
-                if (NT_SUCCESS(st))
-                    HYPERPLATFORM_LOG_INFO("[td-map] header page 鈫?PAGE_EXECUTE_READ");
-                else
-                    HYPERPLATFORM_LOG_WARN("[td-map] header page protect failed: 0x%08X", st);
-            }
-        }
+        // 9. executable sections + header stub page: do NOT mark PAGE_EXECUTE_READ
+        // in the REAL PTE. Stealth rule: any executable memory in the target
+        // process must be shadowed. The real PTE stays PAGE_READWRITE (NX=1,
+        // non-executable) so scanners reading the real CR3 see no executable
+        // private memory. The shadow CR3 built later in TdInjectRenderdocShadow
+        // (TdBuildShadowCR3 / TdExtendShadowCR3) clears NX on every PTE across
+        // the whole image range, so .text and the header DllMain stub page
+        // execute under the shadow CR3. Never modify real PTEs to executable
+        // (matches the shadow-alloc pattern: "never modifies real PTEs - no
+        // conflict with MiAgeWorkingSet").
 
         HYPERPLATFORM_LOG_INFO("[td-map] manual map complete: base=%p entry=%p", base, entry);
         return STATUS_SUCCESS;

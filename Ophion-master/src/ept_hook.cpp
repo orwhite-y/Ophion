@@ -24,6 +24,15 @@
 // mask PCID and no-flush bit from CR3, keep only PML4 physical address
 #define CR3_ADDR_MASK  0x000FFFFFFFFFF000ULL
 
+#ifndef INT32_MIN
+#define INT32_MIN (-2147483647 - 1)
+#define INT32_MAX 2147483647
+#endif
+#ifndef INT8_MIN
+#define INT8_MIN (-128)
+#define INT8_MAX 127
+#endif
+
 //
 // spinlock for serializing the "new page" full install path in ept_hook_install.
 // the DPC broadcast VMCALL handler uses InterlockedCompareExchange on the shared
@@ -112,6 +121,100 @@ hook_write_absolute_jump(PUINT8 buf, UINT64 dst)
     buf[5] = 0xC7; buf[6] = 0x44; buf[7] = 0x24; buf[8] = 0x04;
     *(PUINT32)(&buf[9]) = (UINT32)(dst >> 32);
     buf[13] = 0xC3;
+}
+
+// The trampoline may live far away from the hooked image.  Copying an x64
+// instruction byte-for-byte is therefore not sufficient: RIP-relative
+// operands and relative branches retain the old instruction address.  Fix the
+// common encodings used by PE export thunks/prologues while the bytes are
+// still in the guest address space.
+static BOOLEAN
+hook_relocate_instruction(PUINT8 src, PUINT8 dst, SIZE_T len,
+                          UINT64 src_va, UINT64 dst_va)
+{
+    if (!src || !dst || !len) return FALSE;
+    RtlCopyMemory(dst, src, len);
+
+    UCHAR op = src[0];
+    SIZE_T prefix = 0;
+    while (prefix < len && (src[prefix] == 0x40 || src[prefix] == 0x41 ||
+                            src[prefix] == 0x42 || src[prefix] == 0x43 ||
+                            src[prefix] == 0x44 || src[prefix] == 0x45 ||
+                            src[prefix] == 0x46 || src[prefix] == 0x47 ||
+                            src[prefix] == 0x66 || src[prefix] == 0x67))
+        prefix++;
+    if (prefix >= len) return TRUE;
+    op = src[prefix++];
+
+    // CALL/JMP rel32 and short JMP.
+    if ((op == 0xE8 || op == 0xE9) && len >= prefix + 4)
+    {
+        INT32 old_disp = *(INT32 *)(src + prefix);
+        UINT64 target = src_va + len + (INT64)old_disp;
+        INT64 new_disp = (INT64)target - (INT64)(dst_va + len);
+        if (new_disp < INT32_MIN || new_disp > INT32_MAX) return FALSE;
+        *(INT32 *)(dst + prefix) = (INT32)new_disp;
+        return TRUE;
+    }
+    if (op == 0xEB && len >= prefix + 1)
+    {
+        INT8 old_disp = *(INT8 *)(src + prefix);
+        UINT64 target = src_va + len + (INT64)old_disp;
+        INT64 new_disp = (INT64)target - (INT64)(dst_va + len);
+        if (new_disp < INT8_MIN || new_disp > INT8_MAX) return FALSE;
+        *(INT8 *)(dst + prefix) = (INT8)new_disp;
+        return TRUE;
+    }
+
+    // Most RIP-relative instructions have a ModRM byte with mod=00,r/m=101.
+    // Handle the common one-byte opcode forms and 0F 8x conditional branches.
+    if (op == 0x0F && prefix < len && (src[prefix] & 0xF0) == 0x80)
+    {
+        if (len < prefix + 5) return TRUE;
+        INT32 old_disp = *(INT32 *)(src + prefix + 1);
+        UINT64 target = src_va + len + (INT64)old_disp;
+        INT64 new_disp = (INT64)target - (INT64)(dst_va + len);
+        if (new_disp < INT32_MIN || new_disp > INT32_MAX) return FALSE;
+        *(INT32 *)(dst + prefix + 1) = (INT32)new_disp;
+        return TRUE;
+    }
+
+    const BOOLEAN has_modrm = (op == 0x88 || op == 0x89 || op == 0x8A ||
+                               op == 0x8B || op == 0x8D || op == 0x8F ||
+                               op == 0x03 || op == 0x0B || op == 0x2B ||
+                               op == 0x33 || op == 0x3B || op == 0x39 ||
+                               op == 0x3A || op == 0x85 || op == 0x84 ||
+                               op == 0xC6 || op == 0xC7 || op == 0xFF);
+    if (has_modrm && prefix < len)
+    {
+        UCHAR modrm = src[prefix];
+        if ((modrm & 0xC7) == 0x05 && len >= prefix + 5)
+        {
+            INT32 old_disp = *(INT32 *)(src + prefix + 1);
+            UINT64 target = src_va + len + (INT64)old_disp;
+            INT64 new_disp = (INT64)target - (INT64)(dst_va + len);
+            if (new_disp < INT32_MIN || new_disp > INT32_MAX) return FALSE;
+            *(INT32 *)(dst + prefix + 1) = (INT32)new_disp;
+        }
+    }
+    return TRUE;
+}
+
+static BOOLEAN
+hook_build_trampoline(PUINT8 src, PUINT8 dst, SIZE_T hook_size,
+                       UINT64 src_va, UINT64 dst_va)
+{
+    SIZE_T off = 0;
+    while (off < hook_size)
+    {
+        SIZE_T insn = LDE(src + off, 64);
+        if (!insn || off + insn > hook_size) return FALSE;
+        if (!hook_relocate_instruction(src + off, dst + off, insn,
+                                       src_va + off, dst_va + off))
+            return FALSE;
+        off += insn;
+    }
+    return TRUE;
 }
 
 static VOID
@@ -290,7 +393,14 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
                         SIZE_T min_sz = (req->hook_type == 1) ? 3 : (req->hook_type == 2) ? 1 : 14;
                         SIZE_T ow = 0;
                         while (ow < min_sz) ow += LDE((PUINT8)req->target_function + ow, 64);
-                        RtlCopyMemory((PUINT8)req->user_trampoline, req->target_function, ow);
+                        if (!hook_build_trampoline((PUINT8)req->target_function,
+                                                   (PUINT8)req->user_trampoline, ow,
+                                                   (UINT64)req->target_function,
+                                                   (UINT64)req->user_trampoline))
+                        {
+                            _InterlockedExchange(&g_hook_list_lock, 0);
+                            HOOK_RESTORE_CR3_AND_RETURN(FALSE);
+                        }
                         hook_write_absolute_jump((PUINT8)req->user_trampoline + ow,
                                                  (UINT64)req->target_function + ow);
                         efi->first_trampoline_address = (PUINT8)req->user_trampoline;
@@ -384,7 +494,17 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
             while (ow < min_sz) ow += LDE((PUINT8)req->target_function + ow, 64);
             fi->hook_size = ow;
 
-            RtlCopyMemory(fi->first_trampoline_address, req->target_function, ow);
+            if (!hook_build_trampoline((PUINT8)req->target_function,
+                                       fi->first_trampoline_address, ow,
+                                       (UINT64)req->target_function,
+                                       (UINT64)fi->first_trampoline_address))
+            {
+                if (!fi->user_trampoline)
+                    pool_manager_release(fi->first_trampoline_address);
+                pool_manager_release(fi);
+                _InterlockedExchange(&g_hook_list_lock, 0);
+                HOOK_RESTORE_CR3_AND_RETURN(FALSE);
+            }
             hook_write_absolute_jump(&fi->first_trampoline_address[ow],
                                      (UINT64)req->target_function + ow);
 
@@ -514,7 +634,17 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     while (ow < min_sz) ow += LDE((PUINT8)req->target_function + ow, 64);
     fi->hook_size = ow;
 
-    RtlCopyMemory(fi->first_trampoline_address, req->target_function, ow);
+    if (!hook_build_trampoline((PUINT8)req->target_function,
+                               fi->first_trampoline_address, ow,
+                               (UINT64)req->target_function,
+                               (UINT64)fi->first_trampoline_address))
+    {
+        pool_manager_release(fi->first_trampoline_address);
+        pool_manager_release(fi);
+        pool_manager_release(hp);
+        _InterlockedExchange(&g_hook_list_lock, 0);
+        HOOK_RESTORE_CR3_AND_RETURN(FALSE);
+    }
     hook_write_absolute_jump(&fi->first_trampoline_address[ow],
                              (UINT64)req->target_function + ow);
 

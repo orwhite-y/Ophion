@@ -4533,6 +4533,19 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
         return STATUS_UNSUCCESSFUL;
     }
 
+    if (!mapped_entry)
+    {
+        HYPERPLATFORM_LOG_ERROR("[%s] mapped entry is NULL", log_prefix);
+        for (SIZE_T i = 0; i < total_pages; i++)
+            TdStealthFreePage((PUINT8)mapped_base + (i * PAGE_SIZE));
+        if (!existing)
+            TdShadowFreeCr3(shadow_cr3);
+        ZwFreeVirtualMemory(ZwCurrentProcess(), &mapped_base, &image_size, MEM_RELEASE);
+        ExFreePoolWithTag(raw_dll, 'fRdO');
+        KeUnstackDetachProcess(&apc_state);
+        return STATUS_UNSUCCESSFUL;
+    }
+
     // 6. track for process exit cleanup
     if (!TdStealthTrackAdd(target_pid, mapped_base, image_size, shadow_cr3))
     {
@@ -4768,6 +4781,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
             HYPERPLATFORM_LOG_INFO("[%s] thread RESUMED trigger=%p tid=%llu prev=%u",
                 log_prefix, trigger_fn, expected_tid, prev_count);
             thread_started = TRUE;
+            st = STATUS_SUCCESS;
         }
         else
         {

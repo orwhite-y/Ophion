@@ -1690,10 +1690,15 @@ TdMakeKernelThreadHandle(HANDLE thread_h, HANDLE * kernel_thread_h, UINT64 * thr
 static VOID
 TdCloseCreatedThreadHandle(HANDLE thread_h, BOOLEAN thread_started)
 {
-    UNREFERENCED_PARAMETER(thread_started);
-
     if (!thread_h)
         return;
+
+    if (thread_started)
+    {
+        // The trigger thread may still be inside the manually mapped DllMain.
+        // Do not remove its EPT trigger or resident pages until it has returned.
+        ZwWaitForSingleObject(thread_h, FALSE, NULL);
+    }
 
     ZwClose(thread_h);
 }
@@ -3114,6 +3119,30 @@ TdEptUnhookR3(UINT64 target_pid, PVOID target_va)
 
     RtlZeroMemory(entry, sizeof(*entry));
     ObDereferenceObject(proc);
+    return unhook_ctx.result;
+}
+
+
+static NTSTATUS
+TdEptUnhookR3ForProcess(PEPROCESS proc, UINT64 target_pid, PVOID target_va)
+{
+    R3_HOOK_ENTRY * entry = R3HookFind(target_pid, target_va);
+    if (!entry)
+        return STATUS_NOT_FOUND;
+
+    KAPC_STATE apc;
+    KeStackAttachProcess(proc, &apc);
+
+    struct {
+        PVOID target;
+        UINT64 caller_cr3;
+        NTSTATUS result;
+    } unhook_ctx = {};
+    unhook_ctx.target = target_va;
+    unhook_ctx.caller_cr3 = entry->target_cr3;
+
+    KeGenericCallDpc(DpcEptUnhook, &unhook_ctx);
+    KeUnstackDetachProcess(&apc);
     return unhook_ctx.result;
 }
 
@@ -7450,6 +7479,19 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
 
         HYPERPLATFORM_LOG_INFO("[td-rw] process exit cleanup R3 hook: pid=%llu target=%p",
                    pid, g_r3_hooks[i].target_va);
+
+        // Restore the EPT view before touching any process-owned memory.  The
+        // hook page is global to the hypervisor EPT, so freeing the trampoline
+        // first leaves a dangling proxy/trampoline target and can hang the host
+        // when the physical page is reused by a later process.
+        NTSTATUS unhook_st = TdEptUnhookR3ForProcess(Process, pid, g_r3_hooks[i].target_va);
+        if (!NT_SUCCESS(unhook_st) && unhook_st != STATUS_NOT_FOUND)
+        {
+            HYPERPLATFORM_LOG_ERROR(
+                "[td-rw] process exit: EPT unhook failed pid=%llu target=%p st=0x%08X; "
+                "retaining hook resources", pid, g_r3_hooks[i].target_va, unhook_st);
+            continue;
+        }
 
         // for real R3 hooks (target_mdl != NULL): unlock + free
         if (g_r3_hooks[i].target_mdl != NULL)

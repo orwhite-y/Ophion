@@ -58,6 +58,8 @@ static volatile UINT64 g_hook_fire_va[HOOK_FIRE_SLOTS];
 static volatile UINT64 g_hook_fire_proxy[HOOK_FIRE_SLOTS];
 static volatile LONG   g_hook_fire_count[HOOK_FIRE_SLOTS];
 static volatile LONG   g_hook_fire_total = 0;
+static volatile LONG   g_hook_fire_unique = 0;     // count of distinct hooked VAs that have fired (1st = NtTestAlert trigger -> DllMain; 2nd+ = D3D12/DXGI -> proxy phase)
+extern volatile LONG   g_dbg_proxy_phase;          // defined in ept_stealth.cpp; diagnostic gate that suppresses the DllMain #PF-log flood so O.log survives to the proxy phase
 
 static void
 ept_hook_fire_record(UINT64 va, UINT64 proxy)
@@ -85,6 +87,12 @@ ept_hook_fire_record(UINT64 va, UINT64 proxy)
                 g_hook_fire_proxy[i] = proxy;
                 _InterlockedExchange(&g_hook_fire_count[i], 1);
                 HYPERPLATFORM_LOG_WARN_SAFE("[hook-fire] FIRST va=%llx proxy=%llx", va, proxy);
+                // 2nd+ distinct hooked VA to fire marks the proxy phase (1st fire is
+                // the NtTestAlert trigger -> renderdoc DllMain, which floods O.log).
+                // Flip the diagnostic gate so the verbose #PF logs capture the proxy
+                // (where the hang occurs) instead of the DllMain flood.
+                if (_InterlockedIncrement(&g_hook_fire_unique) >= 2)
+                    _InterlockedExchange(&g_dbg_proxy_phase, 1);
                 found = TRUE;
                 break;
             }

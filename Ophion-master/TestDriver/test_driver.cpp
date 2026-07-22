@@ -3091,10 +3091,15 @@ TdEptUnhookR3(UINT64 target_pid, PVOID target_va)
     KeGenericCallDpc(DpcEptUnhook, &unhook_ctx);
 
     //
-    // 2. free trampoline in target process
+    // 2. free trampoline stealth page (sp) registered in TdEptHookR3 step
+    //    2.6, then free the trampoline VA in the target process. The sp is a
+    //    single page (tramp_size == PAGE_SIZE). Freeing it here keeps the HV
+    //    stealth_pages list in sync with the driver-side entry; otherwise the
+    //    sp (whose shadow_pte_va points into the shadow PT) is orphaned.
     //
     if (entry->trampoline_va)
     {
+        TdStealthFreePage((PVOID)((UINT64)entry->trampoline_va & ~0xFFFULL));
         SIZE_T sz = entry->trampoline_size;
         ZwFreeVirtualMemory(ZwCurrentProcess(), &entry->trampoline_va, &sz, MEM_RELEASE);
     }
@@ -7437,21 +7442,61 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
         HYPERPLATFORM_LOG_INFO("[td-rw] process exit cleanup R3 hook: pid=%llu target=%p",
                    pid, g_r3_hooks[i].target_va);
 
-        // for real R3 hooks (target_mdl != NULL): unlock + free
-        if (g_r3_hooks[i].target_mdl != NULL)
-        {
-            MmUnlockPages(g_r3_hooks[i].target_mdl);
-            IoFreeMdl(g_r3_hooks[i].target_mdl);
-        }
+        // cache fields before zeroing the entry
+        PVOID  target_va = g_r3_hooks[i].target_va;
+        PVOID  tramp_va  = g_r3_hooks[i].trampoline_va;
+        SIZE_T tramp_sz  = g_r3_hooks[i].trampoline_size;
+        PMDL   mdl       = g_r3_hooks[i].target_mdl;
 
-        // free trampoline in target process
-        if (g_r3_hooks[i].trampoline_va != NULL && g_r3_hooks[i].trampoline_size > 0)
+        //
+        // 1a. unhook via VMCALL (DPC broadcast). MUST happen before freeing
+        // the trampoline/entry, otherwise the HV-side EPT hook entry (with
+        // its first_trampoline_address + target_cr3) survives process exit
+        // and accumulates across runs -- the same DLL PFNs are reused on the
+        // next inject (d3d12/dxgi same base), so stale entries are not
+        // harmless. Mirrors TdEptUnhookR3 / DpcEptUnhook. Fires for both
+        // real R3 hooks (mdl != NULL) and inject hooks (mdl == NULL); both
+        // need the EPT unhook. The process is still alive in the exit
+        // callback, so attach + __readcr3() resolve the target CR3.
+        //
+        KAPC_STATE apc;
+        KeStackAttachProcess(Process, &apc);
+
+        struct {
+            PVOID    target;
+            UINT64   caller_cr3;
+            NTSTATUS result;
+        } unhook_ctx = {};
+        unhook_ctx.target     = target_va;
+        unhook_ctx.caller_cr3 = __readcr3();
+        KeGenericCallDpc(DpcEptUnhook, &unhook_ctx);
+
+        //
+        // 1b. free the trampoline stealth page (sp) registered in TdEptHookR3
+        // step 2.6. Trampolines are NOT in g_stealth_tracks, so section 2
+        // below does not free them; without this the HV stealth_pages entry
+        // (whose shadow_pte_va points into the shadow PT freed by section 2's
+        // TdShadowFreeCr3) leaks per run. Only real R3 hooks have a
+        // trampoline; inject hooks (tramp_va == NULL) skip this. Single page.
+        //
+        if (tramp_va)
+            TdStealthFreePage((PVOID)((UINT64)tramp_va & ~0xFFFULL));
+
+        //
+        // 1c. free the trampoline VA in the target process
+        //
+        if (tramp_va && tramp_sz > 0)
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_sz, MEM_RELEASE);
+
+        KeUnstackDetachProcess(&apc);
+
+        //
+        // 1d. unlock MDL (real R3 hooks only)
+        //
+        if (mdl)
         {
-            KAPC_STATE apc;
-            KeStackAttachProcess(Process, &apc);
-            ZwFreeVirtualMemory(ZwCurrentProcess(),
-                &g_r3_hooks[i].trampoline_va, &g_r3_hooks[i].trampoline_size, MEM_RELEASE);
-            KeUnstackDetachProcess(&apc);
+            MmUnlockPages(mdl);
+            IoFreeMdl(mdl);
         }
 
         RtlZeroMemory(&g_r3_hooks[i], sizeof(g_r3_hooks[i]));

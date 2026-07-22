@@ -33,6 +33,13 @@
 #define PFEC_USER         0x04
 #define PFEC_INSTR_FETCH  0x10
 
+// Cross-2MB proactive shadow-PT refresh: scan OTHER stealth 2MB regions for
+// stale P=1/wrong-PFN data PTEs every (CROSS_2MB_MASK+1) code-enters, closing
+// the residual gap noted at the in-2MB refresh. Small mask so scans land inside
+// the dense DllMain/init code-#PF burst (when LdrLoadDll repages data PFNs).
+#define CROSS_2MB_MASK         0x3F        // scan every 64 code-enters (tunable)
+#define CROSS_2MB_MAX_DISTINCT 32          // max distinct stealth 2MB regions per pass
+
 volatile LONG g_dbg_shadow_pf_seen = 0;
 volatile LONG g_dbg_shadow_pf_allowed = 0;
 volatile LONG g_dbg_shadow_pf_switched = 0;
@@ -58,6 +65,50 @@ volatile LONG g_dbg_a2_stale_p1_logged = 0;       // verbose-log cap counter for
 volatile LONG g_dbg_a2_stale_p1_total = 0;         // A2: total silent P=1/wrong-PFN staleness detected (UNBOUNDED; overlay-killer / crash class)
 volatile LONG g_dbg_a2_dump_tick = 0;              // A2: periodic counter-dump tick (diagnostic)
 volatile LONG g_dbg_a2_already_on_shadow = 0;      // A2: mid-window NX-fetch #PF hitting the already_on_shadow branch (stale-gap suspect)
+volatile LONG g_dbg_a2_cross_tick = 0;             // A2: cross-2MB proactive scan throttle tick (diagnostic)
+volatile LONG g_dbg_a2_cross_synced = 0;           // A2: cross-2MB scans that synced >=1 stale PTE (UNBOUNDED; closes the residual gap)
+volatile LONG g_dbg_a2_cross_synced_logged = 0;    // verbose-log cap for cross-2MB scan summaries (diagnostic only)
+volatile LONG g_dbg_a2_cross_stale = 0;            // A2: stale PTEs found by cross-2MB scans (UNBOUNDED; the residual-gap crash class)
+volatile LONG g_dbg_a2_cross_stale_logged = 0;     // verbose-log cap for cross-2MB stale-P1 samples (diagnostic only)
+volatile LONG g_dbg_a2_cross_enter_logged = 0;     // verbose-log cap for cross-scan-ENTER markers (diagnostic only)
+volatile LONG g_dbg_proxy_phase = 0;                // diagnostic gate: 0 = DllMain/trigger phase (suppress verbose #PF logs so O.log does not truncate before the EPT hooks fire), 1 = proxy phase (a D3D12/DXGI hook fired; allow verbose logs to capture the proxy/hang). Flipped in ept_hook_fire_record on the 2nd+ unique hook fire.
+
+//
+// B (stealth_pages sync): spinlock serializing g_ept->stealth_pages list
+// walks against list mutations across CPUs. The cross-2MB scan (in the #PF
+// handler, VMX-root) iterates the list for a LONG window (all nodes + up to 32
+// page-walks + 32x512 PTE writes); ept_stealth_install_ex (InsertHeadList) and
+// ept_stealth_uninstall (RemoveEntryList + pool_manager_release) mutate it from
+// VMCALL handlers on other CPUs. Without serialization the scan can read a node
+// that uninstall is freeing (use-after-free on the node -> VMX-root fault ->
+// triple fault -> CPU stuck -> TdCleanupStealthForProcess's KeGenericCallDpc
+// waits for that CPU -> system freeze on Box close). VMX-root-safe test-and-set
+// (mirrors g_hook_list_lock in ept_hook.cpp): no IRQL manipulation -- VMX-root
+// is already at the highest effective priority and lock holders are
+// non-preemptible, so a busy-wait is bounded by the holder running to
+// completion (no deadlock, only brief latency). Held only for the list walk /
+// InsertHeadList / RemoveEntryList -- never across pa_to_va or pool frees.
+//
+static volatile LONG g_stealth_pages_lock = 0;
+
+static __forceinline VOID
+stealth_pages_lock_acquire(VOID)
+{
+    unsigned int wait = 1;
+    while (_InterlockedCompareExchange(&g_stealth_pages_lock, 1, 0) != 0)
+    {
+        for (unsigned int i = 0; i < wait; i++)
+            _mm_pause();
+        if (wait < 4096)
+            wait <<= 1;
+    }
+}
+
+static __forceinline VOID
+stealth_pages_lock_release(VOID)
+{
+    _InterlockedExchange(&g_stealth_pages_lock, 0);
+}
 
 //
 // DIAG: capture the first distinct renderdoc code RIPs that open an NX-fetch
@@ -915,15 +966,17 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
         HYPERPLATFORM_LOG_WARN_SAFE(
             "[stealth-diag] DUMP code_enter=%llu code_synced=%llu ptpage_synced=%llu "
             "stale_p1=%llu data_synced=%llu abort=%llu spurious=%llu nomatch=%llu "
-            "pf_seen=%llu pf_switched=%llu a2shadow=%llu",
+            "pf_seen=%llu pf_switched=%llu a2shadow=%llu cross_synced=%llu cross_stale=%llu",
             (UINT64)g_dbg_a2_code_enter, (UINT64)g_dbg_a2_code_synced,
             (UINT64)g_dbg_a2_ptpage_synced, (UINT64)g_dbg_a2_stale_p1_total,
             (UINT64)g_dbg_a2_data_synced, (UINT64)g_dbg_a2_abort,
             (UINT64)g_dbg_a2_spurious, (UINT64)g_dbg_nomatch,
             (UINT64)g_dbg_shadow_pf_seen, (UINT64)g_dbg_shadow_pf_switched,
-            (UINT64)g_dbg_a2_already_on_shadow);
+            (UINT64)g_dbg_a2_already_on_shadow,
+            (UINT64)g_dbg_a2_cross_synced, (UINT64)g_dbg_a2_cross_stale);
     }
-    dbg_log_distinct_rip(vcpu->vmexit_rip);
+    if (g_dbg_proxy_phase)
+        dbg_log_distinct_rip(vcpu->vmexit_rip);
 
     // Same CR3 discipline as stealth_sync_data_pte_in_window: switch to
     // sp->guest_cr3 (the guest KERNEL CR3), under which the shadow pages
@@ -957,7 +1010,7 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
         // to localize the failure: 0xDEAD = stealth_real_va NULL at that level
         // (real page not in the map), 0 = not-present entry, non-zero with bit7
         // = large page.
-        if (_InterlockedIncrement(&g_dbg_a2_code_enter_logged) <= 200)
+        if (g_dbg_proxy_phase && _InterlockedIncrement(&g_dbg_a2_code_enter_logged) <= 128)
         {
             static const UINT32 dsh[4] = { 39, 30, 21, 12 };
             UINT64 dpa = real_cr3 & PFN_MASK;
@@ -1015,7 +1068,7 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
 
         if (!spte)
         {
-            if (_InterlockedIncrement(&g_dbg_a2_code_enter_logged) <= 200)
+            if (g_dbg_proxy_phase && _InterlockedIncrement(&g_dbg_a2_code_enter_logged) <= 128)
                 HYPERPLATFORM_LOG_WARN_SAFE(
                     "[stealth-a2] code-refresh BAIL-noshadowpteva fa=%llx rip=%llx",
                     fault_addr, vcpu->vmexit_rip);
@@ -1054,7 +1107,7 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
             // shadow PTE already matches real PFN (NX cleared): no staleness
             // detectable by PFN compare. Logging this proves the refresh
             // path IS reached and the comparison ran.
-            if (_InterlockedIncrement(&g_dbg_a2_code_enter_logged) <= 200)
+            if (g_dbg_proxy_phase && _InterlockedIncrement(&g_dbg_a2_code_enter_logged) <= 128)
                 HYPERPLATFORM_LOG_WARN_SAFE(
                     "[stealth-a2] code-refresh MATCH fa=%llx rip=%llx "
                     "real_pte=%llx shadow_pte=%llx",
@@ -1118,10 +1171,150 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
                 desc.Vpid = VPID_TAG;
                 asm_invvpid(InvvpidSingleContext, &desc);
                 _InterlockedIncrement(&g_dbg_a2_ptpage_synced);
-                if (_InterlockedIncrement(&g_dbg_a2_ptpage_synced_logged) <= 32)
+                if (g_dbg_proxy_phase && _InterlockedIncrement(&g_dbg_a2_ptpage_synced_logged) <= 32)
                     HYPERPLATFORM_LOG_WARN_SAFE(
                         "[stealth-a2] ptpage-sync fa=%llx rip=%llx changed=%u stale-P1=%u",
                         fault_addr, vcpu->vmexit_rip, changed, stale_p1);
+            }
+        }
+    }
+
+    // --- proactive cross-2MB refresh (throttled): close the residual gap noted
+    //     at the in-2MB refresh above. That pass only syncs the faulting code
+    //     page's 2MB shadow PT page. A data access during this one-instruction
+    //     shadow window can hit a stealth data PTE in a DIFFERENT 2MB whose
+    //     shadow PT page is also a build-time snapshot. If that page was repaged
+    //     (working-set trim / LdrLoadDll) after the snapshot, the shadow PTE is
+    //     P=1 + stale PFN -> no #PF -> silent wrong-PFN write -> corruption
+    //     (the residual intermittent crash: Box 0xC0000409 fast-fail / a victim
+    //     process 0xC000001D illegal-instruction when the wrong-PFN write hits a
+    //     physical page it executes). Non-stealth regions (heap/stack/TLS) share
+    //     the real PT (no snapshot), so only OTHER stealth 2MB regions can go
+    //     stale, and each has a shadow_pte_va. Iterate g_ept->stealth_pages,
+    //     filter the same shadow CR3 (same process), dedup by page-aligned
+    //     shadow_pte_va, skip the code's own 2MB (refreshed above), and sync each
+    //     distinct shadow PT page from its current real PT page using the same
+    //     logic as the in-2MB refresh. Throttled to every CROSS_2MB_MASK+1
+    //     code-enters. Real PT pages are read-only; only shadow PT pages are
+    //     written (A3 preserved: real NX stays 1). Runs under sp->guest_cr3 (set
+    //     above), so pa_to_va resolves every same-process stealth region's real
+    //     PT page via the guest kernel self-map.
+    {
+        if (((_InterlockedIncrement(&g_dbg_a2_cross_tick) & CROSS_2MB_MASK) == 0) && g_ept)
+        {
+            // ENTER marker: if the scan below hangs (e.g. list walk / pa_to_va in
+            // the proxy phase), this logs but the matching cross-2mb-sync EXIT at
+            // the end of the block does not -> unambiguous hang localization.
+            if (g_dbg_proxy_phase && _InterlockedIncrement(&g_dbg_a2_cross_enter_logged) <= 64)
+                HYPERPLATFORM_LOG_WARN_SAFE(
+                    "[stealth-a2] cross-scan-ENTER fa=%llx rip=%llx",
+                    fault_addr, vcpu->vmexit_rip);
+            const UINT64 cur_pt_base = (UINT64)sp->shadow_pte_va & ~0xFFFULL;
+            UINT64 seen[CROSS_2MB_MAX_DISTINCT];
+            UINT32 n_seen = 0;
+            UINT64 snap_sh_pt_base[CROSS_2MB_MAX_DISTINCT];
+            UINT64 snap_guest_va[CROSS_2MB_MAX_DISTINCT];
+            UINT32 n_snaps = 0;
+
+            // B (sync): snapshot matching regions UNDER the stealth_pages lock,
+            // then sync each snapshot's 2MB shadow PT page OUTSIDE the lock.
+            // The lock serializes this walk with ept_stealth_install_ex
+            // (InsertHeadList) / ept_stealth_uninstall (RemoveEntryList + free)
+            // on other CPUs, so a node cannot be freed while we read its fields.
+            // The snapshot only needs the VALUES (shadow PT page VA + guest VA);
+            // the shadow PT page itself stays mapped for the whole scan because
+            // this runs in sp's #PF handler (sp active -> its stealth track
+            // present -> the process shadow CR3, which owns every same-process
+            // shadow_pte_va target, is NOT torn down by TdShadowFreeCr3). A node
+            // ref-count would add no extra safety: it cannot keep the shadow CR3
+            // alive either, so both rely on the same sp-active invariant.
+            stealth_pages_lock_acquire();
+            {
+                PLIST_ENTRY cur = g_ept->stealth_pages.Flink;
+                while (cur != &g_ept->stealth_pages)
+                {
+                    PEPT_STEALTH_PAGE_INFO s = CONTAINING_RECORD(cur, EPT_STEALTH_PAGE_INFO, stealth_page_list);
+                    cur = cur->Flink;
+                    if (s->shadow_cr3_phys != sp->shadow_cr3_phys) continue;   // same process / shadow CR3
+                    if (!s->shadow_pte_va || !s->guest_va) continue;
+                    UINT64 sh_pt_base = (UINT64)s->shadow_pte_va & ~0xFFFULL;
+                    if (sh_pt_base == cur_pt_base) continue;                   // code's own 2MB (refreshed above)
+                    BOOLEAN dup = FALSE;
+                    for (UINT32 k = 0; k < n_seen; k++)
+                        if (seen[k] == sh_pt_base) { dup = TRUE; break; }
+                    if (dup) continue;
+                    if (n_seen < CROSS_2MB_MAX_DISTINCT)
+                        seen[n_seen++] = sh_pt_base;
+                    else
+                        continue;                                             // dedup table full; skip (rare)
+                    if (n_snaps < CROSS_2MB_MAX_DISTINCT)
+                    {
+                        snap_sh_pt_base[n_snaps] = sh_pt_base;
+                        snap_guest_va[n_snaps]   = s->guest_va;
+                        n_snaps++;
+                    }
+                }
+            }
+            stealth_pages_lock_release();
+
+            // sync each snapshotted 2MB shadow PT page from its current real PT
+            // page, OUTSIDE the lock (stealth_walk_pt_page calls pa_to_va, which
+            // must not run under the spinlock). Real PT pages are read-only; only
+            // shadow PT pages are written (A3 preserved: real NX stays 1).
+            UINT32 distinct = 0;
+            UINT32 total_stale = 0;
+            BOOLEAN any_changed = FALSE;
+            for (UINT32 k = 0; k < n_snaps; k++)
+            {
+                UINT64 real_pt_va = 0, dummy = 0;
+                if (!stealth_walk_pt_page(NULL, real_cr3, snap_guest_va[k], &real_pt_va, &dummy) || !real_pt_va)
+                    continue;                                             // real PT unmapped / large page
+                PUINT64 sh_pt = (PUINT64)snap_sh_pt_base[k];
+                PUINT64 r_pt  = (PUINT64)real_pt_va;
+                UINT32 changed = 0, stale_p1 = 0;
+                for (UINT32 i = 0; i < 512; i++)
+                {
+                    UINT64 r = r_pt[i];
+                    UINT64 sv = sh_pt[i];
+                    if ((((sv ^ r) & PFN_MASK) == 0) && (((sv ^ r) & 1ULL) == 0))
+                        continue;                                         // fresh: same PFN + present-bit
+                    if ((sv & 1) && (r & 1) && ((sv & PFN_MASK) != (r & PFN_MASK)))
+                    {
+                        stale_p1++;
+                        _InterlockedIncrement(&g_dbg_a2_stale_p1_total);
+                        _InterlockedIncrement(&g_dbg_a2_cross_stale);
+                        if (_InterlockedIncrement(&g_dbg_a2_cross_stale_logged) <= 64)
+                        {
+                            UINT64 va_i = (snap_guest_va[k] & ~0x1FFFFFULL) | ((UINT64)i << 12);
+                            HYPERPLATFORM_LOG_WARN_SAFE(
+                                "[stealth-a2] STALE-P1(cross) idx=%u va=%llx shadow=%llx real=%llx",
+                                i, va_i, sv, r);
+                        }
+                    }
+                    UINT64 want_i = (r & 1) ? (r & ~NX_BIT) : 0ULL;
+                    want_i &= ~0x2ULL;                                    // drop W, re-apply from shadow below
+                    want_i |= (sv & 0x2ULL);                              // preserve shadow W (intercept_write stays W=0)
+                    sh_pt[i] = want_i;
+                    changed++;
+                }
+                if (changed)
+                {
+                    any_changed = TRUE;
+                    distinct++;
+                    _InterlockedIncrement(&g_dbg_a2_ptpage_synced);
+                }
+                total_stale += stale_p1;
+            }
+            if (any_changed)
+            {
+                INVVPID_DESCRIPTOR desc = {0};
+                desc.Vpid = VPID_TAG;
+                asm_invvpid(InvvpidSingleContext, &desc);
+                _InterlockedIncrement(&g_dbg_a2_cross_synced);
+                if (g_dbg_proxy_phase && _InterlockedIncrement(&g_dbg_a2_cross_synced_logged) <= 64)
+                    HYPERPLATFORM_LOG_WARN_SAFE(
+                        "[stealth-a2] cross-2mb-sync fa=%llx rip=%llx distinct=%u stale-P1=%u",
+                        fault_addr, vcpu->vmexit_rip, distinct, total_stale);
             }
         }
     }
@@ -1345,7 +1538,9 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
             hostcr3_map_va(sp->pt_page_va, PAGE_SIZE);
 #endif
 
+        stealth_pages_lock_acquire();
         InsertHeadList(&g_ept->stealth_pages, &sp->stealth_page_list);
+        stealth_pages_lock_release();
         ept_update_pf_intercept(vcpu);
 
         _mm_mfence();
@@ -1485,7 +1680,9 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     //   no-fake-pt mode: #PF → clear NX in real PTE → MTF → restore NX
     // both require intercepting NX violations (P=1 + I/D=1).
     //
+    stealth_pages_lock_acquire();
     InsertHeadList(&g_ept->stealth_pages, &sp->stealth_page_list);
+    stealth_pages_lock_release();
     if (sp->fake_pt || sp->shadow_cr3_phys)
         ept_update_pf_intercept(vcpu);
 
@@ -2087,7 +2284,9 @@ ept_stealth_uninstall(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_FREE_PARAM req)
                 }
             }
 
+            stealth_pages_lock_acquire();
             RemoveEntryList(&sp->stealth_page_list);
+            stealth_pages_lock_release();
             pool_manager_release(sp);
             req->result = TRUE;
             break;
@@ -2113,10 +2312,19 @@ ept_stealth_free_all(VOID)
 {
     if (!g_ept) return;
 
-    // restore target page EPT on ALL CPUs
-    while (!IsListEmpty(&g_ept->stealth_pages))
+    // restore target page EPT on ALL CPUs. Runs at DriverUnload BEFORE
+    // vmx_terminate, so VMX is still on and #PF handlers (incl. the cross-2MB
+    // scan) can fire on other CPUs concurrently -- take the stealth_pages lock
+    // for the IsListEmpty + RemoveHeadList so a cross-scan cannot use-after-free
+    // a node we are about to free. The hold is just two list ops (microseconds);
+    // EPT restore + pool_manager_release run outside the lock (no pa_to_va / pool
+    // nesting under the spinlock).
+    for (;;)
     {
+        stealth_pages_lock_acquire();
+        if (IsListEmpty(&g_ept->stealth_pages)) { stealth_pages_lock_release(); break; }
         PLIST_ENTRY item = RemoveHeadList(&g_ept->stealth_pages);
+        stealth_pages_lock_release();
         PEPT_STEALTH_PAGE_INFO sp = CONTAINING_RECORD(item, EPT_STEALTH_PAGE_INFO, stealth_page_list);
 
         for (UINT32 i = 0; i < g_cpu_count; i++)

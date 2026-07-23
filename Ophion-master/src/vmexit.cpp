@@ -853,6 +853,18 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             regs->rax = (UINT64)STATUS_SUCCESS;
             break;
 
+        case VMCALL_EPT_UNHOOK_BY_CR3:
+        {
+            // rdx = target_cr3 (match value only; NOT loaded). No CR3 switch,
+            // no user-VA resolution -> safe to issue from the process-exit
+            // notify callback (VMCALL_EPT_UNHOOK would load the dying CR3 on
+            // every CPU via __writecr3 and deadlock there).
+            UINT64 target_cr3 = regs->rdx;
+            ept_unhook_by_cr3(vcpu, target_cr3);
+            regs->rax = (UINT64)STATUS_SUCCESS;
+            break;
+        }
+
         case VMCALL_STEALTH_ALLOC:
         {
             UINT64 _saved_cr3 = vmx_enter_guest_cr3();

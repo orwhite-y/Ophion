@@ -308,6 +308,7 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_STEALTH_FREE     0x00000007
 #define VMCALL_EPT_HOOK_INJECT  0x00000008
 #define VMCALL_EPT_SET_EXTERNAL_FIRED 0x00000009
+#define VMCALL_EPT_UNHOOK_BY_CR3 0x0000000A   // retire all R3 hooks for a CR3 (no CR3 switch - safe from process-exit callback)
 
 //
 // VMCALL identifier in rax — like UnrealVTDbg's VMCALL_IDENTIFIER

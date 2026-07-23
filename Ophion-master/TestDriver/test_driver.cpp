@@ -79,6 +79,7 @@ typedef struct _TD_PEB_LDR_DATA {
 #define VMCALL_STEALTH_FREE     0x00000007
 #define VMCALL_EPT_HOOK_INJECT  0x00000008
 #define VMCALL_EPT_SET_EXTERNAL_FIRED 0x00000009
+#define VMCALL_EPT_UNHOOK_BY_CR3 0x0000000A   // retire all R3 hooks for a CR3 (no CR3 switch - safe from process-exit callback)
 
 //
 // EPT hook inject param 鈥?pre-built at PASSIVE_LEVEL, passed to VMX-root.
@@ -2490,6 +2491,29 @@ DpcEptUnhook(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
     KeSignalCallDpcDone(A1);
 }
 
+// DPC broadcast for VMCALL_EPT_UNHOOK_BY_CR3. r10 (caller_cr3) = 0, so the HV
+// does NOT __writecr3 -> safe to issue from the process-exit notify callback
+// (where loading the dying CR3 on every CPU deadlocks). rdx = target_cr3,
+// used only as a match value to retire this process's hooks.
+static VOID
+DpcEptUnhookByCr3(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
+{
+    UNREFERENCED_PARAMETER(Dpc);
+
+    struct _EPT_UNHOOK_BY_CR3_CTX {
+        UINT64 target_cr3;
+    } * ctx = (struct _EPT_UNHOOK_BY_CR3_CTX *)Ctx;
+
+    hv_vmcall_ex(
+        VMCALL_EPT_UNHOOK_BY_CR3,
+        ctx->target_cr3,
+        0, 0, 0,
+        0, 0, 0, 0, 0);
+
+    KeSignalCallDpcSynchronize(A2);
+    KeSignalCallDpcDone(A1);
+}
+
 static NTSTATUS
 TdEptHookNtCreateFile(VOID)
 {
@@ -3091,10 +3115,17 @@ TdEptUnhookR3(UINT64 target_pid, PVOID target_va)
     KeGenericCallDpc(DpcEptUnhook, &unhook_ctx);
 
     //
-    // 2. free trampoline in target process
+    // 2. free trampoline stealth page, then trampoline memory in target process
     //
     if (entry->trampoline_va)
     {
+        // TdEptHookR3 registered the trampoline as a stealth page (target_pid=0,
+        // so it is NOT in g_stealth_tracks). Free it here, otherwise the sp leaks
+        // in g_ept->stealth_pages holding a reference to this process's
+        // (soon-freed) shadow CR3. Must run while the trampoline page is still
+        // mapped, i.e. before ZwFreeVirtualMemory.
+        TdStealthFreePage((PVOID)((UINT64)entry->trampoline_va & ~0xFFFULL));
+
         SIZE_T sz = entry->trampoline_size;
         ZwFreeVirtualMemory(ZwCurrentProcess(), &entry->trampoline_va, &sz, MEM_RELEASE);
     }
@@ -7441,6 +7472,27 @@ static VOID
 TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
 {
     //
+    // 0. retire (passthrough) this process's EPT hooks on the shared d3d12/dxgi
+    //    pages. Without this, the hooks (and their proxy pointers) survive exit
+    //    and the NEXT Box process gets dispatched to THIS process's freed proxy
+    //    during its own hook re-install window -> 0xC0000005 (confirmed: the
+    //    crash RIP was the prior run's CreateDXGIFactory2 proxy). VMCALL_EPT_UNHOOK
+    //    can't be used here (it loads the dying CR3 on every CPU and deadlocks
+    //    in the exit callback), so use the CR3-free VMCALL_EPT_UNHOOK_BY_CR3.
+    //    The VMCALL does not switch CR3, so it is safe to issue from here.
+    //
+    {
+        KAPC_STATE apc;
+        KeStackAttachProcess(Process, &apc);
+        UINT64 dying_cr3 = __readcr3();
+        KeUnstackDetachProcess(&apc);
+
+        struct { UINT64 target_cr3; } rctx;
+        rctx.target_cr3 = dying_cr3;
+        KeGenericCallDpc(DpcEptUnhookByCr3, &rctx);
+    }
+
+    //
     // 1. clean up R3 EPT hooks for this process (unlock MDL pages, free trampoline)
     //
     for (int i = 0; i < MAX_R3_HOOKS; i++)
@@ -7451,21 +7503,46 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
         HYPERPLATFORM_LOG_INFO("[td-rw] process exit cleanup R3 hook: pid=%llu target=%p",
                    pid, g_r3_hooks[i].target_va);
 
-        // for real R3 hooks (target_mdl != NULL): unlock + free
-        if (g_r3_hooks[i].target_mdl != NULL)
-        {
-            MmUnlockPages(g_r3_hooks[i].target_mdl);
-            IoFreeMdl(g_r3_hooks[i].target_mdl);
-        }
+        // snapshot before teardown (ZwFreeVirtualMemory zeroes trampoline_va).
+        PVOID   trampoline_va = g_r3_hooks[i].trampoline_va;
+        SIZE_T  trampoline_sz = g_r3_hooks[i].trampoline_size;
+        PMDL    target_mdl    = g_r3_hooks[i].target_mdl;
 
-        // free trampoline in target process
-        if (g_r3_hooks[i].trampoline_va != NULL && g_r3_hooks[i].trampoline_size > 0)
+        // The hypervisor-side EPT hook on the shared d3d12/dxgi page is NOT
+        // unhooked here. VMCALL_EPT_UNHOOK switches CR3 to the (dying) process
+        // on every CPU via KeGenericCallDpc, which deadlocks when issued from
+        // the process-exit notify callback (one CPU never reaches
+        // KeSignalCallDpcDone -> caller blocks forever). The hook is CR3-filtered
+        // (ept_hook.cpp target_cr3 check), so it is inert for every other
+        // process, and the next Box process repoints it (existing-entry update
+        // path) on re-install. Full unhook happens on driver unload
+        // (TdEptUnhookAllR3 -> ept_unhook_all).
+
+        // attach: trampoline stealth-page free + trampoline free need the
+        // process address space, still valid at exit-notify time.
+        KAPC_STATE apc;
+        KeStackAttachProcess(Process, &apc);
+
+        // free the trampoline stealth page (registered in TdEptHookR3 via
+        // TdStealthAllocPage with target_pid=0, so NOT in g_stealth_tracks and
+        // never freed before). Without this the sp leaks in g_ept->stealth_pages
+        // referencing this process's soon-freed shadow CR3. VMCALL_STEALTH_FREE
+        // does not switch CR3, so it is safe from the exit callback. Must run
+        // while the trampoline page is still mapped (before ZwFreeVirtualMemory).
+        if (trampoline_va)
+            TdStealthFreePage((PVOID)((UINT64)trampoline_va & ~0xFFFULL));
+
+        // free trampoline memory
+        if (trampoline_va != NULL && trampoline_sz > 0)
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &trampoline_va, &trampoline_sz, MEM_RELEASE);
+
+        KeUnstackDetachProcess(&apc);
+
+        // unlock target page MDL
+        if (target_mdl != NULL)
         {
-            KAPC_STATE apc;
-            KeStackAttachProcess(Process, &apc);
-            ZwFreeVirtualMemory(ZwCurrentProcess(),
-                &g_r3_hooks[i].trampoline_va, &g_r3_hooks[i].trampoline_size, MEM_RELEASE);
-            KeUnstackDetachProcess(&apc);
+            MmUnlockPages(target_mdl);
+            IoFreeMdl(target_mdl);
         }
 
         RtlZeroMemory(&g_r3_hooks[i], sizeof(g_r3_hooks[i]));

@@ -826,6 +826,52 @@ ept_unhook_all(VOID)
 }
 
 // =========================================================================
+//  VMX-root: retire (passthrough) every R3 hook whose page targets a given
+//  CR3. Used at process exit to neutralize stale hooks left on the shared
+//  d3d12/dxgi pages so the NEXT process is never dispatched to THIS process's
+//  (soon-freed) proxy. Sets fi->retiring=TRUE and restores this vCPU's EPT to
+//  the original page (RWX); a DPC broadcast runs it on every vCPU. No CR3
+//  switch and no user-VA resolution, so it is safe from the process-exit
+//  notify callback (unlike VMCALL_EPT_UNHOOK, which loads the dying CR3 on
+//  every CPU and deadlocks there).
+// =========================================================================
+VOID
+ept_unhook_by_cr3(VIRTUAL_MACHINE_STATE * vcpu, UINT64 target_cr3)
+{
+    if (!g_ept || !target_cr3)
+        return;
+
+    PLIST_ENTRY cur = g_ept->hooked_pages.Flink;
+    while (cur != &g_ept->hooked_pages)
+    {
+        PEPT_HOOKED_PAGE_INFO hp = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
+        cur = cur->Flink;
+
+        if ((hp->target_cr3 & CR3_ADDR_MASK) != (target_cr3 & CR3_ADDR_MASK))
+            continue;
+
+        // retire every function on this page so both the violation handler
+        // (ept_hook_page_has_active_function -> restore) and the VMCALL
+        // dispatch (fi->retiring -> restore) pass through to the original
+        // code instead of redirecting to this process's proxy.
+        PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
+        while (fc != &hp->hooked_functions_list)
+        {
+            PEPT_HOOKED_FUNCTION_INFO fi = CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
+            fc = fc->Flink;
+            fi->retiring = TRUE;
+        }
+
+        // restore THIS vCPU's EPT to the original page (RWX). the DPC broadcast
+        // runs this on every vCPU, so all vCPUs drop the hook. target_cr3 is
+        // left as-is so non-target processes still take the cheap non-target
+        // pass-through in ept_handle_violation without a VMCALL.
+        if (!ept_hook_page_has_active_function(hp))
+            ept_hook_restore_current_vcpu(vcpu, hp);
+    }
+}
+
+// =========================================================================
 //  VMX-root: EPT violation / MTF / VMCALL-hook handlers
 // =========================================================================
 

@@ -1070,8 +1070,8 @@ TdFlushAddressRange(UINT64 base_va, SIZE_T size, UINT64 target_cr3, UINT64 shado
 }
 
 // ---- forward declarations ----
-static BOOLEAN TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3);
-static UINT64 TdStealthTrackRemove(UINT64 pid, PVOID va);
+static BOOLEAN TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3, PMDL image_mdl = NULL);
+static UINT64 TdStealthTrackRemove(UINT64 pid, PVOID va, PMDL * out_mdl = NULL);
 static BOOLEAN TdStealthTrackFindOverlap(UINT64 pid, PVOID base_va, SIZE_T size, PVOID * out_base, SIZE_T * out_size, UINT64 * out_shadow_cr3);
 static BOOLEAN TdStealthTrackHasPartialOverlap(UINT64 pid, PVOID base_va, SIZE_T size);
 static UINT64 TdStealthFindShadowCr3ForPid(UINT64 pid);
@@ -2395,6 +2395,25 @@ static volatile LONG   g_hook_log_count    = 0;
 // injected the very first one.
 static volatile LONG64 g_test_injected_pid = 0;
 
+// Only Box.exe and PioneerGame.exe get detection/logging in HookedNtCreateFile;
+// every other process is forwarded to the original NtCreateFile silently (the
+// every-100th-call log was flooding every process on the system).
+static BOOLEAN TdIsTargetProcessName(PEPROCESS proc)
+{
+    if (!proc) return FALSE;
+    PCHAR img = (PCHAR)proc + 0x5a8;   // EPROCESS->ImageFileName (Win10/11 offset)
+    static const char kBox[] = "Box.exe";
+    BOOLEAN m = TRUE;
+    for (int i = 0; i < (int)(sizeof(kBox) - 1); i++)
+        if ((img[i] | 0x20) != (kBox[i] | 0x20)) { m = FALSE; break; }
+    if (m) return TRUE;
+    static const char kPioneer[] = "PioneerGame.exe";
+    m = TRUE;
+    for (int i = 0; i < (int)(sizeof(kPioneer) - 1); i++)
+        if ((img[i] | 0x20) != (kPioneer[i] | 0x20)) { m = FALSE; break; }
+    return m;
+}
+
 static NTSTATUS NTAPI
 HookedNtCreateFile(
     PHANDLE FileHandle,
@@ -2409,6 +2428,11 @@ HookedNtCreateFile(
     PVOID EaBuffer,
     ULONG EaLength)
 {
+    // Only Box.exe / PioneerGame.exe get detection + logging; everything else is
+    // forwarded to the original NtCreateFile silently.
+    if (!TdIsTargetProcessName(PsGetCurrentProcess()))
+        goto call_original;
+
     //
     // 匹配文件名是否为 "test"，触发 renderdoc 注入
     //
@@ -2491,6 +2515,7 @@ HookedNtCreateFile(
                    count, ObjectAttributes->ObjectName);
     }
 
+call_original:
     //
     // call original via trampoline
     //
@@ -4584,6 +4609,19 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
     HYPERPLATFORM_LOG_INFO("[%s] manual map complete: base=%p entry=%p size=0x%llX",
         log_prefix, mapped_base, mapped_entry, (UINT64)image_size);
 
+    // 3.5 [DISABLED] Pinning the image pages with MmProbeAndLockPages was meant
+    //     to stop the stale-PFN crash (OS repage changes real PFNs under the
+    //     shadow CR3 snapshot). But it hard-freezes the system on the 2nd Box
+    //     run: 1st run works, 2nd run hangs during DllMain at shadow-CR3
+    //     activation (the shadow CR3 PA gets reused across runs). Root cause not
+    //     yet pinned - likely a deadlock between the locked pages and the
+    //     shadow-CR3 stealth resync. A reproducible freeze is worse than the
+    //     intermittent (1/6) stale-PFN crash, so locking is disabled: image_mdl
+    //     stays NULL -> no lock, no unlock. Revisit with a non-locking fix, e.g.
+    //     extend stealth_refresh_shadow_code_pte to resync the whole image (not
+    //     just the faulting 2MB) to close the cross-2MB stale-PFN gap.
+    PMDL image_mdl = NULL;
+
     // 4. build shadow CR3 for the mapped image range (NX cleared)
     //    image_size is already page-aligned from ZwAllocateVirtualMemory
     total_pages = (image_size + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -4659,7 +4697,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
     }
 
     // 6. track for process exit cleanup
-    if (!TdStealthTrackAdd(target_pid, mapped_base, image_size, shadow_cr3))
+    if (!TdStealthTrackAdd(target_pid, mapped_base, image_size, shadow_cr3, image_mdl))
     {
         HYPERPLATFORM_LOG_ERROR("[%s] stealth track table full", log_prefix);
         for (SIZE_T i = 0; i < pages_installed; i++)
@@ -5015,11 +5053,17 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
         KeStackAttachProcess(proc, &cleanup_apc);
         if (trigger_hooked)
             TdUnhookTriggerAllCpus(trigger_fn, caller_cr3);
-        UINT64 cleanup_shadow_cr3 = TdStealthTrackRemove(target_pid, mapped_base);
+        PMDL cleanup_mdl = NULL;
+        UINT64 cleanup_shadow_cr3 = TdStealthTrackRemove(target_pid, mapped_base, &cleanup_mdl);
         for (SIZE_T i = 0; i < pages_installed; i++)
             TdStealthFreePage((PUINT8)mapped_base + (i * PAGE_SIZE));
         if (cleanup_shadow_cr3)
             TdShadowFreeCr3(cleanup_shadow_cr3);
+        if (cleanup_mdl)
+        {
+            MmUnlockPages(cleanup_mdl);
+            IoFreeMdl(cleanup_mdl);
+        }
         ZwFreeVirtualMemory(ZwCurrentProcess(), &mapped_base, &image_size, MEM_RELEASE);
         KeUnstackDetachProcess(&cleanup_apc);
         stealth_tracked = FALSE;
@@ -7397,13 +7441,14 @@ typedef struct _STEALTH_TRACK_ENTRY {
     PVOID   target_va;
     SIZE_T  alloc_size;
     UINT64  shadow_cr3_phys;
+    PMDL    image_mdl;       // locked image pages (MmProbeAndLockPages), NULL if none
 } STEALTH_TRACK_ENTRY;
 
 static STEALTH_TRACK_ENTRY g_stealth_tracks[MAX_STEALTH_TRACKS] = {};
 static KSPIN_LOCK g_stealth_track_lock;
 
 static BOOLEAN
-TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3)
+TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3, PMDL image_mdl)
 {
     BOOLEAN added = FALSE;
     KIRQL old_irql;
@@ -7417,6 +7462,7 @@ TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3)
             g_stealth_tracks[i].target_va   = va;
             g_stealth_tracks[i].alloc_size  = size;
             g_stealth_tracks[i].shadow_cr3_phys = shadow_cr3;
+            g_stealth_tracks[i].image_mdl   = image_mdl;
             g_stealth_tracks[i].active      = TRUE;
             added = TRUE;
             break;
@@ -7434,7 +7480,7 @@ TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3)
 }
 
 static UINT64
-TdStealthTrackRemove(UINT64 pid, PVOID va)
+TdStealthTrackRemove(UINT64 pid, PVOID va, PMDL * out_mdl)
 {
     UINT64 shadow_cr3 = 0;
     UINT64 to_free = 0;
@@ -7448,7 +7494,12 @@ TdStealthTrackRemove(UINT64 pid, PVOID va)
             g_stealth_tracks[i].target_va == va)
         {
             shadow_cr3 = g_stealth_tracks[i].shadow_cr3_phys;
+            PMDL mdl = g_stealth_tracks[i].image_mdl;
             RtlZeroMemory(&g_stealth_tracks[i], sizeof(g_stealth_tracks[i]));
+            if (out_mdl)
+                *out_mdl = mdl;
+            else if (mdl)
+                HYPERPLATFORM_LOG_WARN("[td-rw] TdStealthTrackRemove dropping image_mdl=%p (out_mdl=NULL)", mdl);
             break;
         }
     }
@@ -7693,7 +7744,8 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
         // Remove the tracked range. TdStealthTrackRemove decrements the shared
         // CR3's refcount and returns the CR3 only if this was the last range for
         // the process, so the shared shadow CR3 is freed once per process.
-        UINT64 to_free = TdStealthTrackRemove(pid, va);
+        PMDL track_mdl = NULL;
+        UINT64 to_free = TdStealthTrackRemove(pid, va, &track_mdl);
 
         // attach to the exiting process to free stealth pages
         KAPC_STATE apc;
@@ -7708,6 +7760,15 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
             TdShadowFreeCr3(to_free);
 
         KeUnstackDetachProcess(&apc);
+
+        // unlock the image pages pinned at injection (MmProbeAndLockPages).
+        // PASSIVE here (exit-notify); the track spinlock was released inside
+        // TdStealthTrackRemove, so MmUnlockPages is safe.
+        if (track_mdl)
+        {
+            MmUnlockPages(track_mdl);
+            IoFreeMdl(track_mdl);
+        }
 
         HYPERPLATFORM_LOG_INFO("[td-rw] process exit cleanup done: pid=%llu", pid);
     }

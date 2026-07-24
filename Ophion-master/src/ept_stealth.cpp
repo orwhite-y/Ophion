@@ -1109,7 +1109,58 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
                 sh_pt[i] = want_i;
                 changed++;
             }
-            if (changed)
+            // Cross-2MB heal (EVERY code #PF): resync ALL 2MBs of this shadow
+            // CR3, not just the faulting one. Closes the cross-2MB stale-PFN gap
+            // (the known residual crash cause): a DATA PTE in a 2MB the CPU is NOT
+            // executing goes stale on repage and is never healed by the faulting-
+            // 2MB resync above -> CPU reads wrong bytes under the shadow CR3 ->
+            // execute AV. The data 2MB is often trimmed while the code 2MB stays
+            // hot, so gating on faulting-2MB staleness (stale_p1) would miss it.
+            // Healing every 2MB on each code #PF (the shadow window is already
+            // open here) keeps every image data PTE current. The faulting 2MB is
+            // pre-marked healed (done by the loop above) so it is skipped below.
+            UINT32 cross_changed = 0;
+            UINT32 cross_2mbs = 0;
+            if (sp->shadow_cr3_phys)
+            {
+                UINT64 healed[64];
+                UINT32 healed_count = 0;
+                healed[healed_count++] = (UINT64)sh_pt;   // faulting 2MB already resynced above
+                PLIST_ENTRY cur2 = g_ept->stealth_pages.Flink;
+                while (cur2 != &g_ept->stealth_pages)
+                {
+                    PEPT_STEALTH_PAGE_INFO s2 = CONTAINING_RECORD(cur2, EPT_STEALTH_PAGE_INFO, stealth_page_list);
+                    cur2 = cur2->Flink;
+                    if (s2->shadow_cr3_phys != sp->shadow_cr3_phys) continue;
+                    if (!s2->shadow_pte_va) continue;
+                    UINT64 sh_pt_va2 = (UINT64)s2->shadow_pte_va & ~0xFFFULL;
+                    UINT32 k;
+                    for (k = 0; k < healed_count; k++)
+                        if (healed[k] == sh_pt_va2) break;
+                    if (k < healed_count) continue;       // already healed this 2MB
+                    if (healed_count < 64) healed[healed_count++] = sh_pt_va2;
+                    cross_2mbs++;
+                    UINT64 real_pt_va2 = 0, dummy2 = 0;
+                    if (!stealth_walk_pt_page(sp, real_cr3, s2->guest_va, &real_pt_va2, &dummy2) || !real_pt_va2)
+                        continue;
+                    PUINT64 r_pt2 = (PUINT64)real_pt_va2;
+                    PUINT64 sh_pt2 = (PUINT64)sh_pt_va2;
+                    for (UINT32 j = 0; j < 512; j++)
+                    {
+                        UINT64 r = r_pt2[j];
+                        UINT64 s = sh_pt2[j];
+                        if ((((s ^ r) & PFN_MASK) == 0) && (((s ^ r) & 1ULL) == 0))
+                            continue;
+                        UINT64 want_j = (r & 1) ? (r & ~NX_BIT) : 0ULL;
+                        want_j &= ~0x2ULL;
+                        want_j |= (s & 0x2ULL);
+                        sh_pt2[j] = want_j;
+                        cross_changed++;
+                    }
+                }
+            }
+
+            if (changed || cross_changed)
             {
                 // flush cached translations for this context so post-swap data
                 // accesses re-walk the refreshed shadow PTEs. Per-VA INVVPID for
@@ -1120,8 +1171,8 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
                 _InterlockedIncrement(&g_dbg_a2_ptpage_synced);
                 if (_InterlockedIncrement(&g_dbg_a2_ptpage_synced_logged) <= 32)
                     HYPERPLATFORM_LOG_WARN_SAFE(
-                        "[stealth-a2] ptpage-sync fa=%llx rip=%llx changed=%u stale-P1=%u",
-                        fault_addr, vcpu->vmexit_rip, changed, stale_p1);
+                        "[stealth-a2] ptpage-sync fa=%llx rip=%llx changed=%u stale-P1=%u cross2MB=%u cross_changed=%u",
+                        fault_addr, vcpu->vmexit_rip, changed, stale_p1, cross_2mbs, cross_changed);
             }
         }
     }

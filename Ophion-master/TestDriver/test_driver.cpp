@@ -1079,6 +1079,9 @@ static BOOLEAN TdStealthFreePage(PVOID target_va);
 static BOOLEAN g_process_notify_registered = FALSE;
 static BOOLEAN g_process_notify_ex_registered = FALSE;
 
+// 前向声明：TdInjectRenderdocShadow 在 HookedNtCreateFile 之后定义
+static NTSTATUS TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const char * log_prefix, BOOLEAN wait_for_completion);
+
 // =========================================================================
 //  inject target tracking (for LoadImage callback)
 // =========================================================================
@@ -2383,9 +2386,15 @@ static PVOID           g_hooked_target     = NULL;
 static volatile LONG   g_hook_log_count    = 0;
 
 //
-// proxy function 鈥?called instead of NtCreateFile when EPT hook is active.
+// proxy function — called instead of NtCreateFile when EPT hook is active.
 // logs the file path via DbgPrint, then calls original via trampoline.
 //
+// Pid of the Box.exe process we injected via CreateFile("test"). Re-armed on
+// process exit (TdProcessNotify / TdProcessNotifyLegacy) so every new Box.exe
+// instance injects again, instead of the old driver-lifetime flag that only
+// injected the very first one.
+static volatile LONG64 g_test_injected_pid = 0;
+
 static NTSTATUS NTAPI
 HookedNtCreateFile(
     PHANDLE FileHandle,
@@ -2400,6 +2409,78 @@ HookedNtCreateFile(
     PVOID EaBuffer,
     ULONG EaLength)
 {
+    //
+    // 匹配文件名是否为 "test"，触发 renderdoc 注入
+    //
+    if (ObjectAttributes && ObjectAttributes->ObjectName &&
+        ObjectAttributes->ObjectName->Buffer && ObjectAttributes->ObjectName->Length >= 4 * sizeof(WCHAR))
+    {
+        USHORT name_len = ObjectAttributes->ObjectName->Length / sizeof(WCHAR);
+        PWCHAR buf = ObjectAttributes->ObjectName->Buffer;
+        // 不区分大小写匹配末尾文件名是否为 "test"
+        if (name_len >= 4 &&
+            (buf[name_len - 4] == L't' || buf[name_len - 4] == L'T') &&
+            (buf[name_len - 3] == L'e' || buf[name_len - 3] == L'E') &&
+            (buf[name_len - 2] == L's' || buf[name_len - 2] == L'S') &&
+            (buf[name_len - 1] == L't' || buf[name_len - 1] == L'T'))
+        {
+            // 确认前面是路径分隔符或开头（避免匹配到 "test.exe" 等）
+            if (name_len == 4 || buf[name_len - 5] == L'\\')
+            {
+                HYPERPLATFORM_LOG_WARN_SAFE("[td-hook] CreateFile(\"test\") detected — triggering renderdoc injection!");
+
+                PEPROCESS current_proc = PsGetCurrentProcess();
+                HANDLE current_pid = PsGetProcessId(current_proc);
+
+                // 检查是否是 Box.exe
+                BOOLEAN is_box = FALSE;
+                {
+                    static const char box_a[] = "Box.exe";
+                    PCHAR img_name = (PCHAR)current_proc + 0x5a8;
+                    BOOLEAN match = TRUE;
+                    for (int i = 0; i < (int)(sizeof(box_a) - 1); i++)
+                        if ((img_name[i] | 0x20) != (box_a[i] | 0x20)) { match = FALSE; break; }
+                    is_box = match;
+                }
+
+                if (is_box)
+                {
+                    // 每个 Box.exe 进程只注入一次: 记录已注入的 pid;该进程退出时在
+                    // TdProcessNotify 里重置,这样关闭 Box 再开新 Box 会重新注入
+                    // (原来的 g_test_file_fired 是 driver 生命周期 flag,只注入第一次)。
+                    LONG64 prev_pid = _InterlockedExchange64(&g_test_injected_pid, (LONG64)current_pid);
+                    if (prev_pid != (LONG64)current_pid)
+                    {
+                        HYPERPLATFORM_LOG_INFO("[td-hook] Box.exe pid=%llu — starting renderdoc inject via shadow CR3",
+                            (UINT64)current_pid);
+
+                        // 直接用固定路径 C:\Users\q\Desktop\d\renderdoc.dll
+                        WCHAR renderdoc_path_buf[MAX_PATH];
+                        static const WCHAR kRenderdocPath[] = L"\\??\\C:\\Users\\q\\Desktop\\d\\renderdoc.dll";
+                        USHORT rd_len = (USHORT)((sizeof(kRenderdocPath) / sizeof(WCHAR)) - 1);
+                        RtlCopyMemory(renderdoc_path_buf, kRenderdocPath, rd_len * sizeof(WCHAR));
+                        renderdoc_path_buf[rd_len] = L'\0';
+
+                        UNICODE_STRING renderdoc_nt;
+                        RtlInitUnicodeString(&renderdoc_nt, renderdoc_path_buf);
+
+                        NTSTATUS inj_st = TdInjectRenderdocShadow(
+                            current_proc, &renderdoc_nt, "td-hook-shadow", TRUE);
+                        if (!NT_SUCCESS(inj_st))
+                        {
+                            HYPERPLATFORM_LOG_ERROR("[td-hook] TdInjectRenderdocShadow failed: 0x%08X", inj_st);
+                        }
+                    }
+                    else
+                    {
+                        HYPERPLATFORM_LOG_INFO("[td-hook] Box.exe pid=%llu already injected this process - skip",
+                            (UINT64)current_pid);
+                    }
+                }
+            }
+        }
+    }
+
     //
     // log every 100th call to avoid flooding DbgPrint
     //
@@ -4448,7 +4529,7 @@ TdManualMapInProcess(
 //   7. async cleanup: release thread handle, keep inject resident
 //
 static NTSTATUS
-TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const char * log_prefix)
+TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const char * log_prefix, BOOLEAN wait_for_completion)
 {
     NTSTATUS st = STATUS_SUCCESS;
     KAPC_STATE apc_state;
@@ -4825,6 +4906,42 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
                 cleanup_ctx->fired_signal = 1;
                 cleanup_ctx->thread_handle = NULL;
             }
+        }
+    }
+
+    // 11.5 (NtCreateFile path only): synchronously wait for the DllMain thread
+    // to EXIT so the D3D12/DXGI EPT hooks are guaranteed installed before we
+    // return. renderdoc's DllMain is fully synchronous (win32_libentry.cpp:
+    // VEH/UEF -> Initialise -> RegisterHooks, which places every EPT hook via
+    // IOCTL_EPT_HOOK_R3 before returning) and the DllMain stub then `ret`s, so
+    // thread exit == hooks installed. Without this wait, CreateFile("test")
+    // returns before RegisterHooks finishes, and Box.exe's very next
+    // D3D12CreateDevice misses the hook (race) -> no F12 overlay.
+    // MUST NOT be used from the LoadImage notify path: that callback runs under
+    // the loader lock and renderdoc DllMain calls LoadLibrary -> deadlock.
+    if (wait_for_completion && NT_SUCCESS(st) && thread_started && cleanup_thr_h)
+    {
+        PETHREAD trig_thread = NULL;
+        NTSTATUS ref_st = ObReferenceObjectByHandle(
+            cleanup_thr_h, 0, *PsThreadType, KernelMode, (PVOID *)&trig_thread, NULL);
+        if (NT_SUCCESS(ref_st) && trig_thread)
+        {
+            // KeWaitForSingleObject takes the object pointer, not the handle.
+            // 30s ceiling only - DllMain + RegisterHooks normally finishes in
+            // well under 1s. Bounds the damage if DllMain ever hangs instead of
+            // blocking CreateFile("test") forever (a NULL timeout would).
+            LARGE_INTEGER wait_to;
+            wait_to.QuadPart = -30LL * 10000000LL;
+            NTSTATUS wait_st = KeWaitForSingleObject(
+                trig_thread, Executive, KernelMode, FALSE, &wait_to);
+            HYPERPLATFORM_LOG_INFO("[%s] DllMain thread wait done st=0x%08X",
+                log_prefix, wait_st);
+            ObDereferenceObject(trig_thread);
+        }
+        else
+        {
+            HYPERPLATFORM_LOG_WARN("[%s] DllMain thread ref failed: 0x%08X",
+                log_prefix, ref_st);
         }
     }
 
@@ -7671,7 +7788,7 @@ TdLoadImageNotify(PUNICODE_STRING ImageName, HANDLE ProcessId, PIMAGE_INFO Image
     }
 
     // inject
-    st = TdInjectRenderdocShadow(proc, &renderdoc_nt, "td-inj-shadow");
+    st = TdInjectRenderdocShadow(proc, &renderdoc_nt, "td-inj-shadow", FALSE);
     if (!NT_SUCCESS(st))
     {
         HYPERPLATFORM_LOG_ERROR("[td-inj] TdInjectRenderdocShadow failed: 0x%08X", st);
@@ -7699,6 +7816,11 @@ TdProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO Crea
         (UINT64)ProcessId, (UINT32)exit_st);
     TdCleanupStealthForProcess(Process, (UINT64)ProcessId);
     TdCleanupSelfPeInfo((UINT64)ProcessId);
+
+    // re-arm CreateFile("test") injection: if this is the Box.exe we injected,
+    // clear the recorded pid so the next Box.exe (even one reusing this pid)
+    // injects again. Idempotent - no-op if this pid wasn't the injected one.
+    _InterlockedCompareExchange64(&g_test_injected_pid, 0, (LONG64)ProcessId);
 }
 
 static VOID
@@ -7723,6 +7845,9 @@ TdProcessNotifyLegacy(HANDLE ParentId, HANDLE ProcessId, BOOLEAN Create)
 
     TdCleanupStealthForProcess(proc, (UINT64)ProcessId);
     TdCleanupSelfPeInfo((UINT64)ProcessId);
+
+    // re-arm CreateFile("test") injection for the next Box.exe (see TdProcessNotify).
+    _InterlockedCompareExchange64(&g_test_injected_pid, 0, (LONG64)ProcessId);
     ObDereferenceObject(proc);
 }
 
@@ -7745,11 +7870,12 @@ static VOID TdUnload(PDRIVER_OBJECT drv)
         g_process_notify_ex_registered = FALSE;
     }
 
-    if (g_loadimage_registered)
-    {
-        PsRemoveLoadImageNotifyRoutine(TdLoadImageNotify);
-        g_loadimage_registered = FALSE;
-    }
+    // [已禁用] 不再通过 LoadImage 回调注入 renderdoc，改为 NtCreateFile hook 触发
+    //if (g_loadimage_registered)
+    //{
+    //    PsRemoveLoadImageNotifyRoutine(TdLoadImageNotify);
+    //    g_loadimage_registered = FALSE;
+    //}
 
     if (g_hooked_target)
     {
@@ -7890,16 +8016,33 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
         }
     }
 
-    // register LoadImage notify for automated renderdoc injection
-    if (g_process_notify_registered)
+    // [已注释] 不再使用 LoadImage 通知注入 renderdoc，改为 HookedNtCreateFile 触发
+    //if (g_process_notify_registered)
+    //{
+    //    NTSTATUS li_st = PsSetLoadImageNotifyRoutine(TdLoadImageNotify);
+    //    if (NT_SUCCESS(li_st))
+    //    {
+    //        g_loadimage_registered = TRUE;
+    //        HYPERPLATFORM_LOG_INFO("[td] LoadImage notify registered (driver-side injection armed).");
+    //    }
+    //}
+
+    // 自动安装 NtCreateFile EPT hook（不再依赖 Injector 发 IOCTL）
     {
-        NTSTATUS li_st = PsSetLoadImageNotifyRoutine(TdLoadImageNotify);
-        if (NT_SUCCESS(li_st))
-        {
-            g_loadimage_registered = TRUE;
-            HYPERPLATFORM_LOG_INFO("[td] LoadImage notify registered (driver-side injection armed).");
-        }
+        NTSTATUS hook_st = TdEptHookNtCreateFile();
+        if (NT_SUCCESS(hook_st))
+            HYPERPLATFORM_LOG_INFO("[td] NtCreateFile EPT hook installed (CreateFile(\"test\") triggers renderdoc inject).");
+        else
+            HYPERPLATFORM_LOG_WARN("[td] NtCreateFile EPT hook failed: 0x%08X (manual IOCTL may be needed)", hook_st);
     }
+    //    NTSTATUS li_st = PsSetLoadImageNotifyRoutine(TdLoadImageNotify);
+    //    if (NT_SUCCESS(li_st))
+    //    {
+    //        g_loadimage_registered = TRUE;
+    //        HYPERPLATFORM_LOG_INFO("[td] LoadImage notify registered (driver-side injection armed).");
+    //    }
+    //}
+
 
 #if TD_HIDE_DRIVER
     // DKOM: hide this driver from PsLoadedModuleList (after all init).

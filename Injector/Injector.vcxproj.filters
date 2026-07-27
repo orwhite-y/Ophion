@@ -15,7 +15,7 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="..\Ophion-master\Injector\injector.cpp">
+    <ClCompile Include="inject_renderdoc.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>

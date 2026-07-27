@@ -899,6 +899,7 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
         return;
 
     _InterlockedIncrement(&g_dbg_a2_code_enter);
+    wedge_cmos_mark(0x03);  // WEDGE-C (heal enter)
 
     //
     // DIAG: periodic counter dump + distinct renderdoc code-RIP capture.
@@ -933,6 +934,7 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
     // (PML4[idx]=0 for the code VA) -> sync always bailed -> stale shadow code
     // PFN -> CPU fetched wrong bytes -> execute AV.
     UINT64 saved_cr3 = vmx_enter_cr3(sp->guest_cr3);
+    wedge_cmos_mark(0x04);  // WEDGE-D (post-enter-cr3, in heal)
 
     // One-shot sanity check: under sp->guest_cr3 (guest kernel CR3), pa_to_va on
     // the shadow PML4 (a NonPaged-pool page, resolved via system PTE in the kernel
@@ -949,7 +951,9 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
     }
 
     UINT64 real_pte = 0;
+    wedge_cmos_mark(0x05);  // WEDGE-E (pre-walk)
     BOOLEAN walk_ok = stealth_walk_pte(sp, real_cr3, fault_addr, &real_pte);
+    wedge_cmos_mark(0x06);  // WEDGE-E2 (post-walk)
     if (!walk_ok || !(real_pte & 1))
     {
         // real not present / large / NULL: nothing to sync (the existing NX-open
@@ -1614,6 +1618,10 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
 {
     if (!g_ept || IsListEmpty(&g_ept->stealth_pages)) return FALSE;
 
+    // WEDGE-B (0x02) removed: per-CPU exit-reason snap in vmexit_handler records
+    // #PF as 0x8E per-CPU now. This global mark was a per-#PF port-I/O confound
+    // (it + 0x0D were why the global marker always read 0x0d under the storm).
+
     //
     // mid shadow window: a non-fetch (data) #PF arrived while this vCPU is already
     // running on the shadow CR3. it must be serviced under the REAL CR3 - never let
@@ -1706,6 +1714,10 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             return FALSE;
         }
 
+        // WEDGE-B1 (CMOS 0x0B): stealth page MATCHED (guest_va + pid/cr3), entering mode handling.
+        wedge_cmos_mark(0x0B);
+        wedge_cmos_set_match_seen();  // sticky: a match happened this run (survives reset)
+
         if (sp->fake_pt)
         {
             // fake PT mode
@@ -1728,6 +1740,9 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             UINT64 current_pfn = (UINT64)current_cr3 & PFN_MASK;
             UINT64 shadow_pfn  = sp->shadow_cr3_phys & PFN_MASK;
             BOOLEAN already_on_shadow = (current_pfn == shadow_pfn);
+
+            // WEDGE-B2 (CMOS 0x0C): match, CR3 read + already_on_shadow done, about to call heal.
+            wedge_cmos_mark(0x0C);
 
             // Re-sync the shadow CODE PTE from the current real PTE before opening
             // the window. The shadow PT is a build-time snapshot; a code page
@@ -1857,6 +1872,9 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
 
         return TRUE;
     }
+
+    // WEDGE-BN (0x0D) removed: per-CPU snap captures the nomatch reinject; this
+    // global mark was a hot-path port-I/O confound. (nomatch reinject path follows.)
 
     // no stealth page matched. if a shadow window is still open, close it first so
     // the re-injected #PF is serviced under the real CR3. (defensive: the mid-window

@@ -1722,6 +1722,7 @@ extern BOOLEAN g_device_hidden;
 #define IOCTL_GET_MODULE_BASE CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 13, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_HIDE_DEVICE     CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 14, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_GET_SELF_PE_INFO CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 15, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_INJECT_RENDERDOC  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 16, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #pragma pack(push, 8)
 typedef struct _TD_RESOLVE_EXPORT_PARAMS {
@@ -1760,6 +1761,18 @@ typedef struct _TD_INJECT_PARAMS {
     UINT64 shellcode_va;    // [out]
     UINT64 actual_size;     // [out]
 } TD_INJECT_PARAMS;
+
+//
+// R3 renderdoc shadow-inject params (must match Injector/inject_renderdoc.cpp).
+// renderdoc_path is an NT path like "\??\C:\dir\renderdoc.dll".
+//
+#pragma pack(push, 8)
+typedef struct _TD_INJECT_RENDERDOC_PARAMS {
+    UINT64 target_pid;          // [in]  target process PID
+    WCHAR  renderdoc_path[520]; // [in]  NT path to renderdoc.dll (null-terminated)
+    UINT64 status;              // [out] NTSTATUS from TdInjectRenderdocShadow (0 = ok)
+} TD_INJECT_RENDERDOC_PARAMS;
+#pragma pack(pop)
 
 //
 // R3 EPT hook params 鈥?from user-mode app via DeviceIoControl
@@ -4346,15 +4359,37 @@ TdPeResolveImports(PVOID mapped_base)
 //   ret
 //
 static UINT32
-TdBuildDllMainStub(PVOID stub_addr, UINT64 image_base, UINT64 entry_point)
+TdBuildDllMainStub(PVOID stub_addr, UINT64 image_base, UINT64 entry_point,
+                   UINT64 rtl_add_function_table_va, UINT64 pdata_va, UINT32 pdata_count)
 {
     PUINT8 s = (PUINT8)stub_addr;
     UINT32 off = 0;
 
-    // sub rsp, 28h  (align stack for call)
+    // sub rsp, 28h
     s[off++] = 0x48; s[off++] = 0x83; s[off++] = 0xEC; s[off++] = 0x28;
 
-    // mov rcx, image_base  (hinstDLL)
+    // optional: RtlAddFunctionTable(pdata, count, base) -- registers .pdata so
+    // SEH/.pdata unwind resolves during CRT init (required for static-CRT DLLs
+    // like renderdoc; without it CRT init FAST_FAILs).
+    if (rtl_add_function_table_va && pdata_count)
+    {
+        // mov rcx, PDATA_VA (imm64)
+        s[off++] = 0x48; s[off++] = 0xB9;
+        *(PUINT64)(s + off) = pdata_va; off += 8;
+        // mov edx, COUNT (imm32, zero-extends to rdx)
+        s[off++] = 0xBA;
+        *(PUINT32)(s + off) = pdata_count; off += 4;
+        // mov r8, IMAGE_BASE (imm64)   49 B8
+        s[off++] = 0x49; s[off++] = 0xB8;
+        *(PUINT64)(s + off) = image_base; off += 8;
+        // mov rax, RTLADDFUNCTIONTABLE_VA (imm64)
+        s[off++] = 0x48; s[off++] = 0xB8;
+        *(PUINT64)(s + off) = rtl_add_function_table_va; off += 8;
+        // call rax
+        s[off++] = 0xFF; s[off++] = 0xD0;
+    }
+
+    // mov rcx, IMAGE_BASE (imm64)   (hinstDLL)
     s[off++] = 0x48; s[off++] = 0xB9;
     *(PUINT64)(s + off) = image_base; off += 8;
 
@@ -4364,7 +4399,7 @@ TdBuildDllMainStub(PVOID stub_addr, UINT64 image_base, UINT64 entry_point)
     // xor r8d, r8d  (lpvReserved = 0)
     s[off++] = 0x45; s[off++] = 0x31; s[off++] = 0xC0;
 
-    // mov rax, entry_point
+    // mov rax, ENTRY_POINT (imm64)
     s[off++] = 0x48; s[off++] = 0xB8;
     *(PUINT64)(s + off) = entry_point; off += 8;
 
@@ -4481,40 +4516,81 @@ TdManualMapInProcess(
             HYPERPLATFORM_LOG_WARN("[td-map] TdPeResolveImports had errors (continuing)");
         }
 
-        // 6.5 cache PE info (resource + export dir RVAs) for this mapped image
-        // BEFORE header erasure below. R3 queries it via IOCTL_GET_SELF_PE_INFO
-        // to walk .rsrc / resolve exports after the headers are erased. `nt`
-        // points into raw_dll (intact on-disk headers), so the DataDirectory
-        // reads are always valid; key by the mapped `base` so R3 (which only
-        // knows g_renderdoc_hModule == base) can look it up.
+        // 6.5 cache PE info (resource + export dir RVAs) for this mapped image.
+        // R3 queries it via IOCTL_GET_SELF_PE_INFO to walk .rsrc / resolve
+        // exports (the mapped headers are preserved below, but the cache saves
+        // R3 from re-parsing the image). `nt` points into raw_dll (intact
+        // on-disk headers), so the DataDirectory reads are always valid; key by
+        // the mapped `base` so R3 (which only knows g_renderdoc_hModule == base)
+        // can look it up.
         TdCacheSelfPeInfo((UINT64)(ULONG_PTR)PsGetProcessId(proc), (UINT64)base, nt);
 
-        // 7. build DllMain stub at base+0 (overwrites DOS header)
+        // 7. build DllMain stub AFTER the PE headers (at base + stub_off,
+        //    16-byte aligned, in the header padding before the first section).
+        //    Preserving the DOS/NT headers is required: a CRT-linked DLL's SEH
+        //    unwind walks RtlLookupFunctionEntry -> RtlImageNtHeader(image_base),
+        //    which validates the "MZ" signature and e_lfanew. The old base+0 stub
+        //    overwrote "MZ" and zeroed e_lfanew/NT headers, so any exception during
+        //    CRT init became an unrecoverable crash (FAST_FAIL on static-CRT DLLs
+        //    like renderdoc). The stub still lives in page 0, so it stays inside
+        //    the stealth/NX region and runs via shadow CR3 + #PF.
         PVOID entry = NULL;
+        ULONG  hdr_size = nt->OptionalHeader.SizeOfHeaders;
+        UINT32 stub_off = (hdr_size + 15) & ~15u;   // 16-byte aligned, after headers
+
+        // keep the stub inside page 0 (before the first section at SectionAlignment)
+        // so it remains within the stealth-registered region. Allow up to 128 bytes
+        // (DllMain stub with the optional RtlAddFunctionTable block is ~78 bytes).
+        if (stub_off + 128 > 0x1000)
+        {
+            HYPERPLATFORM_LOG_ERROR("[td-map] no room for stub after headers (SizeOfHeaders=0x%X)",
+                        hdr_size);
+            ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &image_size, MEM_RELEASE);
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
         if (nt->OptionalHeader.AddressOfEntryPoint)
         {
             UINT64 entry_point_va = (UINT64)base + nt->OptionalHeader.AddressOfEntryPoint;
-            UINT32 stub_size = TdBuildDllMainStub(base, (UINT64)base, entry_point_va);
 
-            HYPERPLATFORM_LOG_INFO("[td-map] DllMain stub: base=%p entry=0x%llX stub_size=%u",
-                       base, entry_point_va, stub_size);
+            // Resolve .pdata (exception directory) + ntdll!RtlAddFunctionTable so the
+            // stub registers the function table before calling DllMain. Without this,
+            // SEH/.pdata unwind can't resolve during CRT init -> FAST_FAIL on static-CRT
+            // DLLs (e.g. renderdoc). Skipped if the image has no exception directory.
+            UINT64 rtl_va = 0;
+            UINT64 pdata_va = 0;
+            UINT32 pdata_count = 0;
+            IMAGE_DATA_DIRECTORY* exc =
+                &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+            if (exc->Size && exc->VirtualAddress)
+            {
+                PVOID ntdll_base = TdFindModuleBaseA("ntdll.dll", NULL);
+                rtl_va = ntdll_base ? (UINT64)TdFindExportByName(ntdll_base, "RtlAddFunctionTable") : 0;
+                if (rtl_va)
+                {
+                    pdata_va = (UINT64)base + exc->VirtualAddress;
+                    pdata_count = exc->Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
+                }
+                else
+                {
+                    HYPERPLATFORM_LOG_WARN("[td-map] RtlAddFunctionTable not resolved; SEH unwind may fail");
+                }
+            }
 
-            // 8. zero from stub end to SizeOfHeaders (clear remaining PE header data)
-            ULONG hdr_size = nt->OptionalHeader.SizeOfHeaders;
-            if (stub_size < hdr_size)
-                RtlZeroMemory((PUINT8)base + stub_size, hdr_size - stub_size);
-
-            entry = base;  // stub is at base+0
+            UINT32 stub_size = TdBuildDllMainStub((PUINT8)base + stub_off,
+                                                  (UINT64)base, entry_point_va,
+                                                  rtl_va, pdata_va, pdata_count);
+            HYPERPLATFORM_LOG_INFO("[td-map] DllMain stub: base=%p stub_off=0x%X entry=0x%llX rtl_add_fn_tbl=0x%llX pdata=0x%llX count=%u stub_size=%u",
+                       base, stub_off, entry_point_va, rtl_va, pdata_va, pdata_count, stub_size);
+            entry = (PUINT8)base + stub_off;
         }
         else
         {
             HYPERPLATFORM_LOG_WARN("[td-map] no entry point in DLL");
-            // zero the entire header area
-            RtlZeroMemory(base, nt->OptionalHeader.SizeOfHeaders);
             entry = NULL;
         }
 
-        // set output before we lose access to nt headers (they're overwritten)
+        // headers are preserved (not zeroed) so CRT SEH unwind can resolve them.
         *out_base  = base;
         *out_entry = entry;
 
@@ -4901,17 +4977,17 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
         }
     }
 
-    // 10. EPT hook trigger -> mapped_base (DllMain stub) (TID-filtered, oneshot)
+    // 10. EPT hook trigger -> mapped_entry (DllMain stub at base+stub_off) (TID-filtered, oneshot)
     if (NT_SUCCESS(st) && expected_tid)
     {
         PVOID dummy_origin = NULL;
         volatile LONG * fired_ptr = cleanup_ctx ? &cleanup_ctx->fired_signal : NULL;
         NTSTATUS hook_st = TdInstallTriggerHookAllCpus(
-            trigger_fn, mapped_base, caller_cr3, 2, expected_tid, &dummy_origin, fired_ptr);
+            trigger_fn, mapped_entry, caller_cr3, 2, expected_tid, &dummy_origin, fired_ptr);
 
         HYPERPLATFORM_LOG_INFO("[%s] trigger hook %s trigger=%p sc=%p tid=%llu st=0x%08X",
                    log_prefix, NT_SUCCESS(hook_st) ? "OK" : "FAILED",
-                   trigger_fn, mapped_base, expected_tid, hook_st);
+                   trigger_fn, mapped_entry, expected_tid, hook_st);
 
         if (!NT_SUCCESS(hook_st))
             st = hook_st;
@@ -7399,6 +7475,48 @@ static NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         break;
     }
 
+    case IOCTL_INJECT_RENDERDOC:
+    {
+        // R3-triggered renderdoc shadow inject -- alternative to the automatic
+        // LoadImage/d3d12-detect path. Lets R3 inject renderdoc into a given PID
+        // on demand, useful to test TdInjectRenderdocShadow in isolation from the
+        // wedge-prone auto path. Matches Injector/inject_renderdoc.cpp.
+        // TdInjectRenderdocShadow attaches to the target itself (like the auto
+        // path at the LoadImage callback), so we do NOT KeStackAttachProcess here.
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_INJECT_RENDERDOC_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_INJECT_RENDERDOC_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_INJECT_RENDERDOC_PARAMS * p = (TD_INJECT_RENDERDOC_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+        p->renderdoc_path[519] = L'\0';   // hard null-terminate (defensive vs. R3)
+
+        PEPROCESS proc = NULL;
+        NTSTATUS lookup_st = PsLookupProcessByProcessId((HANDLE)p->target_pid, &proc);
+        if (!NT_SUCCESS(lookup_st) || !proc)
+        {
+            HYPERPLATFORM_LOG_ERROR("[rd-r3] PsLookupProcessByProcessId failed pid=%llu st=0x%08X",
+                p->target_pid, lookup_st);
+            p->status = (UINT64)lookup_st;
+            irp->IoStatus.Information = sizeof(TD_INJECT_RENDERDOC_PARAMS);
+            st = STATUS_SUCCESS;   // IOCTL ok; result delivered in p->status
+            break;
+        }
+
+        UNICODE_STRING renderdoc_nt;
+        RtlInitUnicodeString(&renderdoc_nt, p->renderdoc_path);
+
+        HYPERPLATFORM_LOG_INFO("[rd-r3] inject renderdoc pid=%llu path=%wZ",
+            p->target_pid, &renderdoc_nt);
+
+        NTSTATUS inj_st = TdInjectRenderdocShadow(proc, &renderdoc_nt, "rd-r3", FALSE);
+        ObDereferenceObject(proc);
+
+        p->status = (UINT64)inj_st;
+        irp->IoStatus.Information = sizeof(TD_INJECT_RENDERDOC_PARAMS);
+        st = STATUS_SUCCESS;   // IOCTL ok; injection result in p->status (0 = set up OK)
+        break;
+    }
+
     default:
         st = STATUS_INVALID_DEVICE_REQUEST;
         HYPERPLATFORM_LOG_ERROR("[td-ioctl] unhandled IOCTL code=0x%08X", io->Parameters.DeviceIoControl.IoControlCode);
@@ -7966,7 +8084,7 @@ extern "C"
 // no-op (safe). Must be called AFTER all init (MmGetSystemRoutineAddress,
 // IoCreateDevice, etc.) so those APIs find the driver while it's set up.
 #ifndef TD_HIDE_DRIVER
-#define TD_HIDE_DRIVER 1
+#define TD_HIDE_DRIVER 0
 #endif
 #if TD_HIDE_DRIVER
 static VOID TdHideFromPsLoadedModuleList(PDRIVER_OBJECT drv)
@@ -8089,13 +8207,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     //}
 
     // 自动安装 NtCreateFile EPT hook（不再依赖 Injector 发 IOCTL）
-    {
-        NTSTATUS hook_st = TdEptHookNtCreateFile();
-        if (NT_SUCCESS(hook_st))
-            HYPERPLATFORM_LOG_INFO("[td] NtCreateFile EPT hook installed (CreateFile(\"test\") triggers renderdoc inject).");
-        else
-            HYPERPLATFORM_LOG_WARN("[td] NtCreateFile EPT hook failed: 0x%08X (manual IOCTL may be needed)", hook_st);
-    }
+    //{
+    //    //NTSTATUS hook_st = TdEptHookNtCreateFile();
+    //    if (NT_SUCCESS(hook_st))
+    //        HYPERPLATFORM_LOG_INFO("[td] NtCreateFile EPT hook installed (CreateFile(\"test\") triggers renderdoc inject).");
+    //    else
+    //        HYPERPLATFORM_LOG_WARN("[td] NtCreateFile EPT hook failed: 0x%08X (manual IOCTL may be needed)", hook_st);
+    //}
     //    NTSTATUS li_st = PsSetLoadImageNotifyRoutine(TdLoadImageNotify);
     //    if (NT_SUCCESS(li_st))
     //    {

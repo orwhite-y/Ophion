@@ -108,6 +108,213 @@ vmx_leave_guest_cr3(UINT64 saved)
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// WEDGE CMOS diagnostic marker: writes a 1-byte progress marker to battery-backed
+// RTC NVRAM (CMOS) so it survives a triple-fault reset (the RAM log buffer is lost
+// on reset). Port 0x70 = index (bit7 = NMI disable), 0x71 = data. Offsets 0x50/0x51
+// are in extended CMOS (usually free on modern 256-byte RTC). Host port IO in
+// VMX-root is never intercepted, so __outbyte / __inbyte work directly. The trailing
+// __outbyte(0x70, 0x0D) clears bit7 to re-enable NMI after each access.
+//
+#define WEDGE_CMOS_MAGIC_OFF  0x50
+#define WEDGE_CMOS_VALUE_OFF  0x51
+#define WEDGE_CMOS_MAGIC      0xA5
+// Sticky "match seen" flag: set once (at WEDGE 0x0B) the first time a stealth page
+// matches, never cleared during the run. Survives reset alongside the marker so the
+// readback can tell "shellcode matched+healed then a later nomatch killed it" apart
+// from "shellcode never matched at all". Cleared by wedge_cmos_clear on readback.
+#define WEDGE_CMOS_MATCH_OFF  0x52
+// Sticky "trigger seen" flag: set once (at WEDGE 0x01) the first time the injection
+// trigger fires. Survives reset. Tells "shellcode ran but didn't match" (trig=1,
+// match=0 -> target filter wrong for this process) apart from "shellcode never ran"
+// (trig=0 -> the fetch #PFs are EAC/kernel NX code, not the shellcode).
+#define WEDGE_CMOS_TRIG_OFF   0x53
+// WEDGE reinject livelock probe (replaces the old per-#PF 0x0E mark, which did
+// port I/O on EVERY fetch-#PF reinject -> hot path under EAC's #PF storm). A
+// per-CPU consecutive same-address reinject streak is tracked in memory (no
+// per-#PF port I/O); only when a CPU's streak hits 1024 (pathological = guest
+// re-#PFs the same instruction, HV re-injects, tight loop = livelock) does that
+// CPU snap to CMOS. Normal activity never reaches 1024 consecutive same-addr
+// reinjects (each NX #PF is resolved by the guest handler -> next #PF is a
+// different addr -> streak resets), so normal CPUs never write. On a 卡死 (freeze)
+// boot: streak>=1024 + addr = #PF reinject livelock on addr; streak=0 = no
+// livelock (deadlock, or normal activity). 4-byte streak @ 0x54, 8-byte VA @ 0x58.
+#define WEDGE_CMOS_REINJ_CNT_OFF   0x54
+#define WEDGE_CMOS_REINJ_ADDR_OFF  0x58
+
+// per-CPU last-VM-exit byte (0x60..0x7F, up to 32 CPUs). Each CPU owns its byte so
+// the #PF storm on other CPUs can't mask the handler a wedged/TFing CPU is actually
+// in. Throttled (write only on value change): hot path costs ~1 write/CPU, not
+// 1 write/#PF. Encoding: 0x80|vector for exceptions (0x8E=#PF,0x8D=#GP,0x86=#UD);
+// else raw exit reason (<0x40). 0 = no VM-exit recorded on that CPU.
+#define WEDGE_CMOS_PERCPU_BASE  0x60
+
+static __forceinline VOID
+wedge_cmos_mark(UCHAR v)
+{
+    __outbyte(0x70, WEDGE_CMOS_VALUE_OFF | 0x80);
+    __outbyte(0x71, v);
+    __outbyte(0x70, WEDGE_CMOS_MAGIC_OFF | 0x80);
+    __outbyte(0x71, WEDGE_CMOS_MAGIC);
+    __outbyte(0x70, 0x0D);  // re-enable NMI (clear bit7)
+}
+
+static __forceinline VOID
+wedge_cmos_read(UCHAR *magic, UCHAR *val)
+{
+    __outbyte(0x70, WEDGE_CMOS_MAGIC_OFF | 0x80);
+    *magic = __inbyte(0x71);
+    __outbyte(0x70, WEDGE_CMOS_VALUE_OFF | 0x80);
+    *val = __inbyte(0x71);
+    __outbyte(0x70, 0x0D);  // re-enable NMI
+}
+
+static __forceinline VOID
+wedge_cmos_clear(VOID)
+{
+    __outbyte(0x70, WEDGE_CMOS_MAGIC_OFF | 0x80);
+    __outbyte(0x71, 0);
+    __outbyte(0x70, WEDGE_CMOS_MATCH_OFF | 0x80);
+    __outbyte(0x71, 0);
+    __outbyte(0x70, WEDGE_CMOS_TRIG_OFF | 0x80);
+    __outbyte(0x71, 0);
+    // reinject livelock probe (0x54-0x5F, 12 bytes)
+    for (UINT32 i = 0; i < 12; i++)
+    {
+        __outbyte(0x70, (WEDGE_CMOS_REINJ_CNT_OFF + i) | 0x80);
+        __outbyte(0x71, 0);
+    }
+    // per-CPU last-exit bytes (0x60-0x7F, 32 bytes).
+    for (UINT32 i = 0; i < 32; i++)
+    {
+        __outbyte(0x70, (WEDGE_CMOS_PERCPU_BASE + i) | 0x80);
+        __outbyte(0x71, 0);
+    }
+    __outbyte(0x70, 0x0D);  // re-enable NMI
+}
+
+// Set the sticky "match seen" flag (idempotent). Called at WEDGE 0x0B.
+static __forceinline VOID
+wedge_cmos_set_match_seen(VOID)
+{
+    __outbyte(0x70, WEDGE_CMOS_MATCH_OFF | 0x80);
+    __outbyte(0x71, 0x01);
+    __outbyte(0x70, 0x0D);  // re-enable NMI
+}
+
+// Read the sticky "match seen" flag (0 = no match this run, 1 = a stealth page
+// matched at some point before the reset).
+static __forceinline UCHAR
+wedge_cmos_read_match_seen(VOID)
+{
+    __outbyte(0x70, WEDGE_CMOS_MATCH_OFF | 0x80);
+    UCHAR m = __inbyte(0x71);
+    __outbyte(0x70, 0x0D);  // re-enable NMI
+    return m;
+}
+
+// Set the sticky "trigger seen" flag (idempotent). Called at WEDGE 0x01.
+static __forceinline VOID
+wedge_cmos_set_trig_seen(VOID)
+{
+    __outbyte(0x70, WEDGE_CMOS_TRIG_OFF | 0x80);
+    __outbyte(0x71, 0x01);
+    __outbyte(0x70, 0x0D);  // re-enable NMI
+}
+
+// Read the sticky "trigger seen" flag (0 = trigger never fired this run, 1 = the
+// injection trigger fired at some point before the reset).
+static __forceinline UCHAR
+wedge_cmos_read_trig_seen(VOID)
+{
+    __outbyte(0x70, WEDGE_CMOS_TRIG_OFF | 0x80);
+    UCHAR t = __inbyte(0x71);
+    __outbyte(0x70, 0x0D);  // re-enable NMI
+    return t;
+}
+
+// Snap the reinject livelock probe (streak + fault addr) to CMOS. Called ONLY when
+// a CPU's consecutive same-addr reinject streak hits a multiple of 1024 (i.e. only
+// by a livelocked CPU), so this is NOT on the hot #PF path - no per-#PF port I/O.
+static __forceinline VOID
+wedge_cmos_snap_reinj(UINT32 streak, UINT64 addr)
+{
+    __outbyte(0x70, WEDGE_CMOS_REINJ_CNT_OFF | 0x80);
+    __outbyte(0x71, (UCHAR)(streak));
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_CNT_OFF + 1) | 0x80);
+    __outbyte(0x71, (UCHAR)(streak >> 8));
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_CNT_OFF + 2) | 0x80);
+    __outbyte(0x71, (UCHAR)(streak >> 16));
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_CNT_OFF + 3) | 0x80);
+    __outbyte(0x71, (UCHAR)(streak >> 24));
+    __outbyte(0x70, WEDGE_CMOS_REINJ_ADDR_OFF | 0x80);
+    __outbyte(0x71, (UCHAR)(addr));
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 1) | 0x80);
+    __outbyte(0x71, (UCHAR)(addr >> 8));
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 2) | 0x80);
+    __outbyte(0x71, (UCHAR)(addr >> 16));
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 3) | 0x80);
+    __outbyte(0x71, (UCHAR)(addr >> 24));
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 4) | 0x80);
+    __outbyte(0x71, (UCHAR)(addr >> 32));
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 5) | 0x80);
+    __outbyte(0x71, (UCHAR)(addr >> 40));
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 6) | 0x80);
+    __outbyte(0x71, (UCHAR)(addr >> 48));
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 7) | 0x80);
+    __outbyte(0x71, (UCHAR)(addr >> 56));
+    __outbyte(0x70, 0x0D);  // re-enable NMI
+}
+
+// Read back the reinject livelock probe. streak==0 (+ addr==0) = no livelock this
+// run; streak>=1024 + addr = #PF reinject livelock on that fault VA.
+static __forceinline VOID
+wedge_cmos_read_reinj(UINT32 *streak, UINT64 *addr)
+{
+    UINT32 s = 0;
+    UINT64 a = 0;
+    __outbyte(0x70, WEDGE_CMOS_REINJ_CNT_OFF | 0x80);
+    s = __inbyte(0x71);
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_CNT_OFF + 1) | 0x80);
+    s |= (UINT32)__inbyte(0x71) << 8;
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_CNT_OFF + 2) | 0x80);
+    s |= (UINT32)__inbyte(0x71) << 16;
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_CNT_OFF + 3) | 0x80);
+    s |= (UINT32)__inbyte(0x71) << 24;
+    __outbyte(0x70, WEDGE_CMOS_REINJ_ADDR_OFF | 0x80);
+    a = __inbyte(0x71);
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 1) | 0x80);
+    a |= (UINT64)__inbyte(0x71) << 8;
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 2) | 0x80);
+    a |= (UINT64)__inbyte(0x71) << 16;
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 3) | 0x80);
+    a |= (UINT64)__inbyte(0x71) << 24;
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 4) | 0x80);
+    a |= (UINT64)__inbyte(0x71) << 32;
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 5) | 0x80);
+    a |= (UINT64)__inbyte(0x71) << 40;
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 6) | 0x80);
+    a |= (UINT64)__inbyte(0x71) << 48;
+    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 7) | 0x80);
+    a |= (UINT64)__inbyte(0x71) << 56;
+    __outbyte(0x70, 0x0D);  // re-enable NMI
+    *streak = s;
+    *addr = a;
+}
+
+// Read one CPU's last-exit byte (0x60+cpu). Called from DriverEntry readback.
+static __forceinline UCHAR
+wedge_cmos_read_percpu(UINT32 cpu)
+{
+    UCHAR v = 0;
+    if (cpu >= 32)
+        return 0;
+    __outbyte(0x70, (WEDGE_CMOS_PERCPU_BASE + cpu) | 0x80);
+    v = __inbyte(0x71);
+    __outbyte(0x70, 0x0D);  // re-enable NMI
+    return v;
+}
+
 //
 // private host page tables (hostcr3.c)
 //

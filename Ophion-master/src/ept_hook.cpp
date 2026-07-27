@@ -1413,6 +1413,8 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                             _InterlockedExchange(fi->external_fired, 1);
                         ept_hook_fire_record((UINT64)fi->virtual_address, (UINT64)fi->handler_function);
                         __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
+                        wedge_cmos_mark(0x01);  // WEDGE-A (trigger fired -> redirected RIP to handler)
+                        wedge_cmos_set_trig_seen();  // sticky: the injection trigger fired this run
                         return TRUE;
                     }
 

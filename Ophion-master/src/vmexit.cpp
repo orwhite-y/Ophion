@@ -11,6 +11,69 @@ extern volatile LONG g_dbg_shadow_pf_switched;
 static volatile LONG g_dbg_shadow_timer_restore = 0;
 static volatile LONG g_dbg_shadow_timer_skip = 0;
 
+// WEDGE reinject livelock probe: per-CPU consecutive same-addr fetch-#PF reinject
+// streak. Tracked in memory (no per-#PF port I/O); a CPU snaps to CMOS only when
+// its streak hits 1024 (livelock). See wedge_cmos_snap_reinj in hv.h.
+static volatile LONG g_wedge_reinj_streak[64];
+static UINT64        g_wedge_reinj_addr[64];
+
+// WEDGE liveloop detector: per-CPU consecutive same-exit streak. The vmexit case
+// bodies and the epilogue are all lock-free with no loops, so a frozen system
+// (hard-reset, guest makes zero progress) can ONLY be a liveloop -- the same exit
+// reason firing every VMRESUME. A normal CPU sees varied reasons -> streak resets
+// -> never snaps. A livelooped CPU climbs to 1024 -> snap. Reuses the reinj CMOS
+// area; pcpu_byte (always <=0xFF) is passed as the "addr", distinguishable from a
+// real #PF fault address (page-aligned, >=0x1000). Zero hot-path CMOS cost:
+// interlocked ops only, snap fires only at multiples of 1024.
+static volatile LONG g_wedge_reason_streak[64];
+static UINT32        g_wedge_reason_last[64];
+
+// WEDGE RIP-stuck detector: catches ANY liveloop (same- OR varied-reason) that the
+// same-reason streak misses. A CPU cycling NMI->CPUID->NMI->INIT->... never hits 1024
+// of the SAME reason (streak resets every change), yet the guest makes no progress
+// (frozen) -- so its RIP is STUCK. This tracks guest RIP low 32 bits per CPU; streak
+// resets the moment RIP changes (normal play -> guest advances -> resets -> never
+// snaps), so NO false positive in long normal runs (unlike a raw cumulative exit
+// counter, which accumulates and false-snaps after ~10s of normal play). A genuine
+// deadlock also has a stuck RIP but does 1 exit then sticks (streak=1, no snap); a
+// liveloop re-exits 1024+ times in ms -> snaps. Snap uses (streak, rip_low32 | 0x1):
+// bit0 set distinguishes from #PF fault addr (page-aligned, bit0 clear) and pcpu_byte
+// (<=0xFF). (Odd RIP readback is off-by-1; rare, code is usually even-aligned.)
+static volatile LONG g_wedge_rip_streak[64];
+static UINT32        g_wedge_rip_last[64];
+
+// WEDGE CMOS snap+end throttle. wedge_percpu_mark is 3 RTC port writes (~3us) each,
+// called twice per exit (entry snap + end clear) = ~6us/exit. On a VARIED-reason
+// storm (NMI/INIT/CPUID mixed, as EAC probes) the per-CPU byte value changes every
+// exit, so the g_percpu_last value-change throttle can't help -- it writes all 6us
+// every exit. That alone starves the guest under EAC probing (Run 1's EPT storm was
+// constant-reason -> g_percpu_last throttled it to ~0 -> ran fine). So we additionally
+// throttle the snap+end to every 8th exit via this counter: 6us/8 = ~0.75us/exit. The
+// in-memory detectors above still run every exit (no port I/O), so liveloop detection
+// keeps full resolution; only the per-CPU stuck byte is 1/8 resolution (a wedged CPU
+// shows 0x40 only if it wedges on its 1-in-8 snap exit -- acceptable since the HV's
+// exit path is lock-free, ruling out deadlocks).
+static volatile LONG g_wedge_snap_ctr[64];
+
+// WEDGE per-CPU last-exit byte (throttle cache). Each CPU owns CMOS[0x60+cpu]; the
+// byte is rewritten only when the value changes, so a #PF storm (constant 0x8E)
+// costs ~1 write/CPU total, not 1 write/#PF. This breaks the multi-CPU masking that
+// made the single global marker (0x51) always read 0x0d (last #PF in flight) and
+// hide the real wedged/TFing handler. See the snap in vmexit_handler.
+static UCHAR g_percpu_last[32];
+static __forceinline VOID
+wedge_percpu_mark(UINT32 cpu, UCHAR val)
+{
+    if (cpu >= 32)
+        return;
+    if (g_percpu_last[cpu] == val)
+        return;
+    g_percpu_last[cpu] = val;
+    __outbyte(0x70, (WEDGE_CMOS_PERCPU_BASE + cpu) | 0x80);
+    __outbyte(0x71, val);
+    __outbyte(0x70, 0x0D);  // re-enable NMI
+}
+
 static __forceinline VOID
 vmexit_advance_rip(VIRTUAL_MACHINE_STATE * vcpu)
 {
@@ -702,6 +765,11 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
 {
     PGUEST_REGS regs = vcpu->regs;
 
+    // WEDGE: 0xE0 = at-entry (before ept_handle_vmcall_hook). VMCALL is rare so sub-marks
+    // here are nearly free (unlike epilogue marks which hit the frequent NMI path -> 巨卡).
+    // 0xE1=after-hook 0xE2=after-stealth 0xE3=after-CPL(at switch). stuck byte = last reached.
+    wedge_percpu_mark(KeGetCurrentProcessorNumberEx(NULL), 0xE0);
+
     //
     // EPT hook / stealth VMCALL dispatch — MUST run before CPL check.
     //
@@ -718,12 +786,14 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         vcpu->advance_rip = FALSE;
         return;
     }
+    wedge_percpu_mark(KeGetCurrentProcessorNumberEx(NULL), 0xE1);  // WEDGE: hook done
 
     if (ept_handle_stealth_vmcall(vcpu))
     {
         vcpu->advance_rip = FALSE;
         return;
     }
+    wedge_percpu_mark(KeGetCurrentProcessorNumberEx(NULL), 0xE2);  // WEDGE: stealth done
 
     //
     // reject VMCALL from ring 3 — only kernel callers allowed for OPHION_VMCALL_ID.
@@ -739,6 +809,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             return;
         }
     }
+    wedge_percpu_mark(KeGetCurrentProcessorNumberEx(NULL), 0xE3);  // WEDGE: CPL done, at OPHION switch
 
     //
     // 1. check rax identifier (like UnrealVTDbg's VMCALL_IDENTIFIER)
@@ -1273,6 +1344,12 @@ VOID
 vmexit_handle_triple_fault(VIRTUAL_MACHINE_STATE * vcpu)
 {
     UNREFERENCED_PARAMETER(vcpu);
+    // WEDGE-TF (CMOS 0x0F): guest triple-faulted. Last mark on a 卡死 (freeze)
+    // boot => the freeze IS the guest-TF re-entry loop: this handler is a no-op
+    // (advance_rip=FALSE), so VM-entry re-enters the same faulting RIP -> guest
+    // TFs again -> infinite loop = freeze. A host TF would reset (not freeze)
+    // and would NOT reach this mark, so 0x0F cleanly separates the two modes.
+    wedge_cmos_mark(0x0F);
     vcpu->advance_rip = FALSE;
 }
 
@@ -1426,6 +1503,78 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     __vmx_vmread(VMCS_GUEST_RIP, &vcpu->vmexit_rip);
     __vmx_vmread(VMCS_GUEST_RSP, &vcpu->regs->rsp);
     __vmx_vmread(VMCS_EXIT_QUALIFICATION, &vcpu->exit_qual);
+
+    //
+    // WEDGE per-CPU last-exit snap + in-handler bit. Record this CPU's exit reason
+    // in its own CMOS byte BEFORE dispatching, with bit6 (0x40) set = "in handler".
+    // The 0x40 bit is cleared at the END of vmexit_handler (before return); if a
+    // handler wedges the clear never runs, so this CPU's byte keeps 0x40 = stuck,
+    // and the low bits name the faulting exit. This separates "stuck in a VM-exit
+    // handler" (byte has 0x40) from "host-side hang after the exit completed" (0x40
+    // clear, byte = last completed exit). Encoding: 0x80|vector=exception
+    // (0x8E=#PF,0x8D=#GP,0x86=#UD); else raw exit reason (<0x40). Stuck exception =
+    // 0xC0|vector; stuck other = 0x40|reason. pcpu_byte hoisted to function scope so
+    // the end-clear can reuse it.
+    //
+    UCHAR pcpu_byte;
+    if (exit_reason == VMX_EXIT_REASON_EXCEPTION_OR_NMI)
+    {
+        size_t exit_int_raw = 0;
+        VMENTRY_INTERRUPT_INFORMATION exit_int;
+        __vmx_vmread(VMCS_VMEXIT_INTERRUPTION_INFORMATION, &exit_int_raw);
+        exit_int.AsUInt = (UINT32)exit_int_raw;
+        pcpu_byte = exit_int.Valid ? (UCHAR)(exit_int.Vector | 0x80) : 0;
+    }
+    else
+    {
+        pcpu_byte = (UCHAR)exit_reason;
+    }
+    // WEDGE: throttle the CMOS per-CPU snap+end to every 8th exit. Detectors below
+    // still run every exit (in-memory). wedge_do_snap hoisted to function scope so
+    // the end-clear reuses it. See g_wedge_snap_ctr above.
+    BOOLEAN wedge_do_snap = FALSE;
+
+    // WEDGE liveloop detector (see g_wedge_reason_streak above). pcpu_byte already
+    // encodes the exit type (vector|0x80 for exceptions/NMI, raw reason otherwise),
+    // so it is the streak key. Snap only at multiples of 1024 -- normal varied
+    // traffic never reaches 1024, so this adds zero CMOS I/O to the hot path.
+    {
+        ULONG wcpu = KeGetCurrentProcessorNumberEx(NULL);
+        if (wcpu < 64)
+        {
+            if (g_wedge_reason_last[wcpu] == (UINT32)pcpu_byte)
+                _InterlockedIncrement(&g_wedge_reason_streak[wcpu]);
+            else
+            {
+                g_wedge_reason_last[wcpu] = (UINT32)pcpu_byte;
+                _InterlockedExchange(&g_wedge_reason_streak[wcpu], 1);
+            }
+            LONG ws = g_wedge_reason_streak[wcpu];
+            if (ws >= 1024 && (ws & 0x3FF) == 0)
+                wedge_cmos_snap_reinj((UINT32)ws, (UINT64)pcpu_byte);
+
+            // RIP-stuck detector (see g_wedge_rip_streak above). vcpu->vmexit_rip was
+            // read earlier (VMCS_GUEST_RIP, line ~1465). Same RIP across 1024+ exits =
+            // guest frozen (liveloop). Snap (streak, rip_low32 | 0x1) is distinguishable
+            // on readback from pcpu_byte (<=0xFF) and #PF fault addr (bit0 clear).
+            UINT32 wrip = (UINT32)vcpu->vmexit_rip;
+            if (g_wedge_rip_last[wcpu] == wrip)
+                _InterlockedIncrement(&g_wedge_rip_streak[wcpu]);
+            else
+            {
+                g_wedge_rip_last[wcpu] = wrip;
+                _InterlockedExchange(&g_wedge_rip_streak[wcpu], 1);
+            }
+            LONG wrs = g_wedge_rip_streak[wcpu];
+            if (wrs >= 1024 && (wrs & 0x3FF) == 0)
+                wedge_cmos_snap_reinj((UINT32)wrs, (UINT64)wrip | 0x1);
+
+            // throttle CMOS snap+end to every 8th exit (see g_wedge_snap_ctr above)
+            wedge_do_snap = (_InterlockedIncrement(&g_wedge_snap_ctr[wcpu]) % 8) == 0;
+        }
+    }
+    if (wedge_do_snap)
+        wedge_percpu_mark(KeGetCurrentProcessorNumberEx(NULL), (UCHAR)(pcpu_byte | 0x40));
 
     switch (exit_reason)
     {
@@ -1786,6 +1935,30 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                 // must set CR2 to the fault address before re-injection.
                 //
                 asm_write_cr2(vcpu->exit_qual);
+                // WEDGE reinject livelock probe (replaces per-#PF 0x0E port I/O, which was
+                // on the hot #PF path under EAC's storm). Per-CPU consecutive same-addr
+                // streak in memory; only a livelocked CPU (same instr re-#PFing -> HV
+                // re-injects -> tight loop) reaches 1024 and snaps to CMOS. Normal activity
+                // resolves each NX #PF -> next #PF is a different addr -> streak resets ->
+                // never snaps -> zero hot-path port I/O. FETCH-gated (bit4=0x10) as before.
+                if (pf_error_code & 0x10)
+                {
+                    ULONG wcpu = KeGetCurrentProcessorNumberEx(NULL);
+                    if (wcpu < 64)
+                    {
+                        UINT64 wfa = vcpu->exit_qual;
+                        if (wfa == g_wedge_reinj_addr[wcpu])
+                            _InterlockedIncrement(&g_wedge_reinj_streak[wcpu]);
+                        else
+                        {
+                            g_wedge_reinj_addr[wcpu] = wfa;
+                            _InterlockedExchange(&g_wedge_reinj_streak[wcpu], 1);
+                        }
+                        LONG ws = g_wedge_reinj_streak[wcpu];
+                        if (ws >= 1024 && (ws & 0x3FF) == 0)
+                            wedge_cmos_snap_reinj((UINT32)ws, wfa);
+                    }
+                }
             }
 
             if (int_info.InterruptionType == INTERRUPT_TYPE_NMI)
@@ -2054,5 +2227,12 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         result = TRUE;
 
     vcpu->in_root = FALSE;
+    // WEDGE: clear the in-handler bit (0x40) on the 1-in-8 exits that snapped (see
+    // g_wedge_snap_ctr). If the handler wedged on a snap exit, control never reaches
+    // here, so the byte keeps 0x40 = stuck. Non-snap-exit wedges show a stale byte;
+    // the in-memory detectors (every exit) still catch liveloops. Exit path is
+    // lock-free, so a true deadlock is not expected.
+    if (wedge_do_snap)
+        wedge_percpu_mark(KeGetCurrentProcessorNumberEx(NULL), pcpu_byte);
     return result;
 }

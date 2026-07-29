@@ -17,6 +17,12 @@ static volatile LONG g_dbg_shadow_timer_skip = 0;
 static volatile LONG g_wedge_reinj_streak[64];
 static UINT64        g_wedge_reinj_addr[64];
 
+// EPT violation livelock threshold: after this many consecutive unhandled
+// EPT violations at the same RIP, inject #GP + advance RIP to break the loop.
+// Without this, unresolvable EPT violations (MMIO, unmapped phys) loop forever
+// -> CPU stuck in VMX-root -> CLOCK_WATCHDOG_TIMEOUT BSOD.
+#define EPT_VIOLATION_MAX_RETRIES 64
+
 // WEDGE liveloop detector: per-CPU consecutive same-exit streak. The vmexit case
 // bodies and the epilogue are all lock-free with no loops, so a frozen system
 // (hard-reset, guest makes zero progress) can ONLY be a liveloop -- the same exit
@@ -64,14 +70,14 @@ static UCHAR g_percpu_last[32];
 static __forceinline VOID
 wedge_percpu_mark(UINT32 cpu, UCHAR val)
 {
-    if (cpu >= 32)
-        return;
-    if (g_percpu_last[cpu] == val)
-        return;
-    g_percpu_last[cpu] = val;
-    __outbyte(0x70, (WEDGE_CMOS_PERCPU_BASE + cpu) | 0x80);
-    __outbyte(0x71, val);
-    __outbyte(0x70, 0x0D);  // re-enable NMI
+    // WEDGE instrumentation disabled: __outbyte(0x70/0x71) are GLOBAL CMOS
+    // ports shared across all CPUs. Concurrent writes race, corrupt the CMOS
+    // index register, and leave NMI masked (port 0x70 bit7) -> under load this
+    // starves/locks CPUs -> CLOCK_WATCHDOG / hard hang. In-memory liveloop
+    // counters below are untouched (free, no port I/O); only the CMOS snap is
+    // gone. This debug probe is not needed for normal operation.
+    UNREFERENCED_PARAMETER(cpu);
+    UNREFERENCED_PARAMETER(val);
 }
 
 static __forceinline VOID
@@ -243,7 +249,7 @@ vmx_return_rip_for_vmxoff(VOID)
 // Strategy:
 //   before VMXON, we cache what the real CPU returns for an out-of-range leaf.
 //   during VM-exit, if the guest queries an invalid/hypervisor leaf, we return
-//   the cached response 鈥?identical to what bare metal would return.
+//   the cached response �?identical to what bare metal would return.
 //   for leaf 1, we clear ECX[31] (hypervisor present bit).
 //
 
@@ -303,7 +309,7 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
     UINT32      target_msr = (UINT32)(regs->rcx & 0xFFFFFFFF);
 
     //
-    // hypervisor synthetic MSRs (0x40000000+) 鈥?inject #GP on bare metal
+    // hypervisor synthetic MSRs (0x40000000+) �?inject #GP on bare metal
     // this includes Hyper-V (0x40000000-0x400000FF) and KVM (0x4b564d00-02) MSRs
     //
     if (target_msr >= 0x40000000 && target_msr <= 0x4FFFFFFF)
@@ -347,7 +353,7 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
         // intercepted via MSR bitmap. in the handler, __rdtsc() returns raw
         // hardware TSC (no offset in VMX root), so we apply TSC_OFFSET manually.
         // per SDM 27.6.5, "use TSC offsetting" applies the same offset to RDTSC,
-        // RDTSCP, and RDMSR of this MSR 鈥?interception is only needed so the
+        // RDTSCP, and RDMSR of this MSR �?interception is only needed so the
         // TSC compensation path can also cover RDMSR-based timing attacks.
         //
         case 0x10:
@@ -387,7 +393,7 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
 
         default:
             //
-            // VMX capability MSRs (0x480-0x493) 鈥?always readable on VMX-capable
+            // VMX capability MSRs (0x480-0x493) �?always readable on VMX-capable
             // CPUs regardless of FEATURE_CONTROL lock state. return real values
             // to match bare-metal behavior for stealth.
             //
@@ -398,7 +404,7 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
             }
 
             //
-            // unhandled 鈥?never forward to hardware in VMX-root, would #GP
+            // unhandled �?never forward to hardware in VMX-root, would #GP
             // and hit our private IDT halt handler. inject #GP(0) to guest.
             //
             vmexit_inject_gp();
@@ -428,7 +434,7 @@ vmexit_handle_msr_write(VIRTUAL_MACHINE_STATE * vcpu)
     msr.Fields.High = (ULONG)regs->rdx;
 
     //
-    // hypervisor synthetic MSRs 鈥?inject #GP
+    // hypervisor synthetic MSRs �?inject #GP
     //
     if (target_msr >= 0x40000000 && target_msr <= 0x4FFFFFFF)
     {
@@ -473,7 +479,7 @@ vmexit_handle_msr_write(VIRTUAL_MACHINE_STATE * vcpu)
 
         default:
             //
-            // unhandled 鈥?never forward to hardware in VMX-root, would #GP
+            // unhandled �?never forward to hardware in VMX-root, would #GP
             // and hit our private IDT halt handler. inject #GP(0) to guest.
             //
             vmexit_inject_gp();
@@ -575,7 +581,7 @@ vmexit_handle_mov_cr(VIRTUAL_MACHINE_STATE * vcpu)
             {
                 //
                 // prefer RetainingGlobals (type 3) to preserve global kernel
-                // tlb entries 鈥?matches bare-metal mov cr3 behavior
+                // tlb entries �?matches bare-metal mov cr3 behavior
                 //
                 INVVPID_DESCRIPTOR desc = {0};
                 desc.Vpid = VPID_TAG;
@@ -668,7 +674,7 @@ vmexit_handle_mov_cr(VIRTUAL_MACHINE_STATE * vcpu)
         }
         break;
     }
-    case 2: // CLTS 鈥?clear CR0.TS (bit 3)
+    case 2: // CLTS �?clear CR0.TS (bit 3)
     {
         UINT64  guest_cr0 = 0;
         UINT64  shadow    = 0;
@@ -689,7 +695,7 @@ vmexit_handle_mov_cr(VIRTUAL_MACHINE_STATE * vcpu)
         __vmx_vmwrite(VMCS_CTRL_CR0_READ_SHADOW, shadow);
         break;
     }
-    case 3: // LMSW 鈥?load machine status word (bits 0-3 of CR0)
+    case 3: // LMSW �?load machine status word (bits 0-3 of CR0)
     {
         //
         // LMSW loads PE, MP, EM, TS from source data in exit qualification.
@@ -705,7 +711,7 @@ vmexit_handle_mov_cr(VIRTUAL_MACHINE_STATE * vcpu)
 
         //
         // Bits 1-3 (MP, EM, TS): loaded from source
-        // Bit 0 (PE): can be set, never cleared 鈥?OR with current value
+        // Bit 0 (PE): can be set, never cleared �?OR with current value
         //
         guest_cr0 = (guest_cr0 & ~0xEULL) | (src & 0xEULL) | ((guest_cr0 | src) & 1ULL);
         shadow    = (shadow    & ~0xEULL) | (src & 0xEULL) | ((shadow    | src) & 1ULL);
@@ -735,7 +741,7 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
     //
     if (ept_handle_violation(vcpu, guest_phys, vcpu->exit_qual))
     {
-        // handled 鈥?don't advance RIP, the guest will re-execute
+        // handled �?don't advance RIP, the guest will re-execute
         vcpu->advance_rip = FALSE;
         return;
     }
@@ -750,12 +756,44 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
     }
 
     //
-    // unhandled EPT violation 鈥?鍙兘鏄垰 unhook 浣?TLB 杩樻病鍒锋柊
-    // 鍋氫竴娆?INVEPT 璁?CPU 閲嶈瘯锛圥TE 宸叉仮澶?RWX锛岄噸璇曞悗涓嶄細鍐?violation锛?
-    // 濡傛灉纭疄鏄?EPT 閰嶇疆閿欒锛岄噸璇曞嚑娆″悗绯荤粺浼氳嚜鐒舵仮澶嶆垨瑙﹀彂 misconfig
+    // unhandled EPT violation �?鍙兘鏄垰 unhook �?TLB 杩樻病鍒锋柊
+    // 鍋氫竴娆?INVEPT �?CPU 閲嶈瘯锛圥TE 宸叉仮澶?RWX锛岄噸璇曞悗涓嶄細鍐?violation�?
+    // 濡傛灉纭疄�?EPT 閰嶇疆閿欒锛岄噸璇曞嚑娆″悗绯荤粺浼氳嚜鐒舵仮澶嶆垨瑙﹀�?misconfig
     //
     // PITFALL #13: Don't inject #GP - page may have been unhooked but TLB stale.
     // FIX: INVEPT flushes stale TLB, CPU retries with updated PTE (now RWX), no more violation.
+    //
+    // Livelock detection: if the same guest RIP keeps causing unhandled EPT
+    // violations (e.g., MMIO access to unmapped physical address), infinite
+    // retry causes CLOCK_WATCHDOG_TIMEOUT (CPU stuck in VMX-root, can't
+    // process IPIs). After EPT_VIOLATION_MAX_RETRIES consecutive same-RIP
+    // violations, inject #GP and advance RIP to break the loop.
+    //
+    {
+        UINT64 guest_rip = 0;
+        __vmx_vmread(VMCS_GUEST_RIP, &guest_rip);
+
+        if (vcpu->ept_violation_rip == guest_rip)
+        {
+            vcpu->ept_violation_count++;
+        }
+        else
+        {
+            vcpu->ept_violation_rip    = guest_rip;
+            vcpu->ept_violation_count  = 1;
+        }
+
+        if (vcpu->ept_violation_count >= EPT_VIOLATION_MAX_RETRIES)
+        {
+            // Break the livelock: inject #GP and advance RIP
+            vcpu->ept_violation_count = 0;
+            vcpu->ept_violation_rip   = 0;
+            vmexit_inject_gp();
+            vcpu->advance_rip = TRUE;
+            return;
+        }
+    }
+
     ept_invept_single(vcpu->ept_pointer);
     vcpu->advance_rip = FALSE;
 }
@@ -863,12 +901,12 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
     PGUEST_REGS regs = vcpu->regs;
 
     // WEDGE: 0xE0 = at-entry (before ept_handle_vmcall_hook). VMCALL is rare so sub-marks
-    // here are nearly free (unlike epilogue marks which hit the frequent NMI path -> 宸ㄥ崱).
+    // here are nearly free (unlike epilogue marks which hit the frequent NMI path -> 宸ㄥ�?.
     // 0xE1=after-hook 0xE2=after-stealth 0xE3=after-CPL(at switch). stuck byte = last reached.
     wedge_percpu_mark(KeGetCurrentProcessorNumberEx(NULL), 0xE0);
 
     //
-    // EPT hook / stealth VMCALL dispatch 鈥?MUST run before CPL check.
+    // EPT hook / stealth VMCALL dispatch �?MUST run before CPL check.
     //
     // Ring 3 EPT hooks (type 1) and stealth oneshot pages embed VMCALL (0F 01 C1)
     // in user-mode execute pages. the CPU executes vmcall from CPL=3 which causes
@@ -998,7 +1036,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             UINT64 _saved_cr3 = vmx_enter_guest_cr3();
 
             //
-            // for R3 unhook: need caller_cr3 to resolve R3 VA 鈫?PA
+            // for R3 unhook: need caller_cr3 to resolve R3 VA �?PA
             // switch from system CR3 to caller_cr3 if provided
             //
             UINT64 _pre_unhook_cr3 = 0;
@@ -1083,13 +1121,13 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         case VMCALL_EPT_HOOK_INJECT:
         {
             //
-            // shellcode inject via EPT hook 鈥?all data pre-built at PASSIVE_LEVEL.
+            // shellcode inject via EPT hook �?all data pre-built at PASSIVE_LEVEL.
             // NO user VA access in VMX-root (SMAP safe).
             // rdx = pointer to EPT_HOOK_INJECT_PARAM (kernel NonPaged memory)
             //
             // CRITICAL: must switch to system CR3 for private host CR3 mode.
             // inj pointer and its buffers (fake_page_buffer, pt_page_copy) are
-            // post-init NonPaged pool allocations 鈥?not mapped in private CR3.
+            // post-init NonPaged pool allocations �?not mapped in private CR3.
             //
             #define _POOL_TAG_HOOKED_PAGE 1
             #define _POOL_TAG_HOOKED_FUNC 2
@@ -1162,11 +1200,11 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             if (_InterlockedCompareExchange(&inj->installed, 1, 0) != 0)
             {
                 //
-                // lost interlock 鈥?another CPU is doing the full install.
+                // lost interlock �?another CPU is doing the full install.
                 // don't wait for the list entry (spin may not be enough on 20 CPUs).
                 // just split THIS CPU's EPT and set X=0. the global list entry
                 // (for violation/VMCALL dispatch) will be available once the winner
-                // CPU completes InsertHeadList 鈥?the list is shared across all CPUs.
+                // CPU completes InsertHeadList �?the list is shared across all CPUs.
                 //
                 PEPT_PML2_ENTRY p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
                 if (p2 && p2->LargePage)
@@ -1175,7 +1213,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 if (p1) { p1->ReadAccess = 1; p1->WriteAccess = 1; p1->ExecuteAccess = 0; }
 
                 //
-                // enable #PF interception on this CPU (lazy 鈥?the #PF handler
+                // enable #PF interception on this CPU (lazy �?the #PF handler
                 // will split the PT page when the first instruction-fetch #PF fires).
                 // we can't read hp->fake_pt yet because the winner CPU may still be
                 // building the list entry. the #PF handler will find it via the list.
@@ -1210,7 +1248,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             RtlZeroMemory(fi, sizeof(*fi));
             InitializeListHead(&hp->hooked_functions_list);
 
-            // split 2MB 鈫?4KB
+            // split 2MB �?4KB
             PEPT_PML2_ENTRY pml2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
             PEPT_PML1_ENTRY pte = NULL;
             if (pml2 && pml2->LargePage)
@@ -1239,11 +1277,11 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 hp->pfn_of_fake_page_contents = fake_pfn;
             }
             hp->entry_address = pte;
-            hp->target_cr3 = 0;  // global (no CR3 filtering 鈥?private page, safe)
+            hp->target_cr3 = 0;  // global (no CR3 filtering �?private page, safe)
 
             RtlCopyMemory(hp->fake_page_va, inj->fake_page_buffer, PAGE_SIZE);
 
-            // EPT X-only on fake page physical page (anti-cheat phys scan 鈫?EPT violation)
+            // EPT X-only on fake page physical page (anti-cheat phys scan �?EPT violation)
             {
                 SIZE_T fake_phys = (SIZE_T)(hp->pfn_of_fake_page_contents << 12);
                 PEPT_PML2_ENTRY fp2 = ept_get_pml2(vcpu->ept_page_table, fake_phys);
@@ -1304,7 +1342,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                     hp->pt_pte_index  = inj->pt_pte_index;
                     inj->fake_pt_ok   = TRUE;
 
-                    // create exec PT page (NX=0) 鈥?separate physical page
+                    // create exec PT page (NX=0) �?separate physical page
                     UINT64 exec_pfn = 0;
                     PUINT8 exec_page = stealth_region_alloc_page(&exec_pfn);
                     if (exec_page)
@@ -1319,7 +1357,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                         // build EPT entry for exec PT page
                         // CRITICAL: must have W=1! CPU sets Accessed bit in PTE during
                         // page walk by WRITING to the PT page. if W=0, the write causes
-                        // an EPT violation that no handler recognizes 鈫?infinite loop 鈫?BSOD.
+                        // an EPT violation that no handler recognizes �?infinite loop �?BSOD.
                         // (pt_fake_entry has W=0 for write-sync, but exec PT needs W=1)
                         hp->pt_exec_entry = fpt->pt_fake_entry;
                         hp->pt_exec_entry.PageFrameNumber = exec_pfn;
@@ -1329,12 +1367,12 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             }
 
             // when fake PT is active, set initial EPT to execute view (changed_entry).
-            // execution is controlled by fake PT (NX=1 鈫?#PF), NOT by EPT X bit.
+            // execution is controlled by fake PT (NX=1 �?#PF), NOT by EPT X bit.
             // if we leave EPT X=0, we get double VMEXIT (first #PF, then EPT violation)
-            // and the MTF handler can only restore one per trap 鈫?infinite loop.
+            // and the MTF handler can only restore one per trap �?infinite loop.
             //
-            // with EPT X=1 (changed_entry): read 鈫?R=0 鈫?EPT violation 鈫?zeros.
-            //                               exec 鈫?EPT ok 鈫?fake PT NX=1 鈫?#PF 鈫?exec PT 鈫?run.
+            // with EPT X=1 (changed_entry): read �?R=0 �?EPT violation �?zeros.
+            //                               exec �?EPT ok �?fake PT NX=1 �?#PF �?exec PT �?run.
             if (hp->fake_pt && hp->exec_pt_page)
             {
                 pte->AsUInt = hp->changed_entry.AsUInt;
@@ -1650,7 +1688,7 @@ VOID
 vmexit_handle_triple_fault(VIRTUAL_MACHINE_STATE * vcpu)
 {
     UNREFERENCED_PARAMETER(vcpu);
-    // WEDGE-TF (CMOS 0x0F): guest triple-faulted. Last mark on a 鍗℃ (freeze)
+    // WEDGE-TF (CMOS 0x0F): guest triple-faulted. Last mark on a 鍗℃�?(freeze)
     // boot => the freeze IS the guest-TF re-entry loop: this handler is a no-op
     // (advance_rip=FALSE), so VM-entry re-enters the same faulting RIP -> guest
     // TFs again -> infinite loop = freeze. A host TF would reset (not freeze)
@@ -1755,7 +1793,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
 #if STEALTH_COMPENSATE_TIMING
     //
-    // capture TSC as early as possible 鈥?used by TSC compensation to measure
+    // capture TSC as early as possible �?used by TSC compensation to measure
     // handler overhead. Must be before any other work.
     //
     UINT64 exit_tsc_start = __rdtsc();
@@ -1889,7 +1927,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         break;
 
     //
-    // VMX instructions in guest 鈥?inject #UD (bare metal behavior)
+    // VMX instructions in guest �?inject #UD (bare metal behavior)
     //
     case VMX_EXIT_REASON_EXECUTE_VMCLEAR:
     case VMX_EXIT_REASON_EXECUTE_VMPTRLD:
@@ -1908,7 +1946,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         break;
 
     case VMX_EXIT_REASON_EXECUTE_INVD:
-        // INVD would discard dirty cache lines 鈥?use WBINVD instead
+        // INVD would discard dirty cache lines �?use WBINVD instead
         __wbinvd();
         break;
 
@@ -2001,7 +2039,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         // arm RDTSC exiting for the next instruction. the timing attack
         // pattern is RDTSC -> CPUID -> RDTSC. By trapping the next RDTSC,
         // we can return a compensated value that hides VM-exit overhead.
-        // TSC_OFFSET is never modified 鈥?zero drift.
+        // TSC_OFFSET is never modified �?zero drift.
         //
         if (g_stealth_enabled)
         {
@@ -2061,10 +2099,10 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     case VMX_EXIT_REASON_EPT_MISCONFIGURATION:
     {
         //
-        // EPT misconfiguration is a host-side fault 鈥?the EPT entry has
+        // EPT misconfiguration is a host-side fault �?the EPT entry has
         // invalid configuration (reserved bits, write-only, etc).
         // the guest didn't cause this and can't handle it.
-        // enter shutdown state 鈥?system will triple-fault cleanly.
+        // enter shutdown state �?system will triple-fault cleanly.
         //
         __vmx_vmwrite(VMCS_CTRL_VMENTRY_INTERRUPTION_INFORMATION_FIELD, 0);
         __vmx_vmwrite(VMCS_GUEST_ACTIVITY_STATE, GUEST_ACTIVITY_STATE_SHUTDOWN);
@@ -2079,7 +2117,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     case VMX_EXIT_REASON_EXECUTE_XSETBV:
     {
         //
-        // XSETBV 鈥?stealth: proper validation per Intel SDM
+        // XSETBV �?stealth: proper validation per Intel SDM
         //
         // Defeats:
         //   - XSETBV with high bits in ECX should #GP
@@ -2147,23 +2185,29 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                 (rflags_raw & (1ULL << 9)) &&
                 !(intr_state & (GUEST_INTR_STATE_BLOCKING_BY_STI |
                                 GUEST_INTR_STATE_BLOCKING_BY_MOV_SS));
-
+            // Respect guest CR8/TPR priority. ack-interrupt-on-exit already EOI'd the
+            // interrupt at the LAPIC during the VM-exit, so when CR8 masks the
+            // vector, dropping it is safe (IRR cleared by hardware) and cannot
+            // cause a re-exit loop. We must NOT inject regardless of CR8: that
+            // bypasses the guest's TPR and runs the IDT handler when the OS
+            // explicitly asked to mask it.
             if (guest_interruptible)
             {
                 UINT8 vector_priority = (UINT8)(vector >> 4);
-                if (vector_priority <= vcpu->guest_cr8)
-                    guest_interruptible = FALSE;
-            }
-
-            if (guest_interruptible)
-            {
-                vmexit_inject_interrupt(vector);
+                if (vector_priority > vcpu->guest_cr8)
+                {
+                    // deliverable + CR8 allows: inject. guest IDT handler EOIs.
+                    vmexit_inject_interrupt(vector);
+                }
+                // else: CR8/TPR masks -> drop (already EOI'd, safe).
             }
             else
             {
                 //
-                // guest can't take it now 鈥?defer and enable
-                // interrupt-window exiting to inject later
+                // guest can't take it now (IF=0, STI/MOV-SS blocking) - defer
+                // and enable interrupt-window exiting to inject later. The
+                // window handler clears window-exiting unconditionally to avoid
+                // a re-exit loop, and drops if CR8 still masks.
                 //
                 vcpu->pending_ext_vector = (UINT8)vector;
                 vcpu->has_pending_ext_interrupt = TRUE;
@@ -2219,9 +2263,9 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                     if (ept_stealth_handle_pf(vcpu, fault_addr, (UINT32)pf_error_code))
                     {
                         //
-                        // handled 鈥?don't inject #PF, don't advance RIP.
+                        // handled �?don't inject #PF, don't advance RIP.
                         // CPU will retry the instruction after VMRESUME.
-                        // page walk will now read real PT page (NX=0) 鈫?execute succeeds.
+                        // page walk will now read real PT page (NX=0) �?execute succeeds.
                         //
                         vcpu->advance_rip = FALSE;
                         break;
@@ -2237,7 +2281,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                 }
 
                 //
-                // not our stealth page 鈥?fall through to re-inject #PF normally.
+                // not our stealth page �?fall through to re-inject #PF normally.
                 // must set CR2 to the fault address before re-injection.
                 //
                 asm_write_cr2(vcpu->exit_qual);
@@ -2271,7 +2315,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
             {
                 //
                 // with virtual NMIs, the NMI exit sets blocking-by-NMI.
-                // clear it before reinjecting 鈥?the NMI was intercepted
+                // clear it before reinjecting �?the NMI was intercepted
                 // before guest delivery, and VM-entry re-sets blocking
                 // when it delivers the injected NMI (SDM 26.6.1.2).
                 //
@@ -2308,16 +2352,25 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         {
             UINT8 vector_priority = (UINT8)(vcpu->pending_ext_vector >> 4);
 
+            // ALWAYS clear interrupt-window exiting first. The window is open
+            // (IF=1, no STI/SS blocking), so leaving it set would re-exit on
+            // the very next VM-entry -> infinite loop -> CLOCK_WATCHDOG. This
+            // was the original bug.
+            size_t proc_ctrl = 0;
+            __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &proc_ctrl);
+            proc_ctrl &= ~(size_t)CPU_BASED_VM_EXEC_CTRL_INTERRUPT_WINDOW_EXITING;
+            __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, proc_ctrl);
+
             if (vector_priority > vcpu->guest_cr8)
             {
-                size_t proc_ctrl = 0;
-                __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &proc_ctrl);
-                proc_ctrl &= ~(size_t)CPU_BASED_VM_EXEC_CTRL_INTERRUPT_WINDOW_EXITING;
-                __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, proc_ctrl);
-
+                // window open and CR8 allows: deliver the deferred interrupt.
                 vmexit_inject_interrupt(vcpu->pending_ext_vector);
-                vcpu->has_pending_ext_interrupt = FALSE;
             }
+            // else: CR8/TPR still masks. drop - the IRQ was already EOI'd by
+            // ack-interrupt-on-exit at the original external-interrupt VM-exit,
+            // so this is safe and cannot loop.
+
+            vcpu->has_pending_ext_interrupt = FALSE;
         }
         else
         {
@@ -2407,7 +2460,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
     //
     // re-inject IDT vectoring event if one was in progress during this VM-exit.
-    // skip when vmxoff has been executed 鈥?vmread would #UD outside VMX.
+    // skip when vmxoff has been executed �?vmread would #UD outside VMX.
     //
     if (!vcpu->vmxoff.executed)
     {
@@ -2448,18 +2501,18 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                     }
                     else if (should_generate_df(idt_vec.Vector, exit_int.Vector))
                     {
-                        // contributory+contributory, PF+contributory, PF+PF 鈫?#DF
+                        // contributory+contributory, PF+contributory, PF+PF �?#DF
                         vmexit_inject_df();
                         reinject_idt = FALSE;
                     }
-                    // else: benign combination 鈥?reinject IDT event,
+                    // else: benign combination �?reinject IDT event,
                     // exit exception regenerates during delivery
                 }
             }
 
             if (reinject_idt)
             {
-                // if the handler already queued an NMI injection, defer it 鈥?
+                // if the handler already queued an NMI injection, defer it �?
                 // IDT vectoring event takes priority
                 size_t entry_info_raw = 0;
                 __vmx_vmread(VMCS_CTRL_VMENTRY_INTERRUPTION_INFORMATION_FIELD, &entry_info_raw);

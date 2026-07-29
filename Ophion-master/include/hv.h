@@ -156,54 +156,25 @@ vmx_leave_guest_cr3(UINT64 saved)
 static __forceinline VOID
 wedge_cmos_mark(UCHAR v)
 {
-    __outbyte(0x70, WEDGE_CMOS_VALUE_OFF | 0x80);
-    __outbyte(0x71, v);
-    __outbyte(0x70, WEDGE_CMOS_MAGIC_OFF | 0x80);
-    __outbyte(0x71, WEDGE_CMOS_MAGIC);
-    __outbyte(0x70, 0x0D);  // re-enable NMI (clear bit7)
+    UNREFERENCED_PARAMETER(v);
 }
 
 static __forceinline VOID
 wedge_cmos_read(UCHAR *magic, UCHAR *val)
 {
-    __outbyte(0x70, WEDGE_CMOS_MAGIC_OFF | 0x80);
-    *magic = __inbyte(0x71);
-    __outbyte(0x70, WEDGE_CMOS_VALUE_OFF | 0x80);
-    *val = __inbyte(0x71);
-    __outbyte(0x70, 0x0D);  // re-enable NMI
+    if (magic) *magic = 0;
+    if (val) *val = 0;
 }
 
 static __forceinline VOID
 wedge_cmos_clear(VOID)
 {
-    __outbyte(0x70, WEDGE_CMOS_MAGIC_OFF | 0x80);
-    __outbyte(0x71, 0);
-    __outbyte(0x70, WEDGE_CMOS_MATCH_OFF | 0x80);
-    __outbyte(0x71, 0);
-    __outbyte(0x70, WEDGE_CMOS_TRIG_OFF | 0x80);
-    __outbyte(0x71, 0);
-    // reinject livelock probe (0x54-0x5F, 12 bytes)
-    for (UINT32 i = 0; i < 12; i++)
-    {
-        __outbyte(0x70, (WEDGE_CMOS_REINJ_CNT_OFF + i) | 0x80);
-        __outbyte(0x71, 0);
-    }
-    // per-CPU last-exit bytes (0x60-0x7F, 32 bytes).
-    for (UINT32 i = 0; i < 32; i++)
-    {
-        __outbyte(0x70, (WEDGE_CMOS_PERCPU_BASE + i) | 0x80);
-        __outbyte(0x71, 0);
-    }
-    __outbyte(0x70, 0x0D);  // re-enable NMI
 }
 
 // Set the sticky "match seen" flag (idempotent). Called at WEDGE 0x0B.
 static __forceinline VOID
 wedge_cmos_set_match_seen(VOID)
 {
-    __outbyte(0x70, WEDGE_CMOS_MATCH_OFF | 0x80);
-    __outbyte(0x71, 0x01);
-    __outbyte(0x70, 0x0D);  // re-enable NMI
 }
 
 // Read the sticky "match seen" flag (0 = no match this run, 1 = a stealth page
@@ -211,19 +182,13 @@ wedge_cmos_set_match_seen(VOID)
 static __forceinline UCHAR
 wedge_cmos_read_match_seen(VOID)
 {
-    __outbyte(0x70, WEDGE_CMOS_MATCH_OFF | 0x80);
-    UCHAR m = __inbyte(0x71);
-    __outbyte(0x70, 0x0D);  // re-enable NMI
-    return m;
+    return 0;
 }
 
 // Set the sticky "trigger seen" flag (idempotent). Called at WEDGE 0x01.
 static __forceinline VOID
 wedge_cmos_set_trig_seen(VOID)
 {
-    __outbyte(0x70, WEDGE_CMOS_TRIG_OFF | 0x80);
-    __outbyte(0x71, 0x01);
-    __outbyte(0x70, 0x0D);  // re-enable NMI
 }
 
 // Read the sticky "trigger seen" flag (0 = trigger never fired this run, 1 = the
@@ -231,10 +196,8 @@ wedge_cmos_set_trig_seen(VOID)
 static __forceinline UCHAR
 wedge_cmos_read_trig_seen(VOID)
 {
-    __outbyte(0x70, WEDGE_CMOS_TRIG_OFF | 0x80);
-    UCHAR t = __inbyte(0x71);
-    __outbyte(0x70, 0x0D);  // re-enable NMI
-    return t;
+    // disabled: CMOS port I/O races across CPUs. Return 0 (not seen).
+    return 0;
 }
 
 // Snap the reinject livelock probe (streak + fault addr) to CMOS. Called ONLY when
@@ -243,31 +206,10 @@ wedge_cmos_read_trig_seen(VOID)
 static __forceinline VOID
 wedge_cmos_snap_reinj(UINT32 streak, UINT64 addr)
 {
-    __outbyte(0x70, WEDGE_CMOS_REINJ_CNT_OFF | 0x80);
-    __outbyte(0x71, (UCHAR)(streak));
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_CNT_OFF + 1) | 0x80);
-    __outbyte(0x71, (UCHAR)(streak >> 8));
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_CNT_OFF + 2) | 0x80);
-    __outbyte(0x71, (UCHAR)(streak >> 16));
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_CNT_OFF + 3) | 0x80);
-    __outbyte(0x71, (UCHAR)(streak >> 24));
-    __outbyte(0x70, WEDGE_CMOS_REINJ_ADDR_OFF | 0x80);
-    __outbyte(0x71, (UCHAR)(addr));
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 1) | 0x80);
-    __outbyte(0x71, (UCHAR)(addr >> 8));
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 2) | 0x80);
-    __outbyte(0x71, (UCHAR)(addr >> 16));
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 3) | 0x80);
-    __outbyte(0x71, (UCHAR)(addr >> 24));
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 4) | 0x80);
-    __outbyte(0x71, (UCHAR)(addr >> 32));
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 5) | 0x80);
-    __outbyte(0x71, (UCHAR)(addr >> 40));
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 6) | 0x80);
-    __outbyte(0x71, (UCHAR)(addr >> 48));
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 7) | 0x80);
-    __outbyte(0x71, (UCHAR)(addr >> 56));
-    __outbyte(0x70, 0x0D);  // re-enable NMI
+    // disabled: CMOS port I/O races across CPUs under load (see vmexit.cpp).
+    // livelock info is kept in-memory only; no port writes.
+    UNREFERENCED_PARAMETER(streak);
+    UNREFERENCED_PARAMETER(addr);
 }
 
 // Read back the reinject livelock probe. streak==0 (+ addr==0) = no livelock this
@@ -275,48 +217,16 @@ wedge_cmos_snap_reinj(UINT32 streak, UINT64 addr)
 static __forceinline VOID
 wedge_cmos_read_reinj(UINT32 *streak, UINT64 *addr)
 {
-    UINT32 s = 0;
-    UINT64 a = 0;
-    __outbyte(0x70, WEDGE_CMOS_REINJ_CNT_OFF | 0x80);
-    s = __inbyte(0x71);
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_CNT_OFF + 1) | 0x80);
-    s |= (UINT32)__inbyte(0x71) << 8;
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_CNT_OFF + 2) | 0x80);
-    s |= (UINT32)__inbyte(0x71) << 16;
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_CNT_OFF + 3) | 0x80);
-    s |= (UINT32)__inbyte(0x71) << 24;
-    __outbyte(0x70, WEDGE_CMOS_REINJ_ADDR_OFF | 0x80);
-    a = __inbyte(0x71);
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 1) | 0x80);
-    a |= (UINT64)__inbyte(0x71) << 8;
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 2) | 0x80);
-    a |= (UINT64)__inbyte(0x71) << 16;
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 3) | 0x80);
-    a |= (UINT64)__inbyte(0x71) << 24;
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 4) | 0x80);
-    a |= (UINT64)__inbyte(0x71) << 32;
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 5) | 0x80);
-    a |= (UINT64)__inbyte(0x71) << 40;
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 6) | 0x80);
-    a |= (UINT64)__inbyte(0x71) << 48;
-    __outbyte(0x70, (WEDGE_CMOS_REINJ_ADDR_OFF + 7) | 0x80);
-    a |= (UINT64)__inbyte(0x71) << 56;
-    __outbyte(0x70, 0x0D);  // re-enable NMI
-    *streak = s;
-    *addr = a;
+    if (streak) *streak = 0;
+    if (addr) *addr = 0;
 }
 
 // Read one CPU's last-exit byte (0x60+cpu). Called from DriverEntry readback.
 static __forceinline UCHAR
 wedge_cmos_read_percpu(UINT32 cpu)
 {
-    UCHAR v = 0;
-    if (cpu >= 32)
-        return 0;
-    __outbyte(0x70, (WEDGE_CMOS_PERCPU_BASE + cpu) | 0x80);
-    v = __inbyte(0x71);
-    __outbyte(0x70, 0x0D);  // re-enable NMI
-    return v;
+    UNREFERENCED_PARAMETER(cpu);
+    return 0;
 }
 
 //

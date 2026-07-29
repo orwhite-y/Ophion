@@ -71,6 +71,7 @@ extern VOID asm_host_df_handler(VOID);
 extern VOID asm_host_gp_handler(VOID);
 extern VOID asm_host_default_handler(VOID);
 
+extern VOID asm_host_pf_handler(VOID);
 //
 // Length Disassembly Engine (lde64.asm)
 // rcx = address to disassemble, edx = mode (0=32-bit, 64=64-bit)

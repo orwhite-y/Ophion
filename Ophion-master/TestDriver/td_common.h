@@ -1,4 +1,4 @@
-ï»¿/*
+/*
 *   td_common.h - shared declarations for TestDriver (split from test_driver.cpp)
 */
 #pragma once
@@ -72,7 +72,7 @@ typedef struct _TD_PEB_LDR_DATA {
 #define VMCALL_EPT_UNHOOK_BY_CR3 0x0000000A   // retire all R3 hooks for a CR3 (no CR3 switch - safe from process-exit callback)
 
 //
-// EPT hook inject param é—‚?pre-built at PASSIVE_LEVEL, passed to VMX-root.
+// EPT hook inject param é—?pre-built at PASSIVE_LEVEL, passed to VMX-root.
 // must match Ophion's EPT_HOOK_INJECT_PARAM.
 //
 #pragma pack(push, 8)
@@ -285,7 +285,7 @@ typedef struct _TD_INJECT_RENDERDOC_PARAMS {
 #pragma pack(pop)
 
 //
-// R3 EPT hook params é—‚?from user-mode app via DeviceIoControl
+// R3 EPT hook params é—?from user-mode app via DeviceIoControl
 //
 typedef struct _TD_R3_HOOK_PARAMS {
     UINT64 target_pid;          // [in]  target process PID
@@ -376,6 +376,45 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
 #define IOCTL_INSTALL_TRIGGER_JUMP CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 9, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_FREE_SHADOW_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 10, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_SHADOW_PROTECT_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 11, METHOD_BUFFERED, FILE_ANY_ACCESS)
+// ---- HV memory read/write via VMCALL (R0 path, no CR3 caching) ----
+#define IOCTL_HV_READ_MEM   CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 17, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_HV_WRITE_MEM  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 18, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_HV_QUERY_VA   CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 19, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_HV_DETECT     CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 20, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// VMCALL subcodes (must match Ophion include/hv_types.h)
+#define HV_VMCALL_READ_MEM   0x0000000B
+#define HV_VMCALL_WRITE_MEM  0x0000000C
+#define HV_VMCALL_QUERY_VA   0x0000000D
+#define HV_VMCALL_QUERY_CR3  0x0000000E
+#define HV_MEM_MAX           4096
+
+// VMCALL memory request struct (rdx pointer to hypervisor, must match VMCALL_MEM_REQUEST)
+typedef struct _HV_MEM_REQUEST {
+    UINT64  target_cr3;     // [in] 0 = resolve from target_pid
+    UINT64  target_va;      // [in] VA in target
+    UINT32  size;           // [in] bytes (max HV_MEM_MAX)
+    UINT32  status;         // [out] NTSTATUS
+    UINT64  result;         // [out] bytes copied
+    UINT8   data[HV_MEM_MAX];
+} HV_MEM_REQUEST, *PHV_MEM_REQUEST;
+
+// IOCTL param (CE <-> TestDriver, METHOD_BUFFERED SystemBuffer)
+typedef struct _TD_HV_MEM_RW {
+    UINT64  target_pid;       // [in] process to read/write
+    UINT64  target_va;        // [in] VA in target
+    UINT32  size;             // [in] bytes (max HV_MEM_MAX)
+    UINT32  status;           // [out] NTSTATUS from hypervisor
+    UINT64  result;           // [out] bytes transferred
+    UINT8   data[HV_MEM_MAX]; // [out read] / [in write]
+} TD_HV_MEM_RW, *PTD_HV_MEM_RW;
+
+// IOCTL detect param
+typedef struct _TD_HV_DETECT {
+    UINT64  target_pid;   // [in]  pid to query CR3 for (0 = self)
+    UINT64  cr3;          // [out] resolved CR3 (0 = not found / no VMX)
+    UINT32  vmx_active;   // [out] 1 = VMCALL succeeded (VMX-root present)
+} TD_HV_DETECT, *PTD_HV_DETECT;
 
 #define TD_MAX_INJECT_RW_SIZE (16ULL * 1024ULL * 1024ULL)
 

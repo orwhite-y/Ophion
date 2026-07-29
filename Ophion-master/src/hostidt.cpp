@@ -9,6 +9,7 @@ extern VOID asm_host_nmi_handler(VOID);
 extern VOID asm_host_df_handler(VOID);
 extern VOID asm_host_gp_handler(VOID);
 extern VOID asm_host_default_handler(VOID);
+extern VOID asm_host_pf_handler(VOID);
 
 static VOID
 hostidt_set_gate(
@@ -45,7 +46,7 @@ hostidt_build(VOID)
     g_host_idt.original_idt_base = asm_get_idt_base();
 
     //
-    // default handler halts cpu â€” anything unexpected is a bug
+    // default handler halts cpu â€?anything unexpected is a bug
     //
     for (UINT32 i = 0; i < IDT_NUM_ENTRIES; i++)
         hostidt_set_gate(&g_host_idt.idt[i], (UINT64)asm_host_default_handler, cs, IDT_TYPE_INTERRUPT_GATE, 0);
@@ -60,6 +61,13 @@ hostidt_build(VOID)
     //
     hostidt_set_gate(&g_host_idt.idt[IDT_VECTOR_DF], (UINT64)asm_host_df_handler, cs, IDT_TYPE_INTERRUPT_GATE, 0);
     hostidt_set_gate(&g_host_idt.idt[IDT_VECTOR_GP], (UINT64)asm_host_gp_handler, cs, IDT_TYPE_INTERRUPT_GATE, 0);
+
+    //
+    // #PF: advance RIP instead of halting. A #PF in VMX-root means we accessed
+    // a page not mapped in the private host CR3. Halting causes CLOCK_WATCHDOG_TIMEOUT.
+    // Advancing RIP lets the CPU continue (skips the faulting instruction).
+    //
+    hostidt_set_gate(&g_host_idt.idt[IDT_VECTOR_PF], (UINT64)asm_host_pf_handler, cs, IDT_TYPE_INTERRUPT_GATE, 0);
 
     g_host_idt.initialized = TRUE;
     return TRUE;

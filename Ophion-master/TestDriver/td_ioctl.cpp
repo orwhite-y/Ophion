@@ -2499,29 +2499,30 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             KeAcquireSpinLock(&g_pfc_lock, &old_irql);
             TdMemCacheInvalidate();
 
+            // Zero-copy write: pass SystemBuffer (p) directly as the vmcall
+            // request.  TD_HV_MEM_RW and VMCALL_MEM_REQUEST share identical
+            // layout at offsets 8+ (target_va, size, status, result, data[]).
+            // Setting offset 0 (target_pid) to 0 makes the VMX-root handler
+            // see target_cr3=0 and resolve the CR3 from r9 (target_pid).
+            // p->data already holds the write payload from CE -- no copy.
             BOOLEAN vmc_ok = FALSE;
-            if (g_pfc_req)
             {
-                PHV_MEM_REQUEST req = g_pfc_req;
-                req->target_cr3 = 0;
-                req->target_va  = p->target_va;
-                req->size       = p->size;
-                req->status     = 0;
-                req->result     = 0;
-                RtlCopyMemory(req->data, p->data, (SIZE_T)p->size);
+                UINT64 saved_pid = p->target_pid;
+                p->target_pid = 0;    // seen as target_cr3=0 by VMX-root
+                p->status     = 0;
+                p->result     = 0;
 
                 __try {
                     NTSTATUS vr = hv_vmcall_simple(
-                        HV_VMCALL_WRITE_MEM, (UINT64)req, 0, p->target_pid);
+                        HV_VMCALL_WRITE_MEM, (UINT64)p, 0, saved_pid);
                     if (vr == STATUS_SUCCESS) vmc_ok = TRUE;
                 } __except (EXCEPTION_EXECUTE_HANDLER) {
                     vmc_ok = FALSE;        // #UD: Ophion not loaded
                 }
+                p->target_pid = saved_pid;  // restore for CE
 
-                if (vmc_ok && req->result > 0)
+                if (vmc_ok && p->result > 0)
                 {
-                    p->status = req->status;
-                    p->result = req->result;
                     irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
                     KeReleaseSpinLock(&g_pfc_lock, old_irql);
                     st = STATUS_SUCCESS;
@@ -2577,25 +2578,33 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 // ============================================================
                 if (sz >= HV_PFC_SIZE)
                 {
-                    req->target_cr3 = 0;
-                    req->target_va  = va;
-                    req->size       = sz;
-                    req->status     = 0;
-                    req->result     = 0;
+                    // Zero-copy fast path: pass the IOCTL SystemBuffer (p)
+                    // directly as the vmcall request.  TD_HV_MEM_RW and
+                    // VMCALL_MEM_REQUEST share identical layout at offsets
+                    // 8+ (target_va, size, status, result, data[]).  Setting
+                    // offset 0 (target_pid) to 0 -> VMX-root sees target_cr3=0
+                    // and resolves CR3 from r9 (pid).  The vmcall writes
+                    // target_va directly into p->data -- zero intermediate
+                    // copies.  Combined with vmexit.cpp opt A (R0 caller
+                    // skips scratch), this is a single memcpy per 64 KB read.
+                    UINT64 saved_pid = p->target_pid;
+                    p->target_pid = 0;    // seen as target_cr3=0 by VMX-root
+                    p->status     = 0;
+                    p->result     = 0;
+                    // p->target_va and p->size already set by CE
 
                     __try {
                         NTSTATUS vr = hv_vmcall_simple(
-                            HV_VMCALL_READ_MEM, (UINT64)req, 0, (UINT64)pid);
+                            HV_VMCALL_READ_MEM, (UINT64)p, 0, saved_pid);
                         if (vr == STATUS_SUCCESS) vmc_ok = TRUE;
                     } __except (EXCEPTION_EXECUTE_HANDLER) {
                         vmc_ok = FALSE;        // #UD: Ophion not loaded
                     }
+                    p->target_pid = saved_pid;  // restore for CE
 
-                    if (vmc_ok && req->result > 0)
+                    if (vmc_ok && p->result > 0)
                     {
-                        RtlCopyMemory(p->data, req->data, (SIZE_T)req->result);
-                        p->status = req->status;
-                        p->result = req->result;
+                        // p->data already filled by vmcall -- no copy needed
                         irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
                         KeReleaseSpinLock(&g_pfc_lock, old_irql);
                         st = STATUS_SUCCESS;

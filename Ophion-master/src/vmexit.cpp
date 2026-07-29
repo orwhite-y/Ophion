@@ -1531,8 +1531,14 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 break;
             }
 
-            PUCHAR scratch = hv_get_scratch();
-            if (!scratch)
+            // R0 caller (TestDriver): req->data is a kernel VA (NonPagedPool
+            // SystemBuffer), globally mapped in all CR3s.  Copy directly
+            // target_va -> req->data under the target CR3, skipping the
+            // scratch intermediary (saves one 64 KB memcpy per read).
+            // R3 caller: req->data is a user VA valid only under caller CR3,
+            // so scratch is still needed as intermediary.
+            PUCHAR scratch = (caller_pid == 0) ? NULL : hv_get_scratch();
+            if (caller_pid != 0 && !scratch)
             {
                 req->status = (UINT32)STATUS_INSUFFICIENT_RESOURCES;
                 req->result = 0;
@@ -1540,8 +1546,9 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 regs->rax = (UINT64)STATUS_INSUFFICIENT_RESOURCES;
                 break;
             }
+            PUCHAR dst = (caller_pid == 0) ? req->data : scratch;
 
-            // switch to target CR3, copy target_va -> scratch
+            // switch to target CR3, copy target_va -> dst
             // CR3-switch critical section: interrupts OFF. Ophion runs VMX-root
             // under a private host CR3+IDT; a timer interrupt under the target
             // CR3 runs the host-IDT handler in the wrong address space -> #PF
@@ -1560,7 +1567,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 UINT64 chunk = 0x1000 - off;
                 if (chunk > (UINT64)size - done) chunk = (UINT64)size - done;
                 if (!hv_walk_va(target_cr3, cur, NULL, FALSE)) break;
-                RtlCopyMemory(scratch + done, (PVOID)(UINT_PTR)cur, (SIZE_T)chunk);
+                RtlCopyMemory(dst + done, (PVOID)(UINT_PTR)cur, (SIZE_T)chunk);
                 done += chunk;
                 cur  += chunk;
             }
@@ -1568,8 +1575,9 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             vmx_leave_guest_cr3(s_target);  // back to caller CR3 (or private host for R0)
             __writeeflags(_saved_flags);  // restore interrupt state
 
-            // copy scratch -> data[] (caller user VA valid again)
-            if (done) RtlCopyMemory(req->data, scratch, (SIZE_T)done);
+            // R3 caller: copy scratch -> data[] (user VA valid again under caller CR3)
+            // R0 caller: data[] already filled directly, nothing to do.
+            if (caller_pid != 0 && done) RtlCopyMemory(req->data, scratch, (SIZE_T)done);
             req->result = done;
             req->status = (done == size) ? (UINT32)STATUS_SUCCESS
                                          : (UINT32)STATUS_SOME_NOT_MAPPED;
@@ -1615,8 +1623,11 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 break;
             }
 
-            PUCHAR scratch = hv_get_scratch();
-            if (!scratch)
+            // R0 caller: req->data is a kernel VA, globally mapped in all CR3s.
+            // Copy directly req->data -> target_va under target CR3 (no scratch).
+            // R3 caller: req->data is a user VA; stage via scratch first.
+            PUCHAR scratch = (caller_pid == 0) ? NULL : hv_get_scratch();
+            if (caller_pid != 0 && !scratch)
             {
                 req->status = (UINT32)STATUS_INSUFFICIENT_RESOURCES;
                 req->result = 0;
@@ -1625,10 +1636,11 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 break;
             }
 
-            // copy data[] -> scratch (under caller CR3, user VA valid)
-            RtlCopyMemory(scratch, req->data, (SIZE_T)size);
+            // R3: copy data[] -> scratch (under caller CR3, user VA valid)
+            if (caller_pid != 0) RtlCopyMemory(scratch, req->data, (SIZE_T)size);
+            PUCHAR src = (caller_pid == 0) ? req->data : scratch;
 
-            // switch to target CR3, copy scratch -> target_va
+            // switch to target CR3, copy src -> target_va
             // CR3-switch critical section: interrupts OFF (see READ_MEM note).
             UINT64 _saved_flags = __readeflags();
             _disable();
@@ -1642,7 +1654,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 UINT64 chunk = 0x1000 - off;
                 if (chunk > (UINT64)size - done) chunk = (UINT64)size - done;
                 if (!hv_walk_va(target_cr3, cur, NULL, TRUE)) break;
-                RtlCopyMemory((PVOID)(UINT_PTR)cur, scratch + done, (SIZE_T)chunk);
+                RtlCopyMemory((PVOID)(UINT_PTR)cur, src + done, (SIZE_T)chunk);
                 done += chunk;
                 cur  += chunk;
             }

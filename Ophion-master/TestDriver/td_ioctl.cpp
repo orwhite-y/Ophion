@@ -2408,16 +2408,15 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         break;
     }
     // ================================================================
-    //  HV memory read/write  --  NATIVE R0 path (NO vmcall, NO VMX-root)
-    //  CE -> IOCTL -> TestDriver(R0) -> MmCopyVirtualMemory
+    // ================================================================
+    //  HV memory read/write  --  VMX-root path (primary) + R0 fallback
     //
-    //  The Ophion READ_MEM/WRITE_MEM vmcall handler performs a raw
-    //  __writecr3(target_cr3) + RtlCopyMemory INSIDE VMX-root. If a
-    //  timer/NMI fires during that window the host IDT runs under the
-    //  wrong CR3 -> 0x101 CLOCK_WATCHDOG_TIMEOUT / 0x50 #PF -> freeze.
-    //  MmCopyVirtualMemory is the canonical, proven cross-process copy
-    //  API and runs in normal R0 (full interrupt + #PF handling).
-    //  Ophion stays loaded for EPT-hook stealth; plain R/W needs no HV.
+    //  CE -> IOCTL -> TestDriver(R0) -> vmcall -> Ophion VMX-root.
+    //  Ophion switches to the target CR3 (interrupts OFF via cli) and
+    //  copies through the PML4 self-map. Stealth path: no
+    //  MmCopyVirtualMemory, no KeStackAttach, no ObRef trace.
+    //  If Ophion is not loaded, vmcall raises #UD -> fall back to
+    //  native MmCopyVirtualMemory (proven cross-process copy in R0).
     // ================================================================
     case IOCTL_HV_READ_MEM:
     case IOCTL_HV_WRITE_MEM:
@@ -2432,6 +2431,38 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
         BOOLEAN is_write = (io->Parameters.DeviceIoControl.IoControlCode == IOCTL_HV_WRITE_MEM);
 
+        // --- primary: VMX-root vmcall (stealth) ---
+        HV_MEM_REQUEST req;
+        RtlZeroMemory(&req, sizeof(req));
+        req.target_cr3 = 0;            // Ophion resolves from target_pid (r9)
+        req.target_va  = p->target_va;
+        req.size       = p->size;
+        if (is_write)
+            RtlCopyMemory(req.data, p->data, (SIZE_T)p->size);
+
+        BOOLEAN vmc_ok = FALSE;
+        __try {
+            NTSTATUS vr = hv_vmcall_simple(
+                is_write ? HV_VMCALL_WRITE_MEM : HV_VMCALL_READ_MEM,
+                (UINT64)&req, 0, p->target_pid);
+            if (vr == STATUS_SUCCESS)
+                vmc_ok = TRUE;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            vmc_ok = FALSE;            // #UD: Ophion (VMX) not loaded
+        }
+
+        if (vmc_ok)
+        {
+            if (!is_write)
+                RtlCopyMemory(p->data, req.data, (SIZE_T)p->size);
+            p->status = req.status;
+            p->result = req.result;
+            irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
+            st = STATUS_SUCCESS;       // IOCTL ok; per-call result in p->status
+            break;
+        }
+
+        // --- fallback: native R0 MmCopyVirtualMemory (no VMX present) ---
         PEPROCESS target = NULL;
         NTSTATUS look = PsLookupProcessByProcessId((HANDLE)p->target_pid, &target);
         if (!NT_SUCCESS(look))
@@ -2482,7 +2513,6 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         st = STATUS_SUCCESS;   // IOCTL ok; per-call result in p->status
         break;
     }
-
     case IOCTL_HV_QUERY_VA:
     {
         if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_HV_MEM_RW) ||

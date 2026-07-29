@@ -1535,6 +1535,14 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             }
 
             // switch to target CR3, copy target_va -> scratch
+            // CR3-switch critical section: interrupts OFF. Ophion runs VMX-root
+            // under a private host CR3+IDT; a timer interrupt under the target
+            // CR3 runs the host-IDT handler in the wrong address space -> #PF
+            // -> CPU halt (0x101/0x50). SEH is unavailable in VMX-root, so we
+            // must block interrupts for the brief switch (4-level walk + <=4KB
+            // copy = sub-us, far below any watchdog timeout).
+            UINT64 _saved_flags = __readeflags();
+            _disable();
             UINT64 s_target = vmx_enter_cr3(target_cr3);
             _mm_mfence();
             UINT64 done = 0;
@@ -1551,6 +1559,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             }
             _mm_mfence();
             vmx_leave_guest_cr3(s_target);  // back to caller CR3 (or private host for R0)
+            __writeeflags(_saved_flags);  // restore interrupt state
 
             // copy scratch -> data[] (caller user VA valid again)
             if (done) RtlCopyMemory(req->data, scratch, (SIZE_T)done);
@@ -1604,6 +1613,9 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             RtlCopyMemory(scratch, req->data, (SIZE_T)size);
 
             // switch to target CR3, copy scratch -> target_va
+            // CR3-switch critical section: interrupts OFF (see READ_MEM note).
+            UINT64 _saved_flags = __readeflags();
+            _disable();
             UINT64 s_target = vmx_enter_cr3(target_cr3);
             _mm_mfence();
             UINT64 done = 0;
@@ -1620,6 +1632,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             }
             _mm_mfence();
             vmx_leave_guest_cr3(s_target);
+            __writeeflags(_saved_flags);  // restore interrupt state
 
             req->result = done;
             req->status = (done == size) ? (UINT32)STATUS_SUCCESS
@@ -1656,12 +1669,15 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 break;
             }
 
+            UINT64 _saved_flags = __readeflags();
+            _disable();
             UINT64 s_target = vmx_enter_cr3(target_cr3);
             _mm_mfence();
             UINT64 pa = 0;
             BOOLEAN present = hv_walk_va(target_cr3, target_va, &pa, FALSE);
             _mm_mfence();
             vmx_leave_guest_cr3(s_target);
+            __writeeflags(_saved_flags);  // restore interrupt state
 
             req->result = present ? pa : 0;
             req->status = present ? (UINT32)STATUS_SUCCESS : (UINT32)STATUS_NOT_FOUND;

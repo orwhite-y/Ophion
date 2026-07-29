@@ -2514,7 +2514,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             RtlCopyMemory(out_buf, g_pfc_buf + (va - g_pfc_base), (SIZE_T)sz);
             hdr->status = (UINT32)STATUS_SUCCESS;
             hdr->result = sz;
-            irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
+            irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
             KeReleaseSpinLock(&g_pfc_lock, old_irql);
             st = STATUS_SUCCESS;
             break;
@@ -2549,7 +2549,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 {
                     hdr->status = req->status;
                     hdr->result = req->result;
-                    irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
+                    irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
                     KeReleaseSpinLock(&g_pfc_lock, old_irql);
                     st = STATUS_SUCCESS;
                     break;
@@ -2587,7 +2587,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                         RtlCopyMemory(out_buf, g_pfc_buf + (va - pbase), (SIZE_T)sz);
                         hdr->status = (UINT32)STATUS_SUCCESS;
                         hdr->result = sz;
-                        irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
+                        irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
                         KeReleaseSpinLock(&g_pfc_lock, old_irql);
                         st = STATUS_SUCCESS;
                         break;
@@ -2604,7 +2604,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         {
             hdr->status = (UINT32)look;
             hdr->result = 0;
-            irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
+            irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
             st = STATUS_SUCCESS;
             break;
         }
@@ -2621,7 +2621,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
         KeUnstackDetachProcess(&apc);
         ObDereferenceObject(target);
-        irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
+        irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
         st = STATUS_SUCCESS;
         break;
     }
@@ -2678,7 +2678,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             {
                 hdr->status = req->status;
                 hdr->result = req->result;
-                irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
+                irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
                 KeReleaseSpinLock(&g_pfc_lock, old_irql);
                 st = STATUS_SUCCESS;
                 break;
@@ -2693,7 +2693,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         {
             hdr->status = (UINT32)look;
             hdr->result = 0;
-            irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
+            irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
             st = STATUS_SUCCESS;
             break;
         }
@@ -2710,7 +2710,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
         KeUnstackDetachProcess(&apc);
         ObDereferenceObject(target);
-        irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
+        irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
         st = STATUS_SUCCESS;
         break;
     }

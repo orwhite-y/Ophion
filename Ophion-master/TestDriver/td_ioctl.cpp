@@ -2563,47 +2563,88 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 break;
             }
 
-            // --- cache miss: prefetch 64 KB aligned block via vmcall ---
+            // --- cache miss ---
             BOOLEAN vmc_ok = FALSE;
             if (g_pfc_req)
             {
-                UINT64 pbase = va & ~((UINT64)HV_PFC_SIZE - 1);
                 PHV_MEM_REQUEST req = g_pfc_req;
-                req->target_cr3 = 0;
-                req->target_va  = pbase;
-                req->size       = HV_PFC_SIZE;
-                req->status     = 0;
-                req->result     = 0;
 
-                __try {
-                    NTSTATUS vr = hv_vmcall_simple(
-                        HV_VMCALL_READ_MEM, (UINT64)req, 0, (UINT64)pid);
-                    if (vr == STATUS_SUCCESS) vmc_ok = TRUE;
-                } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    vmc_ok = FALSE;        // #UD: Ophion not loaded
-                }
-
-                if (vmc_ok && req->result > 0)
+                // ============================================================
+                //  Large read (>= 64 KB): direct vmcall for the full
+                //  requested size.  No cache overhead - sequential scans
+                //  never re-read the same 64 KB block, so caching just
+                //  adds a wasted 64 KB memcpy.  This is the scan hot path.
+                // ============================================================
+                if (sz >= HV_PFC_SIZE)
                 {
-                    UINT64 got = req->result;
-                    RtlCopyMemory(g_pfc_buf, req->data, (SIZE_T)got);
-                    g_pfc_pid  = pid;
-                    g_pfc_base = pbase;
-                    g_pfc_len  = got;
+                    req->target_cr3 = 0;
+                    req->target_va  = va;
+                    req->size       = sz;
+                    req->status     = 0;
+                    req->result     = 0;
 
-                    // serve this request from the freshly cached block
-                    if (va >= pbase && va + sz <= pbase + got)
+                    __try {
+                        NTSTATUS vr = hv_vmcall_simple(
+                            HV_VMCALL_READ_MEM, (UINT64)req, 0, (UINT64)pid);
+                        if (vr == STATUS_SUCCESS) vmc_ok = TRUE;
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        vmc_ok = FALSE;        // #UD: Ophion not loaded
+                    }
+
+                    if (vmc_ok && req->result > 0)
                     {
-                        RtlCopyMemory(p->data, g_pfc_buf + (va - pbase), (SIZE_T)sz);
-                        p->status = (UINT32)STATUS_SUCCESS;
-                        p->result = sz;
+                        RtlCopyMemory(p->data, req->data, (SIZE_T)req->result);
+                        p->status = req->status;
+                        p->result = req->result;
                         irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
                         KeReleaseSpinLock(&g_pfc_lock, old_irql);
                         st = STATUS_SUCCESS;
                         break;
                     }
-                    // partial result didn't cover the requested VA;
-                    // fall through to MmCopyVirtualMemory for this page
+                }
+                else
+                {
+                    // ========================================================
+                    //  Small read (< 64 KB): prefetch the full 64 KB block
+                    //  and cache it.  Subsequent reads in the same block
+                    //  hit the cache without any vmcall.
+                    // ========================================================
+                    UINT64 pbase = va & ~((UINT64)HV_PFC_SIZE - 1);
+                    req->target_cr3 = 0;
+                    req->target_va  = pbase;
+                    req->size       = HV_PFC_SIZE;
+                    req->status     = 0;
+                    req->result     = 0;
+
+                    __try {
+                        NTSTATUS vr = hv_vmcall_simple(
+                            HV_VMCALL_READ_MEM, (UINT64)req, 0, (UINT64)pid);
+                        if (vr == STATUS_SUCCESS) vmc_ok = TRUE;
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        vmc_ok = FALSE;        // #UD: Ophion not loaded
+                    }
+
+                    if (vmc_ok && req->result > 0)
+                    {
+                        UINT64 got = req->result;
+                        RtlCopyMemory(g_pfc_buf, req->data, (SIZE_T)got);
+                        g_pfc_pid  = pid;
+                        g_pfc_base = pbase;
+                        g_pfc_len  = got;
+
+                        if (va >= pbase && va + sz <= pbase + got)
+                        {
+                            RtlCopyMemory(p->data, g_pfc_buf + (va - pbase), (SIZE_T)sz);
+                            p->status = (UINT32)STATUS_SUCCESS;
+                            p->result = sz;
+                            irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
+                            KeReleaseSpinLock(&g_pfc_lock, old_irql);
+                            st = STATUS_SUCCESS;
+                            break;
+                        }
+                        // partial result didn't cover the requested VA;
+                        // fall through to MmCopyVirtualMemory for this page
+                    }
                 }
             }
             KeReleaseSpinLock(&g_pfc_lock, old_irql);

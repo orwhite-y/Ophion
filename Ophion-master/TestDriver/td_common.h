@@ -387,8 +387,8 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
 #define HV_VMCALL_WRITE_MEM  0x0000000C
 #define HV_VMCALL_QUERY_VA   0x0000000D
 #define HV_VMCALL_QUERY_CR3  0x0000000E
-#define HV_MEM_MAX           65536         // CE<->TestDriver IOCTL contract (64 KB per IOCTL)
-#define HV_VMCALL_MEM_MAX    65536         // vmcall batch size (16 pages, must match Ophion HV_R3_MEM_MAX)
+#define HV_MEM_MAX           131072         // CE<->TestDriver IOCTL contract (64 KB per IOCTL)
+#define HV_VMCALL_MEM_MAX    131072         // vmcall batch size (16 pages, must match Ophion HV_R3_MEM_MAX)
 
 // Header-only subset of HV_MEM_REQUEST (same field offsets, no data[]).
 // Safe to place on the kernel stack for QUERY_VA / QUERY_CR3 which never touch data[].

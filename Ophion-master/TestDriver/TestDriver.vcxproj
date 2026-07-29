@@ -90,7 +90,14 @@
   </ItemDefinitionGroup>
   <!-- Source -->
   <ItemGroup>
-    <ClCompile Include="test_driver.cpp" />
+    <ClCompile Include="td_shadow.cpp" />
+    <ClCompile Include="td_inject.cpp" />
+    <ClCompile Include="td_ept_hook.cpp" />
+    <ClCompile Include="td_pe_mapper.cpp" />
+    <ClCompile Include="td_ioctl.cpp" />
+    <ClCompile Include="td_stealth_track.cpp" />
+    <ClCompile Include="td_notify.cpp" />
+    <ClCompile Include="td_driver.cpp" />
     <ClCompile Include="log.cpp" />
   </ItemGroup>
   <ItemGroup>

@@ -1566,7 +1566,21 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 UINT64 off   = cur & 0xFFF;
                 UINT64 chunk = 0x1000 - off;
                 if (chunk > (UINT64)size - done) chunk = (UINT64)size - done;
-                if (!hv_walk_va(target_cr3, cur, NULL, FALSE)) break;
+                if (!hv_walk_va(target_cr3, cur, NULL, FALSE))
+                {
+                    // page not present (paged-out / not committed): VMX-root
+                    // runs interrupts-OFF and cannot fault-in paged-out pages.
+                    // Zero-fill this slice and CONTINUE instead of aborting:
+                    // a short read makes the CE caller advance by the full
+                    // requested size, silently skipping every committed page
+                    // after the gap. Zero-fill sacrifices only these cold
+                    // bytes (paged-out pages are never hot game data) while
+                    // keeping the rest of the region intact.
+                    RtlZeroMemory(dst + done, (SIZE_T)chunk);
+                    done += chunk;
+                    cur  += chunk;
+                    continue;
+                }
                 RtlCopyMemory(dst + done, (PVOID)(UINT_PTR)cur, (SIZE_T)chunk);
                 done += chunk;
                 cur  += chunk;
@@ -1653,7 +1667,14 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 UINT64 off   = cur & 0xFFF;
                 UINT64 chunk = 0x1000 - off;
                 if (chunk > (UINT64)size - done) chunk = (UINT64)size - done;
-                if (!hv_walk_va(target_cr3, cur, NULL, TRUE)) break;
+                if (!hv_walk_va(target_cr3, cur, NULL, TRUE))
+                {
+                    // not-present / read-only: skip slice, keep writing the
+                    // rest of the region (matches READ_MEM gap handling)
+                    done += chunk;
+                    cur  += chunk;
+                    continue;
+                }
                 RtlCopyMemory((PVOID)(UINT_PTR)cur, src + done, (SIZE_T)chunk);
                 done += chunk;
                 cur  += chunk;

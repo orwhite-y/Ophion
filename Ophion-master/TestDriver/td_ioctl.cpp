@@ -2502,11 +2502,11 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         UINT64 va  = hdr->target_va;
         HANDLE pid = (HANDLE)hdr->target_pid;
 
-        // --- READ: prefetch cache + zero-copy vmcall ---
+        // --- READ: cache hit (lock) + large vmcall (lock-free) + small cache (lock) ---
         KIRQL old_irql;
-        KeAcquireSpinLock(&g_pfc_lock, &old_irql);
 
-        // cache hit: serve from cached block
+        // 1) cache hit: serve from cached block (fast, under lock)
+        KeAcquireSpinLock(&g_pfc_lock, &old_irql);
         if (pid == g_pfc_pid &&
             va >= g_pfc_base &&
             va + sz <= g_pfc_base + g_pfc_len)
@@ -2519,46 +2519,50 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             st = STATUS_SUCCESS;
             break;
         }
+        KeReleaseSpinLock(&g_pfc_lock, old_irql);
 
-        // cache miss
-        BOOLEAN vmc_ok = FALSE;
-        if (g_pfc_req)
+        // 2) large read (>= cache block): stack-local HV_MEM_REQUEST, NO lock.
+        //    Each scanner thread vmcalls on its own CPU with its own stack
+        //    req, so reads run fully concurrent across cores. The old code
+        //    shared one global g_pfc_req under a single spinlock -> every
+        //    read serialized -> 1x throughput regardless of core count.
+        if (sz >= HV_PFC_SIZE)
         {
-            HV_MEM_REQUEST * req = g_pfc_req;
+            HV_MEM_REQUEST sreq;
+            sreq.target_cr3 = 0;
+            sreq.target_va  = va;
+            sreq.size       = sz;
+            sreq.status     = 0;
+            sreq.result     = 0;
+            sreq.data       = (PUCHAR)out_buf;
 
-            if (sz >= HV_PFC_SIZE)
-            {
-                // Large read (>= 256 KB): vmcall writes DIRECTLY to CE's
-                // MDL-mapped buffer.  Zero copies in TestDriver.
-                req->target_cr3 = 0;
-                req->target_va  = va;
-                req->size       = sz;
-                req->status     = 0;
-                req->result     = 0;
-                req->data       = (PUCHAR)out_buf;
-
-                __try {
-                    NTSTATUS vr = hv_vmcall_simple(
-                        HV_VMCALL_READ_MEM, (UINT64)req, 0, (UINT64)pid);
-                    if (vr == STATUS_SUCCESS) vmc_ok = TRUE;
-                } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    vmc_ok = FALSE;
-                }
-
-                if (vmc_ok && req->result > 0)
-                {
-                    hdr->status = req->status;
-                    hdr->result = req->result;
-                    irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
-                    KeReleaseSpinLock(&g_pfc_lock, old_irql);
-                    st = STATUS_SUCCESS;
-                    break;
-                }
+            BOOLEAN vmc_ok = FALSE;
+            __try {
+                NTSTATUS vr = hv_vmcall_simple(
+                    HV_VMCALL_READ_MEM, (UINT64)&sreq, 0, (UINT64)pid);
+                if (vr == STATUS_SUCCESS) vmc_ok = TRUE;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                vmc_ok = FALSE;
             }
-            else
+
+            if (vmc_ok && sreq.result > 0)
             {
-                // Small read: prefetch full 256 KB block into cache,
-                // then copy requested bytes to CE's buffer.
+                hdr->status = sreq.status;
+                hdr->result = sreq.result;
+                irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
+                st = STATUS_SUCCESS;
+                break;
+            }
+            // vmcall failed / Ophion absent -> fall through to R0 fallback
+        }
+        else
+        {
+            // 3) small read (< cache block): prefetch full block into the
+            //    shared cache under the lock, then copy out.
+            KeAcquireSpinLock(&g_pfc_lock, &old_irql);
+            if (g_pfc_req)
+            {
+                HV_MEM_REQUEST * req = g_pfc_req;
                 UINT64 pbase = va & ~((UINT64)HV_PFC_SIZE - 1);
                 req->target_cr3 = 0;
                 req->target_va  = pbase;
@@ -2567,6 +2571,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 req->result     = 0;
                 req->data       = g_pfc_buf;
 
+                BOOLEAN vmc_ok = FALSE;
                 __try {
                     NTSTATUS vr = hv_vmcall_simple(
                         HV_VMCALL_READ_MEM, (UINT64)req, 0, (UINT64)pid);
@@ -2594,8 +2599,8 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                     }
                 }
             }
+            KeReleaseSpinLock(&g_pfc_lock, old_irql);
         }
-        KeReleaseSpinLock(&g_pfc_lock, old_irql);
 
         // fallback: KeStackAttachProcess + RtlCopyMemory (no VMX present)
         PEPROCESS target = NULL;

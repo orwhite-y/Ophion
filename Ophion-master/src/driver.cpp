@@ -1,20 +1,56 @@
-/*
+﻿/*
 *   driver.c - Ophion hypervisor kernel driver
-*   pure hypervisor — no IOCTL, no device object.
+*   pure hypervisor 鈥?no IOCTL, no device object.
 *   all communication via VMCALL from other kernel drivers.
 */
 #include "hv.h"
 #include "log.h"
 #include <ntstrsafe.h>
 
+//
+// PID -> kernel CR3 cache. populated by PsSetCreateProcessNotifyRoutine +
+// initial enumeration at DriverEntry. read lock-free from VMX-root (kernel
+// space, mapped under the private host CR3). writes are spinlocked (R0 only).
+//
+// EPROCESS.DirectoryTableBase = kernel CR3 (full mapping incl. user half).
+// stable at 0x28 on Win10/11 x64.
+//
+#define EPROCESS_DIRTABLEBASE  0x28
+#define HV_PID_CR3_MAX         4096
+#define HV_MAX_CPUS            256
+#define HV_SCRATCH_SIZE        HV_R3_MEM_MAX   // 4096 (must match VMCALL_MEM_REQUEST.data)
+
+#ifndef STATUS_SOME_NOT_MAPPED
+#define STATUS_SOME_NOT_MAPPED ((NTSTATUS)0x00000107L)
+#endif
+
+typedef struct _HV_PID_CR3_ENTRY {
+    volatile HANDLE  pid;
+    volatile UINT64  cr3;
+} HV_PID_CR3_ENTRY;
+
+static HV_PID_CR3_ENTRY g_pid_cr3_table[HV_PID_CR3_MAX];
+static KSPIN_LOCK       g_pid_cr3_lock;
+static PUCHAR           g_scratch[HV_MAX_CPUS];
+static BOOLEAN          g_vmx_active = FALSE;
+
+// forward declarations (defined after wedge_write_wlog, used in DriverUnload)
+static NTSTATUS hv_pid_cr3_init(VOID);
+static VOID     hv_pid_cr3_fini(VOID);
+static NTSTATUS hv_scratch_init(VOID);
+static VOID     hv_scratch_fini(VOID);
 VOID
 DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
 {
     UNREFERENCED_PARAMETER(driver_obj);
     HYPERPLATFORM_LOG_INFO("[hv] Unloading hypervisor driver...");
 
+    g_vmx_active = FALSE;
+
     ept_stealth_free_all_broadcast();
     ept_stealth_region_destroy();
+    hv_pid_cr3_fini();
+    hv_scratch_fini();
     broadcast_terminate_all();
     vmx_terminate();
 
@@ -75,6 +111,161 @@ static BOOLEAN wedge_write_wlog(const char *buf, SIZE_T len)
     return NT_SUCCESS(wst);
 }
 
+//
+// PID -> CR3 cache management. writes are spinlocked (R0, PASSIVE/APC).
+// reads (hv_pid_to_cr3) are lock-free, called from VMX-root: the table is in
+// kernel space (NonPagedPool / static BSS), mapped under the private host CR3.
+// stale reads (process just died) are safe: hv_walk_va returns FALSE -> abort.
+//
+static void hv_pid_cr3_insert(HANDLE pid, UINT64 cr3)
+{
+    if (!pid || !cr3) return;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_pid_cr3_lock, &irql);
+    for (UINT32 i = 0; i < HV_PID_CR3_MAX; i++)
+    {
+        if (g_pid_cr3_table[i].pid == pid)
+        {
+            g_pid_cr3_table[i].cr3 = cr3;
+            KeReleaseSpinLock(&g_pid_cr3_lock, irql);
+            return;
+        }
+    }
+    for (UINT32 i = 0; i < HV_PID_CR3_MAX; i++)
+    {
+        if (g_pid_cr3_table[i].pid == 0)
+        {
+            g_pid_cr3_table[i].cr3 = cr3;
+            _mm_mfence();
+            g_pid_cr3_table[i].pid = pid;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_pid_cr3_lock, irql);
+}
+
+static void hv_pid_cr3_remove(HANDLE pid)
+{
+    if (!pid) return;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_pid_cr3_lock, &irql);
+    for (UINT32 i = 0; i < HV_PID_CR3_MAX; i++)
+    {
+        if (g_pid_cr3_table[i].pid == pid)
+        {
+            g_pid_cr3_table[i].pid = 0;
+            g_pid_cr3_table[i].cr3 = 0;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_pid_cr3_lock, irql);
+}
+
+// lock-free lookup, callable from VMX-root.
+UINT64 hv_pid_to_cr3(HANDLE pid)
+{
+    if (!pid) return 0;
+    for (UINT32 i = 0; i < HV_PID_CR3_MAX; i++)
+    {
+        if (g_pid_cr3_table[i].pid == pid)
+            return g_pid_cr3_table[i].cr3;
+    }
+    return 0;
+}
+
+// per-CPU scratch buffer for R3 memory copy (kernel VA, valid under any CR3).
+PUCHAR hv_get_scratch(VOID)
+{
+    ULONG cpu = KeGetCurrentProcessorNumberEx(NULL);
+    if (cpu < HV_MAX_CPUS && g_scratch[cpu])
+        return g_scratch[cpu];
+    return NULL;
+}
+
+static VOID hv_proc_notify(
+    _In_ HANDLE ParentId,
+    _In_ HANDLE ProcessId,
+    _In_ BOOLEAN Create)
+{
+    UNREFERENCED_PARAMETER(ParentId);
+    if (Create)
+    {
+        PEPROCESS eproc = NULL;
+        if (NT_SUCCESS(PsLookupProcessByProcessId(ProcessId, &eproc)) && eproc)
+        {
+            UINT64 cr3 = *(UINT64 *)((PUCHAR)eproc + EPROCESS_DIRTABLEBASE);
+            ObDereferenceObject(eproc);
+            hv_pid_cr3_insert(ProcessId, cr3);
+        }
+    }
+    else
+    {
+        hv_pid_cr3_remove(ProcessId);
+    }
+}
+
+// enumerate all existing processes at init (before hostcr3_build).
+static NTSTATUS hv_pid_cr3_init(VOID)
+{
+    KeInitializeSpinLock(&g_pid_cr3_lock);
+    RtlZeroMemory(g_pid_cr3_table, sizeof(g_pid_cr3_table));
+
+    for (ULONG pid = 0; pid <= 0xFFFF; pid++)
+    {
+        PEPROCESS eproc = NULL;
+        if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &eproc)) && eproc)
+        {
+            UINT64 cr3 = *(UINT64 *)((PUCHAR)eproc + EPROCESS_DIRTABLEBASE);
+            ObDereferenceObject(eproc);
+            hv_pid_cr3_insert((HANDLE)(ULONG_PTR)pid, cr3);
+        }
+    }
+
+    NTSTATUS st = PsSetCreateProcessNotifyRoutine(hv_proc_notify, FALSE);
+    if (!NT_SUCCESS(st))
+    {
+        HYPERPLATFORM_LOG_ERROR("[hv] PsSetCreateProcessNotifyRoutine failed: 0x%x", st);
+        return st;
+    }
+    HYPERPLATFORM_LOG_INFO("[hv] PID->CR3 cache initialized (%u entries max).", HV_PID_CR3_MAX);
+    return STATUS_SUCCESS;
+}
+
+static VOID hv_pid_cr3_fini(VOID)
+{
+    PsSetCreateProcessNotifyRoutine(hv_proc_notify, TRUE);
+}
+
+static NTSTATUS hv_scratch_init(VOID)
+{
+    ULONG n = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    if (n > HV_MAX_CPUS) n = HV_MAX_CPUS;
+    for (ULONG i = 0; i < n; i++)
+    {
+        g_scratch[i] = (PUCHAR)ExAllocatePoolWithTag(
+            NonPagedPool, HV_SCRATCH_SIZE, 'OscH');
+        if (!g_scratch[i])
+        {
+            HYPERPLATFORM_LOG_ERROR("[hv] scratch alloc failed for CPU %u", i);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
+    HYPERPLATFORM_LOG_INFO("[hv] Scratch buffers allocated for %u CPUs.", n);
+    return STATUS_SUCCESS;
+}
+
+static VOID hv_scratch_fini(VOID)
+{
+    for (ULONG i = 0; i < HV_MAX_CPUS; i++)
+    {
+        if (g_scratch[i])
+        {
+            ExFreePoolWithTag(g_scratch[i], 'OscH');
+            g_scratch[i] = NULL;
+        }
+    }
+}
+
 NTSTATUS
 DriverEntry(
     _In_ PDRIVER_OBJECT  driver_obj,
@@ -83,7 +274,7 @@ DriverEntry(
     UNREFERENCED_PARAMETER(registry_path);
 
     //
-    // init log system — buffer-based, safe for VMX-root via _SAFE macros
+    // init log system 鈥?buffer-based, safe for VMX-root via _SAFE macros
     //
     static const wchar_t kLogFilePath[] = L"\\SystemRoot\\O.log";
     auto log_status = LogInitialization(kLogPutLevelDebug, kLogFilePath);
@@ -168,6 +359,27 @@ DriverEntry(
     // the first phase mark the readback takes the marker= branch instead of no-marker.
     //   0x10 about-to-vmx_init | 0x11 VMX-on | 0x12 EPT-done | 0x13 ready
     //   0x1E EPT-fail(non-fatal) | 0x1F vmx_init FAILED
+    //
+    // PID->CR3 cache + scratch buffers MUST be allocated before vmx_init()
+    // (which calls hostcr3_build): NonPagedPool allocs after hostcr3_build are
+    // not mapped in the private host CR3 and would fault in VMX-root.
+    //
+    {
+        NTSTATUS _cr3st = hv_pid_cr3_init();
+        if (!NT_SUCCESS(_cr3st))
+        {
+            LogTermination();
+            return _cr3st;
+        }
+        NTSTATUS _scst = hv_scratch_init();
+        if (!NT_SUCCESS(_scst))
+        {
+            hv_pid_cr3_fini();
+            LogTermination();
+            return _scst;
+        }
+    }
+
     wedge_cmos_mark(0x10);
 
     if (!vmx_init())
@@ -181,6 +393,7 @@ DriverEntry(
     }
 
     wedge_cmos_mark(0x11);  // VMX is ON
+    g_vmx_active = TRUE;
 
     if (ept_stealth_region_init())
     {

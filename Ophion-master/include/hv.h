@@ -1,5 +1,5 @@
-/*
-*   hv.h - master hypervisor header — includes everything needed
+﻿/*
+*   hv.h - master hypervisor header 鈥?includes everything needed
 */
 #pragma once
 
@@ -35,7 +35,7 @@ UINT64 get_system_cr3(VOID);
 // (allocated before hostcr3_build, mapped in both private and system CR3).
 //
 // IMPORTANT: read all values from VMM stack (regs->xxx) BEFORE switching CR3.
-// the compiler may reorder reads across __writecr3 — use _mm_mfence if needed.
+// the compiler may reorder reads across __writecr3 鈥?use _mm_mfence if needed.
 //
 static __forceinline UINT64
 vmx_enter_guest_cr3(VOID)
@@ -136,7 +136,7 @@ vmx_leave_guest_cr3(UINT64 saved)
 // re-#PFs the same instruction, HV re-injects, tight loop = livelock) does that
 // CPU snap to CMOS. Normal activity never reaches 1024 consecutive same-addr
 // reinjects (each NX #PF is resolved by the guest handler -> next #PF is a
-// different addr -> streak resets), so normal CPUs never write. On a 卡死 (freeze)
+// different addr -> streak resets), so normal CPUs never write. On a 鍗℃ (freeze)
 // boot: streak>=1024 + addr = #PF reinject livelock on addr; streak=0 = no
 // livelock (deadlock, or normal activity). 4-byte streak @ 0x54, 8-byte VA @ 0x58.
 #define WEDGE_CMOS_REINJ_CNT_OFF   0x54
@@ -324,6 +324,13 @@ VOID    hostcr3_destroy(VOID);
 BOOLEAN hostcr3_map_va(PVOID va, SIZE_T size);
 
 //
+// PID -> kernel CR3 cache + per-CPU scratch buffer (driver.c)
+// lock-free lookup, callable from VMX-root.
+//
+UINT64  hv_pid_to_cr3(HANDLE pid);
+PUCHAR  hv_get_scratch(VOID);
+
+//
 // private host IDT (hostidt.c)
 //
 BOOLEAN hostidt_build(VOID);
@@ -385,16 +392,16 @@ VOID vpid_invvpid_single(UINT16 vpid);
 //   hook_type: 0 = absolute jump (14B), 1 = VMCALL (3B), 2 = INT3 (1B)
 //
 
-// VMX-root internal — called from VMCALL handler (guest CR3 must be active)
+// VMX-root internal 鈥?called from VMCALL handler (guest CR3 must be active)
 BOOLEAN ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req);
 BOOLEAN ept_unhook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_UNHOOK_VMCALL_PARAM req);
 VOID    ept_unhook_all(VOID);
 VOID    ept_unhook_by_cr3(VIRTUAL_MACHINE_STATE * vcpu, UINT64 target_cr3);
 
-// VMX-root safe EPT 2MB→4KB split (uses pre-allocated pool, NOT ExAllocatePool2)
+// VMX-root safe EPT 2MB鈫?KB split (uses pre-allocated pool, NOT ExAllocatePool2)
 PVMM_EPT_DYNAMIC_SPLIT ept_split_large_page_pool(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 
-// VMX-root handlers — called from vmexit dispatch
+// VMX-root handlers 鈥?called from vmexit dispatch
 BOOLEAN ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exit_qual);
 VOID    ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu);
 BOOLEAN ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu);
@@ -402,14 +409,14 @@ BOOLEAN ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu);
 //
 // stealth memory allocation (ept_stealth.cpp)
 //   allocates PAGE_READWRITE memory with hidden execute capability via EPT split
-//   read → clean data (no exec attr), execute → VMCALL → handler dispatch
+//   read 鈫?clean data (no exec attr), execute 鈫?VMCALL 鈫?handler dispatch
 //
 
-// stealth region — contiguous physical memory for shadow/fake pages
+// stealth region 鈥?contiguous physical memory for shadow/fake pages
 BOOLEAN ept_stealth_region_init(VOID);
 VOID    ept_stealth_region_destroy(VOID);
 
-// public API — PASSIVE_LEVEL
+// public API 鈥?PASSIVE_LEVEL
 BOOLEAN ept_stealth_alloc(PVOID target_va, PVOID handler_function);
 BOOLEAN ept_stealth_inject(PVOID target_va, PVOID shellcode, UINT32 shellcode_size);
 BOOLEAN ept_stealth_map_resident(PVOID target_va, SIZE_T size);
@@ -427,13 +434,13 @@ ept_stealth_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM req)
 BOOLEAN ept_stealth_uninstall(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_FREE_PARAM req);
 VOID    ept_stealth_free_all(VOID);
 
-// VMX-root handler — check if VMCALL came from a stealth page
+// VMX-root handler 鈥?check if VMCALL came from a stealth page
 BOOLEAN ept_handle_stealth_vmcall(VIRTUAL_MACHINE_STATE * vcpu);
 
 // EPT violation handler for stealth pages (target page + PT page writes)
 BOOLEAN ept_stealth_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exit_qual);
 
-// #PF handler — intercepts instruction-fetch page faults (NX violations)
+// #PF handler 鈥?intercepts instruction-fetch page faults (NX violations)
 // temporarily swaps PT page EPT to real view so CPU page walk sees NX=0
 BOOLEAN ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error_code);
 VOID    ept_update_pf_intercept(VIRTUAL_MACHINE_STATE * vcpu);

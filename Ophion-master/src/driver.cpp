@@ -1,4 +1,4 @@
-﻿/*
+/*
 *   driver.c - Ophion hypervisor kernel driver
 *   pure hypervisor 鈥?no IOCTL, no device object.
 *   all communication via VMCALL from other kernel drivers.
@@ -33,6 +33,11 @@ static HV_PID_CR3_ENTRY g_pid_cr3_table[HV_PID_CR3_MAX];
 static KSPIN_LOCK       g_pid_cr3_lock;
 static PUCHAR           g_scratch[HV_MAX_CPUS];
 static BOOLEAN          g_vmx_active = FALSE;
+
+// self-map index: PML4[S] points to PML4 itself. found at PASSIVE_LEVEL by
+// scanning the System PML4 for a self-referencing entry. used by hv_walk_va
+// in VMX-root to read PTEs through the self-map (lock-free, no pa_to_va).
+volatile UINT32         g_self_map_index = 0xFFFFFFFF;  // invalid until init
 
 // forward declarations (defined after wedge_write_wlog, used in DriverUnload)
 static NTSTATUS hv_pid_cr3_init(VOID);
@@ -171,6 +176,33 @@ UINT64 hv_pid_to_cr3(HANDLE pid)
             return g_pid_cr3_table[i].cr3;
     }
     return 0;
+}
+
+// Find the PML4 self-map index by scanning for a self-referencing entry.
+// Must run at PASSIVE_LEVEL (uses pa_to_va which acquires PFN DB lock).
+// The self-map index is the same for all processes (kernel-space constant).
+static NTSTATUS hv_selfmap_init(VOID)
+{
+    UINT64 sys_cr3 = get_system_cr3();
+    UINT64 pml4_pa = sys_cr3 & 0x000FFFFFFFFFF000ULL;
+    PUINT64 pml4 = (PUINT64)pa_to_va(pml4_pa);
+    if (!pml4)
+    {
+        HYPERPLATFORM_LOG_ERROR("[hv] selfmap init: pa_to_va(pml4) NULL");
+        return STATUS_UNSUCCESSFUL;
+    }
+    for (UINT32 i = 0; i < 512; i++)
+    {
+        if ((pml4[i] & 0x000FFFFFFFFFF000ULL) == pml4_pa && (pml4[i] & 1))
+        {
+            g_self_map_index = i;
+            HYPERPLATFORM_LOG_INFO("[hv] self-map index = 0x%x (PML4[%x] = %llx)",
+                i, i, pml4[i]);
+            return STATUS_SUCCESS;
+        }
+    }
+    HYPERPLATFORM_LOG_ERROR("[hv] selfmap init: no self-referencing PML4 entry found");
+    return STATUS_NOT_FOUND;
 }
 
 // per-CPU scratch buffer for R3 memory copy (kernel VA, valid under any CR3).
@@ -377,6 +409,17 @@ DriverEntry(
             hv_pid_cr3_fini();
             LogTermination();
             return _scst;
+        }
+    }
+
+    // find PML4 self-map index (must be before vmx_init / hostcr3_build).
+    // used by hv_walk_va in VMX-root to read PTEs without pa_to_va (deadlock-safe).
+    {
+        NTSTATUS _smst = hv_selfmap_init();
+        if (!NT_SUCCESS(_smst))
+        {
+            HYPERPLATFORM_LOG_ERROR("[hv] self-map init FAILED - R3 mem VMCALL disabled");
+            // non-fatal: hv_walk_va will return FALSE if index is invalid
         }
     }
 

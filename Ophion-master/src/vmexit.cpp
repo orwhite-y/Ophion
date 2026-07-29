@@ -1,4 +1,4 @@
-﻿/*
+/*
 *   vmexit.c - vm-exit handler dispatches exits to sub-handlers
 */
 #include "hv.h"
@@ -759,47 +759,105 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
     ept_invept_single(vcpu->ept_pointer);
     vcpu->advance_rip = FALSE;
 }
-
 //
-// Walk a 4-level guest CR3 for va. Returns TRUE if the page is mapped
-// (present, including 2MB/1GB large pages). If out_pa != NULL it receives
-// the physical address. Must run under the target CR3 (vmx_enter_cr3) so
-// pa_to_va's self-map resolves the target's page-table pages. Mirrors
-// stealth_walk_pte in ept_stealth.cpp.
+// Walk a 4-level guest CR3 for va using the PML4 self-map.
+// Returns TRUE if the page is mapped (present, including 2MB/1GB large pages).
+// If out_pa != NULL it receives the physical address.
+// If check_writable is TRUE, also verifies the leaf PTE has R/W=1.
+//
+// CRITICAL: this runs in VMX-root and MUST NOT call pa_to_va (MmGetVirtualForPhysical)
+// which deadlocks on PFN DB locks. Instead, it reads PTEs through the self-map:
+// PML4[S] maps the PML4 page to itself, so VAs with all-4-indices = S dereference
+// the PML4. By substituting the target VA's indices at successive levels, we read
+// each level's PTE as a plain memory load (no MM API, no locks).
+//
+// Must run under the target CR3 (vmx_enter_cr3) so the self-map resolves the
+// target's page tables (the self-map entry is in kernel space, shared across
+// all processes on Windows).
 //
 #define HV_MEM_PFN_MASK 0x000FFFFFFFFFF000ULL
-static BOOLEAN
-hv_walk_va(UINT64 cr3, UINT64 va, UINT64 * out_pa)
+
+static __forceinline UINT64
+hv_selfmap_sign_extend(UINT64 idx)
 {
-    static const UINT32 shift[4] = { 39, 30, 21, 12 };
-    UINT64 pa = cr3 & HV_MEM_PFN_MASK;
-    for (UINT32 lvl = 0; lvl < 4; lvl++)
+    // canonical sign-extension: if bit 47 (bit 8 of PML4 index) is set,
+    // fill bits 63:48 with 1s.
+    if (idx & 0x100)
+        return (idx << 39) | 0xFFFF000000000000ULL;
+    return idx << 39;
+}
+
+static BOOLEAN
+hv_walk_va(UINT64 cr3, UINT64 va, UINT64 * out_pa, BOOLEAN check_writable)
+{
+    UNREFERENCED_PARAMETER(cr3);  // self-map uses current CR3, not this param
+    UINT32 S = g_self_map_index;
+    if (S >= 512)
+        return FALSE;  // not initialized
+
+    UINT64 p4 = (va >> 39) & 0x1FF;
+    UINT64 p3 = (va >> 30) & 0x1FF;
+    UINT64 p2 = (va >> 21) & 0x1FF;
+    UINT64 p1 = (va >> 12) & 0x1FF;
+
+    UINT64 selfmap_base = hv_selfmap_sign_extend(S);
+
+    // Level 0 (PML4): read PML4[p4] via self-map VA (S,S,S,S,off=p4*8)
+    UINT64 pml4e_va = selfmap_base | (S << 30) | (S << 21) | (S << 12) | (p4 << 3);
+    UINT64 pml4e = *(volatile UINT64 *)pml4e_va;
+    if (!(pml4e & 1))
+        return FALSE;
+    if (pml4e & (1ULL << 7))  // 1GB large page at PML4 level (rare)
     {
-        PUINT64 table = (PUINT64)pa_to_va(pa);
-        if (!table)
+        if (check_writable && !(pml4e & 2))
             return FALSE;
-        UINT64 entry = table[(va >> shift[lvl]) & 0x1FF];
-        if (!(entry & 1))                 // not present at this level
-            return FALSE;
-        if (lvl == 3)                     // leaf 4KB PTE
-        {
-            if (out_pa)
-                *out_pa = (entry & HV_MEM_PFN_MASK) | (va & 0xFFF);
-            return TRUE;
-        }
-        if (entry & (1ULL << 7))          // large page at an intermediate level
-        {
-            UINT64 mask = (lvl == 2) ? 0x1FFFFF : 0x3FFFFFFF;   // 2MB / 1GB
-            if (out_pa)
-                *out_pa = (entry & ~mask & HV_MEM_PFN_MASK) | (va & mask);
-            return TRUE;
-        }
-        pa = entry & HV_MEM_PFN_MASK;
+        if (out_pa)
+            *out_pa = (pml4e & ~0x3FFFFFFFULL & HV_MEM_PFN_MASK) | (va & 0x3FFFFFFF);
+        return TRUE;
     }
-    return FALSE;
+
+    // Level 1 (PDPT): read PDPT[p3] via self-map VA (S,S,S,p4,off=p3*8)
+    UINT64 pdpte_va = selfmap_base | (S << 30) | (S << 21) | (p4 << 12) | (p3 << 3);
+    UINT64 pdpte = *(volatile UINT64 *)pdpte_va;
+    if (!(pdpte & 1))
+        return FALSE;
+    if (pdpte & (1ULL << 7))  // 1GB large page at PDPT level
+    {
+        if (check_writable && !(pdpte & 2))
+            return FALSE;
+        if (out_pa)
+            *out_pa = (pdpte & ~0x3FFFFFFFULL & HV_MEM_PFN_MASK) | (va & 0x3FFFFFFF);
+        return TRUE;
+    }
+
+    // Level 2 (PD): read PD[p2] via self-map VA (S,S,p4,p3,off=p2*8)
+    UINT64 pde_va = selfmap_base | (S << 30) | (p4 << 21) | (p3 << 12) | (p2 << 3);
+    UINT64 pde = *(volatile UINT64 *)pde_va;
+    if (!(pde & 1))
+        return FALSE;
+    if (pde & (1ULL << 7))  // 2MB large page at PD level
+    {
+        if (check_writable && !(pde & 2))
+            return FALSE;
+        if (out_pa)
+            *out_pa = (pde & ~0x1FFFFFULL & HV_MEM_PFN_MASK) | (va & 0x1FFFFF);
+        return TRUE;
+    }
+
+    // Level 3 (PT): read PT[p1] via self-map VA (p4,p3,p2,p1,off=p1*8) -- leaf PTE
+    UINT64 pte_va = selfmap_base | (p4 << 30) | (p3 << 21) | (p2 << 12) | (p1 << 3);
+    UINT64 pte = *(volatile UINT64 *)pte_va;
+    if (!(pte & 1))
+        return FALSE;
+    if (check_writable && !(pte & 2))
+        return FALSE;
+    if (out_pa)
+        *out_pa = (pte & HV_MEM_PFN_MASK) | (va & 0xFFF);
+    return TRUE;
 }
 
 VOID
+
 vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
 {
     PGUEST_REGS regs = vcpu->regs;
@@ -1448,7 +1506,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 UINT64 off   = cur & 0xFFF;
                 UINT64 chunk = 0x1000 - off;
                 if (chunk > (UINT64)size - done) chunk = (UINT64)size - done;
-                if (!hv_walk_va(target_cr3, cur, NULL)) break;
+                if (!hv_walk_va(target_cr3, cur, NULL, FALSE)) break;
                 RtlCopyMemory(scratch + done, (PVOID)(UINT_PTR)cur, (SIZE_T)chunk);
                 done += chunk;
                 cur  += chunk;
@@ -1517,7 +1575,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 UINT64 off   = cur & 0xFFF;
                 UINT64 chunk = 0x1000 - off;
                 if (chunk > (UINT64)size - done) chunk = (UINT64)size - done;
-                if (!hv_walk_va(target_cr3, cur, NULL)) break;
+                if (!hv_walk_va(target_cr3, cur, NULL, TRUE)) break;
                 RtlCopyMemory((PVOID)(UINT_PTR)cur, scratch + done, (SIZE_T)chunk);
                 done += chunk;
                 cur  += chunk;
@@ -1563,7 +1621,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             UINT64 s_target = vmx_enter_cr3(target_cr3);
             _mm_mfence();
             UINT64 pa = 0;
-            BOOLEAN present = hv_walk_va(target_cr3, target_va, &pa);
+            BOOLEAN present = hv_walk_va(target_cr3, target_va, &pa, FALSE);
             _mm_mfence();
             vmx_leave_guest_cr3(s_target);
 

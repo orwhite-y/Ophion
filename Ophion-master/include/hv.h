@@ -22,6 +22,10 @@ extern "C" {
 
 UINT64 va_to_pa(PVOID va);
 PVOID  pa_to_va(UINT64 pa);
+
+// PML4 self-map index (found at PASSIVE_LEVEL by hv_selfmap_init).
+// 0xFFFFFFFF = not initialized (hv_walk_va returns FALSE).
+extern volatile UINT32 g_self_map_index;
 UINT64 get_system_cr3(VOID);
 
 //

@@ -185,22 +185,57 @@ static NTSTATUS hv_selfmap_init(VOID)
 {
     UINT64 sys_cr3 = get_system_cr3();
     UINT64 pml4_pa = sys_cr3 & 0x000FFFFFFFFFF000ULL;
+
+    // Method 1: MmGetVirtualForPhysical. On some builds this returns NULL
+    // for page-table pages (the MM refuses to alias them), so it may fail.
     PUINT64 pml4 = (PUINT64)pa_to_va(pml4_pa);
-    if (!pml4)
+    if (pml4)
     {
-        HYPERPLATFORM_LOG_ERROR("[hv] selfmap init: pa_to_va(pml4) NULL");
-        return STATUS_UNSUCCESSFUL;
-    }
-    for (UINT32 i = 0; i < 512; i++)
-    {
-        if ((pml4[i] & 0x000FFFFFFFFFF000ULL) == pml4_pa && (pml4[i] & 1))
+        for (UINT32 i = 0; i < 512; i++)
         {
-            g_self_map_index = i;
-            HYPERPLATFORM_LOG_INFO("[hv] self-map index = 0x%x (PML4[%x] = %llx)",
-                i, i, pml4[i]);
-            return STATUS_SUCCESS;
+            if ((pml4[i] & 0x000FFFFFFFFFF000ULL) == pml4_pa && (pml4[i] & 1))
+            {
+                g_self_map_index = i;
+                HYPERPLATFORM_LOG_INFO("[hv] self-map index = 0x%x (pa_to_va) (PML4[%x]=%llx)",
+                    i, i, pml4[i]);
+                return STATUS_SUCCESS;
+            }
         }
     }
+    else
+    {
+        HYPERPLATFORM_LOG_ERROR("[hv] selfmap init: pa_to_va(pml4) NULL, trying SEH probe");
+    }
+
+    // Method 2: brute-force SEH probe. For each candidate self-map index S,
+    // read PML4[S] through the self-map VA [S,S,S,S,S*8]. If PML4[S] is
+    // self-referencing (PFN == pml4_pa, present), S is the index. Wrong S
+    // values either fault (#PF, caught by SEH) or read a non-matching entry.
+    // Runs at PASSIVE_LEVEL under the system CR3, so SEH is available.
+    for (UINT32 S = 0; S < 512; S++)
+    {
+        UINT64 selfmap_base = (S & 0x100)
+            ? ((UINT64)S << 39) | 0xFFFF000000000000ULL
+            : ((UINT64)S << 39);
+        UINT64 pml4e_va = selfmap_base | ((UINT64)S << 30) | ((UINT64)S << 21)
+                        | ((UINT64)S << 12) | ((UINT64)S << 3);
+        __try
+        {
+            UINT64 entry = *(volatile UINT64 *)pml4e_va;
+            if ((entry & 0x000FFFFFFFFFF000ULL) == pml4_pa && (entry & 1))
+            {
+                g_self_map_index = S;
+                HYPERPLATFORM_LOG_INFO("[hv] self-map index = 0x%x (SEH probe) (PML4[%x]=%llx)",
+                    S, S, entry);
+                return STATUS_SUCCESS;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            // VA not mapped for this S candidate; try the next.
+        }
+    }
+
     HYPERPLATFORM_LOG_ERROR("[hv] selfmap init: no self-referencing PML4 entry found");
     return STATUS_NOT_FOUND;
 }

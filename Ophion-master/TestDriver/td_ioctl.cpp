@@ -2451,10 +2451,15 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             vmc_ok = FALSE;            // #UD: Ophion (VMX) not loaded
         }
 
-        if (vmc_ok)
+        // Use the VMX path only when it actually transferred bytes.
+        // If Ophion is not loaded (#UD) or the vmcall read yielded 0
+        // bytes (e.g. self-map not initialised -> hv_walk_va fails for
+        // every page), fall through to the proven MmCopyVirtualMemory
+        // path so CE always gets correct data.
+        if (vmc_ok && req.result > 0)
         {
             if (!is_write)
-                RtlCopyMemory(p->data, req.data, (SIZE_T)p->size);
+                RtlCopyMemory(p->data, req.data, (SIZE_T)req.result);
             p->status = req.status;
             p->result = req.result;
             irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);

@@ -387,16 +387,29 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
 #define HV_VMCALL_WRITE_MEM  0x0000000C
 #define HV_VMCALL_QUERY_VA   0x0000000D
 #define HV_VMCALL_QUERY_CR3  0x0000000E
-#define HV_MEM_MAX           4096
+#define HV_MEM_MAX           4096          // CE<->TestDriver IOCTL contract (do NOT change)
+#define HV_VMCALL_MEM_MAX    65536         // vmcall batch size (16 pages, must match Ophion HV_R3_MEM_MAX)
+
+// Header-only subset of HV_MEM_REQUEST (same field offsets, no data[]).
+// Safe to place on the kernel stack for QUERY_VA / QUERY_CR3 which never touch data[].
+typedef struct _HV_MEM_REQUEST_HDR {
+    UINT64  target_cr3;
+    UINT64  target_va;
+    UINT32  size;
+    UINT32  status;
+    UINT64  result;
+} HV_MEM_REQUEST_HDR, *PHV_MEM_REQUEST_HDR;
 
 // VMCALL memory request struct (rdx pointer to hypervisor, must match VMCALL_MEM_REQUEST)
+// data[] is enlarged to HV_VMCALL_MEM_MAX so a single vmcall can read 64 KB.
+// MUST be pool-allocated (not stack) due to its size (~65 KB).
 typedef struct _HV_MEM_REQUEST {
     UINT64  target_cr3;     // [in] 0 = resolve from target_pid
     UINT64  target_va;      // [in] VA in target
-    UINT32  size;           // [in] bytes (max HV_MEM_MAX)
+    UINT32  size;           // [in] bytes (max HV_VMCALL_MEM_MAX)
     UINT32  status;         // [out] NTSTATUS
     UINT64  result;         // [out] bytes copied
-    UINT8   data[HV_MEM_MAX];
+    UINT8   data[HV_VMCALL_MEM_MAX];
 } HV_MEM_REQUEST, *PHV_MEM_REQUEST;
 
 // IOCTL param (CE <-> TestDriver, METHOD_BUFFERED SystemBuffer)
@@ -605,6 +618,8 @@ BOOLEAN TdStealthTrackHasPartialOverlap(UINT64 pid, PVOID base_va, SIZE_T size);
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg);
 NTSTATUS NTAPI HookedNtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock, PLARGE_INTEGER AllocationSize, ULONG FileAttributes, ULONG ShareAccess, ULONG CreateDisposition, ULONG CreateOptions, PVOID EaBuffer, ULONG EaLength);
 NTSTATUS TdCreateClose(PDEVICE_OBJECT, PIRP irp);
+VOID TdMemCacheInit(VOID);
+VOID TdMemCacheFini(VOID);
 NTSTATUS TdCreateThread(PEPROCESS process, PVOID entry);
 NTSTATUS TdEptHookNtCreateFile(VOID);
 NTSTATUS TdEptHookR3( UINT64 target_pid, PVOID target_va, PVOID proxy_va, UINT32 hook_type, PVOID * out_trampoline);

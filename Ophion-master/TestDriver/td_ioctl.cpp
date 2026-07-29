@@ -28,6 +28,64 @@ static VOID TdResolveMemApis(VOID)
     HYPERPLATFORM_LOG_INFO("[td] MmCopyVirtualMemory = %p", g_MmCopyVirtualMemory);
 }
 
+// ===========================================================================
+//  Prefetch read cache (per-process, 64 KB aligned)
+//
+//  CE issues 4 KB reads sequentially through a memory region.  Each 4 KB
+//  read triggers a vmcall -> VM exit + CR3 switch + cli window, which is
+//  extremely slow for multi-GB scans.  This cache transparently prefetches
+//  a 64 KB block (16 pages) per vmcall and serves up to 16 consecutive
+//  CE reads from the cached buffer, cutting vmcall count ~16x.
+//
+//  All cached data still originates from the VMX-root stealth path - the
+//  only thing that changes is batch size.  No MmCopyVirtualMemory,
+//  no KeStackAttach, no ObRef trace on the hot path.
+//
+//  The cache is protected by a spinlock so the vmcall (which runs under
+//  cli in VMX-root) and the buffer copy are atomic w.r.t. concurrent
+//  IOCTLs.  MmCopyVirtualMemory fallback runs AFTER releasing the lock
+//  (needs PASSIVE_LEVEL for #PF).
+// ===========================================================================
+#define HV_PFC_SIZE   HV_VMCALL_MEM_MAX   // 65536
+
+static KSPIN_LOCK   g_pfc_lock;
+static PHV_MEM_REQUEST g_pfc_req = NULL;   // pool, ~65 KB, reused for vmcall
+static HANDLE       g_pfc_pid  = (HANDLE)0;
+static UINT64       g_pfc_base = 0;        // 64 KB-aligned base of cached block
+static UINT64       g_pfc_len  = 0;        // valid bytes from g_pfc_base
+static UINT8        g_pfc_buf[HV_PFC_SIZE];
+
+VOID TdMemCacheInit(VOID)
+{
+    KeInitializeSpinLock(&g_pfc_lock);
+    g_pfc_req = (PHV_MEM_REQUEST)ExAllocatePoolWithTag(
+        NonPagedPool, sizeof(HV_MEM_REQUEST), 'cfpT');
+    if (g_pfc_req)
+        RtlZeroMemory(g_pfc_req, sizeof(HV_MEM_REQUEST));
+    else
+        HYPERPLATFORM_LOG_ERROR("[td] pfc_req alloc failed (size=%zu)", sizeof(HV_MEM_REQUEST));
+    g_pfc_pid  = (HANDLE)0;
+    g_pfc_base = 0;
+    g_pfc_len  = 0;
+    HYPERPLATFORM_LOG_INFO("[td] prefetch cache init (req=%p, buf=%p, %u KB)",
+        g_pfc_req, g_pfc_buf, HV_PFC_SIZE / 1024);
+}
+
+VOID TdMemCacheFini(VOID)
+{
+    if (g_pfc_req)
+    {
+        ExFreePoolWithTag(g_pfc_req, 'cfpT');
+        g_pfc_req = NULL;
+    }
+}
+
+// Invalidate cache (called on write so stale data is never served).
+static __forceinline VOID TdMemCacheInvalidate(VOID)
+{
+    g_pfc_len = 0;
+}
+
 // =========================================================================
 //  IOCTL handler
 // =========================================================================
@@ -2431,40 +2489,125 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
         BOOLEAN is_write = (io->Parameters.DeviceIoControl.IoControlCode == IOCTL_HV_WRITE_MEM);
 
-        // --- primary: VMX-root vmcall (stealth) ---
-        HV_MEM_REQUEST req;
-        RtlZeroMemory(&req, sizeof(req));
-        req.target_cr3 = 0;            // Ophion resolves from target_pid (r9)
-        req.target_va  = p->target_va;
-        req.size       = p->size;
+        // ================================================================
+        //  WRITE: vmcall directly (no prefetch).  Invalidate the read
+        //  cache so stale data is never served after a write.
+        // ================================================================
         if (is_write)
-            RtlCopyMemory(req.data, p->data, (SIZE_T)p->size);
-
-        BOOLEAN vmc_ok = FALSE;
-        __try {
-            NTSTATUS vr = hv_vmcall_simple(
-                is_write ? HV_VMCALL_WRITE_MEM : HV_VMCALL_READ_MEM,
-                (UINT64)&req, 0, p->target_pid);
-            if (vr == STATUS_SUCCESS)
-                vmc_ok = TRUE;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            vmc_ok = FALSE;            // #UD: Ophion (VMX) not loaded
-        }
-
-        // Use the VMX path only when it actually transferred bytes.
-        // If Ophion is not loaded (#UD) or the vmcall read yielded 0
-        // bytes (e.g. self-map not initialised -> hv_walk_va fails for
-        // every page), fall through to the proven MmCopyVirtualMemory
-        // path so CE always gets correct data.
-        if (vmc_ok && req.result > 0)
         {
-            if (!is_write)
-                RtlCopyMemory(p->data, req.data, (SIZE_T)req.result);
-            p->status = req.status;
-            p->result = req.result;
-            irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
-            st = STATUS_SUCCESS;       // IOCTL ok; per-call result in p->status
-            break;
+            KIRQL old_irql;
+            KeAcquireSpinLock(&g_pfc_lock, &old_irql);
+            TdMemCacheInvalidate();
+
+            BOOLEAN vmc_ok = FALSE;
+            if (g_pfc_req)
+            {
+                PHV_MEM_REQUEST req = g_pfc_req;
+                req->target_cr3 = 0;
+                req->target_va  = p->target_va;
+                req->size       = p->size;
+                req->status     = 0;
+                req->result     = 0;
+                RtlCopyMemory(req->data, p->data, (SIZE_T)p->size);
+
+                __try {
+                    NTSTATUS vr = hv_vmcall_simple(
+                        HV_VMCALL_WRITE_MEM, (UINT64)req, 0, p->target_pid);
+                    if (vr == STATUS_SUCCESS) vmc_ok = TRUE;
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    vmc_ok = FALSE;        // #UD: Ophion not loaded
+                }
+
+                if (vmc_ok && req->result > 0)
+                {
+                    p->status = req->status;
+                    p->result = req->result;
+                    irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
+                    KeReleaseSpinLock(&g_pfc_lock, old_irql);
+                    st = STATUS_SUCCESS;
+                    break;
+                }
+            }
+            KeReleaseSpinLock(&g_pfc_lock, old_irql);
+            // fall through to MmCopyVirtualMemory fallback
+        }
+        else
+        {
+            // ============================================================
+            //  READ: transparent 64 KB prefetch cache.
+            //
+            //  CE issues 4 KB reads sequentially.  On the first miss in a
+            //  64 KB block we issue one vmcall for the full 64 KB, then
+            //  serve up to 15 subsequent 4 KB reads from the cached buffer
+            //  without any vmcall.  All data still comes from the VMX-root
+            //  stealth path - only the batch size changes.
+            // ============================================================
+            KIRQL old_irql;
+            KeAcquireSpinLock(&g_pfc_lock, &old_irql);
+
+            UINT64 va  = p->target_va;
+            UINT32 sz  = p->size;
+            HANDLE pid = (HANDLE)p->target_pid;
+
+            // --- cache hit: serve from cached 64 KB block ---
+            if (pid == g_pfc_pid &&
+                va >= g_pfc_base &&
+                va + sz <= g_pfc_base + g_pfc_len)
+            {
+                RtlCopyMemory(p->data, g_pfc_buf + (va - g_pfc_base), (SIZE_T)sz);
+                p->status = (UINT32)STATUS_SUCCESS;
+                p->result = sz;
+                irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
+                KeReleaseSpinLock(&g_pfc_lock, old_irql);
+                st = STATUS_SUCCESS;
+                break;
+            }
+
+            // --- cache miss: prefetch 64 KB aligned block via vmcall ---
+            BOOLEAN vmc_ok = FALSE;
+            if (g_pfc_req)
+            {
+                UINT64 pbase = va & ~((UINT64)HV_PFC_SIZE - 1);
+                PHV_MEM_REQUEST req = g_pfc_req;
+                req->target_cr3 = 0;
+                req->target_va  = pbase;
+                req->size       = HV_PFC_SIZE;
+                req->status     = 0;
+                req->result     = 0;
+
+                __try {
+                    NTSTATUS vr = hv_vmcall_simple(
+                        HV_VMCALL_READ_MEM, (UINT64)req, 0, (UINT64)pid);
+                    if (vr == STATUS_SUCCESS) vmc_ok = TRUE;
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    vmc_ok = FALSE;        // #UD: Ophion not loaded
+                }
+
+                if (vmc_ok && req->result > 0)
+                {
+                    UINT64 got = req->result;
+                    RtlCopyMemory(g_pfc_buf, req->data, (SIZE_T)got);
+                    g_pfc_pid  = pid;
+                    g_pfc_base = pbase;
+                    g_pfc_len  = got;
+
+                    // serve this request from the freshly cached block
+                    if (va >= pbase && va + sz <= pbase + got)
+                    {
+                        RtlCopyMemory(p->data, g_pfc_buf + (va - pbase), (SIZE_T)sz);
+                        p->status = (UINT32)STATUS_SUCCESS;
+                        p->result = sz;
+                        irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
+                        KeReleaseSpinLock(&g_pfc_lock, old_irql);
+                        st = STATUS_SUCCESS;
+                        break;
+                    }
+                    // partial result didn't cover the requested VA;
+                    // fall through to MmCopyVirtualMemory for this page
+                }
+            }
+            KeReleaseSpinLock(&g_pfc_lock, old_irql);
+            // fall through to MmCopyVirtualMemory fallback
         }
 
         // --- fallback: native R0 MmCopyVirtualMemory (no VMX present) ---
@@ -2528,7 +2671,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         if (p->target_pid == 0)
         { st = STATUS_INVALID_PARAMETER; break; }
 
-        HV_MEM_REQUEST req;
+        HV_MEM_REQUEST_HDR req;          // header-only (no data[]), stack-safe
         RtlZeroMemory(&req, sizeof(req));
         req.target_cr3 = 0;
         req.target_va  = p->target_va;

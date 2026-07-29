@@ -13,6 +13,8 @@ BOOLEAN g_process_notify_ex_registered = FALSE;
 
 VOID TdUnload(PDRIVER_OBJECT drv)
 {
+    TdMemCacheFini();
+
     if (g_process_notify_registered)
     {
         if (g_process_notify_ex_registered)
@@ -123,6 +125,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
 
     HYPERPLATFORM_LOG_INFO("[td] thread APIs: create=%p zw_resume=%p ps_resume=%p ke_resume=%p",
         g_pZwCreateThreadEx, g_pZwResumeThread, g_pPsResumeThread, g_pKeResumeThread);
+
+    // prefetch read cache (64 KB batch vmcall) - must be ready before IOCTLs
+    TdMemCacheInit();
 
     UNICODE_STRING dev_name, sym_name;
     RtlInitUnicodeString(&dev_name, TD_DEVICE_NAME);

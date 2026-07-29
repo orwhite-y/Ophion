@@ -326,7 +326,7 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_QUERY_VA         0x0000000D   // R3/R0: query VA->PA (rdx=&req, r8=caller_pid, r9=target_pid)
 #define VMCALL_QUERY_CR3        0x0000000E   // R3: rdx=target_pid -> rax=kernel CR3
 
-#define HV_R3_MEM_MAX           4096         // max bytes per R3 read/write call (one page)
+#define HV_R3_MEM_MAX           65536        // max bytes per R3 read/write call (16 pages, prefetch batch)
 
 //
 // memory read/write VMCALL request (rdx = pointer to this struct).

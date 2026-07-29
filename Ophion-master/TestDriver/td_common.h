@@ -377,8 +377,8 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
 #define IOCTL_FREE_SHADOW_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 10, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_SHADOW_PROTECT_MEMORY CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 11, METHOD_BUFFERED, FILE_ANY_ACCESS)
 // ---- HV memory read/write via VMCALL (R0 path, no CR3 caching) ----
-#define IOCTL_HV_READ_MEM   CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 17, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_HV_WRITE_MEM  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 18, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_HV_READ_MEM   CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 17, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
+#define IOCTL_HV_WRITE_MEM  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 18, METHOD_IN_DIRECT, FILE_ANY_ACCESS)
 #define IOCTL_HV_QUERY_VA   CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 19, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_HV_DETECT     CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 20, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
@@ -387,8 +387,8 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
 #define HV_VMCALL_WRITE_MEM  0x0000000C
 #define HV_VMCALL_QUERY_VA   0x0000000D
 #define HV_VMCALL_QUERY_CR3  0x0000000E
-#define HV_MEM_MAX           131072         // CE<->TestDriver IOCTL contract (64 KB per IOCTL)
-#define HV_VMCALL_MEM_MAX    131072         // vmcall batch size (16 pages, must match Ophion HV_R3_MEM_MAX)
+#define HV_MEM_MAX           262144         // CE<->TestDriver IOCTL contract (64 KB per IOCTL)
+#define HV_VMCALL_MEM_MAX    262144         // vmcall batch size (16 pages, must match Ophion HV_R3_MEM_MAX)
 
 // Header-only subset of HV_MEM_REQUEST (same field offsets, no data[]).
 // Safe to place on the kernel stack for QUERY_VA / QUERY_CR3 which never touch data[].
@@ -401,18 +401,19 @@ typedef struct _HV_MEM_REQUEST_HDR {
 } HV_MEM_REQUEST_HDR, *PHV_MEM_REQUEST_HDR;
 
 // VMCALL memory request struct (rdx pointer to hypervisor, must match VMCALL_MEM_REQUEST)
-// data[] is enlarged to HV_VMCALL_MEM_MAX so a single vmcall can read 64 KB.
-// MUST be pool-allocated (not stack) due to its size (~65 KB).
+// data is a POINTER (not inline array) so the vmcall handler can write directly
+// to any kernel VA: the MDL-mapped CE buffer (METHOD_OUT_DIRECT), the prefetch
+// cache, etc.  Struct is ~40 bytes - safe on the kernel stack.
 typedef struct _HV_MEM_REQUEST {
     UINT64  target_cr3;     // [in] 0 = resolve from target_pid
     UINT64  target_va;      // [in] VA in target
     UINT32  size;           // [in] bytes (max HV_VMCALL_MEM_MAX)
     UINT32  status;         // [out] NTSTATUS
     UINT64  result;         // [out] bytes copied
-    UINT8   data[HV_VMCALL_MEM_MAX];
+    PUCHAR  data;           // [in write]/[out read] pointer to data buffer
 } HV_MEM_REQUEST, *PHV_MEM_REQUEST;
 
-// IOCTL param (CE <-> TestDriver, METHOD_BUFFERED SystemBuffer)
+// IOCTL param for QUERY_VA (METHOD_BUFFERED, no data transfer)
 typedef struct _TD_HV_MEM_RW {
     UINT64  target_pid;       // [in] process to read/write
     UINT64  target_va;        // [in] VA in target
@@ -421,6 +422,17 @@ typedef struct _TD_HV_MEM_RW {
     UINT64  result;           // [out] bytes transferred
     UINT8   data[HV_MEM_MAX]; // [out read] / [in write]
 } TD_HV_MEM_RW, *PTD_HV_MEM_RW;
+
+// IOCTL header for READ_MEM / WRITE_MEM (METHOD_OUT_DIRECT / METHOD_IN_DIRECT)
+// SystemBuffer carries this 32-byte header; the actual data buffer is passed
+// via the MDL (lpOutBuffer in DeviceIoControl) and mapped to a kernel VA.
+typedef struct _TD_HV_MEM_HDR {
+    UINT64  target_pid;       // [in] process to read/write
+    UINT64  target_va;        // [in] VA in target
+    UINT32  size;             // [in] bytes (max HV_MEM_MAX)
+    UINT32  status;           // [out] NTSTATUS from hypervisor
+    UINT64  result;           // [out] bytes transferred
+} TD_HV_MEM_HDR, *PTD_HV_MEM_HDR;
 
 // IOCTL detect param
 typedef struct _TD_HV_DETECT {

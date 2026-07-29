@@ -351,7 +351,7 @@ typedef struct _VMCALL_MEM_REQUEST {
     UINT32  size;           // [in]  bytes (max HV_R3_MEM_MAX)
     UINT32  status;         // [out] NTSTATUS of the operation
     UINT64  result;         // [out] bytes actually copied
-    UINT8   data[HV_R3_MEM_MAX]; // [in write]/[out read] inline buffer
+    PUCHAR  data;               // [in write]/[out read] pointer to data buffer
 } VMCALL_MEM_REQUEST, *PVMCALL_MEM_REQUEST;
 
 //

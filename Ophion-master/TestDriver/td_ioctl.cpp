@@ -46,12 +46,12 @@ static VOID TdResolveMemApis(VOID)
 //  IOCTLs.  MmCopyVirtualMemory fallback runs AFTER releasing the lock
 //  (needs PASSIVE_LEVEL for #PF).
 // ===========================================================================
-#define HV_PFC_SIZE   HV_VMCALL_MEM_MAX   // 65536
+#define HV_PFC_SIZE   HV_VMCALL_MEM_MAX   // 262144 (256 KB)
 
 static KSPIN_LOCK   g_pfc_lock;
-static PHV_MEM_REQUEST g_pfc_req = NULL;   // pool, ~65 KB, reused for vmcall
+static PHV_MEM_REQUEST g_pfc_req = NULL;   // pool, ~40 bytes (data ptr), reused for vmcall
 static HANDLE       g_pfc_pid  = (HANDLE)0;
-static UINT64       g_pfc_base = 0;        // 64 KB-aligned base of cached block
+static UINT64       g_pfc_base = 0;        // 256 KB-aligned base of cached block
 static UINT64       g_pfc_len  = 0;        // valid bytes from g_pfc_base
 static UINT8        g_pfc_buf[HV_PFC_SIZE];
 
@@ -2477,251 +2477,255 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
     //  native MmCopyVirtualMemory (proven cross-process copy in R0).
     // ================================================================
     case IOCTL_HV_READ_MEM:
-    case IOCTL_HV_WRITE_MEM:
     {
-        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_HV_MEM_RW) ||
-            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_HV_MEM_RW))
+        // ================================================================
+        //  METHOD_OUT_DIRECT: SystemBuffer = TD_HV_MEM_HDR (input),
+        //  MdlAddress = CE's destination buffer (output, write access).
+        //  The vmcall writes target_va directly into the MDL-mapped
+        //  kernel VA -- ZERO intermediate copies.
+        // ================================================================
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_HV_MEM_HDR))
         { st = STATUS_BUFFER_TOO_SMALL; break; }
 
-        TD_HV_MEM_RW * p = (TD_HV_MEM_RW *)irp->AssociatedIrp.SystemBuffer;
-        if (p->size == 0 || p->size > HV_MEM_MAX || p->target_pid == 0)
+        TD_HV_MEM_HDR * hdr = (TD_HV_MEM_HDR *)irp->AssociatedIrp.SystemBuffer;
+        if (hdr->size == 0 || hdr->size > HV_MEM_MAX || hdr->target_pid == 0)
         { st = STATUS_INVALID_PARAMETER; break; }
 
-        BOOLEAN is_write = (io->Parameters.DeviceIoControl.IoControlCode == IOCTL_HV_WRITE_MEM);
+        if (io->Parameters.DeviceIoControl.OutputBufferLength < hdr->size || !irp->MdlAddress)
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
 
-        // ================================================================
-        //  WRITE: vmcall directly (no prefetch).  Invalidate the read
-        //  cache so stale data is never served after a write.
-        // ================================================================
-        if (is_write)
+        PVOID out_buf = MmGetSystemAddressForMdlSafe(irp->MdlAddress, NormalPagePriority);
+        if (!out_buf)
+        { st = STATUS_INSUFFICIENT_RESOURCES; break; }
+
+        UINT32 sz  = hdr->size;
+        UINT64 va  = hdr->target_va;
+        HANDLE pid = (HANDLE)hdr->target_pid;
+
+        // --- READ: prefetch cache + zero-copy vmcall ---
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_pfc_lock, &old_irql);
+
+        // cache hit: serve from cached block
+        if (pid == g_pfc_pid &&
+            va >= g_pfc_base &&
+            va + sz <= g_pfc_base + g_pfc_len)
         {
-            KIRQL old_irql;
-            KeAcquireSpinLock(&g_pfc_lock, &old_irql);
-            TdMemCacheInvalidate();
+            RtlCopyMemory(out_buf, g_pfc_buf + (va - g_pfc_base), (SIZE_T)sz);
+            hdr->status = (UINT32)STATUS_SUCCESS;
+            hdr->result = sz;
+            irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
+            KeReleaseSpinLock(&g_pfc_lock, old_irql);
+            st = STATUS_SUCCESS;
+            break;
+        }
 
-            // Zero-copy write: pass SystemBuffer (p) directly as the vmcall
-            // request.  TD_HV_MEM_RW and VMCALL_MEM_REQUEST share identical
-            // layout at offsets 8+ (target_va, size, status, result, data[]).
-            // Setting offset 0 (target_pid) to 0 makes the VMX-root handler
-            // see target_cr3=0 and resolve the CR3 from r9 (target_pid).
-            // p->data already holds the write payload from CE -- no copy.
-            BOOLEAN vmc_ok = FALSE;
+        // cache miss
+        BOOLEAN vmc_ok = FALSE;
+        if (g_pfc_req)
+        {
+            HV_MEM_REQUEST * req = g_pfc_req;
+
+            if (sz >= HV_PFC_SIZE)
             {
-                UINT64 saved_pid = p->target_pid;
-                p->target_pid = 0;    // seen as target_cr3=0 by VMX-root
-                p->status     = 0;
-                p->result     = 0;
+                // Large read (>= 256 KB): vmcall writes DIRECTLY to CE's
+                // MDL-mapped buffer.  Zero copies in TestDriver.
+                req->target_cr3 = 0;
+                req->target_va  = va;
+                req->size       = sz;
+                req->status     = 0;
+                req->result     = 0;
+                req->data       = (PUCHAR)out_buf;
 
                 __try {
                     NTSTATUS vr = hv_vmcall_simple(
-                        HV_VMCALL_WRITE_MEM, (UINT64)p, 0, saved_pid);
+                        HV_VMCALL_READ_MEM, (UINT64)req, 0, (UINT64)pid);
                     if (vr == STATUS_SUCCESS) vmc_ok = TRUE;
                 } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    vmc_ok = FALSE;        // #UD: Ophion not loaded
+                    vmc_ok = FALSE;
                 }
-                p->target_pid = saved_pid;  // restore for CE
 
-                if (vmc_ok && p->result > 0)
+                if (vmc_ok && req->result > 0)
                 {
-                    irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
+                    hdr->status = req->status;
+                    hdr->result = req->result;
+                    irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
                     KeReleaseSpinLock(&g_pfc_lock, old_irql);
                     st = STATUS_SUCCESS;
                     break;
                 }
             }
-            KeReleaseSpinLock(&g_pfc_lock, old_irql);
-            // fall through to MmCopyVirtualMemory fallback
-        }
-        else
-        {
-            // ============================================================
-            //  READ: transparent 64 KB prefetch cache.
-            //
-            //  CE issues 4 KB reads sequentially.  On the first miss in a
-            //  64 KB block we issue one vmcall for the full 64 KB, then
-            //  serve up to 15 subsequent 4 KB reads from the cached buffer
-            //  without any vmcall.  All data still comes from the VMX-root
-            //  stealth path - only the batch size changes.
-            // ============================================================
-            KIRQL old_irql;
-            KeAcquireSpinLock(&g_pfc_lock, &old_irql);
-
-            UINT64 va  = p->target_va;
-            UINT32 sz  = p->size;
-            HANDLE pid = (HANDLE)p->target_pid;
-
-            // --- cache hit: serve from cached 64 KB block ---
-            if (pid == g_pfc_pid &&
-                va >= g_pfc_base &&
-                va + sz <= g_pfc_base + g_pfc_len)
+            else
             {
-                RtlCopyMemory(p->data, g_pfc_buf + (va - g_pfc_base), (SIZE_T)sz);
-                p->status = (UINT32)STATUS_SUCCESS;
-                p->result = sz;
-                irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
-                KeReleaseSpinLock(&g_pfc_lock, old_irql);
-                st = STATUS_SUCCESS;
-                break;
-            }
+                // Small read: prefetch full 256 KB block into cache,
+                // then copy requested bytes to CE's buffer.
+                UINT64 pbase = va & ~((UINT64)HV_PFC_SIZE - 1);
+                req->target_cr3 = 0;
+                req->target_va  = pbase;
+                req->size       = HV_PFC_SIZE;
+                req->status     = 0;
+                req->result     = 0;
+                req->data       = g_pfc_buf;
 
-            // --- cache miss ---
-            BOOLEAN vmc_ok = FALSE;
-            if (g_pfc_req)
-            {
-                PHV_MEM_REQUEST req = g_pfc_req;
+                __try {
+                    NTSTATUS vr = hv_vmcall_simple(
+                        HV_VMCALL_READ_MEM, (UINT64)req, 0, (UINT64)pid);
+                    if (vr == STATUS_SUCCESS) vmc_ok = TRUE;
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    vmc_ok = FALSE;
+                }
 
-                // ============================================================
-                //  Large read (>= 64 KB): direct vmcall for the full
-                //  requested size.  No cache overhead - sequential scans
-                //  never re-read the same 64 KB block, so caching just
-                //  adds a wasted 64 KB memcpy.  This is the scan hot path.
-                // ============================================================
-                if (sz >= HV_PFC_SIZE)
+                if (vmc_ok && req->result > 0)
                 {
-                    // Zero-copy fast path: pass the IOCTL SystemBuffer (p)
-                    // directly as the vmcall request.  TD_HV_MEM_RW and
-                    // VMCALL_MEM_REQUEST share identical layout at offsets
-                    // 8+ (target_va, size, status, result, data[]).  Setting
-                    // offset 0 (target_pid) to 0 -> VMX-root sees target_cr3=0
-                    // and resolves CR3 from r9 (pid).  The vmcall writes
-                    // target_va directly into p->data -- zero intermediate
-                    // copies.  Combined with vmexit.cpp opt A (R0 caller
-                    // skips scratch), this is a single memcpy per 64 KB read.
-                    UINT64 saved_pid = p->target_pid;
-                    p->target_pid = 0;    // seen as target_cr3=0 by VMX-root
-                    p->status     = 0;
-                    p->result     = 0;
-                    // p->target_va and p->size already set by CE
+                    UINT64 got = req->result;
+                    g_pfc_pid  = pid;
+                    g_pfc_base = pbase;
+                    g_pfc_len  = got;
 
-                    __try {
-                        NTSTATUS vr = hv_vmcall_simple(
-                            HV_VMCALL_READ_MEM, (UINT64)p, 0, saved_pid);
-                        if (vr == STATUS_SUCCESS) vmc_ok = TRUE;
-                    } __except (EXCEPTION_EXECUTE_HANDLER) {
-                        vmc_ok = FALSE;        // #UD: Ophion not loaded
-                    }
-                    p->target_pid = saved_pid;  // restore for CE
-
-                    if (vmc_ok && p->result > 0)
+                    if (va >= pbase && va + sz <= pbase + got)
                     {
-                        // p->data already filled by vmcall -- no copy needed
-                        irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
+                        RtlCopyMemory(out_buf, g_pfc_buf + (va - pbase), (SIZE_T)sz);
+                        hdr->status = (UINT32)STATUS_SUCCESS;
+                        hdr->result = sz;
+                        irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
                         KeReleaseSpinLock(&g_pfc_lock, old_irql);
                         st = STATUS_SUCCESS;
                         break;
                     }
                 }
-                else
-                {
-                    // ========================================================
-                    //  Small read (< 64 KB): prefetch the full 64 KB block
-                    //  and cache it.  Subsequent reads in the same block
-                    //  hit the cache without any vmcall.
-                    // ========================================================
-                    UINT64 pbase = va & ~((UINT64)HV_PFC_SIZE - 1);
-                    req->target_cr3 = 0;
-                    req->target_va  = pbase;
-                    req->size       = HV_PFC_SIZE;
-                    req->status     = 0;
-                    req->result     = 0;
-
-                    __try {
-                        NTSTATUS vr = hv_vmcall_simple(
-                            HV_VMCALL_READ_MEM, (UINT64)req, 0, (UINT64)pid);
-                        if (vr == STATUS_SUCCESS) vmc_ok = TRUE;
-                    } __except (EXCEPTION_EXECUTE_HANDLER) {
-                        vmc_ok = FALSE;        // #UD: Ophion not loaded
-                    }
-
-                    if (vmc_ok && req->result > 0)
-                    {
-                        UINT64 got = req->result;
-                        RtlCopyMemory(g_pfc_buf, req->data, (SIZE_T)got);
-                        g_pfc_pid  = pid;
-                        g_pfc_base = pbase;
-                        g_pfc_len  = got;
-
-                        if (va >= pbase && va + sz <= pbase + got)
-                        {
-                            RtlCopyMemory(p->data, g_pfc_buf + (va - pbase), (SIZE_T)sz);
-                            p->status = (UINT32)STATUS_SUCCESS;
-                            p->result = sz;
-                            irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
-                            KeReleaseSpinLock(&g_pfc_lock, old_irql);
-                            st = STATUS_SUCCESS;
-                            break;
-                        }
-                        // partial result didn't cover the requested VA;
-                        // fall through to MmCopyVirtualMemory for this page
-                    }
-                }
             }
-            KeReleaseSpinLock(&g_pfc_lock, old_irql);
-            // fall through to MmCopyVirtualMemory fallback
         }
+        KeReleaseSpinLock(&g_pfc_lock, old_irql);
 
-        // --- fallback: native R0 MmCopyVirtualMemory (no VMX present) ---
+        // fallback: KeStackAttachProcess + RtlCopyMemory (no VMX present)
         PEPROCESS target = NULL;
-        NTSTATUS look = PsLookupProcessByProcessId((HANDLE)p->target_pid, &target);
+        NTSTATUS look = PsLookupProcessByProcessId((HANDLE)hdr->target_pid, &target);
         if (!NT_SUCCESS(look))
         {
-            p->status = (UINT32)look;
-            p->result = 0;
-            irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
+            hdr->status = (UINT32)look;
+            hdr->result = 0;
+            irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
             st = STATUS_SUCCESS;
             break;
         }
 
-        if (!g_MmCopyVirtualMemory)
-            TdResolveMemApis();
-        if (!g_MmCopyVirtualMemory)
-        {
-            ObDereferenceObject(target);
-            p->status = (UINT32)STATUS_NOT_SUPPORTED;
-            p->result = 0;
-            irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
-            st = STATUS_SUCCESS;
-            break;
+        KAPC_STATE apc;
+        KeStackAttachProcess(target, &apc);
+        __try {
+            RtlCopyMemory(out_buf, (PVOID)(ULONG_PTR)va, (SIZE_T)sz);
+            hdr->status = (UINT32)STATUS_SUCCESS;
+            hdr->result = sz;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            hdr->status = (UINT32)STATUS_ACCESS_VIOLATION;
+            hdr->result = 0;
         }
-
-        SIZE_T transferred = 0;
-        NTSTATUS mst;
-        if (is_write)
-        {
-            // current(SystemBuffer) -> target(target_va)
-            mst = g_MmCopyVirtualMemory(
-                PsGetCurrentProcess(), p->data,
-                target, (PVOID)(ULONG_PTR)p->target_va,
-                (SIZE_T)p->size, KernelMode, &transferred);
-        }
-        else
-        {
-            // target(target_va) -> current(SystemBuffer)
-            mst = g_MmCopyVirtualMemory(
-                target, (PVOID)(ULONG_PTR)p->target_va,
-                PsGetCurrentProcess(), p->data,
-                (SIZE_T)p->size, KernelMode, &transferred);
-        }
-
+        KeUnstackDetachProcess(&apc);
         ObDereferenceObject(target);
-
-        p->status = (UINT32)mst;
-        p->result = NT_SUCCESS(mst) ? (UINT64)transferred : 0;
-        irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
-        st = STATUS_SUCCESS;   // IOCTL ok; per-call result in p->status
+        irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
+        st = STATUS_SUCCESS;
         break;
     }
-    case IOCTL_HV_QUERY_VA:
+
+    case IOCTL_HV_WRITE_MEM:
     {
-        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_HV_MEM_RW) ||
-            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_HV_MEM_RW))
+        // ================================================================
+        //  METHOD_IN_DIRECT: SystemBuffer = TD_HV_MEM_HDR (input),
+        //  MdlAddress = CE's source data buffer (input, read access).
+        //  The vmcall reads DIRECTLY from the MDL-mapped kernel VA and
+        //  writes to the target process -- ZERO intermediate copies.
+        // ================================================================
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_HV_MEM_HDR))
         { st = STATUS_BUFFER_TOO_SMALL; break; }
 
-        TD_HV_MEM_RW * p = (TD_HV_MEM_RW *)irp->AssociatedIrp.SystemBuffer;
+        TD_HV_MEM_HDR * hdr = (TD_HV_MEM_HDR *)irp->AssociatedIrp.SystemBuffer;
+        if (hdr->size == 0 || hdr->size > HV_MEM_MAX || hdr->target_pid == 0)
+        { st = STATUS_INVALID_PARAMETER; break; }
+
+        if (io->Parameters.DeviceIoControl.OutputBufferLength < hdr->size || !irp->MdlAddress)
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        PVOID in_buf = MmGetSystemAddressForMdlSafe(irp->MdlAddress, NormalPagePriority);
+        if (!in_buf)
+        { st = STATUS_INSUFFICIENT_RESOURCES; break; }
+
+        UINT32 sz = hdr->size;
+
+        // invalidate read cache (stale data after write)
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_pfc_lock, &old_irql);
+        TdMemCacheInvalidate();
+
+        BOOLEAN vmc_ok = FALSE;
+        if (g_pfc_req)
+        {
+            HV_MEM_REQUEST * req = g_pfc_req;
+            req->target_cr3 = 0;
+            req->target_va  = hdr->target_va;
+            req->size       = sz;
+            req->status     = 0;
+            req->result     = 0;
+            req->data       = (PUCHAR)in_buf;
+
+            __try {
+                NTSTATUS vr = hv_vmcall_simple(
+                    HV_VMCALL_WRITE_MEM, (UINT64)req, 0, hdr->target_pid);
+                if (vr == STATUS_SUCCESS) vmc_ok = TRUE;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                vmc_ok = FALSE;
+            }
+
+            if (vmc_ok && req->result > 0)
+            {
+                hdr->status = req->status;
+                hdr->result = req->result;
+                irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
+                KeReleaseSpinLock(&g_pfc_lock, old_irql);
+                st = STATUS_SUCCESS;
+                break;
+            }
+        }
+        KeReleaseSpinLock(&g_pfc_lock, old_irql);
+
+        // fallback: KeStackAttachProcess + RtlCopyMemory
+        PEPROCESS target = NULL;
+        NTSTATUS look = PsLookupProcessByProcessId((HANDLE)hdr->target_pid, &target);
+        if (!NT_SUCCESS(look))
+        {
+            hdr->status = (UINT32)look;
+            hdr->result = 0;
+            irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
+            st = STATUS_SUCCESS;
+            break;
+        }
+
+        KAPC_STATE apc;
+        KeStackAttachProcess(target, &apc);
+        __try {
+            RtlCopyMemory((PVOID)(ULONG_PTR)hdr->target_va, in_buf, (SIZE_T)sz);
+            hdr->status = (UINT32)STATUS_SUCCESS;
+            hdr->result = sz;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            hdr->status = (UINT32)STATUS_ACCESS_VIOLATION;
+            hdr->result = 0;
+        }
+        KeUnstackDetachProcess(&apc);
+        ObDereferenceObject(target);
+        irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
+        st = STATUS_SUCCESS;
+        break;
+    }
+
+    case IOCTL_HV_QUERY_VA:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_HV_MEM_HDR) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_HV_MEM_HDR))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_HV_MEM_HDR * p = (TD_HV_MEM_HDR *)irp->AssociatedIrp.SystemBuffer;
         if (p->target_pid == 0)
         { st = STATUS_INVALID_PARAMETER; break; }
 
-        HV_MEM_REQUEST_HDR req;          // header-only (no data[]), stack-safe
+        HV_MEM_REQUEST_HDR req;
         RtlZeroMemory(&req, sizeof(req));
         req.target_cr3 = 0;
         req.target_va  = p->target_va;
@@ -2732,14 +2736,14 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             p->status = (UINT32)STATUS_DEVICE_NOT_READY;
             p->result = 0;
-            irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
+            irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
             st = STATUS_SUCCESS;
             break;
         }
 
         p->status = req.status;
-        p->result = req.result;   // PA if present
-        irp->IoStatus.Information = sizeof(TD_HV_MEM_RW);
+        p->result = req.result;
+        irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
         st = STATUS_SUCCESS;
         break;
     }

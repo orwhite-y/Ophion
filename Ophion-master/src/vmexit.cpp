@@ -1501,13 +1501,20 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             HANDLE target_pid = (HANDLE)regs->r9;
             if (!req) { regs->rax = (UINT64)STATUS_INVALID_PARAMETER; break; }
 
-            // resolve caller kernel CR3 (R3 path); R0 leaves 0 (struct is kernel VA)
-            UINT64 caller_cr3 = caller_pid ? hv_pid_to_cr3(caller_pid) : 0;
-            if (caller_pid && !caller_cr3) { regs->rax = (UINT64)STATUS_NOT_FOUND; break; }
-
-            // switch to caller CR3 to access the struct (user VA for R3)
-            UINT64 s_caller = caller_cr3 ? vmx_enter_cr3(caller_cr3) : 0;
-            if (s_caller) _mm_mfence();
+            // R3 caller: switch to its kernel CR3 so the user VA `req` is valid.
+            // R0 caller (TestDriver vmcall): `req` is a kernel VA on TestDriver's
+            // stack / IOCTL buffer, which is NOT mapped in the private host CR3
+            // (a static snapshot built at Ophion init -- see hostcr3_build).
+            // Switch to the system CR3 so all kernel VAs (req, scratch) resolve.
+            UINT64 s_caller;
+            if (caller_pid) {
+                UINT64 caller_cr3 = hv_pid_to_cr3(caller_pid);
+                if (!caller_cr3) { regs->rax = (UINT64)STATUS_NOT_FOUND; break; }
+                s_caller = vmx_enter_cr3(caller_cr3);
+            } else {
+                s_caller = vmx_enter_guest_cr3();   // private host CR3 -> system CR3
+            }
+            _mm_mfence();
 
             UINT64 target_cr3 = req->target_cr3;
             UINT64 target_va  = req->target_va;
@@ -1578,11 +1585,20 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             HANDLE target_pid = (HANDLE)regs->r9;
             if (!req) { regs->rax = (UINT64)STATUS_INVALID_PARAMETER; break; }
 
-            UINT64 caller_cr3 = caller_pid ? hv_pid_to_cr3(caller_pid) : 0;
-            if (caller_pid && !caller_cr3) { regs->rax = (UINT64)STATUS_NOT_FOUND; break; }
-
-            UINT64 s_caller = caller_cr3 ? vmx_enter_cr3(caller_cr3) : 0;
-            if (s_caller) _mm_mfence();
+            // R3 caller: switch to its kernel CR3 so the user VA `req` is valid.
+            // R0 caller (TestDriver vmcall): `req` is a kernel VA on TestDriver's
+            // stack / IOCTL buffer, which is NOT mapped in the private host CR3
+            // (a static snapshot built at Ophion init -- see hostcr3_build).
+            // Switch to the system CR3 so all kernel VAs (req, scratch) resolve.
+            UINT64 s_caller;
+            if (caller_pid) {
+                UINT64 caller_cr3 = hv_pid_to_cr3(caller_pid);
+                if (!caller_cr3) { regs->rax = (UINT64)STATUS_NOT_FOUND; break; }
+                s_caller = vmx_enter_cr3(caller_cr3);
+            } else {
+                s_caller = vmx_enter_guest_cr3();   // private host CR3 -> system CR3
+            }
+            _mm_mfence();
 
             UINT64 target_cr3 = req->target_cr3;
             UINT64 target_va  = req->target_va;
@@ -1649,11 +1665,20 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             HANDLE target_pid = (HANDLE)regs->r9;
             if (!req) { regs->rax = (UINT64)STATUS_INVALID_PARAMETER; break; }
 
-            UINT64 caller_cr3 = caller_pid ? hv_pid_to_cr3(caller_pid) : 0;
-            if (caller_pid && !caller_cr3) { regs->rax = (UINT64)STATUS_NOT_FOUND; break; }
-
-            UINT64 s_caller = caller_cr3 ? vmx_enter_cr3(caller_cr3) : 0;
-            if (s_caller) _mm_mfence();
+            // R3 caller: switch to its kernel CR3 so the user VA `req` is valid.
+            // R0 caller (TestDriver vmcall): `req` is a kernel VA on TestDriver's
+            // stack / IOCTL buffer, which is NOT mapped in the private host CR3
+            // (a static snapshot built at Ophion init -- see hostcr3_build).
+            // Switch to the system CR3 so all kernel VAs (req, scratch) resolve.
+            UINT64 s_caller;
+            if (caller_pid) {
+                UINT64 caller_cr3 = hv_pid_to_cr3(caller_pid);
+                if (!caller_cr3) { regs->rax = (UINT64)STATUS_NOT_FOUND; break; }
+                s_caller = vmx_enter_cr3(caller_cr3);
+            } else {
+                s_caller = vmx_enter_guest_cr3();   // private host CR3 -> system CR3
+            }
+            _mm_mfence();
 
             UINT64 target_cr3 = req->target_cr3;
             UINT64 target_va  = req->target_va;

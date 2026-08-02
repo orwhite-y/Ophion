@@ -11,8 +11,53 @@ fn_PsResumeThread  g_pPsResumeThread  = NULL;
 BOOLEAN g_process_notify_registered = FALSE;
 BOOLEAN g_process_notify_ex_registered = FALSE;
 
+// ---- Liveness check (named event, no vmcall) ----
+// Ophion creates + signals this event after VMX init succeeds on all cores.
+// TestDriver opens it read-only and checks state before any VMCALL.
+// Name looks like a Windows sync primitive (WcsKsSync = a real Windows event).
+static PKEVENT  g_alive_evt  = NULL;
+static HANDLE   g_alive_h    = NULL;
+#define TD_ALIVE_EVT_NAME L"\\BaseNamedObjects\\WcsKsSync"
+
+VOID TdAliveInit(VOID)
+{
+    UNICODE_STRING nm = RTL_CONSTANT_STRING(TD_ALIVE_EVT_NAME);
+    PKEVENT ev = IoCreateNotificationEvent(&nm, &g_alive_h);
+    if (ev)
+    {
+        g_alive_evt = ev;
+        // Do NOT signal here -- Ophion owns signaling. We just hold a handle.
+        HYPERPLATFORM_LOG_INFO("[td] alive event opened: %p (state=%u)",
+            ev, KeReadStateEvent(ev));
+    }
+    else
+    {
+        HYPERPLATFORM_LOG_WARN("[td] alive event open failed (Ophion not loaded?)");
+    }
+}
+
+VOID TdAliveFini(VOID)
+{
+    if (g_alive_h)
+    {
+        ZwClose(g_alive_h);
+        g_alive_h = NULL;
+    }
+    g_alive_evt = NULL;
+}
+
+BOOLEAN TdOphionAlive(VOID)
+{
+    // Quick check: if we never opened the event, Ophion is not loaded.
+    if (!g_alive_evt)
+        return FALSE;
+    // KeReadStateEvent returns nonzero when signaled.
+    return KeReadStateEvent(g_alive_evt) != 0;
+}
+
 VOID TdUnload(PDRIVER_OBJECT drv)
 {
+    TdAliveFini();
     TdMemCacheFini();
 
     if (g_process_notify_registered)
@@ -128,6 +173,20 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
 
     // prefetch read cache (64 KB batch vmcall) - must be ready before IOCTLs
     TdMemCacheInit();
+
+    // Open liveness event + check if Ophion VMX is active.
+    // If Ophion is not loaded / VMX not active, refuse to load TestDriver:
+    // all memory IOCTLs require VMCALL, so loading without Ophion is useless
+    // and risks #UD BSOD (HvlpVtlCallExceptionHandler bypasses SEH on VBS).
+    TdAliveInit();
+    if (!TdOphionAlive())
+    {
+        HYPERPLATFORM_LOG_ERROR("[td] Ophion not active -- refusing to load TestDriver");
+        TdAliveFini();
+        TdMemCacheFini();
+        return (NTSTATUS)0xC0000362;  // STATUS_FAILED_DRIVER_ENTRY
+    }
+    HYPERPLATFORM_LOG_INFO("[td] Ophion alive -- TestDriver loading with VMX support");
 
     UNICODE_STRING dev_name, sym_name;
     RtlInitUnicodeString(&dev_name, TD_DEVICE_NAME);

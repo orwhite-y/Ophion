@@ -28,6 +28,23 @@ static VOID TdResolveMemApis(VOID)
     HYPERPLATFORM_LOG_INFO("[td] MmCopyVirtualMemory = %p", g_MmCopyVirtualMemory);
 }
 
+
+// R0 CR3 resolution: EPROCESS DirectoryTableBase (offset 0x28 on Win10/11 x64).
+// This avoids hv_pid_to_cr3() in VMX-root (which was unreliable: stale cache,
+// missing entries for processes created after Ophion init).
+static UINT64 TdResolveCr3(HANDLE pid)
+{
+    if (!pid) return 0;
+    PEPROCESS p = NULL;
+    if (NT_SUCCESS(PsLookupProcessByProcessId(pid, &p)) && p)
+    {
+        UINT64 cr3 = *(UINT64 *)((PUCHAR)p + 0x28);
+        ObDereferenceObject(p);
+        return cr3;
+    }
+    return 0;
+}
+
 // ===========================================================================
 //  Prefetch read cache (per-process, 64 KB aligned)
 //
@@ -2481,8 +2498,10 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         // ================================================================
         //  METHOD_OUT_DIRECT: SystemBuffer = TD_HV_MEM_HDR (input),
         //  MdlAddress = CE's destination buffer (output, write access).
-        //  The vmcall writes target_va directly into the MDL-mapped
-        //  kernel VA -- ZERO intermediate copies.
+        //
+        //  All reads use KeStackAttachProcess + RtlCopyMemory at
+        //  PASSIVE_LEVEL. No spinlock, no DISPATCH_LEVEL, no VMX-root.
+        //  Fully concurrent: each scanner thread attaches independently.
         // ================================================================
         if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_HV_MEM_HDR))
         { st = STATUS_BUFFER_TOO_SMALL; break; }
@@ -2502,128 +2521,42 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         UINT64 va  = hdr->target_va;
         HANDLE pid = (HANDLE)hdr->target_pid;
 
-        // --- READ: cache hit (lock) + large vmcall (lock-free) + small cache (lock) ---
-        KIRQL old_irql;
+        // invalidate stale cache on new read target (best-effort, no lock needed)
+        TdMemCacheInvalidate();
 
-        // 1) cache hit: serve from cached block (fast, under lock)
-        KeAcquireSpinLock(&g_pfc_lock, &old_irql);
-        if (pid == g_pfc_pid &&
-            va >= g_pfc_base &&
-            va + sz <= g_pfc_base + g_pfc_len)
-        {
-            RtlCopyMemory(out_buf, g_pfc_buf + (va - g_pfc_base), (SIZE_T)sz);
-            hdr->status = (UINT32)STATUS_SUCCESS;
-            hdr->result = sz;
-            irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
-            KeReleaseSpinLock(&g_pfc_lock, old_irql);
-            st = STATUS_SUCCESS;
-            break;
-        }
-        KeReleaseSpinLock(&g_pfc_lock, old_irql);
-
-        // 2) large read (>= cache block): stack-local HV_MEM_REQUEST, NO lock.
-        //    Each scanner thread vmcalls on its own CPU with its own stack
-        //    req, so reads run fully concurrent across cores. The old code
-        //    shared one global g_pfc_req under a single spinlock -> every
-        //    read serialized -> 1x throughput regardless of core count.
-        if (sz >= HV_PFC_SIZE)
-        {
-            HV_MEM_REQUEST sreq;
-            sreq.target_cr3 = 0;
-            sreq.target_va  = va;
-            sreq.size       = sz;
-            sreq.status     = 0;
-            sreq.result     = 0;
-            sreq.data       = (PUCHAR)out_buf;
-
-            BOOLEAN vmc_ok = FALSE;
-            __try {
-                NTSTATUS vr = hv_vmcall_simple(
-                    HV_VMCALL_READ_MEM, (UINT64)&sreq, 0, (UINT64)pid);
-                if (vr == STATUS_SUCCESS) vmc_ok = TRUE;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                vmc_ok = FALSE;
-            }
-
-            if (vmc_ok && sreq.result > 0)
-            {
-                hdr->status = sreq.status;
-                hdr->result = sreq.result;
-                irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
-                st = STATUS_SUCCESS;
-                break;
-            }
-            // vmcall failed / Ophion absent -> fall through to R0 fallback
-        }
-        else
-        {
-            // 3) small read (< cache block): prefetch full block into the
-            //    shared cache under the lock, then copy out.
-            KeAcquireSpinLock(&g_pfc_lock, &old_irql);
-            if (g_pfc_req)
-            {
-                HV_MEM_REQUEST * req = g_pfc_req;
-                UINT64 pbase = va & ~((UINT64)HV_PFC_SIZE - 1);
-                req->target_cr3 = 0;
-                req->target_va  = pbase;
-                req->size       = HV_PFC_SIZE;
-                req->status     = 0;
-                req->result     = 0;
-                req->data       = g_pfc_buf;
-
-                BOOLEAN vmc_ok = FALSE;
-                __try {
-                    NTSTATUS vr = hv_vmcall_simple(
-                        HV_VMCALL_READ_MEM, (UINT64)req, 0, (UINT64)pid);
-                    if (vr == STATUS_SUCCESS) vmc_ok = TRUE;
-                } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    vmc_ok = FALSE;
-                }
-
-                if (vmc_ok && req->result > 0)
-                {
-                    UINT64 got = req->result;
-                    g_pfc_pid  = pid;
-                    g_pfc_base = pbase;
-                    g_pfc_len  = got;
-
-                    if (va >= pbase && va + sz <= pbase + got)
-                    {
-                        RtlCopyMemory(out_buf, g_pfc_buf + (va - pbase), (SIZE_T)sz);
-                        hdr->status = (UINT32)STATUS_SUCCESS;
-                        hdr->result = sz;
-                        irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
-                        KeReleaseSpinLock(&g_pfc_lock, old_irql);
-                        st = STATUS_SUCCESS;
-                        break;
-                    }
-                }
-            }
-            KeReleaseSpinLock(&g_pfc_lock, old_irql);
-        }
-
-        // fallback: KeStackAttachProcess + RtlCopyMemory (no VMX present)
         PEPROCESS target = NULL;
-        NTSTATUS look = PsLookupProcessByProcessId((HANDLE)hdr->target_pid, &target);
+        NTSTATUS look = PsLookupProcessByProcessId(pid, &target);
         if (!NT_SUCCESS(look))
         {
             hdr->status = (UINT32)look;
             hdr->result = 0;
-            irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
+            irp->IoStatus.Information = 0;
             st = STATUS_SUCCESS;
             break;
         }
 
         KAPC_STATE apc;
         KeStackAttachProcess(target, &apc);
-        __try {
-            RtlCopyMemory(out_buf, (PVOID)(ULONG_PTR)va, (SIZE_T)sz);
-            hdr->status = (UINT32)STATUS_SUCCESS;
-            hdr->result = sz;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            hdr->status = (UINT32)STATUS_ACCESS_VIOLATION;
-            hdr->result = 0;
+        // Page-by-page copy: each 4KB page gets its own __try.
+        // Unmapped pages are zero-filled, mapped pages are copied.
+        // This is critical for scanning: a 256KB region may have gaps.
+        UINT64 done = 0;
+        UINT64 cur  = va;
+        while (done < sz)
+        {
+            UINT64 off   = cur & 0xFFF;
+            UINT64 chunk = 0x1000 - off;
+            if (chunk > (UINT64)sz - done) chunk = (UINT64)sz - done;
+            __try {
+                RtlCopyMemory((PUCHAR)out_buf + done, (PVOID)(ULONG_PTR)cur, (SIZE_T)chunk);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                RtlZeroMemory((PUCHAR)out_buf + done, (SIZE_T)chunk);
+            }
+            done += chunk;
+            cur  += chunk;
         }
+        hdr->status = (UINT32)STATUS_SUCCESS;
+        hdr->result = sz;  // always full size (gaps zeroed)
         KeUnstackDetachProcess(&apc);
         ObDereferenceObject(target);
         irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
@@ -2636,8 +2569,6 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         // ================================================================
         //  METHOD_IN_DIRECT: SystemBuffer = TD_HV_MEM_HDR (input),
         //  MdlAddress = CE's source data buffer (input, read access).
-        //  The vmcall reads DIRECTLY from the MDL-mapped kernel VA and
-        //  writes to the target process -- ZERO intermediate copies.
         // ================================================================
         if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_HV_MEM_HDR))
         { st = STATUS_BUFFER_TOO_SMALL; break; }
@@ -2659,60 +2590,44 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         KIRQL old_irql;
         KeAcquireSpinLock(&g_pfc_lock, &old_irql);
         TdMemCacheInvalidate();
-
-        BOOLEAN vmc_ok = FALSE;
-        if (g_pfc_req)
-        {
-            HV_MEM_REQUEST * req = g_pfc_req;
-            req->target_cr3 = 0;
-            req->target_va  = hdr->target_va;
-            req->size       = sz;
-            req->status     = 0;
-            req->result     = 0;
-            req->data       = (PUCHAR)in_buf;
-
-            __try {
-                NTSTATUS vr = hv_vmcall_simple(
-                    HV_VMCALL_WRITE_MEM, (UINT64)req, 0, hdr->target_pid);
-                if (vr == STATUS_SUCCESS) vmc_ok = TRUE;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                vmc_ok = FALSE;
-            }
-
-            if (vmc_ok && req->result > 0)
-            {
-                hdr->status = req->status;
-                hdr->result = req->result;
-                irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
-                KeReleaseSpinLock(&g_pfc_lock, old_irql);
-                st = STATUS_SUCCESS;
-                break;
-            }
-        }
         KeReleaseSpinLock(&g_pfc_lock, old_irql);
 
-        // fallback: KeStackAttachProcess + RtlCopyMemory
+        // direct attach+copy (concurrent, no lock)
         PEPROCESS target = NULL;
         NTSTATUS look = PsLookupProcessByProcessId((HANDLE)hdr->target_pid, &target);
         if (!NT_SUCCESS(look))
         {
             hdr->status = (UINT32)look;
             hdr->result = 0;
-            irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
+            irp->IoStatus.Information = 0;
             st = STATUS_SUCCESS;
             break;
         }
 
         KAPC_STATE apc;
         KeStackAttachProcess(target, &apc);
-        __try {
-            RtlCopyMemory((PVOID)(ULONG_PTR)hdr->target_va, in_buf, (SIZE_T)sz);
-            hdr->status = (UINT32)STATUS_SUCCESS;
-            hdr->result = sz;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            hdr->status = (UINT32)STATUS_ACCESS_VIOLATION;
-            hdr->result = 0;
+        // Page-by-page write: unmapped pages are skipped.
+        UINT64 done = 0;
+        UINT64 cur  = hdr->target_va;
+        while (done < sz)
+        {
+            UINT64 off   = cur & 0xFFF;
+            UINT64 chunk = 0x1000 - off;
+            if (chunk > (UINT64)sz - done) chunk = (UINT64)sz - done;
+            __try {
+                RtlCopyMemory((PVOID)(ULONG_PTR)cur, (PUCHAR)in_buf + done, (SIZE_T)chunk);
+                done += chunk;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                // skip unmapped page
+            }
+            cur += chunk;
+            if (done < sz) {
+                // continue to next page even if this one failed
+                // (but don't advance done for failed pages)
+            }
         }
+        hdr->status = (UINT32)STATUS_SUCCESS;
+        hdr->result = done;
         KeUnstackDetachProcess(&apc);
         ObDereferenceObject(target);
         irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
@@ -2730,24 +2645,31 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         if (p->target_pid == 0)
         { st = STATUS_INVALID_PARAMETER; break; }
 
-        HV_MEM_REQUEST_HDR req;
-        RtlZeroMemory(&req, sizeof(req));
-        req.target_cr3 = 0;
-        req.target_va  = p->target_va;
-        req.size       = 0;
-
-        __try {
-            hv_vmcall_simple(HV_VMCALL_QUERY_VA, (UINT64)&req, 0, p->target_pid);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            p->status = (UINT32)STATUS_DEVICE_NOT_READY;
+        PEPROCESS target = NULL;
+        NTSTATUS look = PsLookupProcessByProcessId((HANDLE)p->target_pid, &target);
+        if (!NT_SUCCESS(look))
+        {
+            p->status = (UINT32)look;
             p->result = 0;
             irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
             st = STATUS_SUCCESS;
             break;
         }
 
-        p->status = req.status;
-        p->result = req.result;
+        KAPC_STATE apc;
+        KeStackAttachProcess(target, &apc);
+        __try {
+            // probe read access
+            volatile UCHAR dummy = *(volatile UCHAR *)(ULONG_PTR)p->target_va;
+            (void)dummy;
+            p->status = (UINT32)STATUS_SUCCESS;
+            p->result = 1;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            p->status = (UINT32)STATUS_NOT_FOUND;
+            p->result = 0;
+        }
+        KeUnstackDetachProcess(&apc);
+        ObDereferenceObject(target);
         irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
         st = STATUS_SUCCESS;
         break;
@@ -2777,6 +2699,13 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         st = STATUS_SUCCESS;
         break;
     }
+
+
+    case IOCTL_HV_DIAG_WALK:
+        // DISABLED: was diagnostic only, caused hangs. Returns not-supported.
+        irp->IoStatus.Information = 0;
+        st = STATUS_NOT_SUPPORTED;
+        break;
 
     default:
         st = STATUS_INVALID_DEVICE_REQUEST;

@@ -324,7 +324,9 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_READ_MEM         0x0000000B   // R3/R0: read target mem (rdx=&req, r8=caller_pid, r9=target_pid)
 #define VMCALL_WRITE_MEM        0x0000000C   // R3/R0: write target mem (rdx=&req, r8=caller_pid, r9=target_pid)
 #define VMCALL_QUERY_VA         0x0000000D   // R3/R0: query VA->PA (rdx=&req, r8=caller_pid, r9=target_pid)
-#define VMCALL_QUERY_CR3        0x0000000E   // R3: rdx=target_pid -> rax=kernel CR3
+#define VMCALL_QUERY_CR3        0x0000000E
+#define VMCALL_SET_SELFMAP     0x0000000F
+#define VMCALL_DIAG_WALK        0x00000010   // R3: rdx=target_pid -> rax=kernel CR3
 
 #define HV_R3_MEM_MAX           262144        // max bytes per R3 read/write call (16 pages, prefetch batch)
 

@@ -1,6 +1,6 @@
 /*
 *   driver.c - Ophion hypervisor kernel driver
-*   pure hypervisor 鈥?no IOCTL, no device object.
+*   pure hypervisor 闂?no IOCTL, no device object.
 *   all communication via VMCALL from other kernel drivers.
 */
 #include "hv.h"
@@ -44,6 +44,49 @@ static NTSTATUS hv_pid_cr3_init(VOID);
 static VOID     hv_pid_cr3_fini(VOID);
 static NTSTATUS hv_scratch_init(VOID);
 static VOID     hv_scratch_fini(VOID);
+// ---------------------------------------------------------------------------
+//  Liveness signal: named notification event signaled while VMX is active on
+//  all cores.  Other kernel drivers (TestDriver) read its state WITHOUT a
+//  vmcall, so they never VMCALL into a CPU where VMX is off (which #UDs ->
+//  BSOD on VBS systems via HvlpVtlCallExceptionHandler, which bypasses SEH).
+//  Set after vmx_init() succeeds, cleared at the very start of DriverUnload
+//  (before broadcast_terminate_all) so clients stop vmcalling during teardown.
+// ---------------------------------------------------------------------------
+#define HV_ALIVE_EVT_NAME L"\\BaseNamedObjects\\WcsKsSync"
+static PKEVENT  g_alive_evt = NULL;
+static HANDLE   g_alive_h   = NULL;
+
+static VOID hv_alive_set(VOID)
+{
+    UNICODE_STRING nm = RTL_CONSTANT_STRING(HV_ALIVE_EVT_NAME);
+    PKEVENT ev = IoCreateNotificationEvent(&nm, &g_alive_h);
+    if (ev)
+    {
+        g_alive_evt = ev;
+        KeClearEvent(g_alive_evt);
+        KeSetEvent(g_alive_evt, IO_NO_INCREMENT, FALSE);
+        HYPERPLATFORM_LOG_INFO("[hv] alive event signaled (VMX active)");
+    }
+    else
+    {
+        HYPERPLATFORM_LOG_ERROR("[hv] alive event create failed");
+    }
+}
+
+static VOID hv_alive_clear(VOID)
+{
+    if (g_alive_evt)
+    {
+        KeClearEvent(g_alive_evt);
+        g_alive_evt = NULL;
+        HYPERPLATFORM_LOG_INFO("[hv] alive event cleared (VMX tearing down)");
+    }
+    if (g_alive_h)
+    {
+        ZwClose(g_alive_h);
+        g_alive_h = NULL;
+    }
+}
 VOID
 DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
 {
@@ -51,6 +94,7 @@ DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
     HYPERPLATFORM_LOG_INFO("[hv] Unloading hypervisor driver...");
 
     g_vmx_active = FALSE;
+    hv_alive_clear();          // tell clients to stop vmcalling BEFORE VMX goes off
 
     ept_stealth_free_all_broadcast();
     ept_stealth_region_destroy();
@@ -185,58 +229,80 @@ static NTSTATUS hv_selfmap_init(VOID)
 {
     UINT64 sys_cr3 = get_system_cr3();
     UINT64 pml4_pa = sys_cr3 & 0x000FFFFFFFFFF000ULL;
+    HYPERPLATFORM_LOG_INFO("[hv] selfmap_init: sys_cr3=%llx pml4_pa=%llx", sys_cr3, pml4_pa);
 
-    // Method 1: MmGetVirtualForPhysical. On some builds this returns NULL
-    // for page-table pages (the MM refuses to alias them), so it may fail.
-    PUINT64 pml4 = (PUINT64)pa_to_va(pml4_pa);
+    // Try multiple methods to map the PML4 physical page and scan for
+    // a self-referencing entry (PML4[S] & PFN_MASK == pml4_pa && present).
+    PUINT64 pml4 = NULL;
+    BOOLEAN mapped_iospace = FALSE;
+
+    // Method A: MmGetVirtualForPhysical (pa_to_va). Works on some builds.
+    pml4 = (PUINT64)pa_to_va(pml4_pa);
     if (pml4)
     {
+        HYPERPLATFORM_LOG_INFO("[hv] selfmap: pa_to_va ok pml4=%p", pml4);
+    }
+    else
+    {
+        // Method B: MmMapIoSpace with MmCached
+        PHYSICAL_ADDRESS _phys; _phys.QuadPart = (LONGLONG)pml4_pa;
+        pml4 = (PUINT64)MmMapIoSpace(_phys, 0x1000, MmCached);
+        if (pml4)
+        {
+            mapped_iospace = TRUE;
+            HYPERPLATFORM_LOG_INFO("[hv] selfmap: MmMapIoSpace(MmCached) ok pml4=%p", pml4);
+        }
+        else
+        {
+            // Method C: MmMapIoSpace with MmNonCached
+            pml4 = (PUINT64)MmMapIoSpace(_phys, 0x1000, MmNonCached);
+            if (pml4)
+            {
+                mapped_iospace = TRUE;
+                HYPERPLATFORM_LOG_INFO("[hv] selfmap: MmMapIoSpace(MmNonCached) ok pml4=%p", pml4);
+            }
+            else
+            {
+                HYPERPLATFORM_LOG_ERROR("[hv] selfmap: ALL mapping methods failed");
+            }
+        }
+    }
+
+    if (pml4)
+    {
+        // Scan for self-referencing entry
+        UINT32 sm_found = 0xFFFFFFFF;
+        UINT64 sm_entry = 0;
         for (UINT32 i = 0; i < 512; i++)
         {
             if ((pml4[i] & 0x000FFFFFFFFFF000ULL) == pml4_pa && (pml4[i] & 1))
             {
-                g_self_map_index = i;
-                HYPERPLATFORM_LOG_INFO("[hv] self-map index = 0x%x (pa_to_va) (PML4[%x]=%llx)",
-                    i, i, pml4[i]);
-                return STATUS_SUCCESS;
+                sm_found = i;
+                sm_entry = pml4[i];
+                break;
             }
         }
-    }
-    else
-    {
-        HYPERPLATFORM_LOG_ERROR("[hv] selfmap init: pa_to_va(pml4) NULL, trying SEH probe");
-    }
 
-    // Method 2: brute-force SEH probe. For each candidate self-map index S,
-    // read PML4[S] through the self-map VA [S,S,S,S,S*8]. If PML4[S] is
-    // self-referencing (PFN == pml4_pa, present), S is the index. Wrong S
-    // values either fault (#PF, caught by SEH) or read a non-matching entry.
-    // Runs at PASSIVE_LEVEL under the system CR3, so SEH is available.
-    for (UINT32 S = 0; S < 512; S++)
-    {
-        UINT64 selfmap_base = (S & 0x100)
-            ? ((UINT64)S << 39) | 0xFFFF000000000000ULL
-            : ((UINT64)S << 39);
-        UINT64 pml4e_va = selfmap_base | ((UINT64)S << 30) | ((UINT64)S << 21)
-                        | ((UINT64)S << 12) | ((UINT64)S << 3);
-        __try
+        // Log first 8 entries for diagnostics if not found
+        if (sm_found == 0xFFFFFFFF)
         {
-            UINT64 entry = *(volatile UINT64 *)pml4e_va;
-            if ((entry & 0x000FFFFFFFFFF000ULL) == pml4_pa && (entry & 1))
-            {
-                g_self_map_index = S;
-                HYPERPLATFORM_LOG_INFO("[hv] self-map index = 0x%x (SEH probe) (PML4[%x]=%llx)",
-                    S, S, entry);
-                return STATUS_SUCCESS;
-            }
+            HYPERPLATFORM_LOG_ERROR("[hv] selfmap: no self-ref found. PML4[0..7]:",
+                pml4[0], pml4[1], pml4[2], pml4[3],
+                pml4[4], pml4[5], pml4[6], pml4[7]);
         }
-        __except (EXCEPTION_EXECUTE_HANDLER)
+
+        if (mapped_iospace) MmUnmapIoSpace(pml4, 0x1000);
+
+        if (sm_found != 0xFFFFFFFF)
         {
-            // VA not mapped for this S candidate; try the next.
+            g_self_map_index = sm_found;
+            HYPERPLATFORM_LOG_INFO("[hv] self-map index = 0x%x (PML4[%x]=%llx)",
+                sm_found, sm_found, sm_entry);
+            return STATUS_SUCCESS;
         }
     }
 
-    HYPERPLATFORM_LOG_ERROR("[hv] selfmap init: no self-referencing PML4 entry found");
+    HYPERPLATFORM_LOG_ERROR("[hv] selfmap init: FAILED - R3 mem VMCALL will zero-fill");
     return STATUS_NOT_FOUND;
 }
 
@@ -341,7 +407,7 @@ DriverEntry(
     UNREFERENCED_PARAMETER(registry_path);
 
     //
-    // init log system 鈥?buffer-based, safe for VMX-root via _SAFE macros
+    // init log system 闂?buffer-based, safe for VMX-root via _SAFE macros
     //
     static const wchar_t kLogFilePath[] = L"\\SystemRoot\\O.log";
     auto log_status = LogInitialization(kLogPutLevelDebug, kLogFilePath);
@@ -472,6 +538,7 @@ DriverEntry(
 
     wedge_cmos_mark(0x11);  // VMX is ON
     g_vmx_active = TRUE;
+    hv_alive_set();           // signal VMX active to all kernel clients
 
     if (ept_stealth_region_init())
     {

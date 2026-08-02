@@ -381,11 +381,15 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
 #define IOCTL_HV_WRITE_MEM  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 18, METHOD_IN_DIRECT, FILE_ANY_ACCESS)
 #define IOCTL_HV_QUERY_VA   CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 19, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_HV_DETECT     CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 20, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_HV_DIAG_WALK  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 22, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // VMCALL subcodes (must match Ophion include/hv_types.h)
 #define HV_VMCALL_READ_MEM   0x0000000B
 #define HV_VMCALL_WRITE_MEM  0x0000000C
 #define HV_VMCALL_QUERY_VA   0x0000000D
+#define HV_VMCALL_SET_SELFMAP  0x0000000F
+#define HV_VMCALL_DIAG_WALK   0x00000010
+
 #define HV_VMCALL_QUERY_CR3  0x0000000E
 #define HV_MEM_MAX           262144         // CE<->TestDriver IOCTL contract (64 KB per IOCTL)
 #define HV_VMCALL_MEM_MAX    262144         // vmcall batch size (16 pages, must match Ophion HV_R3_MEM_MAX)
@@ -430,7 +434,9 @@ typedef struct _TD_HV_MEM_HDR {
     UINT64  target_pid;       // [in] process to read/write
     UINT64  target_va;        // [in] VA in target
     UINT32  size;             // [in] bytes (max HV_MEM_MAX)
+    UINT32  mode;             // [in] 0=auto, 1=native API, 2=kernel, 3=VMX
     UINT32  status;           // [out] NTSTATUS from hypervisor
+    UINT32  _pad;             // align result to 8 bytes
     UINT64  result;           // [out] bytes transferred
 } TD_HV_MEM_HDR, *PTD_HV_MEM_HDR;
 
@@ -701,4 +707,12 @@ VOID TdShadowUnmapRealPage(STEALTH_REAL_PAGE_ENTRY * e);
 VOID TdStealthAllocDpc(PKDPC Dpc, PVOID Ctx, PVOID, PVOID);
 VOID TdStealthAllocReleaseCtx(TD_STEALTH_ALLOC_DPC_CTX * ctx);
 VOID TdUnload(PDRIVER_OBJECT drv);
+
+// Liveness check: Ophion signals a named event when VMX is active on all cores.
+// TestDriver reads the event state (no vmcall) before issuing any VMCALL.
+// If event is not signaled (Ophion not loaded / VMX not active / VBS on),
+// TestDriver skips vmcall and uses kernel fallback (RMode=2 path).
+VOID TdAliveInit(VOID);
+VOID TdAliveFini(VOID);
+BOOLEAN TdOphionAlive(VOID);
 

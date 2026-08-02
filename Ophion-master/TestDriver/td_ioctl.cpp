@@ -28,7 +28,6 @@ static VOID TdResolveMemApis(VOID)
     HYPERPLATFORM_LOG_INFO("[td] MmCopyVirtualMemory = %p", g_MmCopyVirtualMemory);
 }
 
-
 // R0 CR3 resolution: EPROCESS DirectoryTableBase (offset 0x28 on Win10/11 x64).
 // This avoids hv_pid_to_cr3() in VMX-root (which was unreliable: stale cache,
 // missing entries for processes created after Ophion init).
@@ -71,6 +70,7 @@ static HANDLE       g_pfc_pid  = (HANDLE)0;
 static UINT64       g_pfc_base = 0;        // 256 KB-aligned base of cached block
 static UINT64       g_pfc_len  = 0;        // valid bytes from g_pfc_base
 static UINT8        g_pfc_buf[HV_PFC_SIZE];
+static volatile LONG g_vmx_available = 1;  // 1=VMX active, 0=VMCALL #UD detected
 
 VOID TdMemCacheInit(VOID)
 {
@@ -2534,7 +2534,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         // ---- mode=3: VMX PTE-window read ----
         // R0 pre-resolves PAs via MmGetPhysicalAddress under KeStackAttachProcess,
         // then vmcall passes PA array to VMX-root which uses PTE window to read.
-        if (hdr->mode == 3)
+        if (hdr->mode == 3 && g_vmx_available)
         {
             // pa_list[4096] = 32KB, heap-allocated (too large for kernel stack).
             // Allocate from NonPagedPool to avoid stack overflow.
@@ -2542,8 +2542,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 POOL_FLAG_NON_PAGED, 4096 * sizeof(UINT64), 'plTd');
             if (!pa_list)
             {
-                ObDereferenceObject(target);
-                goto r0_read_path;
+                goto r0_read_path;  // target deref by r0_read_path
             }
 
             KAPC_STATE apc;
@@ -2568,15 +2567,22 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
             KeUnstackDetachProcess(&apc);
 
-            NTSTATUS vc = hv_vmcall_ex(
-                HV_VMCALL_READ_MEM_PTE,
-                (UINT64)pa_list,
-                (UINT64)out_buf,
-                (UINT64)sz,
-                va,
-                (UINT64)pa_count,
-                0, 0, 0, 0
-            );
+            NTSTATUS vc = STATUS_UNSUCCESSFUL;
+            __try {
+                vc = hv_vmcall_ex(
+                    HV_VMCALL_READ_MEM_PTE,
+                    (UINT64)pa_list,
+                    (UINT64)out_buf,
+                    (UINT64)sz,
+                    va,
+                    (UINT64)pa_count,
+                    0, 0, 0, 0
+                );
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                vc = STATUS_UNSUCCESSFUL;
+                InterlockedExchange(&g_vmx_available, 0);
+                HYPERPLATFORM_LOG_WARN("[td] VMCALL #UD (READ) - VMX not active, falling back to R0");
+            }
 
             if (NT_SUCCESS(vc))
             {
@@ -2704,7 +2710,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
 
         // ---- mode=3: VMX PTE-window write ----
-        if (hdr->mode == 3)
+        if (hdr->mode == 3 && g_vmx_available)
         {
             // pa_list[4096] = 32KB, heap-allocated (too large for kernel stack).
             // Allocate from NonPagedPool to avoid stack overflow.
@@ -2712,8 +2718,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 POOL_FLAG_NON_PAGED, 4096 * sizeof(UINT64), 'plTd');
             if (!pa_list)
             {
-                ObDereferenceObject(target);
-                goto r0_write_path;
+                goto r0_write_path;  // target deref by r0_write_path
             }
 
             KAPC_STATE apc;
@@ -2738,15 +2743,22 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
             KeUnstackDetachProcess(&apc);
 
-            NTSTATUS vc = hv_vmcall_ex(
-                HV_VMCALL_WRITE_MEM_PTE,
-                (UINT64)pa_list,
-                (UINT64)in_buf,
-                (UINT64)sz,
-                va,
-                (UINT64)pa_count,
-                0, 0, 0, 0
-            );
+            NTSTATUS vc = STATUS_UNSUCCESSFUL;
+            __try {
+                vc = hv_vmcall_ex(
+                    HV_VMCALL_WRITE_MEM_PTE,
+                    (UINT64)pa_list,
+                    (UINT64)in_buf,
+                    (UINT64)sz,
+                    va,
+                    (UINT64)pa_count,
+                    0, 0, 0, 0
+                );
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                vc = STATUS_UNSUCCESSFUL;
+                InterlockedExchange(&g_vmx_available, 0);
+                HYPERPLATFORM_LOG_WARN("[td] VMCALL #UD (WRITE) - VMX not active, falling back to R0");
+            }
 
             if (NT_SUCCESS(vc))
             {
@@ -2887,7 +2899,6 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         st = STATUS_SUCCESS;
         break;
     }
-
 
     case IOCTL_HV_DIAG_WALK:
         // DISABLED: was diagnostic only, caused hangs. Returns not-supported.

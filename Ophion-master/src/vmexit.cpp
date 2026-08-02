@@ -894,6 +894,81 @@ hv_walk_va(UINT64 cr3, UINT64 va, UINT64 * out_pa, BOOLEAN check_writable)
     return TRUE;
 }
 
+// =========================================================================
+//  Per-CPU PTE window pages for VMX-root memory access.
+//
+//  Each CPU gets a 4KB window page from the stealth region. The window page's
+//  PTE (in the system CR3's page tables, found via PML4 self-map) is temporarily
+//  remapped to point at a target physical address. After invlpg + copy, the
+//  original PTE is restored.
+//
+//  This is the ONLY safe VMX-root memory access method under USE_PRIVATE_HOST_CR3:
+//  - No target CR3 switch (only system CR3 switch via vmx_enter_guest_cr3)
+//  - No MM API calls (no MmGetPhysicalAddress, no MmMapIoSpace)
+//  - No PFN DB locks (just PTE read/write + invlpg)
+//  - Per-CPU pages prevent cross-CPU PTE corruption
+//
+//  R0 caller (TestDriver) pre-resolves target PAs via MmGetPhysicalAddress under
+//  KeStackAttachProcess, then passes the PA array to the vmcall.
+// =========================================================================
+
+#define HV_PTE_WIN_MAX_CPUS 256
+
+typedef struct _PTE_WINDOW {
+    PUCHAR          page_va;     // window page VA (stealth region, mapped in private host CR3)
+    volatile LONG   initialized; // 0 = not allocated, 1 = ready
+} PTE_WINDOW;
+
+static PTE_WINDOW g_pte_windows[HV_PTE_WIN_MAX_CPUS];
+
+// Initialize per-CPU window pages. Called from R0 (driver.cpp) after stealth
+// region init. Each CPU gets one 4KB page from the stealth region.
+VOID hv_pte_window_init(ULONG cpu_count)
+{
+    // CRITICAL: window pages MUST be NonPagedPool (valid under g_system_cr3).
+    // The VMCALL handler switches to system CR3 via vmx_enter_guest_cr3(),
+    // where stealth-region VAs are NOT mapped. NonPagedPool kernel VAs are
+    // globally valid in ALL process CR3s (system PTE region, shared kernel map).
+    ULONG allocated = 0;
+    for (ULONG i = 0; i < cpu_count && i < HV_PTE_WIN_MAX_CPUS; i++)
+    {
+        PUINT8 page = (PUINT8)ExAllocatePoolWithTag(
+            NonPagedPool, 0x1000, 'WpTv');
+        if (page)
+        {
+            RtlZeroMemory(page, 0x1000);
+            g_pte_windows[i].page_va = page;
+            _mm_sfence();
+            InterlockedExchange(&g_pte_windows[i].initialized, 1);
+            allocated++;
+        }
+    }
+    HYPERPLATFORM_LOG_INFO("[hv] PTE window: %lu/%lu CPU window pages allocated (NonPagedPool)",
+        allocated, cpu_count);
+}
+
+// Calculate the PTE virtual address for a given page VA via PML4 self-map.
+// The returned pointer addresses the leaf PTE (4KB page table entry).
+// g_self_map_index was found by scanning g_system_cr3's PML4 (Windows self-map),
+// so the returned VA is valid under system CR3 (after vmx_enter_guest_cr3).
+// The pointer arithmetic itself is CR3-independent (no memory access).
+static __forceinline volatile UINT64 *
+hv_pte_calc_pte_va(PUCHAR page_va)
+{
+    UINT32 S = g_self_map_index;
+    if (S >= 512)
+        return NULL;
+
+    UINT64 va = (UINT64)page_va;
+    UINT64 p4 = (va >> 39) & 0x1FF;
+    UINT64 p3 = (va >> 30) & 0x1FF;
+    UINT64 p2 = (va >> 21) & 0x1FF;
+    UINT64 p1 = (va >> 12) & 0x1FF;
+    UINT64 selfmap_base = hv_selfmap_sign_extend(S);
+    return (volatile UINT64 *)(selfmap_base | (p4 << 30) | (p3 << 21) | (p2 << 12) | (p1 << 3));
+}
+
+
 VOID
 
 vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
@@ -1511,6 +1586,164 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             // VA queries now done by TestDriver R0 via KeStackAttachProcess.
             regs->rax = (UINT64)STATUS_NOT_SUPPORTED;
             break;
+
+        //
+        // PTE-window memory access: the SAFE VMX-root memory read/write method.
+        //
+        // R0 caller (TestDriver) pre-resolves target PAs via MmGetPhysicalAddress
+        // under KeStackAttachProcess, then passes the PA array + data buffer.
+        //
+        // Handler flow:
+        //   1. Read all params from regs (VMM stack, valid under both CR3s)
+        //   2. vmx_enter_guest_cr3() -> switch to system CR3 (ALL kernel VAs valid)
+        //   3. For each PA: temporarily remap window page PTE -> invlpg -> copy -> restore
+        //   4. vmx_leave_guest_cr3() -> back to private host CR3
+        //
+        // Register layout (hv_vmcall_ex):
+        //   rdx = pa_array (kernel VA, array of UINT64 PAs, page-aligned)
+        //   r8  = data buffer (kernel VA, where to write read data / read write data)
+        //   r9  = size (bytes)
+        //   r10 = target_va (for per-page offset calculation)
+        //   r11 = pa_count (number of PAs in array)
+        //
+        case VMCALL_READ_MEM_PTE:
+        {
+            // Read all params BEFORE CR3 switch (VMM stack valid under both CR3s)
+            volatile UINT64 * pa_arr = (volatile UINT64 *)regs->rdx;
+            PUCHAR  data_buf = (PUCHAR)regs->r8;
+            UINT32  total_sz = (UINT32)regs->r9;
+            UINT64  target_va = regs->r10;
+            UINT32  pa_cnt    = (UINT32)regs->r11;
+
+            if (!pa_arr || !data_buf || total_sz == 0 || pa_cnt == 0 || pa_cnt > 64)
+            {
+                regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            ULONG cpu = KeGetCurrentProcessorNumberEx(NULL);
+            if (cpu >= HV_PTE_WIN_MAX_CPUS || !g_pte_windows[cpu].initialized)
+            {
+                regs->rax = (UINT64)STATUS_DEVICE_NOT_READY;
+                break;
+            }
+
+            PUCHAR window_va = g_pte_windows[cpu].page_va;
+            volatile UINT64 * pte_ptr = hv_pte_calc_pte_va(window_va);
+            if (!pte_ptr)
+            {
+                regs->rax = (UINT64)STATUS_DEVICE_NOT_READY;
+                break;
+            }
+
+            // Switch to system CR3: all kernel VAs valid (pa_arr, data_buf, window PTE)
+            UINT64 saved_cr3 = vmx_enter_guest_cr3();
+
+            UINT64 done = 0;
+            UINT64 cur_va = target_va;
+            for (UINT32 i = 0; i < pa_cnt && done < total_sz; i++)
+            {
+                UINT64 pa = pa_arr[i];
+                UINT64 off = cur_va & 0xFFF;
+                UINT64 chunk = 0x1000 - off;
+                if (chunk > (UINT64)total_sz - done)
+                    chunk = (UINT64)total_sz - done;
+
+                if (pa == 0)
+                {
+                    // Unmapped page: zero-fill
+                    RtlZeroMemory(data_buf + done, (SIZE_T)chunk);
+                }
+                else
+                {
+                    // Save original PTE, remap window page to target PA.
+                    // Preserve all flags (NX, cache attrs, etc.), only change PFN.
+                    UINT64 old_pte = *pte_ptr;
+                    *pte_ptr = (old_pte & ~HV_MEM_PFN_MASK) | (pa & HV_MEM_PFN_MASK);
+                    __invlpg((PVOID)(ULONG_PTR)window_va);
+
+                    // Copy from window page (now maps target PA) to data buffer
+                    RtlCopyMemory(data_buf + done, window_va + off, (SIZE_T)chunk);
+
+                    // Restore original PTE
+                    *pte_ptr = old_pte;
+                    __invlpg((PVOID)(ULONG_PTR)window_va);
+                }
+
+                done += chunk;
+                cur_va += chunk;
+            }
+
+            vmx_leave_guest_cr3(saved_cr3);
+            regs->rax = (UINT64)(done == total_sz ? STATUS_SUCCESS : STATUS_SOME_NOT_MAPPED);
+            break;
+        }
+
+        case VMCALL_WRITE_MEM_PTE:
+        {
+            volatile UINT64 * pa_arr = (volatile UINT64 *)regs->rdx;
+            PUCHAR  data_buf = (PUCHAR)regs->r8;
+            UINT32  total_sz = (UINT32)regs->r9;
+            UINT64  target_va = regs->r10;
+            UINT32  pa_cnt    = (UINT32)regs->r11;
+
+            if (!pa_arr || !data_buf || total_sz == 0 || pa_cnt == 0 || pa_cnt > 64)
+            {
+                regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            ULONG cpu = KeGetCurrentProcessorNumberEx(NULL);
+            if (cpu >= HV_PTE_WIN_MAX_CPUS || !g_pte_windows[cpu].initialized)
+            {
+                regs->rax = (UINT64)STATUS_DEVICE_NOT_READY;
+                break;
+            }
+
+            PUCHAR window_va = g_pte_windows[cpu].page_va;
+            volatile UINT64 * pte_ptr = hv_pte_calc_pte_va(window_va);
+            if (!pte_ptr)
+            {
+                regs->rax = (UINT64)STATUS_DEVICE_NOT_READY;
+                break;
+            }
+
+            UINT64 saved_cr3 = vmx_enter_guest_cr3();
+
+            UINT64 done = 0;
+            UINT64 cur_va = target_va;
+            for (UINT32 i = 0; i < pa_cnt && done < total_sz; i++)
+            {
+                UINT64 pa = pa_arr[i];
+                UINT64 off = cur_va & 0xFFF;
+                UINT64 chunk = 0x1000 - off;
+                if (chunk > (UINT64)total_sz - done)
+                    chunk = (UINT64)total_sz - done;
+
+                if (pa != 0)
+                {
+                    // Remap window page to target PA.
+                    // Preserve all flags, only change PFN.
+                    UINT64 old_pte = *pte_ptr;
+                    *pte_ptr = (old_pte & ~HV_MEM_PFN_MASK) | (pa & HV_MEM_PFN_MASK);
+                    __invlpg((PVOID)(ULONG_PTR)window_va);
+
+                    // Copy from data buffer to window page (now maps target PA)
+                    RtlCopyMemory(window_va + off, data_buf + done, (SIZE_T)chunk);
+
+                    // Restore original PTE
+                    *pte_ptr = old_pte;
+                    __invlpg((PVOID)(ULONG_PTR)window_va);
+                }
+
+                done += chunk;
+                cur_va += chunk;
+            }
+
+            vmx_leave_guest_cr3(saved_cr3);
+            regs->rax = (UINT64)(done == total_sz ? STATUS_SUCCESS : STATUS_SOME_NOT_MAPPED);
+            break;
+        }
 
         default:
             regs->rax = (UINT64)STATUS_UNSUCCESSFUL;

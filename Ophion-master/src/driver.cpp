@@ -1,6 +1,6 @@
 /*
 *   driver.c - Ophion hypervisor kernel driver
-*   pure hypervisor é—‚?no IOCTL, no device object.
+*   pure hypervisor é—?no IOCTL, no device object.
 *   all communication via VMCALL from other kernel drivers.
 */
 #include "hv.h"
@@ -407,7 +407,7 @@ DriverEntry(
     UNREFERENCED_PARAMETER(registry_path);
 
     //
-    // init log system é—‚?buffer-based, safe for VMX-root via _SAFE macros
+    // init log system é—?buffer-based, safe for VMX-root via _SAFE macros
     //
     static const wchar_t kLogFilePath[] = L"\\SystemRoot\\O.log";
     auto log_status = LogInitialization(kLogPutLevelDebug, kLogFilePath);
@@ -544,6 +544,14 @@ DriverEntry(
     {
         HYPERPLATFORM_LOG_INFO("[hv] Stealth region initialized.");
         wedge_cmos_mark(0x12);
+
+        // Allocate per-CPU PTE window pages for VMX-root memory access.
+        // Must be after stealth region init (pages come from stealth region)
+        // and after selfmap init (PTE VA calculation needs self-map index).
+        {
+            ULONG ncpu = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+            hv_pte_window_init(ncpu);
+        }
     }
     else
     {

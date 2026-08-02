@@ -1,4 +1,4 @@
-/*
+ï»¿/*
 *   td_common.h - shared declarations for TestDriver (split from test_driver.cpp)
 */
 #pragma once
@@ -72,7 +72,7 @@ typedef struct _TD_PEB_LDR_DATA {
 #define VMCALL_EPT_UNHOOK_BY_CR3 0x0000000A   // retire all R3 hooks for a CR3 (no CR3 switch - safe from process-exit callback)
 
 //
-// EPT hook inject param é—?pre-built at PASSIVE_LEVEL, passed to VMX-root.
+// EPT hook inject param ï¿½?pre-built at PASSIVE_LEVEL, passed to VMX-root.
 // must match Ophion's EPT_HOOK_INJECT_PARAM.
 //
 #pragma pack(push, 8)
@@ -285,7 +285,7 @@ typedef struct _TD_INJECT_RENDERDOC_PARAMS {
 #pragma pack(pop)
 
 //
-// R3 EPT hook params é—?from user-mode app via DeviceIoControl
+// R3 EPT hook params ï¿½?from user-mode app via DeviceIoControl
 //
 typedef struct _TD_R3_HOOK_PARAMS {
     UINT64 target_pid;          // [in]  target process PID
@@ -393,7 +393,7 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
 #define HV_VMCALL_WRITE_MEM_PTE 0x00000012
 
 #define HV_VMCALL_QUERY_CR3  0x0000000E
-#define HV_MEM_MAX           262144         // CE<->TestDriver IOCTL contract (64 KB per IOCTL)
+#define HV_MEM_MAX           16777216       // CE<->TestDriver IOCTL contract (16 MB per IOCTL)
 #define HV_VMCALL_MEM_MAX    262144         // vmcall batch size (16 pages, must match Ophion HV_R3_MEM_MAX)
 
 // Header-only subset of HV_MEM_REQUEST (same field offsets, no data[]).
@@ -438,7 +438,7 @@ typedef struct _TD_HV_MEM_HDR {
     UINT32  size;             // [in] bytes (max HV_MEM_MAX)
     UINT32  mode;             // [in] 0=auto, 1=native API, 2=kernel, 3=VMX
     UINT32  status;           // [out] NTSTATUS from hypervisor
-    UINT32  _pad;             // align result to 8 bytes
+    UINT32  _pad;             // bit0: 1=fixup paged-out pages (mode=3)
     UINT64  result;           // [out] bytes transferred
 } TD_HV_MEM_HDR, *PTD_HV_MEM_HDR;
 

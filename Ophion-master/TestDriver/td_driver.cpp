@@ -137,7 +137,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     // init log system 闁?file output, truncate on load
     //
     static const wchar_t kLogFilePath[] = L"\\SystemRoot\\T.log";
-    auto log_status = LogInitialization(kLogPutLevelDebug, kLogFilePath);
+    auto log_status = LogInitialization(kLogPutLevelWarn, kLogFilePath);
     if (log_status == STATUS_REINITIALIZATION_NEEDED)
         LogRegisterReinitialization(drv);
 

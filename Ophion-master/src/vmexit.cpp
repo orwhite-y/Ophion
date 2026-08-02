@@ -1615,7 +1615,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             UINT64  target_va = regs->r10;
             UINT32  pa_cnt    = (UINT32)regs->r11;
 
-            if (!pa_arr || !data_buf || total_sz == 0 || pa_cnt == 0 || pa_cnt > 64)
+            if (!pa_arr || !data_buf || total_sz == 0 || pa_cnt == 0 || pa_cnt > 4096)
             {
                 regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
                 break;
@@ -1639,8 +1639,13 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             // Switch to system CR3: all kernel VAs valid (pa_arr, data_buf, window PTE)
             UINT64 saved_cr3 = vmx_enter_guest_cr3();
 
+            // Optimization: save original PTE once, remap per page without
+            // restore-invlpg each iteration. Only invlpg BEFORE copy (to flush
+            // stale TLB entry from previous page). Restore + invlpg ONCE after
+            // the entire loop. This halves invlpg count (1024 -> 513 for 2MB).
             UINT64 done = 0;
             UINT64 cur_va = target_va;
+            UINT64 saved_pte = *pte_ptr;
             for (UINT32 i = 0; i < pa_cnt && done < total_sz; i++)
             {
                 UINT64 pa = pa_arr[i];
@@ -1656,23 +1661,22 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 }
                 else
                 {
-                    // Save original PTE, remap window page to target PA.
-                    // Preserve all flags (NX, cache attrs, etc.), only change PFN.
-                    UINT64 old_pte = *pte_ptr;
-                    *pte_ptr = (old_pte & ~HV_MEM_PFN_MASK) | (pa & HV_MEM_PFN_MASK);
+                    // Remap window page to target PA (preserve flags, change PFN)
+                    *pte_ptr = (saved_pte & ~HV_MEM_PFN_MASK) | (pa & HV_MEM_PFN_MASK);
                     __invlpg((PVOID)(ULONG_PTR)window_va);
 
                     // Copy from window page (now maps target PA) to data buffer
                     RtlCopyMemory(data_buf + done, window_va + off, (SIZE_T)chunk);
-
-                    // Restore original PTE
-                    *pte_ptr = old_pte;
-                    __invlpg((PVOID)(ULONG_PTR)window_va);
+                    // NO restore invlpg here -- next iteration overwrites PTE + invlpg
                 }
 
                 done += chunk;
                 cur_va += chunk;
             }
+
+            // Restore original PTE and flush once
+            *pte_ptr = saved_pte;
+            __invlpg((PVOID)(ULONG_PTR)window_va);
 
             vmx_leave_guest_cr3(saved_cr3);
             regs->rax = (UINT64)(done == total_sz ? STATUS_SUCCESS : STATUS_SOME_NOT_MAPPED);
@@ -1687,7 +1691,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             UINT64  target_va = regs->r10;
             UINT32  pa_cnt    = (UINT32)regs->r11;
 
-            if (!pa_arr || !data_buf || total_sz == 0 || pa_cnt == 0 || pa_cnt > 64)
+            if (!pa_arr || !data_buf || total_sz == 0 || pa_cnt == 0 || pa_cnt > 4096)
             {
                 regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
                 break;
@@ -1710,8 +1714,10 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
 
             UINT64 saved_cr3 = vmx_enter_guest_cr3();
 
+            // Optimization: save PTE once, invlpg only before copy (not after restore)
             UINT64 done = 0;
             UINT64 cur_va = target_va;
+            UINT64 saved_pte = *pte_ptr;
             for (UINT32 i = 0; i < pa_cnt && done < total_sz; i++)
             {
                 UINT64 pa = pa_arr[i];
@@ -1722,23 +1728,22 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
 
                 if (pa != 0)
                 {
-                    // Remap window page to target PA.
-                    // Preserve all flags, only change PFN.
-                    UINT64 old_pte = *pte_ptr;
-                    *pte_ptr = (old_pte & ~HV_MEM_PFN_MASK) | (pa & HV_MEM_PFN_MASK);
+                    // Remap window page to target PA (preserve flags, change PFN)
+                    *pte_ptr = (saved_pte & ~HV_MEM_PFN_MASK) | (pa & HV_MEM_PFN_MASK);
                     __invlpg((PVOID)(ULONG_PTR)window_va);
 
                     // Copy from data buffer to window page (now maps target PA)
                     RtlCopyMemory(window_va + off, data_buf + done, (SIZE_T)chunk);
-
-                    // Restore original PTE
-                    *pte_ptr = old_pte;
-                    __invlpg((PVOID)(ULONG_PTR)window_va);
+                    // NO restore invlpg -- next iteration overwrites PTE + invlpg
                 }
 
                 done += chunk;
                 cur_va += chunk;
             }
+
+            // Restore original PTE and flush once
+            *pte_ptr = saved_pte;
+            __invlpg((PVOID)(ULONG_PTR)window_va);
 
             vmx_leave_guest_cr3(saved_cr3);
             regs->rax = (UINT64)(done == total_sz ? STATUS_SUCCESS : STATUS_SOME_NOT_MAPPED);

@@ -121,11 +121,8 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
     PIO_STACK_LOCATION io = IoGetCurrentIrpStackLocation(irp);
     irp->IoStatus.Information = 0;
 
-    HYPERPLATFORM_LOG_INFO("[td-ioctl] enter: code=0x%08X in=%u out=%u",
-        io->Parameters.DeviceIoControl.IoControlCode,
-        io->Parameters.DeviceIoControl.InputBufferLength,
-        io->Parameters.DeviceIoControl.OutputBufferLength);
-
+    // Per-IOCTL logging removed: HYPERPLATFORM_LOG_INFO adds ~1-2ms per call
+    // (file buffer + format string), causing 60x slowdown in scan workloads.
     switch (io->Parameters.DeviceIoControl.IoControlCode)
     {
     case IOCTL_INJECT:
@@ -2539,14 +2536,23 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         // then vmcall passes PA array to VMX-root which uses PTE window to read.
         if (hdr->mode == 3)
         {
+            // pa_list[4096] = 32KB, heap-allocated (too large for kernel stack).
+            // Allocate from NonPagedPool to avoid stack overflow.
+            UINT64 * pa_list = (UINT64 *)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED, 4096 * sizeof(UINT64), 'plTd');
+            if (!pa_list)
+            {
+                ObDereferenceObject(target);
+                goto r0_read_path;
+            }
+
             KAPC_STATE apc;
             KeStackAttachProcess(target, &apc);
 
-            UINT64 pa_list[64];  // max 64 pages = 256KB
             UINT32 pa_count = 0;
             UINT64 cur = va;
             UINT64 remaining = sz;
-            while (remaining > 0 && pa_count < 64)
+            while (remaining > 0 && pa_count < 4096)
             {
                 UINT64 page_va = cur & ~0xFFFULL;
                 PHYSICAL_ADDRESS pa = MmGetPhysicalAddress((PVOID)(ULONG_PTR)page_va);
@@ -2574,18 +2580,58 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
             if (NT_SUCCESS(vc))
             {
+                // VMX read succeeded, but pages with PA=0 were zero-filled.
+                // Re-read those pages via R0 KeStackAttachProcess to trigger
+                // soft page-in and get real data.  This fixes the scan-result
+                // mismatch where paged-out pages return 0 instead of real data.
+                BOOLEAN need_fixup = FALSE;
+                if (hdr->_pad & 1)  // fixup flag from user-mode
+                {
+                    for (UINT32 i = 0; i < pa_count; i++)
+                    {
+                        if (pa_list[i] == 0) { need_fixup = TRUE; break; }
+                    }
+                }
+                if (need_fixup)
+                {
+                    KAPC_STATE apc2;
+                    KeStackAttachProcess(target, &apc2);
+                    UINT64 fix_cur = va;
+                    for (UINT32 i = 0; i < pa_count; i++)
+                    {
+                        UINT64 off   = fix_cur & 0xFFF;
+                        UINT64 chunk = 0x1000 - off;
+                        if (chunk > (UINT64)sz - (fix_cur - va)) chunk = (UINT64)sz - (fix_cur - va);
+                        if (pa_list[i] == 0)
+                        {
+                            __try {
+                                RtlCopyMemory((PUCHAR)out_buf + (fix_cur - va),
+                                              (PVOID)(ULONG_PTR)fix_cur,
+                                              (SIZE_T)chunk);
+                            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                                RtlZeroMemory((PUCHAR)out_buf + (fix_cur - va),
+                                              (SIZE_T)chunk);
+                            }
+                        }
+                        fix_cur += chunk;
+                    }
+                    KeUnstackDetachProcess(&apc2);
+                }
                 hdr->status = (UINT32)vc;
-                hdr->result = sz;  // full size (unmapped pages zeroed by VMX handler)
+                hdr->result = sz;
                 ObDereferenceObject(target);
                 irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
                 st = STATUS_SUCCESS;
+                ExFreePoolWithTag(pa_list, 'plTd');
                 break;
             }
-            // VMX failed -> fall through to R0 path
+            // VMX failed -> fall through to R0 path, free pa_list first
             HYPERPLATFORM_LOG_WARN("[td] READ mode=3 vmcall failed 0x%08X, falling back to R0", vc);
+            ExFreePoolWithTag(pa_list, 'plTd');
         }
 
         // ---- R0 path (mode 0/1/2 or VMX fallback) ----
+        r0_read_path:
         {
             KAPC_STATE apc;
             KeStackAttachProcess(target, &apc);
@@ -2660,14 +2706,23 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         // ---- mode=3: VMX PTE-window write ----
         if (hdr->mode == 3)
         {
+            // pa_list[4096] = 32KB, heap-allocated (too large for kernel stack).
+            // Allocate from NonPagedPool to avoid stack overflow.
+            UINT64 * pa_list = (UINT64 *)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED, 4096 * sizeof(UINT64), 'plTd');
+            if (!pa_list)
+            {
+                ObDereferenceObject(target);
+                goto r0_write_path;
+            }
+
             KAPC_STATE apc;
             KeStackAttachProcess(target, &apc);
 
-            UINT64 pa_list[64];
             UINT32 pa_count = 0;
             UINT64 cur = va;
             UINT64 remaining = sz;
-            while (remaining > 0 && pa_count < 64)
+            while (remaining > 0 && pa_count < 4096)
             {
                 UINT64 page_va = cur & ~0xFFFULL;
                 PHYSICAL_ADDRESS pa = MmGetPhysicalAddress((PVOID)(ULONG_PTR)page_va);
@@ -2695,17 +2750,52 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
             if (NT_SUCCESS(vc))
             {
+                // Fix up paged-out pages (PA=0) via R0 write to trigger page-in
+                BOOLEAN need_fixup = FALSE;
+                if (hdr->_pad & 1)  // fixup flag from user-mode
+                {
+                    for (UINT32 i = 0; i < pa_count; i++)
+                    {
+                        if (pa_list[i] == 0) { need_fixup = TRUE; break; }
+                    }
+                }
+                if (need_fixup)
+                {
+                    KAPC_STATE apc2;
+                    KeStackAttachProcess(target, &apc2);
+                    UINT64 fix_cur = va;
+                    for (UINT32 i = 0; i < pa_count; i++)
+                    {
+                        UINT64 off   = fix_cur & 0xFFF;
+                        UINT64 chunk = 0x1000 - off;
+                        if (chunk > (UINT64)sz - (fix_cur - va)) chunk = (UINT64)sz - (fix_cur - va);
+                        if (pa_list[i] == 0)
+                        {
+                            __try {
+                                RtlCopyMemory((PVOID)(ULONG_PTR)fix_cur,
+                                              (PUCHAR)in_buf + (fix_cur - va),
+                                              (SIZE_T)chunk);
+                            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                            }
+                        }
+                        fix_cur += chunk;
+                    }
+                    KeUnstackDetachProcess(&apc2);
+                }
                 hdr->status = (UINT32)vc;
                 hdr->result = sz;
                 ObDereferenceObject(target);
                 irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
                 st = STATUS_SUCCESS;
+                ExFreePoolWithTag(pa_list, 'plTd');
                 break;
             }
             HYPERPLATFORM_LOG_WARN("[td] WRITE mode=3 vmcall failed 0x%08X, falling back to R0", vc);
+            ExFreePoolWithTag(pa_list, 'plTd');
         }
 
         // ---- R0 path (mode 0/1/2 or VMX fallback) ----
+        r0_write_path:
         {
             KAPC_STATE apc;
             KeStackAttachProcess(target, &apc);

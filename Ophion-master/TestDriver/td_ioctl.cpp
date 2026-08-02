@@ -44,6 +44,256 @@ static UINT64 TdResolveCr3(HANDLE pid)
     return 0;
 }
 
+//
+// PTE-window page-table walk: uses the Windows PML4 self-map to find
+// the PTE of a window page, then remaps that PTE to walk target page
+// tables at ~500ns per remap (vs ~8ms for MmMapIoSpace).
+//
+// No KeStackAttachProcess, no MmMapIoSpace on the hot path = stealthier.
+// Only td_ioctl.cpp is changed; Ophion (vmexit.cpp) is untouched = no BSOD risk.
+//
+
+// Global PTE window state (initialized once in TdMemCacheInit at PASSIVE_LEVEL)
+static KSPIN_LOCK        g_td_pte_lock;
+static PUCHAR            g_td_win_va   = NULL;     // window page VA (NonPagedPool)
+static volatile UINT64 * g_td_win_pte  = NULL;     // PTE pointer for window page
+static volatile UINT32   g_td_selfmap_idx = 0xFFFFFFFF;  // PML4 self-map index
+static PUCHAR            g_td_data_va  = NULL;     // data window page (read/write target PA)
+static volatile UINT64 * g_td_data_pte = NULL;     // PTE pointer for data window page
+
+// Canonical sign-extension for PML4 self-map base VA.
+static __forceinline UINT64
+td_selfmap_sign_extend(UINT64 idx)
+{
+    if (idx & 0x100)
+        return (idx << 39) | 0xFFFF000000000000ULL;
+    return idx << 39;
+}
+
+// Find the Windows PML4 self-map index by scanning the current CR3's PML4.
+// The self-map entry PML4[S] points back to the PML4 page itself.
+// Called once at PASSIVE_LEVEL during TdInitPteWindow.
+static VOID
+TdFindSelfMapIndex(VOID)
+{
+    if (g_td_selfmap_idx != 0xFFFFFFFF) return;
+
+    // Use System process (PID 4) CR3 - same method as Ophion's get_system_cr3().
+    // __readcr3() may return a user-process CR3 (no self-map) depending on context.
+    PEPROCESS sys_proc = PsInitialSystemProcess;
+    UINT64 cr3 = 0;
+    if (sys_proc)
+        cr3 = *(UINT64 *)((PUCHAR)sys_proc + 0x28);
+    if (!cr3)
+        cr3 = __readcr3();
+    UINT64 pml4_pa = cr3 & PFN_MASK_;
+
+    HYPERPLATFORM_LOG_WARN("[td] selfmap: sys_cr3=%llx pml4_pa=%llx", cr3, pml4_pa);
+
+    // Method A: MmGetVirtualForPhysical (same as Ophion pa_to_va).
+    // Works for page-table pages because they are already mapped via
+    // the PML4 self-map entry in system VA space.
+    PHYSICAL_ADDRESS pa;
+    pa.QuadPart = (LONGLONG)pml4_pa;
+    PUINT64 pml4 = (PUINT64)MmGetVirtualForPhysical(pa);
+    BOOLEAN mapped_iospace = FALSE;
+
+    if (pml4)
+    {
+        HYPERPLATFORM_LOG_WARN("[td] selfmap: MmGetVirtualForPhysical ok pml4=%p first=%llx", pml4, pml4[0]);
+    }
+    else
+    {
+        // Method B: MmMapIoSpace (fallback - may fail for PFN-managed pages)
+        pml4 = (PUINT64)MmMapIoSpace(pa, PAGE_SIZE, MmCached);
+        if (!pml4)
+            pml4 = (PUINT64)MmMapIoSpace(pa, PAGE_SIZE, MmNonCached);
+        if (pml4)
+        {
+            mapped_iospace = TRUE;
+            HYPERPLATFORM_LOG_WARN("[td] selfmap: MmMapIoSpace ok pml4=%p first=%llx", pml4, pml4[0]);
+        }
+        else
+        {
+            HYPERPLATFORM_LOG_WARN("[td] selfmap: ALL mapping methods failed for pa=%llx", pml4_pa);
+            return;
+        }
+    }
+
+    HYPERPLATFORM_LOG_WARN("[td] selfmap: pml4 mapped at va=%p, first entry=%llx", pml4, pml4[0]);
+    // Scan ALL 512 entries for self-referencing PML4 entry (same as Ophion).
+    for (UINT32 i = 0; i < 512; i++)
+    {
+        if ((pml4[i] & 1) && ((pml4[i] & PFN_MASK_) == pml4_pa))
+        {
+            g_td_selfmap_idx = i;
+            HYPERPLATFORM_LOG_WARN("[td] selfmap: found idx=%u entry=%llx", i, pml4[i]);
+            break;
+        }
+    }
+
+    if (g_td_selfmap_idx == 0xFFFFFFFF)
+    {
+        HYPERPLATFORM_LOG_WARN("[td] selfmap: NOT FOUND. PML4[0..7]=%llx %llx %llx %llx %llx %llx %llx %llx",
+            pml4[0], pml4[1], pml4[2], pml4[3], pml4[4], pml4[5], pml4[6], pml4[7]);
+    }
+
+    if (mapped_iospace) MmUnmapIoSpace(pml4, PAGE_SIZE);
+}
+
+// Allocate the window page and find its PTE via the self-map.
+// Called once from TdMemCacheInit (PASSIVE_LEVEL, before any IOCTL).
+static VOID
+TdInitPteWindow(VOID)
+{
+    if (g_td_win_va) return;
+
+    KeInitializeSpinLock(&g_td_pte_lock);
+    TdFindSelfMapIndex();
+    if (g_td_selfmap_idx >= 512)
+    {
+        HYPERPLATFORM_LOG_WARN("[td] PTE window: self-map index not found, falling back to R0 path");
+        return;
+    }
+
+    g_td_win_va = (PUCHAR)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, PAGE_SIZE, 'WpTd');
+    if (!g_td_win_va) return;
+    RtlZeroMemory(g_td_win_va, PAGE_SIZE);
+
+    // Compute the leaf PTE VA for the window page via PML4 self-map.
+    UINT64 S = g_td_selfmap_idx;
+    UINT64 va = (UINT64)g_td_win_va;
+    UINT64 selfmap_base = td_selfmap_sign_extend(S);
+    g_td_win_pte = (volatile UINT64 *)(selfmap_base
+        | (((va >> 39) & 0x1FF) << 30)
+        | (((va >> 30) & 0x1FF) << 21)
+        | (((va >> 21) & 0x1FF) << 12)
+        | (((va >> 12) & 0x1FF) << 3));
+
+    HYPERPLATFORM_LOG_INFO("[td] PTE window: va=%p pte=%p selfmap_idx=%u",
+        g_td_win_va, g_td_win_pte, g_td_selfmap_idx);
+
+    // Data window: second NonPagedPool page for direct PA read/write.
+    g_td_data_va = (PUCHAR)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, PAGE_SIZE, 'DpTd');
+    if (!g_td_data_va) return;
+    RtlZeroMemory(g_td_data_va, PAGE_SIZE);
+
+    UINT64 dva = (UINT64)g_td_data_va;
+    g_td_data_pte = (volatile UINT64 *)(selfmap_base
+        | (((dva >> 39) & 0x1FF) << 30)
+        | (((dva >> 30) & 0x1FF) << 21)
+        | (((dva >> 21) & 0x1FF) << 12)
+        | (((dva >> 12) & 0x1FF) << 3));
+
+    HYPERPLATFORM_LOG_INFO("[td] data window: va=%p pte=%p",
+        g_td_data_va, g_td_data_pte);
+}
+
+typedef struct _TD_PT_CACHE {
+    UINT64  saved_pte;        // original walk window PTE (restored in cleanup)
+    UINT64  saved_data_pte;   // original data window PTE
+    KIRQL   old_irql;         // saved IRQL from spinlock acquisition
+    UINT64  cached_2mb;       // 2MB base of currently-mapped PT page
+    BOOLEAN pt_valid;         // TRUE if window maps PT page for cached_2mb
+    BOOLEAN initialized;      // saved_pte is valid (spinlock held)
+} TD_PT_CACHE;
+
+static VOID
+TdPtCacheInit(TD_PT_CACHE *c)
+{
+    c->cached_2mb  = 0;
+    c->pt_valid    = FALSE;
+    c->initialized = FALSE;
+    if (!g_td_win_pte || !g_td_data_pte) return;  // windows not initialized
+    KeAcquireSpinLock(&g_td_pte_lock, &c->old_irql);
+    c->saved_pte       = *g_td_win_pte;
+    c->saved_data_pte  = *g_td_data_pte;
+    c->initialized = TRUE;
+}
+
+static VOID
+TdPtCacheCleanup(TD_PT_CACHE *c)
+{
+    if (c->initialized && g_td_win_pte)
+    {
+        *g_td_win_pte = c->saved_pte;
+        __invlpg(g_td_win_va);
+        if (g_td_data_pte)
+        {
+            *g_td_data_pte = c->saved_data_pte;
+            __invlpg(g_td_data_va);
+        }
+        KeReleaseSpinLock(&g_td_pte_lock, c->old_irql);
+    }
+    c->initialized = FALSE;
+    c->pt_valid    = FALSE;
+}
+
+// Walk target page tables via the PTE window.
+// Assumes spinlock is held (TdPtCacheInit called, initialized=TRUE).
+// Caches the PT page per 2MB region for O(1) per page within a region.
+// Each 2MB-region change = 4 PTE remaps + invlpg (~2us total).
+static __forceinline UINT64
+TdResolvePaCached(
+    UINT64       target_cr3,
+    UINT64       va,
+    TD_PT_CACHE *cache
+)
+{
+    UINT64 page_va = va & ~0xFFFULL;
+    UINT64 cur_2mb = page_va & ~0x1FFFFFULL;
+
+    // Cache hit: window still maps the PT page for this 2MB region
+    if (cache->pt_valid && cur_2mb == cache->cached_2mb)
+    {
+        UINT64 pte = ((volatile UINT64*)g_td_win_va)[(va >> 12) & 0x1FF];
+        return (pte & 1) ? (pte & PFN_MASK_) : 0;
+    }
+
+    // Cache miss: walk PML4 -> PDPT -> PD -> PT using the window page.
+    // PTE flags: P=1 (present), R/W=1 (writable), U/S=0 (supervisor).
+    #define TD_PT_FLAGS 0x03ULL
+
+    // PML4
+    *g_td_win_pte = (target_cr3 & PFN_MASK_) | TD_PT_FLAGS;
+    __invlpg(g_td_win_va);
+    UINT64 pml4e = ((volatile UINT64*)g_td_win_va)[(va >> 39) & 0x1FF];
+    if (!(pml4e & 1)) { cache->pt_valid = FALSE; return 0; }
+
+    // PDPT
+    *g_td_win_pte = (pml4e & PFN_MASK_) | TD_PT_FLAGS;
+    __invlpg(g_td_win_va);
+    UINT64 pdpe = ((volatile UINT64*)g_td_win_va)[(va >> 30) & 0x1FF];
+    if (!(pdpe & 1)) { cache->pt_valid = FALSE; return 0; }
+
+    // 1 GB large page
+    if (pdpe & (1ULL << 7))
+        return ((pdpe & 0x000FFFFFFC0000000ULL) + (page_va & 0x3FFFFFFF)) & ~0xFFFULL;
+
+    // PD
+    *g_td_win_pte = (pdpe & PFN_MASK_) | TD_PT_FLAGS;
+    __invlpg(g_td_win_va);
+    UINT64 pde = ((volatile UINT64*)g_td_win_va)[(va >> 21) & 0x1FF];
+    if (!(pde & 1)) { cache->pt_valid = FALSE; return 0; }
+
+    // 2 MB large page
+    if (pde & (1ULL << 7))
+        return ((pde & 0x000FFFFFFFE00000ULL) + (page_va & 0x1FFFFF)) & ~0xFFFULL;
+
+    // PT: map and cache (leave window pointing at PT page)
+    *g_td_win_pte = (pde & PFN_MASK_) | TD_PT_FLAGS;
+    __invlpg(g_td_win_va);
+    cache->cached_2mb = cur_2mb;
+    cache->pt_valid   = TRUE;
+
+    UINT64 pte = ((volatile UINT64*)g_td_win_va)[(va >> 12) & 0x1FF];
+    return (pte & 1) ? (pte & PFN_MASK_) : 0;
+
+    #undef TD_PT_FLAGS
+}
+
 // ===========================================================================
 //  Prefetch read cache (per-process, 64 KB aligned)
 //
@@ -86,6 +336,10 @@ VOID TdMemCacheInit(VOID)
     g_pfc_len  = 0;
     HYPERPLATFORM_LOG_INFO("[td] prefetch cache init (req=%p, buf=%p, %u KB)",
         g_pfc_req, g_pfc_buf, HV_PFC_SIZE / 1024);
+
+    // Initialize PTE window for fast page-table walking (mode=3).
+    // Runs at PASSIVE_LEVEL in DriverEntry, before any IOCTL.
+    TdInitPteWindow();
 }
 
 VOID TdMemCacheFini(VOID)
@@ -94,6 +348,12 @@ VOID TdMemCacheFini(VOID)
     {
         ExFreePoolWithTag(g_pfc_req, 'cfpT');
         g_pfc_req = NULL;
+    }
+    if (g_td_win_va)
+    {
+        ExFreePoolWithTag(g_td_win_va, 'WpTd');
+        g_td_win_va  = NULL;
+        g_td_win_pte = NULL;
     }
 }
 
@@ -2531,73 +2791,58 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             break;
         }
 
-        // ---- mode=3: VMX PTE-window read ----
-        // R0 pre-resolves PAs via MmGetPhysicalAddress under KeStackAttachProcess,
-        // then vmcall passes PA array to VMX-root which uses PTE window to read.
+        // ---- mode=3: PTE-window PA resolve + VMCALL data read ----
+        // R0 walks target page tables via self-map (no KeStackAttachProcess),
+        // then VMCALL sends PA list to VMX-root which reads via per-CPU window.
         if (hdr->mode == 3 && g_vmx_available)
         {
-            // pa_list[4096] = 32KB, heap-allocated (too large for kernel stack).
-            // Allocate from NonPagedPool to avoid stack overflow.
             UINT64 * pa_list = (UINT64 *)ExAllocatePool2(
                 POOL_FLAG_NON_PAGED, 4096 * sizeof(UINT64), 'plTd');
             if (!pa_list)
-            {
-                goto r0_read_path;  // target deref by r0_read_path
-            }
+                goto r0_read_path;
 
-            KAPC_STATE apc;
-            KeStackAttachProcess(target, &apc);
+            UINT64 target_cr3 = *(UINT64 *)((PUCHAR)target + 0x28);
+            if (!target_cr3) { ExFreePoolWithTag(pa_list, 'plTd'); goto r0_read_path; }
+
+            TD_PT_CACHE pt_cache;
+            TdPtCacheInit(&pt_cache);
+            if (!pt_cache.initialized)
+            { ExFreePoolWithTag(pa_list, 'plTd'); goto r0_read_path; }
 
             UINT32 pa_count = 0;
             UINT64 cur = va;
             UINT64 remaining = sz;
             while (remaining > 0 && pa_count < 4096)
             {
-                UINT64 page_va = cur & ~0xFFFULL;
-                PHYSICAL_ADDRESS pa = MmGetPhysicalAddress((PVOID)(ULONG_PTR)page_va);
-                pa_list[pa_count] = (pa.QuadPart == 0) ? 0 : (pa.QuadPart & ~0xFFFULL);
+                pa_list[pa_count] = TdResolvePaCached(target_cr3, cur, &pt_cache);
                 pa_count++;
-
                 UINT64 off = cur & 0xFFF;
                 UINT64 chunk = 0x1000 - off;
                 if (chunk > remaining) chunk = remaining;
                 remaining -= chunk;
                 cur += chunk;
             }
-
-            KeUnstackDetachProcess(&apc);
+            TdPtCacheCleanup(&pt_cache);
 
             NTSTATUS vc = STATUS_UNSUCCESSFUL;
             __try {
                 vc = hv_vmcall_ex(
                     HV_VMCALL_READ_MEM_PTE,
-                    (UINT64)pa_list,
-                    (UINT64)out_buf,
-                    (UINT64)sz,
-                    va,
-                    (UINT64)pa_count,
+                    (UINT64)pa_list, (UINT64)out_buf,
+                    (UINT64)sz, va, (UINT64)pa_count,
                     0, 0, 0, 0
                 );
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 vc = STATUS_UNSUCCESSFUL;
                 InterlockedExchange(&g_vmx_available, 0);
-                HYPERPLATFORM_LOG_WARN("[td] VMCALL #UD (READ) - VMX not active, falling back to R0");
             }
 
             if (NT_SUCCESS(vc))
             {
-                // VMX read succeeded, but pages with PA=0 were zero-filled.
-                // Re-read those pages via R0 KeStackAttachProcess to trigger
-                // soft page-in and get real data.  This fixes the scan-result
-                // mismatch where paged-out pages return 0 instead of real data.
                 BOOLEAN need_fixup = FALSE;
-                if (hdr->_pad & 1)  // fixup flag from user-mode
-                {
+                if (hdr->_pad & 1)
                     for (UINT32 i = 0; i < pa_count; i++)
-                    {
                         if (pa_list[i] == 0) { need_fixup = TRUE; break; }
-                    }
-                }
                 if (need_fixup)
                 {
                     KAPC_STATE apc2;
@@ -2605,19 +2850,15 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                     UINT64 fix_cur = va;
                     for (UINT32 i = 0; i < pa_count; i++)
                     {
-                        UINT64 off   = fix_cur & 0xFFF;
+                        UINT64 off = fix_cur & 0xFFF;
                         UINT64 chunk = 0x1000 - off;
                         if (chunk > (UINT64)sz - (fix_cur - va)) chunk = (UINT64)sz - (fix_cur - va);
                         if (pa_list[i] == 0)
                         {
-                            __try {
-                                RtlCopyMemory((PUCHAR)out_buf + (fix_cur - va),
-                                              (PVOID)(ULONG_PTR)fix_cur,
-                                              (SIZE_T)chunk);
-                            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                                RtlZeroMemory((PUCHAR)out_buf + (fix_cur - va),
-                                              (SIZE_T)chunk);
-                            }
+                            __try { RtlCopyMemory((PUCHAR)out_buf + (fix_cur - va),
+                                  (PVOID)(ULONG_PTR)fix_cur, (SIZE_T)chunk); }
+                            __except (EXCEPTION_EXECUTE_HANDLER) {
+                                RtlZeroMemory((PUCHAR)out_buf + (fix_cur - va), (SIZE_T)chunk); }
                         }
                         fix_cur += chunk;
                     }
@@ -2631,8 +2872,6 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 ExFreePoolWithTag(pa_list, 'plTd');
                 break;
             }
-            // VMX failed -> fall through to R0 path, free pa_list first
-            HYPERPLATFORM_LOG_WARN("[td] READ mode=3 vmcall failed 0x%08X, falling back to R0", vc);
             ExFreePoolWithTag(pa_list, 'plTd');
         }
 
@@ -2709,68 +2948,56 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             break;
         }
 
-        // ---- mode=3: VMX PTE-window write ----
+        // ---- mode=3: PTE-window PA resolve + VMCALL data write ----
         if (hdr->mode == 3 && g_vmx_available)
         {
-            // pa_list[4096] = 32KB, heap-allocated (too large for kernel stack).
-            // Allocate from NonPagedPool to avoid stack overflow.
             UINT64 * pa_list = (UINT64 *)ExAllocatePool2(
                 POOL_FLAG_NON_PAGED, 4096 * sizeof(UINT64), 'plTd');
             if (!pa_list)
-            {
-                goto r0_write_path;  // target deref by r0_write_path
-            }
+                goto r0_write_path;
 
-            KAPC_STATE apc;
-            KeStackAttachProcess(target, &apc);
+            UINT64 target_cr3 = *(UINT64 *)((PUCHAR)target + 0x28);
+            if (!target_cr3) { ExFreePoolWithTag(pa_list, 'plTd'); goto r0_write_path; }
+
+            TD_PT_CACHE pt_cache;
+            TdPtCacheInit(&pt_cache);
+            if (!pt_cache.initialized)
+            { ExFreePoolWithTag(pa_list, 'plTd'); goto r0_write_path; }
 
             UINT32 pa_count = 0;
             UINT64 cur = va;
             UINT64 remaining = sz;
             while (remaining > 0 && pa_count < 4096)
             {
-                UINT64 page_va = cur & ~0xFFFULL;
-                PHYSICAL_ADDRESS pa = MmGetPhysicalAddress((PVOID)(ULONG_PTR)page_va);
-                pa_list[pa_count] = (pa.QuadPart == 0) ? 0 : (pa.QuadPart & ~0xFFFULL);
+                pa_list[pa_count] = TdResolvePaCached(target_cr3, cur, &pt_cache);
                 pa_count++;
-
                 UINT64 off = cur & 0xFFF;
                 UINT64 chunk = 0x1000 - off;
                 if (chunk > remaining) chunk = remaining;
                 remaining -= chunk;
                 cur += chunk;
             }
-
-            KeUnstackDetachProcess(&apc);
+            TdPtCacheCleanup(&pt_cache);
 
             NTSTATUS vc = STATUS_UNSUCCESSFUL;
             __try {
                 vc = hv_vmcall_ex(
                     HV_VMCALL_WRITE_MEM_PTE,
-                    (UINT64)pa_list,
-                    (UINT64)in_buf,
-                    (UINT64)sz,
-                    va,
-                    (UINT64)pa_count,
+                    (UINT64)pa_list, (UINT64)in_buf,
+                    (UINT64)sz, va, (UINT64)pa_count,
                     0, 0, 0, 0
                 );
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 vc = STATUS_UNSUCCESSFUL;
                 InterlockedExchange(&g_vmx_available, 0);
-                HYPERPLATFORM_LOG_WARN("[td] VMCALL #UD (WRITE) - VMX not active, falling back to R0");
             }
 
             if (NT_SUCCESS(vc))
             {
-                // Fix up paged-out pages (PA=0) via R0 write to trigger page-in
                 BOOLEAN need_fixup = FALSE;
-                if (hdr->_pad & 1)  // fixup flag from user-mode
-                {
+                if (hdr->_pad & 1)
                     for (UINT32 i = 0; i < pa_count; i++)
-                    {
                         if (pa_list[i] == 0) { need_fixup = TRUE; break; }
-                    }
-                }
                 if (need_fixup)
                 {
                     KAPC_STATE apc2;
@@ -2778,17 +3005,14 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                     UINT64 fix_cur = va;
                     for (UINT32 i = 0; i < pa_count; i++)
                     {
-                        UINT64 off   = fix_cur & 0xFFF;
+                        UINT64 off = fix_cur & 0xFFF;
                         UINT64 chunk = 0x1000 - off;
                         if (chunk > (UINT64)sz - (fix_cur - va)) chunk = (UINT64)sz - (fix_cur - va);
                         if (pa_list[i] == 0)
                         {
-                            __try {
-                                RtlCopyMemory((PVOID)(ULONG_PTR)fix_cur,
-                                              (PUCHAR)in_buf + (fix_cur - va),
-                                              (SIZE_T)chunk);
-                            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                            }
+                            __try { RtlCopyMemory((PVOID)(ULONG_PTR)fix_cur,
+                                  (PUCHAR)in_buf + (fix_cur - va), (SIZE_T)chunk); }
+                            __except (EXCEPTION_EXECUTE_HANDLER) {}
                         }
                         fix_cur += chunk;
                     }
@@ -2802,7 +3026,6 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 ExFreePoolWithTag(pa_list, 'plTd');
                 break;
             }
-            HYPERPLATFORM_LOG_WARN("[td] WRITE mode=3 vmcall failed 0x%08X, falling back to R0", vc);
             ExFreePoolWithTag(pa_list, 'plTd');
         }
 

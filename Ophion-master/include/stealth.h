@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 //
-// master stealth switch â€?set to 0 to disable all stealth globally
+// master stealth switch ï¿½?set to 0 to disable all stealth globally
 //
 #define STEALTH_ENABLED                     1
 
@@ -27,7 +27,8 @@ extern "C" {
 //
 #define SHADOW_PT_MODE_A    1
 #define SHADOW_PT_MODE_B    2
-#define SHADOW_PT_MODE      SHADOW_PT_MODE_A
+#define SHADOW_PT_MODE_C    3   // hybrid: code P=1/NX=0 (fast), data P=0 (reactive sync, no stale)
+#define SHADOW_PT_MODE      SHADOW_PT_MODE_C
 
 //
 // hide CR4.VMXE (bit 13) from guest reads
@@ -42,7 +43,7 @@ extern "C" {
 //
 // approach: after CPUID exit, dynamically enable RDTSC exiting for one
 // instruction. the trapped RDTSC returns a compensated value that hides
-// the VM-exit overhead, then RDTSC exiting is disabled. zero drift â€?
+// the VM-exit overhead, then RDTSC exiting is disabled. zero drift ï¿½?
 // TSC_OFFSET is never modified, only one RDTSC per CPUID is trapped.
 //
 #define STEALTH_COMPENSATE_TIMING           1
@@ -56,7 +57,7 @@ extern "C" {
 //
 // use private (deep-copied) host page tables for VMCS_HOST_CR3
 // protects host-mode from guest/anti-cheat page table corruption
-// disabled by default â€?enable once base hv is verified stable
+// disabled by default ï¿½?enable once base hv is verified stable
 //
 // Private host CR3 now works with EPT hooks:
 //   - All VMM memory (pool, stacks, EPT tables) allocated BEFORE hostcr3_build()
@@ -69,7 +70,7 @@ extern "C" {
 // prevents NMI hijacking (attacker corrupts OS IDT vector 2, triggers
 // NMI from another core while in VMX-root -> code execution in ring 0)
 //
-// SEH note: windows SEH cannot work in VMX-root mode â€?we use a private
+// SEH note: windows SEH cannot work in VMX-root mode ï¿½?we use a private
 // stack, private CR3, and private IDT. the OS exception dispatcher cannot
 // unwind our stack or find our exception handlers. the only solution is
 // defensive coding: never cause exceptions in host mode. if one occurs
@@ -83,14 +84,14 @@ extern "C" {
 #define USE_PRIVATE_HOST_GDT                1
 
 //
-// CR4.VMXE â€?bit 13 (may already be defined in ia32.h)
+// CR4.VMXE ï¿½?bit 13 (may already be defined in ia32.h)
 //
 #ifndef CR4_VMX_ENABLE_FLAG
 #define CR4_VMX_ENABLE_FLAG                 0x2000ULL
 #endif
 
 //
-// CR4.LAM_SUP â€?bit 28 (supervisor linear address masking)
+// CR4.LAM_SUP ï¿½?bit 28 (supervisor linear address masking)
 // not masked in guest/host mask, passes through transparently
 //
 #ifndef CR4_LAM_SUP_FLAG
@@ -99,7 +100,7 @@ extern "C" {
 
 //
 // estimated hardware VM-exit + VM-entry transition overhead (cycles)
-// used only for the old accumulating approach â€?no longer needed
+// used only for the old accumulating approach ï¿½?no longer needed
 //
 // #define VM_EXIT_ENTRY_OVERHEAD_ESTIMATE     900
 // #define BARE_METAL_CPUID_CYCLES             80
@@ -132,7 +133,7 @@ typedef struct _STEALTH_CPUID_CACHE {
 
     //
     // TRUE if the CPU forces RDTSC exiting as a must-be-1 bit.
-    // if forced, we can't toggle it off â€?just use the armed flag.
+    // if forced, we can't toggle it off ï¿½?just use the armed flag.
     //
     BOOLEAN rdtsc_exiting_forced;
 

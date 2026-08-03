@@ -1621,7 +1621,11 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
     // sync of not-yet-accessed code pages). Allow all fetches through to
     // stealth matching. Non-fetch P=0 faults are genuine demand faults (bail).
     // P=1 reads bail (protection violation). P=1 writes fall through (COW).
-#if (SHADOW_PT_MODE == SHADOW_PT_MODE_A)
+#if (SHADOW_PT_MODE == SHADOW_PT_MODE_A) || (SHADOW_PT_MODE == SHADOW_PT_MODE_C)
+    // MODE_A and MODE_C: shadow leaf PTEs start P=0. A P=0 fetch is expected
+    // (reactive sync of not-yet-accessed code pages). Allow all fetches through
+    // to stealth matching. Non-fetch P=0 faults are genuine demand faults (bail).
+    // P=1 writes fall through (COW).
     if (!(error_code & PFEC_INSTR_FETCH))
     {
         if (!(error_code & PFEC_PRESENT) || !(error_code & PFEC_WRITE))

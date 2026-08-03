@@ -2333,6 +2333,22 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
                 UINT64 wanted = *real_pte;
                 TdApplyProtectToPte(&wanted, new_protect);
+#if (SHADOW_PT_MODE == SHADOW_PT_MODE_C)
+                // MODE_C hybrid: code pages P=1/NX=0 (fast execution),
+                // data pages P=0 (reactive sync from real PT on first access,
+                // eliminates stale PFN corruption).
+                if (new_protect == PAGE_READWRITE || new_protect == PAGE_READONLY)
+                {
+                    *real_pte = wanted;   // real PTE: P=1, W=1, NX=1 (normal data)
+                    *shadow_pte = 0;      // shadow PTE: P=0 (reactive sync)
+                }
+                else
+                {
+                    // Code pages (PAGE_EXECUTE_*): shadow PTE = P=1/NX=0
+                    *shadow_pte = wanted;  // wanted has NX=0 for execute pages
+                    // Real PTE unchanged (NX=1 for stealth)
+                }
+#else
                 if (wanted == *real_pte)
                     *shadow_pte = *real_pte;
                 else
@@ -2346,6 +2362,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 // Code pages (PAGE_EXECUTE_*) keep the real PTE (NX) for stealth.
                 if (new_protect == PAGE_READWRITE || new_protect == PAGE_READONLY)
                     *real_pte = wanted;
+#endif
 
                 if (page == start)
                 {

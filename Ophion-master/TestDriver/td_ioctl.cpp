@@ -2875,6 +2875,140 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             ExFreePoolWithTag(pa_list, 'plTd');
         }
 
+        // ---- mode=4: direct CR3 switch (no KeStackAttach, no VMCALL) ----
+        // One CR3 switch to target process, then direct RtlCopyMemory.
+        // Interrupts disabled during read (cli/sti).  Kernel PTEs are global
+        // (G bit) so kernel VAs (out_buf, stack, code) stay in TLB.
+        // Paged-out pages raise #PF -> __except zero-fills -> fixup later.
+        // Fastest path: 1 TLB flush vs 4096 invlpg (mode=3) or full APC swap (mode=2).
+        // ---- mode=4: direct CR3 switch + PTE pre-walk (safe, no cli) ----
+        // Phase 1: Walk target PTEs via self-map window -> present bitmap
+        // Phase 2: DISPATCH_LEVEL, switch CR3, copy present pages only
+        // Phase 3: Fixup absent pages via KeStackAttachProcess at PASSIVE_LEVEL
+        // No cli/sti, no VMCALL, no KeStackAttach on main path.
+        if (hdr->mode == 4)
+        {
+            UINT64 target_cr3 = *(UINT64 *)((PUCHAR)target + 0x28);
+            if (!target_cr3 || sz > HV_MEM_MAX) goto r0_read_path;
+            if (g_td_selfmap_idx >= 512 || !g_td_win_pte) goto r0_read_path;
+
+            UINT32 max_pages = (UINT32)((sz + 0xFFF) >> 12);
+            UINT32 bmp_bytes = (max_pages + 7) >> 3;
+            PUCHAR fail_bmp = (PUCHAR)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED, bmp_bytes, 'fbTd');
+            if (!fail_bmp) goto r0_read_path;
+            RtlZeroMemory(fail_bmp, bmp_bytes);
+
+            // Phase 1: Pre-walk PTEs to build present bitmap (DISPATCH_LEVEL)
+            KIRQL saved_irql;
+            KeRaiseIrql(DISPATCH_LEVEL, &saved_irql);
+
+            TD_PT_CACHE pt_cache;
+            TdPtCacheInit(&pt_cache);
+            if (!pt_cache.initialized)
+            {
+                KeLowerIrql(saved_irql);
+                ExFreePoolWithTag(fail_bmp, 'fbTd');
+                goto r0_read_path;
+            }
+
+            {
+                UINT64 cur = va;
+                UINT64 remaining = sz;
+                UINT32 pidx = 0;
+                while (remaining > 0 && pidx < max_pages)
+                {
+                    UINT64 pa = TdResolvePaCached(target_cr3, cur, &pt_cache);
+                    if (pa == 0)
+                        fail_bmp[pidx >> 3] |= (UCHAR)(1 << (pidx & 7));
+                    UINT64 off = cur & 0xFFF;
+                    UINT64 chunk = 0x1000 - off;
+                    if (chunk > remaining) chunk = remaining;
+                    remaining -= chunk;
+                    cur += chunk;
+                    pidx++;
+                }
+            }
+            TdPtCacheCleanup(&pt_cache);
+            // IRQL still DISPATCH_LEVEL (c->old_irql was DISPATCH_LEVEL)
+
+            // Phase 2: Direct CR3 switch + copy present pages
+            UINT64 orig_cr3 = __readcr3();
+            __writecr3(target_cr3);
+
+            BOOLEAN need_fixup = FALSE;
+            {
+                UINT64 done = 0;
+                UINT64 cur  = va;
+                UINT32 pidx = 0;
+                while (done < sz)
+                {
+                    UINT64 off   = cur & 0xFFF;
+                    UINT64 chunk = 0x1000 - off;
+                    if (chunk > (UINT64)sz - done) chunk = (UINT64)sz - done;
+                    if (!(fail_bmp[pidx >> 3] & (1 << (pidx & 7))))
+                    {
+                        __try {
+                            RtlCopyMemory((PUCHAR)out_buf + done,
+                                          (PVOID)(ULONG_PTR)cur,
+                                          (SIZE_T)chunk);
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                            RtlZeroMemory((PUCHAR)out_buf + done, (SIZE_T)chunk);
+                            fail_bmp[pidx >> 3] |= (UCHAR)(1 << (pidx & 7));
+                            need_fixup = TRUE;
+                        }
+                    }
+                    else
+                    {
+                        RtlZeroMemory((PUCHAR)out_buf + done, (SIZE_T)chunk);
+                        need_fixup = TRUE;
+                    }
+                    done += chunk;
+                    cur  += chunk;
+                    pidx++;
+                }
+            }
+
+            __writecr3(orig_cr3);
+            KeLowerIrql(saved_irql);
+
+            // Phase 3: Fixup absent pages via KeStackAttachProcess
+            if (need_fixup && (hdr->_pad & 1))
+            {
+                KAPC_STATE apc2;
+                KeStackAttachProcess(target, &apc2);
+                UINT64 done = 0, cur = va;
+                UINT32 pidx = 0;
+                while (done < sz)
+                {
+                    UINT64 off   = cur & 0xFFF;
+                    UINT64 chunk = 0x1000 - off;
+                    if (chunk > (UINT64)sz - done) chunk = (UINT64)sz - done;
+                    if (fail_bmp[pidx >> 3] & (1 << (pidx & 7)))
+                    {
+                        __try {
+                            RtlCopyMemory((PUCHAR)out_buf + done,
+                                          (PVOID)(ULONG_PTR)cur,
+                                          (SIZE_T)chunk);
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                            RtlZeroMemory((PUCHAR)out_buf + done, (SIZE_T)chunk);
+                        }
+                    }
+                    done += chunk; cur += chunk; pidx++;
+                }
+                KeUnstackDetachProcess(&apc2);
+            }
+
+            ExFreePoolWithTag(fail_bmp, 'fbTd');
+            hdr->status = (UINT32)STATUS_SUCCESS;
+            hdr->result = sz;
+            ObDereferenceObject(target);
+            irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
+            st = STATUS_SUCCESS;
+            break;
+        }
+
+
         // ---- R0 path (mode 0/1/2 or VMX fallback) ----
         r0_read_path:
         {
@@ -3028,6 +3162,126 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             }
             ExFreePoolWithTag(pa_list, 'plTd');
         }
+
+        // ---- mode=4: direct CR3 switch (no KeStackAttach, no VMCALL) ----
+        // ---- mode=4: direct CR3 switch + PTE pre-walk (safe, no cli) ----
+        if (hdr->mode == 4)
+        {
+            UINT64 target_cr3 = *(UINT64 *)((PUCHAR)target + 0x28);
+            if (!target_cr3 || sz > HV_MEM_MAX) goto r0_write_path;
+            if (g_td_selfmap_idx >= 512 || !g_td_win_pte) goto r0_write_path;
+
+            UINT32 max_pages = (UINT32)((sz + 0xFFF) >> 12);
+            UINT32 bmp_bytes = (max_pages + 7) >> 3;
+            PUCHAR fail_bmp = (PUCHAR)ExAllocatePool2(
+                POOL_FLAG_NON_PAGED, bmp_bytes, 'fbTd');
+            if (!fail_bmp) goto r0_write_path;
+            RtlZeroMemory(fail_bmp, bmp_bytes);
+
+            // Phase 1: Pre-walk PTEs to build present bitmap
+            KIRQL saved_irql;
+            KeRaiseIrql(DISPATCH_LEVEL, &saved_irql);
+
+            TD_PT_CACHE pt_cache;
+            TdPtCacheInit(&pt_cache);
+            if (!pt_cache.initialized)
+            {
+                KeLowerIrql(saved_irql);
+                ExFreePoolWithTag(fail_bmp, 'fbTd');
+                goto r0_write_path;
+            }
+
+            {
+                UINT64 cur = va;
+                UINT64 remaining = sz;
+                UINT32 pidx = 0;
+                while (remaining > 0 && pidx < max_pages)
+                {
+                    UINT64 pa = TdResolvePaCached(target_cr3, cur, &pt_cache);
+                    if (pa == 0)
+                        fail_bmp[pidx >> 3] |= (UCHAR)(1 << (pidx & 7));
+                    UINT64 off = cur & 0xFFF;
+                    UINT64 chunk = 0x1000 - off;
+                    if (chunk > remaining) chunk = remaining;
+                    remaining -= chunk;
+                    cur += chunk;
+                    pidx++;
+                }
+            }
+            TdPtCacheCleanup(&pt_cache);
+
+            // Phase 2: Direct CR3 switch + write present pages
+            UINT64 orig_cr3 = __readcr3();
+            __writecr3(target_cr3);
+
+            BOOLEAN need_fixup = FALSE;
+            {
+                UINT64 done = 0;
+                UINT64 cur  = va;
+                UINT32 pidx = 0;
+                while (done < sz)
+                {
+                    UINT64 off   = cur & 0xFFF;
+                    UINT64 chunk = 0x1000 - off;
+                    if (chunk > (UINT64)sz - done) chunk = (UINT64)sz - done;
+                    if (!(fail_bmp[pidx >> 3] & (1 << (pidx & 7))))
+                    {
+                        __try {
+                            RtlCopyMemory((PVOID)(ULONG_PTR)cur,
+                                          (PUCHAR)in_buf + done,
+                                          (SIZE_T)chunk);
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                            fail_bmp[pidx >> 3] |= (UCHAR)(1 << (pidx & 7));
+                            need_fixup = TRUE;
+                        }
+                    }
+                    else
+                    {
+                        need_fixup = TRUE;
+                    }
+                    done += chunk;
+                    cur  += chunk;
+                    pidx++;
+                }
+            }
+
+            __writecr3(orig_cr3);
+            KeLowerIrql(saved_irql);
+
+            // Phase 3: Fixup absent pages via KeStackAttachProcess
+            if (need_fixup && (hdr->_pad & 1))
+            {
+                KAPC_STATE apc2;
+                KeStackAttachProcess(target, &apc2);
+                UINT64 done = 0, cur = va;
+                UINT32 pidx = 0;
+                while (done < sz)
+                {
+                    UINT64 off   = cur & 0xFFF;
+                    UINT64 chunk = 0x1000 - off;
+                    if (chunk > (UINT64)sz - done) chunk = (UINT64)sz - done;
+                    if (fail_bmp[pidx >> 3] & (1 << (pidx & 7)))
+                    {
+                        __try {
+                            RtlCopyMemory((PVOID)(ULONG_PTR)cur,
+                                          (PUCHAR)in_buf + done,
+                                          (SIZE_T)chunk);
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    }
+                    done += chunk; cur += chunk; pidx++;
+                }
+                KeUnstackDetachProcess(&apc2);
+            }
+
+            ExFreePoolWithTag(fail_bmp, 'fbTd');
+            hdr->status = (UINT32)STATUS_SUCCESS;
+            hdr->result = sz;
+            ObDereferenceObject(target);
+            irp->IoStatus.Information = (ULONG_PTR)(hdr->result);
+            st = STATUS_SUCCESS;
+            break;
+        }
+
 
         // ---- R0 path (mode 0/1/2 or VMX fallback) ----
         r0_write_path:

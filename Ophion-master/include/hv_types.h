@@ -329,6 +329,8 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_DIAG_WALK        0x00000010   // R3: rdx=target_pid -> rax=kernel CR3
 #define VMCALL_READ_MEM_PTE     0x00000011   // R0: PTE-window read (rdx=pa_arr, r8=data, r9=size, r10=tva, r11=pa_cnt)
 #define VMCALL_WRITE_MEM_PTE    0x00000012   // R0: PTE-window write (same layout)
+#define VMCALL_SHADOW_ABORT_ALL 0x00000013   // R0: clear stale shadow-CR3 window on this vCPU (nx_timer_restore/real_cr3/MTF)
+#define VMCALL_STEALTH_FREE_ALL  0x00000014   // R0: remove ALL stealth page entries from g_ept->stealth_pages (pre-injection cleanup)
 
 #define HV_R3_MEM_MAX           262144        // max bytes per R3 read/write call (16 pages, prefetch batch)
 

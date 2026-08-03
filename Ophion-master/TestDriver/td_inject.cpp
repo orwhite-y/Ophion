@@ -328,7 +328,7 @@ TdResolveNtoskrnlExport(const char * func_name)
                 {
                     ULONG func_rva = funcs[ord];
                     if (func_rva >= exp_rva && func_rva < exp_rva + exp_sz)
-                        return NULL;  // forwarded export ÈóÅ?skip
+                        return NULL;  // forwarded export Èó?skip
                     PVOID resolved = (PUINT8)g_ntoskrnl_base + func_rva;
                     HYPERPLATFORM_LOG_INFO("[td] nt export %s = %p", func_name, resolved);
                     return resolved;
@@ -586,8 +586,8 @@ TdCloseCreatedThreadHandle(HANDLE thread_h, BOOLEAN thread_started)
 extern PDEVICE_OBJECT g_dev_obj;
 extern BOOLEAN g_device_hidden;
 
-#define TD_DEVICE_NAME  L"\\Device\\OphionTest"
-#define TD_SYMLINK_NAME L"\\DosDevices\\OphionTest"
+#define TD_DEVICE_NAME  L"\\Device\\RMCoreTst"
+#define TD_SYMLINK_NAME L"\\DosDevices\\RMCoreTst"
 
 #define TD_IOCTL_BASE   0x900
 #define IOCTL_INJECT    CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 0, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -617,7 +617,7 @@ extern BOOLEAN g_device_hidden;
 #pragma pack(pop)
 
 //
-// R3 EPT hook params ÈóÅ?from user-mode app via DeviceIoControl
+// R3 EPT hook params Èó?from user-mode app via DeviceIoControl
 //
 
 #pragma pack(pop)
@@ -625,9 +625,9 @@ extern BOOLEAN g_device_hidden;
 // ---- MessageBoxA shellcode (x64 PIC) ----
 //
 // flow:
-//   PEB ÈóÅ?kernel32 base ÈóÅ?parse exports ÈóÅ?find GetProcAddress (hash-based)
-//   GetProcAddress(kernel32, "LoadLibraryA") ÈóÅ?LoadLibraryA("user32.dll")
-//   GetProcAddress(user32, "MessageBoxA") ÈóÅ?MessageBoxA(0, text, title, 0)
+//   PEB Èó?kernel32 base Èó?parse exports Èó?find GetProcAddress (hash-based)
+//   GetProcAddress(kernel32, "LoadLibraryA") Èó?LoadLibraryA("user32.dll")
+//   GetProcAddress(user32, "MessageBoxA") Èó?MessageBoxA(0, text, title, 0)
 //   ret
 //
 // this shellcode is assembled from the following NASM source:
@@ -636,7 +636,7 @@ extern BOOLEAN g_device_hidden;
 //   ; --- prologue ---
 //   sub rsp, 0x28
 //
-//   ; --- PEB ÈóÅ?kernel32 ---
+//   ; --- PEB Èó?kernel32 ---
 //   mov rax, [gs:0x60]        ; PEB
 //   mov rax, [rax+0x18]       ; Ldr
 //   mov rax, [rax+0x20]       ; InMemoryOrderModuleList head
@@ -644,13 +644,13 @@ extern BOOLEAN g_device_hidden;
 //   mov rax, [rax]            ; kernel32
 //   mov rbx, [rax+0x20]      ; kernel32 DllBase
 //
-//   ; --- find_export(rbx=base, r12d=hash) ÈóÅ?rax=funcVA ---
+//   ; --- find_export(rbx=base, r12d=hash) Èó?rax=funcVA ---
 //   ; uses ROR13-add hash of function name
 //   ;   GetProcAddress hash = 0x7C0DFCAA
 //   ;   LoadLibraryA  hash = 0xEC0E4E8E  (resolved via GetProcAddress)
 //   ;   MessageBoxA   hash = 0x1E380A6A  (resolved via GetProcAddress)
 //
-//   (see byte array below ÈóÅ?hand-assembled and verified)
+//   (see byte array below Èó?hand-assembled and verified)
 //
 
 // ---- DLL name matching helpers (used by PIC shellcode + gap finder) ----
@@ -735,7 +735,7 @@ extern const WCHAR g_kernel32_name[] = L"kernel32.dll";
 //
 // build PIC shellcode: resolve user32!MessageBoxA + kernel32!SleepEx
 // via PEB walk + export table.
-// zero runtime API calls ÈóÅ?all resolution done here at PASSIVE_LEVEL.
+// zero runtime API calls Èó?all resolution done here at PASSIVE_LEVEL.
 // must be called while attached to the target process.
 //
 BOOLEAN
@@ -860,13 +860,13 @@ TdBuildShellcodePIC(PVOID buf, SIZE_T buf_size)
 }
 
 // =========================================================================
-//  DPC broadcast ÈóÅ?VMCALL per CPU
+//  DPC broadcast Èó?VMCALL per CPU
 // =========================================================================
 
 //
-// set up EPT stealth for one page ÈóÅ?single VMCALL from current CPU.
+// set up EPT stealth for one page Èó?single VMCALL from current CPU.
 // HV internally loops all g_vcpu[i].ept_page_table to split + set PTE.
-// NO KeGenericCallDpc ÈóÅ?avoids 0x101 CLOCK_WATCHDOG when a CPU is
+// NO KeGenericCallDpc Èó?avoids 0x101 CLOCK_WATCHDOG when a CPU is
 // stuck in VMX-root (Ophion HV pre-existing bug).
 //
 #ifndef TD_MAX_DPC_CPUS
@@ -1041,7 +1041,7 @@ TdStealthAllocPage(
     // copy PT page and target page content into NonPaged kernel buffers.
     // VMX-root accesses these buffers (always valid under any CR3).
     // MmGetVirtualForPhysical returns process-relative VAs that are
-    // invalid under system CR3 in VMX-root ÈóÅ?so we copy the content here.
+    // invalid under system CR3 in VMX-root Èó?so we copy the content here.
     //
     PVOID pt_buf  = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'htpS');
     PVOID tgt_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'htpS');
@@ -1096,7 +1096,7 @@ TdStealthAllocPage(
     req->target_page_copy = tgt_buf;
     req->pt_precomputed   = TRUE;
 
-    // DPC broadcast ÈóÅ?every CPU does VMCALL, each splits its own EPT.
+    // DPC broadcast Èó?every CPU does VMCALL, each splits its own EPT.
     // same pattern as EPT hook's KeGenericCallDpc.
     NTSTATUS run_st = TdRunStealthAllocOnCpus(req, pt_buf, tgt_buf);
     if (run_st == STATUS_IO_TIMEOUT)
@@ -1135,7 +1135,7 @@ TdStealthInjectPages(
         UINT32 chunk      = (shellcode_size - done < space) ? (shellcode_size - done) : space;
 
         //
-        // page already has content from TdBuildShellcodePage ÈóÅ?no need to touch.
+        // page already has content from TdBuildShellcodePage Èó?no need to touch.
         // (touching would overwrite first byte of shellcode with 0)
         // MmGetPhysicalAddress works because the page was already committed+written.
         //
@@ -1164,7 +1164,7 @@ TdStealthInjectPages(
         }
 
         //
-        // NX bit in real PTE is NOT cleared ÈóÅ?Windows' MiAgeWorkingSet
+        // NX bit in real PTE is NOT cleared Èó?Windows' MiAgeWorkingSet
         // can restore it at any time. the fake/exec PT pages handle NX hiding.
         //
 

@@ -1156,6 +1156,32 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             break;
         }
 
+        case VMCALL_SHADOW_ABORT_ALL:
+        {
+            // R0 DPC broadcast from TestDriver cleanup: clear any stale shadow-CR3
+            // window on THIS vCPU before stealth page entries are freed.
+            // Does NOT dereference nx_timer_restore (which may point to freed pool).
+            // Uses nx_timer_real_cr3 (a value copy) for CR3 restore.
+            stealth_clear_stale_window(vcpu);
+            ept_invept_single(vcpu->ept_pointer);
+            regs->rax = (UINT64)STATUS_SUCCESS;
+            break;
+        }
+
+        case VMCALL_STEALTH_FREE_ALL:
+        {
+            // R0 single-caller (NOT DPC): remove ALL stealth state before a new
+            // injection. MUST be single-caller because RemoveHeadList on the
+            // global lists is not SMP-safe.
+            stealth_clear_stale_window(vcpu);
+            ept_stealth_free_all();
+            ept_unhook_all();
+            ept_update_pf_intercept(vcpu);
+            ept_invept_single(vcpu->ept_pointer);
+            regs->rax = (UINT64)STATUS_SUCCESS;
+            break;
+        }
+
         case VMCALL_STEALTH_ALLOC:
         {
             UINT64 _saved_cr3 = vmx_enter_guest_cr3();

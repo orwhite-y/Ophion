@@ -5,7 +5,7 @@
 // =========================================================================
 
 //
-// free param struct 閳?must match Ophion's EPT_STEALTH_FREE_PARAM
+// free param struct �?must match Ophion's EPT_STEALTH_FREE_PARAM
 //
 #pragma pack(push, 8)
 #pragma pack(pop)
@@ -19,7 +19,8 @@ STEALTH_TRACK_ENTRY g_stealth_tracks[MAX_STEALTH_TRACKS] = {};
 KSPIN_LOCK g_stealth_track_lock;
 
 BOOLEAN
-TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3, PMDL image_mdl)
+TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3, PMDL image_mdl,
+                  UINT64 guest_cr3, UINT64 *page_pfns, UINT32 page_count)
 {
     BOOLEAN added = FALSE;
     KIRQL old_irql;
@@ -29,12 +30,15 @@ TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3, PMDL ima
     {
         if (!g_stealth_tracks[i].active)
         {
-            g_stealth_tracks[i].target_pid  = pid;
-            g_stealth_tracks[i].target_va   = va;
-            g_stealth_tracks[i].alloc_size  = size;
+            g_stealth_tracks[i].target_pid      = pid;
+            g_stealth_tracks[i].target_va       = va;
+            g_stealth_tracks[i].alloc_size      = size;
             g_stealth_tracks[i].shadow_cr3_phys = shadow_cr3;
-            g_stealth_tracks[i].image_mdl   = image_mdl;
-            g_stealth_tracks[i].active      = TRUE;
+            g_stealth_tracks[i].image_mdl       = image_mdl;
+            g_stealth_tracks[i].guest_cr3       = guest_cr3;
+            g_stealth_tracks[i].page_pfns       = page_pfns;   // ownership transferred to track
+            g_stealth_tracks[i].page_count      = page_count;
+            g_stealth_tracks[i].active          = TRUE;
             added = TRUE;
             break;
         }
@@ -181,7 +185,7 @@ TdStealthTrackHasPartialOverlap(UINT64 pid, PVOID base_va, SIZE_T size)
 }
 
 //
-// free one stealth page via DPC broadcast 閳?VMCALL_STEALTH_FREE
+// free one stealth page via DPC broadcast �?VMCALL_STEALTH_FREE
 // must be called while attached to the target process.
 //
 BOOLEAN
@@ -189,7 +193,7 @@ TdStealthFreePage(PVOID target_va)
 {
     if (!target_va) return FALSE;
     UINT64 phys = MmGetPhysicalAddress(target_va).QuadPart;
-    // phys may be 0 if page already freed/paged 閳?still try VMCALL with VA match
+    // phys may be 0 if page already freed/paged �?still try VMCALL with VA match
     TD_STEALTH_FREE_PARAM req = {};
     req.caller_cr3  = __readcr3();
     req.target_va   = target_va;
@@ -204,7 +208,33 @@ TdStealthFreePage(PVOID target_va)
 }
 
 //
-// process exit callback 閳?clean up stealth pages + fake PT before
+// free one stealth page via DPC broadcast using a PRE-COMPUTED physical address.
+// Does NOT call MmGetPhysicalAddress -> does NOT need to be attached to the target
+// process. Safe to call from the process-exit callback in System context: the DPC
+// runs at DISPATCH in System context, vmx_enter_guest_cr3() enters System CR3
+// (page tables always valid -> no deadlock). ept_stealth_uninstall matches by
+// PFN or guest VA (not by CR3), and pa_to_va for NonPaged pool shadow/fake-PT
+// pages works under any CR3.
+//
+BOOLEAN
+TdStealthFreePageSafe(PVOID target_va, UINT64 target_phys)
+{
+    if (!target_va) return FALSE;
+    TD_STEALTH_FREE_PARAM req = {};
+    req.caller_cr3  = __readcr3();   // System CR3 (not attached to dying process)
+    req.target_va   = target_va;
+    req.target_phys = target_phys;   // pre-computed at injection time
+
+    KeGenericCallDpc([](PKDPC, PVOID Ctx, PVOID A1, PVOID A2) {
+        hv_vmcall_simple(VMCALL_STEALTH_FREE, (UINT64)Ctx, 0, 0);
+        KeSignalCallDpcSynchronize(A2);
+        KeSignalCallDpcDone(A1);
+    }, &req);
+    return req.result;
+}
+
+//
+// process exit callback �?clean up stealth pages + fake PT before
 // MiDeleteFinalPageTables destroys the address space.
 //
 VOID
@@ -288,20 +318,48 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
     }
 
     //
+    // 1.5. abort stale shadow-CR3 windows on ALL vCPUs BEFORE freeing stealth
+    //      page entries. If the game crashed with a shadow window open (MTF armed,
+    //      nx_timer_restore pointing to a stealth page entry), the entry is about
+    //      to be pool_manager_release'd. A subsequent MTF/#PF on that vCPU would
+    //      dereference the freed pointer -> use-after-free -> triple fault.
+    //      This VMCALL clears nx_timer_restore/nx_timer_real_cr3/MTF on every CPU
+    //      without dereferencing the pointer (uses the value-copied real_cr3).
+    //
+    KeGenericCallDpc([](PKDPC, PVOID, PVOID A1, PVOID A2) {
+        hv_vmcall_simple(VMCALL_SHADOW_ABORT_ALL, 0, 0, 0);
+        KeSignalCallDpcSynchronize(A2);
+        KeSignalCallDpcDone(A1);
+    }, NULL);
+
+    //
     // 2. clean up stealth tracks (shadow memory)
+    //
+    //    Two paths:
+    //    - SAFE path (page_pfns != NULL, renderdoc injection): uses TdStealthFreePageSafe
+    //      with pre-computed PFNs from System context. NO KeStackAttachProcess to the
+    //      dying process -> no deadlock -> TdShadowFreeCr3 always runs -> no stale
+    //      HV stealth entries -> 2nd injection does not freeze.
+    //    - OLD path (page_pfns == NULL, ioctl protect/alloc): attaches to the dying
+    //      process and uses MmGetPhysicalAddress. Retained for callers without
+    //      pre-computed PFNs.
     //
     for (int i = 0; i < MAX_STEALTH_TRACKS; i++)
     {
-        PVOID va = NULL;
-        SIZE_T sz = 0;
+        PVOID   va          = NULL;
+        SIZE_T  sz          = 0;
+        UINT64  *snap_pfns  = NULL;
+        UINT32  snap_pcnt   = 0;
 
         KIRQL old_irql;
         KeAcquireSpinLock(&g_stealth_track_lock, &old_irql);
 
         if (g_stealth_tracks[i].active && g_stealth_tracks[i].target_pid == pid)
         {
-            va = g_stealth_tracks[i].target_va;
-            sz  = g_stealth_tracks[i].alloc_size;
+            va         = g_stealth_tracks[i].target_va;
+            sz         = g_stealth_tracks[i].alloc_size;
+            snap_pfns  = g_stealth_tracks[i].page_pfns;
+            snap_pcnt  = g_stealth_tracks[i].page_count;
         }
 
         KeReleaseSpinLock(&g_stealth_track_lock, old_irql);
@@ -309,28 +367,57 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
         if (!va || !sz)
             continue;
 
-        HYPERPLATFORM_LOG_INFO("[td-rw] process exit cleanup: pid=%llu va=%p size=0x%llX",
-                   pid, va, (UINT64)sz);
+        HYPERPLATFORM_LOG_WARN("[td-rw] process exit cleanup: pid=%llu va=%p size=0x%llX pfns=%u",
+                   pid, va, (UINT64)sz, snap_pcnt);
 
         // Remove the tracked range. TdStealthTrackRemove decrements the shared
-        // CR3's refcount and returns the CR3 only if this was the last range for
-        // the process, so the shared shadow CR3 is freed once per process.
+        // CR3's refcount and returns the CR3 only if this was the last range.
         PMDL track_mdl = NULL;
         UINT64 to_free = TdStealthTrackRemove(pid, va, &track_mdl);
 
-        // attach to the exiting process to free stealth pages
-        KAPC_STATE apc;
-        KeStackAttachProcess(Process, &apc);
+        UINT64 base_va = (UINT64)va & ~0xFFFULL;
+        UINT64 end_va  = ((UINT64)va + sz + PAGE_SIZE - 1) & ~0xFFFULL;
 
-        UINT64 base = (UINT64)va & ~0xFFFULL;
-        UINT64 end  = ((UINT64)va + sz + PAGE_SIZE - 1) & ~0xFFFULL;
-        for (UINT64 page = base; page < end; page += PAGE_SIZE)
-            TdStealthFreePage((PVOID)page);
+        if (snap_pfns && snap_pcnt)
+        {
+            //
+            // SAFE PATH: no KeStackAttachProcess. Use stored PFNs.
+            // DPC runs in System context -> vmx_enter_guest_cr3 enters System
+            // CR3 (always valid) -> no deadlock. ept_stealth_uninstall matches
+            // by PFN/VA (not CR3) -> correct entry removed.
+            //
+            UINT32 pfn_idx = 0;
+            for (UINT64 page = base_va; page < end_va && pfn_idx < snap_pcnt; page += PAGE_SIZE, pfn_idx++)
+                TdStealthFreePageSafe((PVOID)page, snap_pfns[pfn_idx]);
 
-        if (to_free)
-            TdShadowFreeCr3(to_free);
+            // Safe to free shadow CR3 now: the pre-injection cleanup
+            // (VMCALL_STEALTH_FREE_ALL in TdInjectRenderdocShadow) clears ALL
+            // HV stealth state before any new injection, so even if the OS
+            // reuses this PA, HV will never dereference it.
+            if (to_free)
+                TdShadowFreeCr3(to_free);
 
-        KeUnstackDetachProcess(&apc);
+            // free the per-page PFN array (NonPaged pool, ownership was transferred
+            // from TdStealthTrackAdd).
+            ExFreePoolWithTag(snap_pfns, 'fPdS');
+        }
+        else
+        {
+            //
+            // OLD PATH: attach to the dying process for MmGetPhysicalAddress.
+            // Used by ioctl protect/alloc callers that don't have pre-computed PFNs.
+            //
+            KAPC_STATE apc;
+            KeStackAttachProcess(Process, &apc);
+
+            for (UINT64 page = base_va; page < end_va; page += PAGE_SIZE)
+                TdStealthFreePage((PVOID)page);
+
+            if (to_free)
+                TdShadowFreeCr3(to_free);
+
+            KeUnstackDetachProcess(&apc);
+        }
 
         // unlock the image pages pinned at injection (MmProbeAndLockPages).
         // PASSIVE here (exit-notify); the track spinlock was released inside
@@ -341,7 +428,7 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
             IoFreeMdl(track_mdl);
         }
 
-        HYPERPLATFORM_LOG_INFO("[td-rw] process exit cleanup done: pid=%llu", pid);
+        HYPERPLATFORM_LOG_WARN("[td-rw] process exit cleanup done: pid=%llu to_free=0x%llX",
+                   pid, to_free);
     }
 }
-

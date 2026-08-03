@@ -1,7 +1,8 @@
 #include "td_common.h"
+#include <stealth.h>
 
 // =========================================================================
-//  DLL gap finder 閳?find unused page-aligned gap in an image's VA range.
+//  DLL gap finder 闁?find unused page-aligned gap in an image's VA range.
 //
 //  walks PE section headers to find alignment padding between sections
 //  or after the last section. returns a committed page of zeros that
@@ -11,7 +12,7 @@
 // =========================================================================
 
 //
-// find section tail padding in a DLL 閳?unused zero bytes at the end of
+// find section tail padding in a DLL 闁?unused zero bytes at the end of
 // a section's last page. no full-page gap needed.
 //
 // returns page-aligned VA of the page containing padding.
@@ -44,7 +45,7 @@ TdFindSectionPadding(PVOID image_base, SIZE_T min_size, ULONG * out_offset, ULON
 
         //
         // find section with most tail padding on its last page.
-        // prefer executable sections (.text) 閳?shellcode blends in better.
+        // prefer executable sections (.text) 闁?shellcode blends in better.
         //
         for (i = 0; i < num_sections; i++)
         {
@@ -169,18 +170,18 @@ TdFindGapInProcess(SIZE_T min_size, ULONG * out_offset, ULONG * out_avail)
 }
 
 // =========================================================================
-//  PE Manual Mapper 閳?kernel-side DLL loading, zero R3 API calls
+//  PE Manual Mapper 闁?kernel-side DLL loading, zero R3 API calls
 //
 //  flow:
-//    1. injector reads DLL file 閳?sends raw bytes via IOCTL_INJECT_DLL
+//    1. injector reads DLL file 闁?sends raw bytes via IOCTL_INJECT_DLL
 //    2. driver attaches to target process
 //    3. ZwAllocateVirtualMemory(PAGE_READWRITE) for image
 //    4. copy sections, apply relocations, resolve imports (PEB walk)
 //    5. build DllMain stub at image base (overwrites DOS header)
 //    6. clear PE signature from header
-//    7. ZwProtectVirtualMemory 閳?PAGE_EXECUTE_READ for executable sections
-//    8. EPT hook NtTestAlert 閳?DllMain stub (oneshot, per-process CR3 filter)
-//    9. create thread at NtTestAlert 閳?DllMain runs 閳?thread exits
+//    7. ZwProtectVirtualMemory 闁?PAGE_EXECUTE_READ for executable sections
+//    8. EPT hook NtTestAlert 闁?DllMain stub (oneshot, per-process CR3 filter)
+//    9. create thread at NtTestAlert 闁?DllMain runs 闁?thread exits
 //
 //  result: DLL is loaded without LoadLibrary, no module list entry,
 //  no load image notification, no file access from target process.
@@ -208,8 +209,8 @@ TdFindGapInProcess(SIZE_T min_size, ULONG * out_offset, ULONG * out_avail)
 //
 
 //
-// TdFindModuleBaseA 閳?find loaded module by ASCII name via PEB walk.
-// walks PEB 閳?Ldr 閳?InMemoryOrderModuleList. compares BaseDllName
+// TdFindModuleBaseA 闁?find loaded module by ASCII name via PEB walk.
+// walks PEB 闁?Ldr 闁?InMemoryOrderModuleList. compares BaseDllName
 // (Unicode) with the given ASCII name (case-insensitive).
 // must be called while attached to the target process.
 //
@@ -277,7 +278,7 @@ TdFindModuleBaseA(const char * name_ascii, ULONG * out_size)
                 else
                 {
                     // match without extension: BaseDllName could be "foo.dll"
-                    // name_ascii is "foo" 閳?compare first name_len chars,
+                    // name_ascii is "foo" 闁?compare first name_len chars,
                     // then check remaining is ".dll"
                     if (wchar_count == name_len + 4)
                     {
@@ -332,7 +333,7 @@ TdFindModuleBaseA(const char * name_ascii, ULONG * out_size)
 }
 
 //
-// TdFindExportByName 閳?find export by name from a module's export table.
+// TdFindExportByName 闁?find export by name from a module's export table.
 // walks PE export directory. returns function VA. skips forwarded exports
 // (returns NULL for forwards).
 //
@@ -418,21 +419,64 @@ TdFindExportByNameEx(PVOID module_base, const char * func_name, ULONG depth)
                         return NULL;
 
                     PVOID forward_base = TdFindModuleBaseA(dll_name, NULL);
+
+                    // For API set forwarders (api-*, ext-*), the DLL name is a
+                    // virtual API set that does not exist in the PEB loader list.
+                    // Try common host DLLs that implement these API sets.
                     if (!forward_base &&
                         (TdAsciiStartsWithI(dll_name, "api-") ||
                          TdAsciiStartsWithI(dll_name, "ext-")))
                     {
-                        forward_base = TdFindModuleBaseA("kernelbase.dll", NULL);
-                    }
-                    if (!forward_base)
+                        static const char * const api_set_hosts[] = {
+                            "kernelbase.dll",
+                            "combase.dll",
+                            "kernel32.dll",
+                            "ucrtbase.dll",
+                            "user32.dll",
+                            "gdi32.dll",
+                            "advapi32.dll",
+                            "sechost.dll",
+                            "ntdll.dll",
+                        };
+                        for (ULONG hi = 0;
+                             hi < sizeof(api_set_hosts) / sizeof(api_set_hosts[0]);
+                             hi++)
+                        {
+                            PVOID host_base = TdFindModuleBaseA(api_set_hosts[hi], NULL);
+                            if (host_base)
+                            {
+                                PVOID resolved = TdFindExportByNameEx(
+                                    host_base, export_name, depth + 1);
+                                if (resolved)
+                                {
+                                    HYPERPLATFORM_LOG_WARN(
+                                        "[td-map] api-set %s.%s resolved via %s",
+                                        dll_name, export_name, api_set_hosts[hi]);
+                                    return resolved;
+                                }
+                            }
+                        }
+                        HYPERPLATFORM_LOG_WARN(
+                            "[td-map] api-set %s.%s UNRESOLVED (tried %lu hosts)",
+                            dll_name, export_name,
+                            (ULONG)(sizeof(api_set_hosts) / sizeof(api_set_hosts[0])));
                         return NULL;
+                    }
+
+                    if (!forward_base)
+                    {
+                        HYPERPLATFORM_LOG_WARN(
+                            "[td-map] forwarder target not found: %s.%s",
+                            dll_name, export_name);
+                        return NULL;
+                    }
 
                     return TdFindExportByNameEx(forward_base, export_name, depth + 1);
                 }
 
                 // check for forwarded export (RVA points inside export directory)
                 if (func_rva >= exp_rva && func_rva < exp_rva + exp_size)
-                    return NULL;  // forwarded 閳?skip
+                    return NULL;  // forwarded 闁?skip
 
                 return (PUINT8)module_base + func_rva;
             }
@@ -607,7 +651,7 @@ TdResolveDefaultTrigger(PEPROCESS proc, const char * log_prefix)
 }
 
 //
-// TdFindExportByOrdinal 閳?find export by ordinal from a module's export table.
+// TdFindExportByOrdinal 闁?find export by ordinal from a module's export table.
 //
 PVOID
 TdFindExportByOrdinal(PVOID module_base, USHORT ordinal)
@@ -647,7 +691,7 @@ TdFindExportByOrdinal(PVOID module_base, USHORT ordinal)
 }
 
 //
-// TdPeCopySections 閳?copy PE headers and sections from raw DLL to mapped image.
+// TdPeCopySections 闁?copy PE headers and sections from raw DLL to mapped image.
 //
 BOOLEAN
 TdPeCopySections(PVOID mapped_base, PUINT8 raw_dll, SIZE_T raw_size)
@@ -671,7 +715,7 @@ TdPeCopySections(PVOID mapped_base, PUINT8 raw_dll, SIZE_T raw_size)
 
             if (sec[i].SizeOfRawData == 0)
             {
-                // BSS 閳?zero the virtual range
+                // BSS 闁?zero the virtual range
                 ULONG virt_sz = sec[i].Misc.VirtualSize;
                 if (virt_sz > 0)
                     RtlZeroMemory(dst, virt_sz);
@@ -703,7 +747,7 @@ TdPeCopySections(PVOID mapped_base, PUINT8 raw_dll, SIZE_T raw_size)
 }
 
 //
-// TdPeRelocate 閳?apply base relocations.
+// TdPeRelocate 闁?apply base relocations.
 // returns TRUE on success, FALSE if no relocation table and delta != 0.
 //
 BOOLEAN
@@ -720,13 +764,13 @@ TdPeRelocate(PVOID mapped_base, PUINT8 raw_dll, UINT64 delta)
 
         if (!reloc_rva || !reloc_size)
         {
-            // no relocation table 閳?check if DLL has RELOCS_STRIPPED
+            // no relocation table 闁?check if DLL has RELOCS_STRIPPED
             if (nt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED)
             {
                 HYPERPLATFORM_LOG_ERROR("[td-map] no reloc table and delta != 0");
                 return FALSE;
             }
-            // relocation directory empty but delta != 0 and not stripped 閳?fail
+            // relocation directory empty but delta != 0 and not stripped 闁?fail
             HYPERPLATFORM_LOG_ERROR("[td-map] no reloc directory, delta=0x%llX", delta);
             return FALSE;
         }
@@ -748,7 +792,7 @@ TdPeRelocate(PVOID mapped_base, PUINT8 raw_dll, UINT64 delta)
                 switch (type)
                 {
                 case IMAGE_REL_BASED_ABSOLUTE:
-                    // padding 閳?skip
+                    // padding 闁?skip
                     break;
 
                 case IMAGE_REL_BASED_DIR64:
@@ -776,7 +820,7 @@ TdPeRelocate(PVOID mapped_base, PUINT8 raw_dll, UINT64 delta)
 }
 
 //
-// TdPeResolveImports 閳?resolve imports manually via PEB walk.
+// TdPeResolveImports 闁?resolve imports manually via PEB walk.
 // must be called while attached to the target process.
 //
 BOOLEAN
@@ -791,7 +835,7 @@ TdPeResolveImports(PVOID mapped_base)
 
         if (!imp_rva || !imp_size)
         {
-            HYPERPLATFORM_LOG_INFO("[td-map] no import directory 閳?nothing to resolve");
+            HYPERPLATFORM_LOG_INFO("[td-map] no import directory 闁?nothing to resolve");
             return TRUE;
         }
 
@@ -853,7 +897,7 @@ TdPeResolveImports(PVOID mapped_base)
 }
 
 //
-// TdBuildDllMainStub 閳?build a small x64 stub that calls DllMain(base, DLL_PROCESS_ATTACH, NULL).
+// TdBuildDllMainStub 闁?build a small x64 stub that calls DllMain(base, DLL_PROCESS_ATTACH, NULL).
 // placed at image base (overwrites DOS header). returns stub size.
 //
 // stub:
@@ -928,15 +972,15 @@ TdBuildDllMainStub(PVOID stub_addr, UINT64 image_base, UINT64 entry_point,
 }
 
 //
-// TdManualMapInProcess 閳?main manual map function.
+// TdManualMapInProcess 闁?main manual map function.
 // must be called while attached to the target process.
 //
 // parameters:
-//   proc       閳?PEPROCESS (already attached)
-//   raw_dll    閳?raw DLL file bytes (kernel buffer)
-//   dll_size   閳?size of raw DLL
-//   out_base   閳?receives mapped image base (user VA)
-//   out_entry  閳?receives DllMain VA (user VA)
+//   proc       闁?PEPROCESS (already attached)
+//   raw_dll    闁?raw DLL file bytes (kernel buffer)
+//   dll_size   闁?size of raw DLL
+//   out_base   闁?receives mapped image base (user VA)
+//   out_entry  闁?receives DllMain VA (user VA)
 //
 NTSTATUS
 TdManualMapInProcess(
@@ -1019,7 +1063,7 @@ TdManualMapInProcess(
             return STATUS_UNSUCCESSFUL;
         }
 
-        // 6. resolve imports (requires PEB walk 閳?must be attached)
+        // 6. resolve imports (requires PEB walk 闁?must be attached)
         if (!TdPeResolveImports(base))
         {
             HYPERPLATFORM_LOG_WARN("[td-map] TdPeResolveImports had errors (continuing)");
@@ -1124,7 +1168,7 @@ TdManualMapInProcess(
 }
 
 // =========================================================================
-//  TdInjectRenderdocShadow 閳?automated renderdoc injection via LoadImage callback
+//  TdInjectRenderdocShadow 闁?automated renderdoc injection via LoadImage callback
 // =========================================================================
 //
 // Called from TdLoadImageNotify when user32.dll loads in a recorded target.
@@ -1159,6 +1203,31 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
     HANDLE cleanup_thr_h = NULL;
     UINT64 expected_tid = 0;
     BOOLEAN trigger_hooked = FALSE;
+
+    // 0. PRE-INJECTION HV CLEANUP: clear ALL stale stealth state before any
+    //    new shadow CR3 allocation. Two-phase to avoid list corruption:
+    //    Phase A: DPC broadcast VMCALL_SHADOW_ABORT_ALL on ALL CPUs
+    //      -> clears per-vCPU nx_timer_restore/real_cr3/MTF (safe, per-vCPU)
+    //    Phase B: single VMCALL_STEALTH_FREE_ALL on current CPU only
+    //      -> removes global g_ept->stealth_pages list + restores EPT
+    //      -> MUST be single-caller: RemoveHeadList is not SMP-safe
+    KeGenericCallDpc([](PKDPC, PVOID, PVOID A1, PVOID A2) {
+        hv_vmcall_simple(VMCALL_SHADOW_ABORT_ALL, 0, 0, 0);
+        KeSignalCallDpcSynchronize(A2);
+        KeSignalCallDpcDone(A1);
+    }, NULL);
+    hv_vmcall_simple(VMCALL_STEALTH_FREE_ALL, 0, 0, 0);
+    // Phase C: DPC broadcast VMCALL_SHADOW_ABORT_ALL again to flush EPT TLB
+    // (INVEPT) on ALL CPUs. Phase B modified EPT entries on all CPUs from a
+    // single CPU, but other CPUs may have stale EPT TLB entries pointing to
+    // freed stealth/hook pages. This INVEPT flush ensures they see the restored
+    // EPT entries. stealth_clear_stale_window is a no-op here (already cleared).
+    KeGenericCallDpc([](PKDPC, PVOID, PVOID A1, PVOID A2) {
+        hv_vmcall_simple(VMCALL_SHADOW_ABORT_ALL, 0, 0, 0);
+        KeSignalCallDpcSynchronize(A2);
+        KeSignalCallDpcDone(A1);
+    }, NULL);
+    HYPERPLATFORM_LOG_WARN("[%s] pre-injection HV cleanup done (abort + free + unhook + invept)", log_prefix);
 
     // 1. attach to target
     KeStackAttachProcess(proc, &apc_state);
@@ -1207,9 +1276,23 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
     //     just the faulting 2MB) to close the cross-2MB stale-PFN gap.
     PMDL image_mdl = NULL;
 
+    HYPERPLATFORM_LOG_WARN("[%s] step4: building shadow CR3 (image_size=0x%llX)", log_prefix, (UINT64)image_size);
     // 4. build shadow CR3 for the mapped image range (NX cleared)
     //    image_size is already page-aligned from ZwAllocateVirtualMemory
     total_pages = (image_size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    // allocate per-page PFN array for safe cleanup (no KeStackAttachProcess on exit).
+    // Ownership transfers to STEALTH_TRACK_ENTRY via TdStealthTrackAdd on success,
+    // or freed here on failure.
+    UINT64 *page_pfns = (UINT64 *)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(UINT64) * total_pages, 'fPdS');
+    if (!page_pfns)
+    {
+        HYPERPLATFORM_LOG_ERROR("[%s] page_pfns alloc failed", log_prefix);
+        ExFreePoolWithTag(raw_dll, 'fRdO');
+        KeUnstackDetachProcess(&apc_state);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     UINT64 existing = TdStealthFindShadowCr3ForPid(target_pid);
     shadow_cr3 = existing
@@ -1225,7 +1308,8 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
         return STATUS_UNSUCCESSFUL;
     }
 
-    // 5. EPT stealth: shadow page = original (no zeroing needed since shadow CR3 handles NX)
+    HYPERPLATFORM_LOG_WARN("[%s] step5: shadow CR3=0x%llX, setting up EPT stealth pages", log_prefix, shadow_cr3);
+        // 5. EPT stealth: shadow page = original (no zeroing needed since shadow CR3 handles NX)
     //    We need to set up per-page stealth so the shadow CR3 pages are recognized.
     for (SIZE_T off = 0; off < image_size; off += PAGE_SIZE)
     {
@@ -1251,6 +1335,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
             HYPERPLATFORM_LOG_ERROR("[%s] stealth setup failed VA=%p st=0x%08X", log_prefix, page_va, ss);
             break;
         }
+        page_pfns[pages_installed] = page_phys;
         pages_installed++;
     }
 
@@ -1263,6 +1348,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
         if (!existing)
             TdShadowFreeCr3(shadow_cr3);
         ZwFreeVirtualMemory(ZwCurrentProcess(), &mapped_base, &image_size, MEM_RELEASE);
+        ExFreePoolWithTag(page_pfns, 'fPdS');
         ExFreePoolWithTag(raw_dll, 'fRdO');
         KeUnstackDetachProcess(&apc_state);
         return STATUS_UNSUCCESSFUL;
@@ -1276,13 +1362,16 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
         if (!existing)
             TdShadowFreeCr3(shadow_cr3);
         ZwFreeVirtualMemory(ZwCurrentProcess(), &mapped_base, &image_size, MEM_RELEASE);
+        ExFreePoolWithTag(page_pfns, 'fPdS');
         ExFreePoolWithTag(raw_dll, 'fRdO');
         KeUnstackDetachProcess(&apc_state);
         return STATUS_UNSUCCESSFUL;
     }
 
-    // 6. track for process exit cleanup
-    if (!TdStealthTrackAdd(target_pid, mapped_base, image_size, shadow_cr3, image_mdl))
+    HYPERPLATFORM_LOG_WARN("[%s] step6: stealth pages installed %llu/%llu, tracking", log_prefix, (UINT64)pages_installed, (UINT64)total_pages);
+        // 6. track for process exit cleanup
+    if (!TdStealthTrackAdd(target_pid, mapped_base, image_size, shadow_cr3, image_mdl,
+                           caller_cr3, page_pfns, (UINT32)total_pages))
     {
         HYPERPLATFORM_LOG_ERROR("[%s] stealth track table full", log_prefix);
         for (SIZE_T i = 0; i < pages_installed; i++)
@@ -1290,6 +1379,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
         if (!existing)
             TdShadowFreeCr3(shadow_cr3);
         ZwFreeVirtualMemory(ZwCurrentProcess(), &mapped_base, &image_size, MEM_RELEASE);
+        ExFreePoolWithTag(page_pfns, 'fPdS');
         ExFreePoolWithTag(raw_dll, 'fRdO');
         KeUnstackDetachProcess(&apc_state);
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -1299,7 +1389,8 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
     HYPERPLATFORM_LOG_INFO("[%s] shadow CR3 built: PA=0x%llX (VA=%p size=0x%llX, %llu pages NX cleared)",
         log_prefix, shadow_cr3, mapped_base, (UINT64)image_size, (UINT64)total_pages);
 
-    // 7. resolve NtTestAlert (ntdll export) - the CFG-valid thread entry point.
+    HYPERPLATFORM_LOG_WARN("[%s] step7: tracked, resolving NtTestAlert", log_prefix);
+        // 7. resolve NtTestAlert (ntdll export) - the CFG-valid thread entry point.
     //    thread is created SUSPENDED at NtTestAlert, then EPT-hooked to redirect
     //    to mapped_base (DllMain stub), bypassing CFG on the manual-mapped image.
     {
@@ -1340,7 +1431,8 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
         st = STATUS_NOT_FOUND;
     }
 
-    // 8. create thread at trigger (SUSPENDED) - before hook, no race
+    HYPERPLATFORM_LOG_WARN("[%s] step8: creating thread (trigger=%p)", log_prefix, trigger_fn);
+        // 8. create thread at trigger (SUSPENDED) - before hook, no race
     if (NT_SUCCESS(st))
     {
         if (g_pZwCreateThreadEx)
@@ -1376,7 +1468,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
                     else
                     {
                         cleanup_thr_h = kernel_thr_h;
-                        HYPERPLATFORM_LOG_INFO("[%s] thread SUSPENDED trigger=%p tid=%llu",
+                        HYPERPLATFORM_LOG_WARN("[%s] thread SUSPENDED trigger=%p tid=%llu",
                             log_prefix, trigger_fn, expected_tid);
                     }
                 }
@@ -1494,7 +1586,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
         NTSTATUS hook_st = TdInstallTriggerHookAllCpus(
             trigger_fn, mapped_entry, caller_cr3, 2, expected_tid, &dummy_origin, fired_ptr);
 
-        HYPERPLATFORM_LOG_INFO("[%s] trigger hook %s trigger=%p sc=%p tid=%llu st=0x%08X",
+        HYPERPLATFORM_LOG_WARN("[%s] trigger hook %s trigger=%p sc=%p tid=%llu st=0x%08X",
                    log_prefix, NT_SUCCESS(hook_st) ? "OK" : "FAILED",
                    trigger_fn, mapped_entry, expected_tid, hook_st);
 
@@ -1504,6 +1596,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
             trigger_hooked = TRUE;
     }
 
+    HYPERPLATFORM_LOG_WARN("[%s] detached, trigger_hooked=%d, about to resume", log_prefix, (int)trigger_hooked);
     KeUnstackDetachProcess(&apc_state);
 
     // 11. resume thread (now hook is active with correct TID)
@@ -1513,7 +1606,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
         NTSTATUS resume_st = TdResumeThreadHandle(cleanup_thr_h, &prev_count);
         if (NT_SUCCESS(resume_st))
         {
-            HYPERPLATFORM_LOG_INFO("[%s] thread RESUMED trigger=%p tid=%llu prev=%u",
+            HYPERPLATFORM_LOG_WARN("[%s] thread RESUMED trigger=%p tid=%llu prev=%u",
                 log_prefix, trigger_fn, expected_tid, prev_count);
             thread_started = TRUE;
             st = STATUS_SUCCESS;
@@ -1589,19 +1682,27 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
             HYPERPLATFORM_LOG_INFO("[td-inj-shadow] cleanup: unhooking trigger (fired=%ld), inject stays resident",
                 c->fired_signal);
 
+            // Unhook trigger. If the process is still alive, attach and unhook by VA.
+            // If the process is DEAD, use VMCALL_EPT_UNHOOK_BY_CR3 (matches by CR3
+            // value, does NOT load the dead CR3 -> no use-after-free on freed PT).
+            // The pre-injection cleanup (VMCALL_STEALTH_FREE_ALL -> ept_unhook_all)
+            // is the ultimate safety net: it removes ALL hooks before next injection.
             PEPROCESS proc2 = NULL;
             if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)c->target_pid, &proc2)))
             {
                 KAPC_STATE apc2;
                 KeStackAttachProcess(proc2, &apc2);
-
                 TdUnhookTriggerAllCpus(c->trigger_fn, c->target_cr3);
                 KeUnstackDetachProcess(&apc2);
                 ObDereferenceObject(proc2);
-
-                HYPERPLATFORM_LOG_INFO("[td-inj-shadow] cleanup: trigger unhook=%p, inject RESIDENT=%p",
-                    c->trigger_fn, c->shellcode_va);
             }
+            else
+            {
+                // Process dead: unhook by CR3 match (safe, no CR3 load).
+                hv_vmcall_simple(VMCALL_EPT_UNHOOK_BY_CR3, c->target_cr3, 0, 0);
+            }
+            HYPERPLATFORM_LOG_WARN("[td-inj-shadow] cleanup: trigger unhook=%p, inject RESIDENT=%p",
+                c->trigger_fn, c->shellcode_va);
 
             IoFreeWorkItem(c->work_item);
             ExFreePoolWithTag(c, 'wRcI');
@@ -1640,6 +1741,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
             TdUnhookTriggerAllCpus(trigger_fn, caller_cr3);
         PMDL cleanup_mdl = NULL;
         UINT64 cleanup_shadow_cr3 = TdStealthTrackRemove(target_pid, mapped_base, &cleanup_mdl);
+        ExFreePoolWithTag(page_pfns, 'fPdS');
         for (SIZE_T i = 0; i < pages_installed; i++)
             TdStealthFreePage((PUINT8)mapped_base + (i * PAGE_SIZE));
         if (cleanup_shadow_cr3)

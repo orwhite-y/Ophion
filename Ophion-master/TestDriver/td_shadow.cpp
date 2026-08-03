@@ -1,9 +1,10 @@
 #include "td_common.h"
+#include <stealth.h>
 
 // =========================================================================
 //  shadow CR3: build shadow page tables with NX=0 for a VA range.
 //  supports multi-megabyte ranges spanning multiple PT/PD pages.
-//  only duplicates pages along the path 閳?all other entries share real pages.
+//  only duplicates pages along the path 锟?all other entries share real pages.
 //  must be called at PASSIVE_LEVEL while attached to target process.
 // =========================================================================
 
@@ -546,8 +547,14 @@ TdBuildShadowCR3(UINT64 cr3, UINT64 base_va, SIZE_T size)
             last_pd_idx = pd_idx;
         }
 
-        // --- clear NX for this PTE ---
+        // --- set shadow leaf PTE based on mode ---
+        // MODE_A: P=0 (reactive sync on first access, no stale PFN)
+        // default: clear NX (P=1, NX=0 from real snapshot)
+#if (SHADOW_PT_MODE == SHADOW_PT_MODE_A)
+        shadow_pt[pt_idx] = 0;  // P=0: reactive sync on first access (no stale PFN)
+#else
         shadow_pt[pt_idx] = shadow_pt[pt_idx] & ~NX_BIT_;
+#endif
         nx_cleared++;
     }
 
@@ -703,7 +710,11 @@ TdExtendShadowCR3(UINT64 shadow_cr3_phys, UINT64 cr3, UINT64 base_va, SIZE_T siz
         // refresh preserves the NX bit, so it must be cleared here. The protect
         // handler's tracked block overwrites with new_protect afterwards, so
         // this is a no-op for the protect path.
+#if (SHADOW_PT_MODE == SHADOW_PT_MODE_A)
+        shadow_pt[(va >> 12) & 0x1FF] = 0;  // P=0: reactive sync
+#else
         shadow_pt[(va >> 12) & 0x1FF] &= ~NX_BIT_;
+#endif
     }
 
     if (!TdShadowExtendCr3Pages(shadow_cr3_phys, &ctx))

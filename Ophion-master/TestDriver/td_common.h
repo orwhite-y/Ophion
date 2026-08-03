@@ -1,4 +1,4 @@
-﻿/*
+/*
 *   td_common.h - shared declarations for TestDriver (split from test_driver.cpp)
 */
 #pragma once
@@ -70,9 +70,11 @@ typedef struct _TD_PEB_LDR_DATA {
 #define VMCALL_EPT_HOOK_INJECT  0x00000008
 #define VMCALL_EPT_SET_EXTERNAL_FIRED 0x00000009
 #define VMCALL_EPT_UNHOOK_BY_CR3 0x0000000A   // retire all R3 hooks for a CR3 (no CR3 switch - safe from process-exit callback)
+#define VMCALL_SHADOW_ABORT_ALL 0x00000013   // clear stale shadow-CR3 window on all vCPUs (safe from process-exit callback)
+#define VMCALL_STEALTH_FREE_ALL  0x00000014   // remove ALL stealth page entries (pre-injection cleanup)
 
 //
-// EPT hook inject param �?pre-built at PASSIVE_LEVEL, passed to VMX-root.
+// EPT hook inject param ??pre-built at PASSIVE_LEVEL, passed to VMX-root.
 // must match Ophion's EPT_HOOK_INJECT_PARAM.
 //
 #pragma pack(push, 8)
@@ -219,8 +221,8 @@ typedef NTSTATUS (NTAPI * fn_ZwResumeThread)(HANDLE, PULONG);
 
 
 // ---- IOCTL defines and param structs ----
-#define TD_DEVICE_NAME  L"\\Device\\OphionTest"
-#define TD_SYMLINK_NAME L"\\DosDevices\\OphionTest"
+#define TD_DEVICE_NAME  L"\\Device\\RMCoreTst"
+#define TD_SYMLINK_NAME L"\\DosDevices\\RMCoreTst"
 
 #define TD_IOCTL_BASE   0x900
 #define IOCTL_INJECT    CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 0, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -285,7 +287,7 @@ typedef struct _TD_INJECT_RENDERDOC_PARAMS {
 #pragma pack(pop)
 
 //
-// R3 EPT hook params �?from user-mode app via DeviceIoControl
+// R3 EPT hook params ??from user-mode app via DeviceIoControl
 //
 typedef struct _TD_R3_HOOK_PARAMS {
     UINT64 target_pid;          // [in]  target process PID
@@ -525,6 +527,9 @@ typedef struct _STEALTH_TRACK_ENTRY {
     SIZE_T  alloc_size;
     UINT64  shadow_cr3_phys;
     PMDL    image_mdl;       // locked image pages (MmProbeAndLockPages), NULL if none
+    UINT64  guest_cr3;       // guest CR3 at injection time (0 = not tracked)
+    UINT64  *page_pfns;      // per-page PFNs (NonPaged, page_count entries). NULL = old attach-based cleanup
+    UINT32  page_count;      // number of entries in page_pfns
 } STEALTH_TRACK_ENTRY;
 
 
@@ -631,8 +636,9 @@ BOOLEAN TdShadowFreeCr3(UINT64 shadow_cr3_phys);
 BOOLEAN TdShadowMapRealPage(TD_SHADOW_BUILD_CONTEXT * ctx, UINT64 pa);
 BOOLEAN TdShadowRegisterCr3(UINT64 shadow_cr3_phys, TD_SHADOW_BUILD_CONTEXT * ctx);
 BOOLEAN TdStealthFreePage(PVOID target_va);
+BOOLEAN TdStealthFreePageSafe(PVOID target_va, UINT64 target_phys);
 BOOLEAN TdStealthInjectPages( PVOID base_va, PVOID shellcode, UINT32 shellcode_size, BOOLEAN resident);
-BOOLEAN TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3, PMDL image_mdl = NULL);
+BOOLEAN TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3, PMDL image_mdl = NULL, UINT64 guest_cr3 = 0, UINT64 *page_pfns = NULL, UINT32 page_count = 0);
 BOOLEAN TdStealthTrackFindOverlap(UINT64 pid, PVOID base_va, SIZE_T size, PVOID * out_base, SIZE_T * out_size, UINT64 * out_shadow_cr3);
 BOOLEAN TdStealthTrackHasPartialOverlap(UINT64 pid, PVOID base_va, SIZE_T size);
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg);

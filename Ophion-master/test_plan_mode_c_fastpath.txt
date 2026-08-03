@@ -1,0 +1,39 @@
+﻿# Test Plan: MODE_C P=1/NX=0 + Fast-Path Heal
+# Date: 2026-08-03
+# Goal: Eliminate __writecr3 in VMX-root hot path (crash cause)
+
+## Changes Made
+1. td_shadow.cpp: MODE_C now sets ALL shadow PTEs to P=1/NX=0 (was P=0)
+   - TdBuildShadowCR3: shadow_pt[pt_idx] = real_pte & ~NX_BIT (not 0)
+   - TdExtendShadowCR3: same
+2. ept_stealth.cpp: #PF handler filter - MODE_C uses default filter (P=1 fetch+write)
+3. ept_stealth.cpp: stealth_refresh_shadow_code_pte FAST PATH
+   - Before vmx_enter_cr3: check if shadow PTE already P=1
+   - If yes: skip __writecr3 entirely, return TRUE
+   - Every 4096th hit: fall through to slow path (re-sync to catch repage)
+4. ept_stealth.cpp: stealth_sync_data_pte_in_window FAST PATH
+   - If shadow PTE already P=1: skip __writecr3, return TRUE
+5. hv_types.h: Added fast_path_count field to EPT_STEALTH_PAGE_INFO
+6. stealth.h: Updated MODE_C description
+
+## Root Cause Analysis
+- MODE_C was supposed to be "code P=1/NX=0, data P=0" but implementation
+  set ALL PTEs to P=0 (same as MODE_A)
+- Every instruction in renderdoc DLL generated NX #PF -> heal -> __writecr3
+- 8.5MB DLL = millions of instructions = millions of __writecr3 in VMX-root
+- Each __writecr3 can triple-fault if CR3 is stale or TLB inconsistent
+- No minidump = VMX-root triple fault (bypasses normal bugcheck)
+
+## Test Steps
+1. Cold deploy both drivers (system just rebooted, both STOPPED)
+2. Start GoWR.exe
+3. Wait 25s for game to load
+4. Inject renderdoc.dll via Injector.exe
+5. Monitor 60s+ for stability (no crash, no freeze)
+6. If stable: test overlay/capture functionality
+
+## Expected Result
+- No WHEA hard reset
+- No system freeze
+- Game stays alive 60s+
+- __writecr3 calls reduced from millions to ~2128 (one per page, first access)

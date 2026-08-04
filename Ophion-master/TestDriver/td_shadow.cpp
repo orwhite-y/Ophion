@@ -552,10 +552,19 @@ TdBuildShadowCR3(UINT64 cr3, UINT64 base_va, SIZE_T size)
         // default: clear NX (P=1, NX=0 from real snapshot)
 #if (SHADOW_PT_MODE == SHADOW_PT_MODE_A)
         shadow_pt[pt_idx] = 0;  // P=0: reactive sync on first access (no stale PFN)
+#elif (SHADOW_PT_MODE == SHADOW_PT_MODE_G)
+        // MODE_G (Passthrough): clear NX on ALL PTEs in the forked PT page (not just
+        // code entries). The entire 2MB range becomes NX=0 in the shadow PT.
+        // This is safe because stealth is about REAL PTEs (EAC reads real CR3),
+        // not shadow PTEs. Clearing NX on data PTEs in shadow just means they're
+        // also executable from the CPU's perspective under shadow CR3 -- harmless
+        // since the game doesn't jump to its own data pages. The benefit: the
+        // batch-sync in the #PF handler (stealth_sync_pt_batch) copies all 512
+        // PTEs from real and clears NX on all of them in one shot, eliminating
+        // per-PTE A2 heal complexity.
+        shadow_pt[pt_idx] = shadow_pt[pt_idx] & ~NX_BIT_;
 #else
         // MODE_C (default): P=1/NX=0 from real snapshot. No #PF on first access.
-        // Stale PFN handled by fast-path heal (stealth_refresh_shadow_code_pte
-        // skips __writecr3 when PTE already P=1; periodic re-sync catches repage).
         shadow_pt[pt_idx] = shadow_pt[pt_idx] & ~NX_BIT_;
 #endif
         nx_cleared++;

@@ -287,6 +287,19 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     BOOLEAN     stealth_pf_configured;  // TRUE after this CPU's VMCS has #PF interception
 
     //
+    // MODE_G: Passthrough Shadow extended window state.
+    // shadow_extended = TRUE when shadow CR3 is active (no MTF, extended window
+    //   until context switch via CR3-load exiting).
+    // shadow_pending = TRUE when target switched away, waiting for return.
+    // shadow_real_cr3 = target process real CR3 (PFN for comparison).
+    // shadow_cr3_val = shadow CR3 value to write on switch-back.
+    //
+    BOOLEAN     shadow_extended;
+    BOOLEAN     shadow_pending;
+    UINT64      shadow_real_cr3;    // target process real CR3 (PFN compare)
+    UINT64      shadow_cr3_val;     // shadow CR3 value to restore on switch-back
+
+    //
     // inject hook #PF recovery: EPT hook page with fake PT that was swapped for execution
     //
     PEPT_HOOKED_PAGE_INFO stealth_pf_swapped_hook;

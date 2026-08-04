@@ -28,7 +28,8 @@ extern "C" {
 #define SHADOW_PT_MODE_A    1
 #define SHADOW_PT_MODE_B    2
 #define SHADOW_PT_MODE_C    3   // all P=1/NX=0 + fast-path heal: skip __writecr3 when PTE already present. Periodic re-sync (every 4096 hits) catches repage.
-#define SHADOW_PT_MODE      SHADOW_PT_MODE_C
+#define SHADOW_PT_MODE_G    7   // Passthrough Shadow: PML4/PDPT/PD all point to REAL pages (zero staleness). Only fork the single 2MB PT page containing code (clear NX on code PTEs). Data #PF to stale PT -> batch-sync all 512 PTEs from real (one-time per 2MB). No MTF, extended window via CR3-load exiting.
+#define SHADOW_PT_MODE      SHADOW_PT_MODE_G
 
 //
 // hide CR4.VMXE (bit 13) from guest reads

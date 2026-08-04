@@ -4,7 +4,7 @@
 // =========================================================================
 //  shadow CR3: build shadow page tables with NX=0 for a VA range.
 //  supports multi-megabyte ranges spanning multiple PT/PD pages.
-//  only duplicates pages along the path é–¿?all other entries share real pages.
+//  only duplicates pages along the path é–?all other entries share real pages.
 //  must be called at PASSIVE_LEVEL while attached to target process.
 // =========================================================================
 
@@ -552,6 +552,11 @@ TdBuildShadowCR3(UINT64 cr3, UINT64 base_va, SIZE_T size)
         // default: clear NX (P=1, NX=0 from real snapshot)
 #if (SHADOW_PT_MODE == SHADOW_PT_MODE_A)
         shadow_pt[pt_idx] = 0;  // P=0: reactive sync on first access (no stale PFN)
+#elif (SHADOW_PT_MODE == SHADOW_PT_MODE_H)
+        // MODE_H (EPT Write-Protect): clear NX on ALL PTEs in the forked PT page
+        // (same as MODE_G). The shadow PT is kept in sync with the real PT via
+        // EPT write-protection on the real PT page, so no A2 heal is needed.
+        shadow_pt[pt_idx] = shadow_pt[pt_idx] & ~NX_BIT_;
 #else
         // MODE_C (default): P=1/NX=0 from real snapshot. No #PF on first access.
         // Stale PFN handled by fast-path heal (stealth_refresh_shadow_code_pte

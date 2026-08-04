@@ -1,3 +1,6 @@
+#ifndef PFN_MASK
+#define PFN_MASK 0x000FFFFFFFFFF000ULL
+#endif
 /*
 *   vmexit.c - vm-exit handler dispatches exits to sub-handlers
 */
@@ -574,6 +577,57 @@ vmexit_handle_mov_cr(VIRTUAL_MACHINE_STATE * vcpu)
             //
             UINT64  new_cr3  = *reg_ptr;
             BOOLEAN no_flush = (new_cr3 >> 63) & 1;
+            UINT64  new_cr3_clean = new_cr3 & ~(1ULL << 63);
+
+#if (SHADOW_PT_MODE == SHADOW_PT_MODE_G) || (SHADOW_PT_MODE == SHADOW_PT_MODE_H)
+            // MODE_G/H extended shadow window state machine.
+            if (vcpu->shadow_extended || vcpu->shadow_pending)
+            {
+                UINT64 target_pfn = vcpu->shadow_real_cr3 & PFN_MASK;
+                UINT64 new_pfn    = new_cr3_clean & PFN_MASK;
+
+                if (new_pfn == target_pfn)
+                {
+                    // Returning to target -> re-activate shadow.
+                    __vmx_vmwrite(VMCS_GUEST_CR3, vcpu->shadow_cr3_val);
+                    vcpu->shadow_extended = TRUE;
+                    vcpu->shadow_pending  = FALSE;
+                    // No INVVPID: PCID isolates kernel/user TLB. Stale NX=1
+                    // entries handled by already_on_shadow (individual flush).
+
+                    // Restore guard state + widen #PF.
+                    vcpu->nx_timer_real_cr3 = vcpu->shadow_real_cr3;
+                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0);
+                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0);
+                }
+                else
+                {
+                    // Other process/kernel CR3 -> PENDING.
+                    __vmx_vmwrite(VMCS_GUEST_CR3, new_cr3_clean);
+                    vcpu->shadow_extended = FALSE;
+                    vcpu->shadow_pending  = TRUE;
+
+                    // Clear guard + narrow #PF (other processes must not VM-exit).
+                    vcpu->nx_timer_real_cr3 = 0;
+                    ept_update_pf_intercept(vcpu);
+
+                    if (!no_flush)
+                    {
+                        INVVPID_DESCRIPTOR desc = {0};
+                        desc.Vpid = VPID_TAG;
+                        UINT8 ret;
+                        if (g_ept->invvpid_single_retaining_globals)
+                            ret = asm_invvpid(InvvpidSingleContextRetainingGlobals, &desc);
+                        else
+                            ret = asm_invvpid(InvvpidSingleContext, &desc);
+                        if (ret != 0)
+                            asm_invvpid(InvvpidAllContexts, &desc);
+                    }
+                }
+                break;
+            }
+            // Not in shadow window: fall through to default CR3 load.
+#endif
 
             __vmx_vmwrite(VMCS_GUEST_CR3, new_cr3 & ~(1ULL << 63));
 
@@ -662,7 +716,15 @@ vmexit_handle_mov_cr(VIRTUAL_MACHINE_STATE * vcpu)
         switch (cr_qual.ControlRegister)
         {
         case 3:
+#if (SHADOW_PT_MODE == SHADOW_PT_MODE_G) || (SHADOW_PT_MODE == SHADOW_PT_MODE_H)
+            // MODE_G/H: hide shadow CR3 from guest reads while ACTIVE.
+            if (vcpu->shadow_extended)
+                *reg_ptr = vcpu->shadow_real_cr3;
+            else
+                __vmx_vmread(VMCS_GUEST_CR3, reg_ptr);
+#else
             __vmx_vmread(VMCS_GUEST_CR3, reg_ptr);
+#endif
             break;
 
         case 8:

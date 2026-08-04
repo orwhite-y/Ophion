@@ -1,3 +1,6 @@
+#ifndef PFN_MASK
+#define PFN_MASK 0x000FFFFFFFFFF000ULL
+#endif
 /*
 *   ept_stealth.cpp - stealth memory allocation via dual EPT split
 *
@@ -473,6 +476,21 @@ stealth_pf_abort_shadow_window(VIRTUAL_MACHINE_STATE * vcpu)
     // restore the NX-fetch-only #PF intercept that the shadow swap widened to
     // "all" for the duration of the window.
     ept_update_pf_intercept(vcpu);
+
+#if (SHADOW_PT_MODE == SHADOW_PT_MODE_G) || (SHADOW_PT_MODE == SHADOW_PT_MODE_H)
+    // MODE_G/H: disable CR3-load/store exiting and clear extended window state
+    vcpu->shadow_extended = FALSE;
+    vcpu->shadow_pending = FALSE;
+    vcpu->shadow_real_cr3 = 0;
+    vcpu->shadow_cr3_val = 0;
+    {
+        SIZE_T pc2 = 0;
+        __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc2);
+        pc2 &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_CR3_LOAD_EXITING;
+        pc2 &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_CR3_STORE_EXITING;
+        __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc2);
+    }
+#endif
 }
 
 //
@@ -525,6 +543,29 @@ stealth_clear_stale_window(VIRTUAL_MACHINE_STATE * vcpu)
     // Restore the normal (NX-fetch only) #PF intercept that the shadow swap
     // widened to "all faults" for the one-instruction window.
     ept_update_pf_intercept(vcpu);
+
+#if (SHADOW_PT_MODE == SHADOW_PT_MODE_G) || (SHADOW_PT_MODE == SHADOW_PT_MODE_H)
+    // MODE_G/H: only restore if running on shadow CR3 (ACTIVE). In PENDING,
+    // the guest already switched to real CR3, so no restore needed.
+    if (vcpu->shadow_extended)
+    {
+        SIZE_T cur_cr3 = 0;
+        __vmx_vmread(VMCS_GUEST_CR3, &cur_cr3);
+        if ((cur_cr3 & PFN_MASK) == (vcpu->shadow_cr3_val & PFN_MASK))
+            __vmx_vmwrite(VMCS_GUEST_CR3, vcpu->shadow_real_cr3);
+    }
+    vcpu->shadow_extended = FALSE;
+    vcpu->shadow_pending = FALSE;
+    vcpu->shadow_real_cr3 = 0;
+    vcpu->shadow_cr3_val = 0;
+    {
+        SIZE_T pc3 = 0;
+        __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc3);
+        pc3 &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_CR3_LOAD_EXITING;
+        pc3 &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_CR3_STORE_EXITING;
+        __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc3);
+    }
+#endif
 }
 
 
@@ -1219,6 +1260,20 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
                 if (pt_p1) pt_p1->AsUInt = existing->fake_pt->pt_fake_entry.AsUInt;
             }
 
+#if (SHADOW_PT_MODE == SHADOW_PT_MODE_H)
+            // MODE_H: EPT write-protect the real PT page on this CPU too.
+            if (existing->shadow_cr3_phys)
+            {
+                UINT64 pt_phys = existing->pt_page_pfn << 12;
+                PEPT_PML2_ENTRY pt_p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys);
+                if (pt_p2 && pt_p2->LargePage)
+                    ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)pt_phys);
+                PEPT_PML1_ENTRY pt_p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys);
+                if (pt_p1)
+                    pt_p1->WriteAccess = 0;
+            }
+#endif
+
             if (existing->fake_pt || existing->shadow_cr3_phys)
                 ept_update_pf_intercept(vcpu);
 
@@ -1289,6 +1344,20 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
                     PEPT_PML1_ENTRY pt_p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys2);
                     if (pt_p1) pt_p1->AsUInt = existing->fake_pt->pt_fake_entry.AsUInt;
                 }
+
+#if (SHADOW_PT_MODE == SHADOW_PT_MODE_H)
+                // MODE_H: EPT write-protect the real PT page on this CPU too.
+                if (existing->shadow_cr3_phys)
+                {
+                    UINT64 pt_phys = existing->pt_page_pfn << 12;
+                    PEPT_PML2_ENTRY pt_p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys);
+                    if (pt_p2 && pt_p2->LargePage)
+                        ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)pt_phys);
+                    PEPT_PML1_ENTRY pt_p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys);
+                    if (pt_p1)
+                        pt_p1->WriteAccess = 0;
+                }
+#endif
 
                 if (existing->fake_pt || existing->shadow_cr3_phys)
                     ept_update_pf_intercept(vcpu);
@@ -1371,6 +1440,21 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
 #endif
 
         InsertHeadList(&g_ept->stealth_pages, &sp->stealth_page_list);
+
+#if (SHADOW_PT_MODE == SHADOW_PT_MODE_H)
+        // MODE_H: EPT write-protect the real PT page so OS writes to it
+        // trigger EPT violations, keeping the shadow PT in sync.
+        {
+            UINT64 pt_phys = sp->pt_page_pfn << 12;
+            PEPT_PML2_ENTRY pt_p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys);
+            if (pt_p2 && pt_p2->LargePage)
+                ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)pt_phys);
+            PEPT_PML1_ENTRY pt_p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys);
+            if (pt_p1)
+                pt_p1->WriteAccess = 0;
+        }
+#endif
+
         ept_update_pf_intercept(vcpu);
 
         _mm_mfence();
@@ -1772,6 +1856,56 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
 
             vcpu->nx_timer_restore = sp;
 
+#if (SHADOW_PT_MODE == SHADOW_PT_MODE_G) || (SHADOW_PT_MODE == SHADOW_PT_MODE_H)
+            // MODE_G/H: Passthrough Shadow - extended window, no MTF.
+            if (!already_on_shadow)
+            {
+                UINT64 shadow_cr3_val = (current_cr3 & ~PFN_MASK) | shadow_pfn;
+                __vmx_vmwrite(VMCS_GUEST_CR3, shadow_cr3_val);
+                _InterlockedIncrement(&g_dbg_shadow_pf_switched);
+
+                // Individual-address INVVPID: flush only faulting VA.
+                INVVPID_DESCRIPTOR desc = {0};
+                desc.Vpid = VPID_TAG;
+                if (g_ept->invvpid_individual_addr)
+                {
+                    desc.LinearAddress = fault_addr;
+                    asm_invvpid(InvvpidIndividualAddress, &desc);
+                }
+                else
+                    asm_invvpid(InvvpidSingleContext, &desc);
+
+                // Widen #PF to all-faults for extended window.
+                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0);
+                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0);
+
+                // CR3-load + CR3-store exiting for extended window.
+                SIZE_T pc = 0;
+                __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+                pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_CR3_LOAD_EXITING;
+                pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_CR3_STORE_EXITING;
+                __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+
+                vcpu->shadow_extended = TRUE;
+                vcpu->shadow_pending = FALSE;
+                vcpu->shadow_real_cr3 = current_cr3;
+                vcpu->shadow_cr3_val = shadow_cr3_val;
+            }
+            else
+            {
+                INVVPID_DESCRIPTOR desc = {0};
+                desc.Vpid = VPID_TAG;
+                if (g_ept->invvpid_individual_addr)
+                {
+                    desc.LinearAddress = fault_addr;
+                    asm_invvpid(InvvpidIndividualAddress, &desc);
+                }
+                else
+                    asm_invvpid(InvvpidSingleContext, &desc);
+            }
+            // MODE_G/H: no MTF. Extended window stays open until CR3-load.
+#else
+            // MODE_C: one-instruction shadow window with MTF.
             if (!already_on_shadow)
             {
                 // build shadow CR3 value: replace PFN, keep PCID/flags
@@ -1825,6 +1959,7 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
             pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
             __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+#endif
         }
 
         // fake PT mode: EPT changes + MTF

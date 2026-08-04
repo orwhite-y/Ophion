@@ -882,6 +882,44 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
     viol.AsUInt = exit_qual;
     UINT64 pfn = guest_phys >> 12;
 
+#if (SHADOW_PT_MODE == SHADOW_PT_MODE_H)
+    //
+    // MODE_H: EPT write-protect on real PT pages. When the OS writes to a
+    // protected real PT page, lift EPT W temporarily, set MTF to re-sync
+    // the shadow PT after the write completes, then re-protect.
+    //
+    if (viol.WriteAccess && g_ept && !IsListEmpty(&g_ept->stealth_pages))
+    {
+        PLIST_ENTRY sc = g_ept->stealth_pages.Flink;
+        while (sc != &g_ept->stealth_pages)
+        {
+            PEPT_STEALTH_PAGE_INFO sp = CONTAINING_RECORD(sc, EPT_STEALTH_PAGE_INFO, stealth_page_list);
+            sc = sc->Flink;
+            if (!sp->shadow_cr3_phys || sp->pt_page_pfn != pfn)
+                continue;
+
+            // Found: this is a write to a MODE_H-protected real PT page.
+            // Lift EPT W so the faulting instruction can complete the write.
+            PEPT_PML1_ENTRY pt_p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)guest_phys);
+            if (pt_p1)
+            {
+                pt_p1->WriteAccess = 1;
+                _mm_mfence();
+                ept_invept_single(vcpu->ept_pointer);
+
+                vcpu->shadow_ept_wp_pending = TRUE;
+                vcpu->shadow_ept_wp_pt_pfn = pfn;
+
+                SIZE_T pc = 0;
+                __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+                pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+                __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+            }
+            return TRUE;
+        }
+    }
+#endif
+
     PLIST_ENTRY cur = g_ept->hooked_pages.Flink;
     while (cur != &g_ept->hooked_pages)
     {
@@ -1023,6 +1061,59 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
     pc &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
     __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+
+#if (SHADOW_PT_MODE == SHADOW_PT_MODE_H)
+    //
+    // MODE_H: EPT write-protect re-sync. The OS just wrote to a protected
+    // real PT page (EPT W was temporarily lifted). Re-sync the shadow PT
+    // page from the real PT page (copy 512 PTEs, clear NX on all), then
+    // re-protect the EPT entry (W=0).
+    //
+    if (vcpu->shadow_ept_wp_pending)
+    {
+        UINT64 wp_pfn = vcpu->shadow_ept_wp_pt_pfn;
+        vcpu->shadow_ept_wp_pending = FALSE;
+        vcpu->shadow_ept_wp_pt_pfn = 0;
+
+        // Find the stealth page for this PT page
+        PLIST_ENTRY sc = g_ept->stealth_pages.Flink;
+        while (sc != &g_ept->stealth_pages)
+        {
+            PEPT_STEALTH_PAGE_INFO sp = CONTAINING_RECORD(sc, EPT_STEALTH_PAGE_INFO, stealth_page_list);
+            sc = sc->Flink;
+            if (!sp->shadow_cr3_phys || sp->pt_page_pfn != wp_pfn)
+                continue;
+
+            // Re-sync: copy 512 PTEs from real PT to shadow PT, clearing NX.
+            // Must run under the guest kernel CR3 so pa_to_va resolves the
+            // real PT page (same discipline as stealth_refresh_shadow_code_pte).
+            UINT64 saved_cr3 = vmx_enter_cr3(sp->guest_cr3);
+            {
+                PVOID real_pt_va = pa_to_va((UINT64)wp_pfn << 12);
+                PUINT64 shadow_pt = (PUINT64)sp->pt_page_va;
+                if (real_pt_va && shadow_pt)
+                {
+                    PUINT64 real_pt = (PUINT64)real_pt_va;
+                    for (UINT32 i = 0; i < 512; i++)
+                        shadow_pt[i] = real_pt[i] & ~(1ULL << 63);  // clear NX
+                }
+            }
+            vmx_leave_guest_cr3(saved_cr3);
+
+            // Re-protect EPT: W=0 on the real PT page
+            PEPT_PML1_ENTRY pt_p1 = ept_get_pml1(vcpu->ept_page_table,
+                (SIZE_T)((UINT64)wp_pfn << 12));
+            if (pt_p1)
+            {
+                pt_p1->WriteAccess = 0;
+                _mm_mfence();
+                ept_invept_single(vcpu->ept_pointer);
+            }
+            break;
+        }
+        return;
+    }
+#endif
 
     //
     // Shadow-CR3 restore must run first. The same MTF exit can also carry

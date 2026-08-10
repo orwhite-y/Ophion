@@ -1,0 +1,21 @@
+﻿TEST PLAN: CL EPT Hook Diagnostic v2 (2026-08-04 11:16)
+=======================================================
+Purpose: Identify which step in TdEptHookR3 fails for 28/32 CL hooks
+
+Changes from 9f8d515:
+- td_ept_hook.cpp: [cl-diag] step1-7 logging in TdEptHookR3 (R0, safe)
+- ept_hook.cpp: atomic counters at each failure path (VMX-root, no logging)
+- vmexit.cpp: VMCALL_HOOK_DIAG (0x15) to read counters
+- td_ept_hook.cpp: TdLogHookDiag() called after VMCALL failure
+
+Steps:
+1. Launch GoWR.exe
+2. Wait 60s for D3D12 init
+3. Inject renderdoc.dll via Injector.exe
+4. Wait for Present+ECL hooks to succeed
+5. Create capture.flag to trigger frame capture
+6. Wait 15s for CL hooks to attempt
+7. Check T.log for [cl-diag] messages showing which step fails
+8. Check [cl-diag] CNT messages for VMX-root failure breakdown
+
+Expected: step1-6 logs show which R0 step fails, or step7 + CNT shows VMX-root failure

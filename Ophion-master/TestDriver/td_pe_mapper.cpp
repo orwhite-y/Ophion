@@ -1051,7 +1051,7 @@ TdManualMapInProcess(
         {
             HYPERPLATFORM_LOG_ERROR("[td-map] TdPeCopySections failed");
             ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &image_size, MEM_RELEASE);
-            return STATUS_UNSUCCESSFUL;
+            return (NTSTATUS)0xC0002001;  /* stage: CopySections */
         }
 
         // 5. apply relocations
@@ -1060,7 +1060,7 @@ TdManualMapInProcess(
         {
             HYPERPLATFORM_LOG_ERROR("[td-map] TdPeRelocate failed (delta=0x%llX)", delta);
             ZwFreeVirtualMemory(ZwCurrentProcess(), &base, &image_size, MEM_RELEASE);
-            return STATUS_UNSUCCESSFUL;
+            return (NTSTATUS)0xC0002002;  /* stage: Relocate */
         }
 
         // 6. resolve imports (requires PEB walk 闁?must be attached)
@@ -1163,7 +1163,7 @@ TdManualMapInProcess(
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         HYPERPLATFORM_LOG_ERROR("[td-map] exception in TdManualMapInProcess");
-        return STATUS_UNSUCCESSFUL;
+        return (NTSTATUS)0xC0002003;  /* stage: exception */
     }
 }
 
@@ -1199,6 +1199,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
     SIZE_T pages_installed = 0;
     SIZE_T total_pages = 0;
     UINT64 target_pid = (UINT64)PsGetProcessId(proc);
+    UINT32 inj_stage = 0;  /* diag: fail returns 0xC0001000+stage */
     PVOID trigger_fn = NULL;
     HANDLE cleanup_thr_h = NULL;
     UINT64 expected_tid = 0;
@@ -1239,7 +1240,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
     {
         HYPERPLATFORM_LOG_ERROR("[%s] TdReadFileKernel failed: 0x%08X", log_prefix, st);
         KeUnstackDetachProcess(&apc_state);
-        return st;
+        return (NTSTATUS)0xC0003001;  /* stage: ReadFile */
     }
     HYPERPLATFORM_LOG_INFO("[%s] read renderdoc: %wZ size=0x%llX", log_prefix, renderdoc_path, (UINT64)dll_size);
 
@@ -1250,7 +1251,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
         HYPERPLATFORM_LOG_ERROR("[%s] TdManualMapInProcess failed: 0x%08X", log_prefix, st);
         ExFreePoolWithTag(raw_dll, 'fRdO');
         KeUnstackDetachProcess(&apc_state);
-        return st;
+        return (NTSTATUS)0xC0003002;  /* stage: ManualMap st=0x%08X */
     }
 
     // compute image size from raw PE headers
@@ -1301,11 +1302,12 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
 
     if (!shadow_cr3)
     {
+        inj_stage = 4; /* shadow CR3 build failed */
         HYPERPLATFORM_LOG_ERROR("[%s] shadow CR3 build failed", log_prefix);
         ExFreePoolWithTag(raw_dll, 'fRdO');
         ZwFreeVirtualMemory(ZwCurrentProcess(), &mapped_base, &image_size, MEM_RELEASE);
         KeUnstackDetachProcess(&apc_state);
-        return STATUS_UNSUCCESSFUL;
+        return (NTSTATUS)(0xC0001000 + inj_stage);
     }
 
     HYPERPLATFORM_LOG_WARN("[%s] step5: shadow CR3=0x%llX, setting up EPT stealth pages", log_prefix, shadow_cr3);
@@ -1320,6 +1322,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
 
         if (!page_phys || !TdResolveGuestPT(caller_cr3, (UINT64)page_va, &pt_pfn, &pt_idx))
         {
+            inj_stage = 5; /* PT/PA resolve failed */
             HYPERPLATFORM_LOG_ERROR("[%s] PT/PA resolve failed VA=%p at off=0x%llX",
                 log_prefix, page_va, (UINT64)off);
             break;
@@ -1332,6 +1335,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
 
         if (!NT_SUCCESS(ss))
         {
+            inj_stage = 6; /* stealth alloc failed */
             HYPERPLATFORM_LOG_ERROR("[%s] stealth setup failed VA=%p st=0x%08X", log_prefix, page_va, ss);
             break;
         }
@@ -1341,6 +1345,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
 
     if (pages_installed != total_pages)
     {
+        inj_stage = 7; /* pages incomplete */
         HYPERPLATFORM_LOG_ERROR("[%s] stealth setup incomplete: %llu/%llu pages",
             log_prefix, (UINT64)pages_installed, (UINT64)total_pages);
         for (SIZE_T i = 0; i < pages_installed; i++)
@@ -1351,11 +1356,12 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
         ExFreePoolWithTag(page_pfns, 'fPdS');
         ExFreePoolWithTag(raw_dll, 'fRdO');
         KeUnstackDetachProcess(&apc_state);
-        return STATUS_UNSUCCESSFUL;
+        return (NTSTATUS)(0xC0001000 + inj_stage);
     }
 
     if (!mapped_entry)
     {
+        inj_stage = 8; /* mapped entry NULL */
         HYPERPLATFORM_LOG_ERROR("[%s] mapped entry is NULL", log_prefix);
         for (SIZE_T i = 0; i < total_pages; i++)
             TdStealthFreePage((PUINT8)mapped_base + (i * PAGE_SIZE));
@@ -1365,7 +1371,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
         ExFreePoolWithTag(page_pfns, 'fPdS');
         ExFreePoolWithTag(raw_dll, 'fRdO');
         KeUnstackDetachProcess(&apc_state);
-        return STATUS_UNSUCCESSFUL;
+        return (NTSTATUS)(0xC0001000 + inj_stage);
     }
 
     HYPERPLATFORM_LOG_WARN("[%s] step6: stealth pages installed %llu/%llu, tracking", log_prefix, (UINT64)pages_installed, (UINT64)total_pages);
@@ -1373,6 +1379,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
     if (!TdStealthTrackAdd(target_pid, mapped_base, image_size, shadow_cr3, image_mdl,
                            caller_cr3, page_pfns, (UINT32)total_pages))
     {
+        inj_stage = 9; /* stealth track full */
         HYPERPLATFORM_LOG_ERROR("[%s] stealth track table full", log_prefix);
         for (SIZE_T i = 0; i < pages_installed; i++)
             TdStealthFreePage((PUINT8)mapped_base + (i * PAGE_SIZE));
@@ -1463,7 +1470,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
                             log_prefix, kh_st, expected_tid);
                         if (kernel_thr_h)
                             ZwClose(kernel_thr_h);
-                        st = NT_SUCCESS(kh_st) ? STATUS_UNSUCCESSFUL : kh_st;
+                        st = NT_SUCCESS(kh_st) ? (NTSTATUS)0xC0004001 : kh_st;  /* stage: MakeKernelThreadHandle */
                     }
                     else
                     {
@@ -1514,7 +1521,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
                         log_prefix, kh_st, expected_tid);
                     if (kernel_thr_h)
                         ZwClose(kernel_thr_h);
-                    st = !expected_tid ? STATUS_UNSUCCESSFUL : kh_st;
+                    st = !expected_tid ? (NTSTATUS)0xC0004002 : kh_st;  /* stage: fallback handle */
                 }
                 else
                 {
@@ -1731,7 +1738,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
         TdCloseCreatedThreadHandle(cleanup_thr_h, thread_started ? TRUE : FALSE);
 
     if (NT_SUCCESS(st) && !thread_started)
-        st = STATUS_UNSUCCESSFUL;
+        st = (NTSTATUS)0xC0004003;  /* stage: thread not started */
 
     if (!NT_SUCCESS(st) && stealth_tracked && !thread_started)
     {

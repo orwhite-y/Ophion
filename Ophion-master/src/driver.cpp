@@ -524,6 +524,29 @@ DriverEntry(
         }
     }
 
+    // ---- Preserve crash CMOS marker before VMX init overwrites it ----
+    // Ophion's VMX init writes 0x10-0x1F to CMOS, overwriting any crash
+    // marker (0x01-0x0F) from the previous run. Save it to 0x74-0x7F first.
+    {
+        UCHAR prev_magic = wedge_cmos_getc(WEDGE_CMOS_MAGIC_OFF);
+        UCHAR prev_val   = wedge_cmos_getc(WEDGE_CMOS_VALUE_OFF);
+        if (prev_magic == WEDGE_CMOS_MAGIC && prev_val != 0)
+        {
+            wedge_cmos_putc(0x74, prev_magic);
+            wedge_cmos_putc(0x75, prev_val);
+            for (int i = 0; i < 4; i++)
+                wedge_cmos_putc((UCHAR)(0x76 + i), wedge_cmos_getc((UCHAR)(WEDGE_CMOS_REINJ_CNT_OFF + i)));
+            for (int i = 0; i < 8; i++)
+                wedge_cmos_putc((UCHAR)(0x7A + i), wedge_cmos_getc((UCHAR)(WEDGE_CMOS_REINJ_ADDR_OFF + i)));
+            HYPERPLATFORM_LOG_WARN("[hv-cmos] PREV-CRASH preserved: val=0x%02X (copied to 0x74-0x7F)", prev_val);
+        }
+        else
+        {
+            wedge_cmos_putc(0x74, 0);
+            wedge_cmos_putc(0x75, 0);
+        }
+    }
+
     wedge_cmos_mark(0x10);
 
     if (!vmx_init())

@@ -1,0 +1,48 @@
+﻿TESTPLAN: CMOS Diagnostic Capture
+==================================
+Date: 2026-08-09
+Branch: shadow-passthrough @ e383cda + uncommitted CMOS diag changes
+
+PURPOSE:
+  Capture exact VMX-root position when WHEA 0x124 kills the machine
+  during renderdoc injection. CMOS (RTC NVRAM) survives instant-kill.
+
+CHANGES DEPLOYED:
+  1. Ophion: wedge_cmos_* functions re-enabled (spinlock-protected)
+     - Markers 0x03-0x0D at each stage of #PF handler + batch refresh
+     - wedge_cmos_snap_reinj writes streak+addr (12 bytes)
+     - ept_stealth_get_diag_snapshot fills VMX_DIAG_SNAPSHOT struct
+     - VMCALL_GET_DIAG_STATE (0x15) handler in vmexit.cpp
+  2. TestDriver: DPC timer polls VMCALL_GET_DIAG_STATE every 500ms
+     - Logs [diag] counters to T.log
+     - At boot: reads CMOS 0x50-0x73 -> [td-cmos] PREV-CRASH log
+
+TEST STEPS:
+  1. Deploy new Ophion.sys + TestEptHook.sys
+  2. Check T.log for [td-cmos] PREV-CRASH (from previous crash - should be empty)
+  3. Launch GoWR.exe (E:\God of War Ragnarok\GoWR.exe)
+  4. Wait for game to main menu
+  5. Inject: Injector.exe GoWR.exe F:\winDriver\te\renderdoc.dll 0
+  6. Watch T.log for [diag] entries (500ms polling)
+  7. If crash -> reboot -> read T.log [td-cmos] PREV-CRASH
+     - magic=0xA5 val=0xNN -> last position marker
+     - Per-CPU markers show which CPU crashed
+
+EXPECTED CRASH POINT (based on 18:15 T.log):
+  After "thread RESUMED" -> renderdoc DLL executes -> #PF on stealth page
+  -> batch refresh -> WHEA 0x124
+
+CMOS MARKER LEGEND:
+  0x01 = trigger fired (ept_hook)
+  0x03 = heal enter
+  0x04 = post-enter-cr3
+  0x05 = pre-walk
+  0x06 = post-walk
+  0x07 = batch refresh CR3 switched
+  0x08 = batch refresh walk start
+  0x09 = batch refresh walk OK
+  0x0A = batch refresh PTE loop done
+  0x0B = match found
+  0x0C = batch refresh path
+  0x0D = batch refresh walk FAIL
+  0x0F = triple fault

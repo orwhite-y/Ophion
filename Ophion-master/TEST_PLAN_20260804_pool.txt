@@ -1,0 +1,30 @@
+﻿# TEST_PLAN 2026-08-04 - Pool expansion + race fix
+
+## Changes
+1. pool_manager.cpp: hooked_page 32->80, hooked_func 64->160, trampoline 32->80, split cpu*8->cpu*4(min 64)
+2. td_ept_hook.cpp: DpcEptHookR3 race condition fix (preserve first failure via interlocked)
+
+## Problem
+- 32 CL EPT hooks failed: only 4/32 succeeded
+- Root cause: hooked_page pool (32 entries) exhausted after 2 hooks * 20 CPUs = 40 > 32
+- Each CPU allocates its own hooked_page entry in the shared pool
+
+## Steps
+1. Build Ophion.sys + TestEptHook.sys
+2. Sign both (clock rollback)
+3. Deploy: stop+delete RMCoreTst -> 2s -> RMCore -> 3s -> create+start
+4. Clear logs
+5. Start GoWR, wait 60s
+6. Inject renderdoc.dll
+7. Create capture.flag
+8. Wait 15s, check:
+   - GoWR alive
+   - .rdc file exists
+   - T.log shows no R3 EPT hook failures
+   - renderdoc log shows 32/32 CL hooks installed
+9. If .rdc exists with draw calls: SUCCESS
+
+## Expected
+- All 32 CL hooks succeed (pool now has 80 hooked_page entries = 4 hooks * 20 CPUs)
+- .rdc file generated with draw calls
+- Game stable

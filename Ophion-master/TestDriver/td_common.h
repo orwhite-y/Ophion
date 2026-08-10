@@ -72,6 +72,31 @@ typedef struct _TD_PEB_LDR_DATA {
 #define VMCALL_EPT_UNHOOK_BY_CR3 0x0000000A   // retire all R3 hooks for a CR3 (no CR3 switch - safe from process-exit callback)
 #define VMCALL_SHADOW_ABORT_ALL 0x00000013   // clear stale shadow-CR3 window on all vCPUs (safe from process-exit callback)
 #define VMCALL_STEALTH_FREE_ALL  0x00000014   // remove ALL stealth page entries (pre-injection cleanup)
+#define VMCALL_GET_DIAG_STATE  0x00000015   // R0: rdx=&VMX_DIAG_SNAPSHOT -> HV fills counters
+
+// Diagnostic snapshot -- must match Ophion include/hv_types.h VMX_DIAG_SNAPSHOT
+typedef struct _TD_VMX_DIAG_SNAPSHOT {
+    UINT64  pf_seen;
+    UINT64  pf_allowed;
+    UINT64  pf_switched;
+    UINT64  pf_reject;
+    UINT64  pf_midwin;
+    UINT64  pf_synced;
+    UINT64  code_enter;
+    UINT64  code_synced;
+    UINT64  ptpage_synced;
+    UINT64  data_synced;
+    UINT64  abort_count;
+    UINT64  spurious;
+    UINT64  nomatch;
+    UINT64  stale_p1;
+    UINT64  already_on_shadow;
+    UINT32  exit_reason;
+    UINT32  cpu;
+    UINT64  vmx_rip;
+    UINT64  cmos_value;
+    UINT64  stealth_page_count;
+} TD_VMX_DIAG_SNAPSHOT, *PTD_VMX_DIAG_SNAPSHOT;
 
 //
 // EPT hook inject param ??pre-built at PASSIVE_LEVEL, passed to VMX-root.

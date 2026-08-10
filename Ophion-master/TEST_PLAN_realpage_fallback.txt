@@ -1,0 +1,30 @@
+# TEST PLAN: real_page_map fallback + safety check
+# Date: 2026-08-04
+# Goal: Fix injection freeze (10 PT pages MDL_IO_SPACE fail -> stale shadow PTE -> crash)
+
+## Root Cause (confirmed from O.log 16:26)
+- O.log last line: code-refresh BAIL-realwalk pa=58636f000 (one of 10 failed PT pages)
+- stealth_walk_pte -> stealth_lookup_real_page returns NULL -> walk fails -> stale PTE -> wrong code -> crash
+- TdShadowMapRealPage return value was IGNORED in TdBuildShadowCR3/TdExtendShadowCR3
+
+## Fix
+1. MmGetVirtualForPhysical fallback already in TdShadowMapRealPage (source, never built)
+2. NEW: check TdShadowMapRealPage return value, goto Fail on FALSE (safety net)
+
+## Steps
+1. Add return value checks to all TdShadowMapRealPage calls
+2. Stop services (RMCoreTst -> 2s -> RMCore -> 3s)
+3. Clean obj dir
+4. Build with VS2022 MSBuild (Ophion.sln Debug x64)
+5. Deploy via deploy_drivers.ps1 -Start
+6. Launch GoWR, wait 60s
+7. Inject: Injector.exe GoWR.exe <renderdoc.dll> 0
+8. Wait 15s - check system responsive + GoWR running
+9. Check T.log: NO real-page map FAIL lines
+10. If stable: trigger .rdc capture
+11. If .rdc OK: commit + push + update PROCESS.md
+
+## Abort conditions
+- System freeze/BSOD -> stop, analyze
+- GoWR crash -> check T.log + O.log for BAIL-realwalk
+- Any real-page map FAIL in T.log -> fallback not working, analyze

@@ -1,0 +1,20 @@
+TEST PLAN: real_page_map walk (no vmx_enter_cr3)
+=================================================
+Date: 2026-08-04
+Change: stealth_walk_pte now uses MDL-mapped real_page_map instead of
+  vmx_enter_cr3 + self-map walk. TdBuildShadowCR3 + TdExtendShadowCR3
+  now call TdShadowMapRealPage for PML4/PDPT/PD/PT pages.
+  Root cause of freeze: vmx_enter_cr3 did __writecr3(guest_cr3) in VMX-root,
+  then self-map walk could #PF -> KeBugCheckEx hung under private host CR3.
+
+Steps:
+1. [DONE] Deploy RMCore + RMCoreTst (both running)
+2. Launch GoWR (D:\God of War Ragnarok\GoWR.exe)
+3. Wait 60 seconds for game to settle
+4. Inject renderdoc: Injector.exe GoWR.exe <renderdoc.dll> 0
+5. Wait 10 seconds - check if system is still responsive
+6. If stable: check T.log for injection steps
+7. If stable: check RenderDoc log for swapchain wrap success
+8. If stable: trigger .rdc capture via capture.flag
+9. If stable: SUCCESS - commit and push
+10. If freeze/crash: read CMOS 0x60 diagnostic, read T.log

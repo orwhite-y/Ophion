@@ -1,0 +1,40 @@
+适用于 .NET Framework MSBuild 版本 17.14.40+3e7442088
+
+  Building 'Ophion' with toolset 'WindowsKernelModeDriver10.0' and the 'Desktop' target platform.
+  ept_hook.cpp
+F:\winDriver\te\Ophion-master\Ophion-master\src\ept_hook.cpp(1,1): warning C4819: 该文件包含不能在当前代码页(936)中表示的字符。请将该文件保存为 Unicode 格式以防止数据丢失 [F:\winDriver\te\Ophion-master\Ophion-master\Ophion.vcxproj]
+F:\winDriver\te\Ophion-master\Ophion-master\include\hv.h(1,1): warning C4819: 该文件包含不能在当前代码页(936)中表示的字符。请将该文件保存为 Unicode 格式以防止数据丢失 [F:\winDriver\te\Ophion-master\Ophion-master\Ophion.vcxproj]
+  (编译源文件“src/ept_hook.cpp”)
+  
+F:\winDriver\te\Ophion-master\Ophion-master\include\ia32.h(1,1): warning C4819: 该文件包含不能在当前代码页(936)中表示的字符。请将该文件保存为 Unicode 格式以防止数据丢失 [F:\winDriver\te\Ophion-master\Ophion-master\Ophion.vcxproj]
+  (编译源文件“src/ept_hook.cpp”)
+  
+F:\winDriver\te\Ophion-master\Ophion-master\include\ia32.h(763,1): warning C4819: 该文件包含不能在当前代码页(936)中表示的字符。请将该文件保存为 Unicode 格式以防止数据丢失 [F:\winDriver\te\Ophion-master\Ophion-master\Ophion.vcxproj]
+  (编译源文件“src/ept_hook.cpp”)
+  
+F:\winDriver\te\Ophion-master\Ophion-master\include\hv_types.h(1,1): warning C4819: 该文件包含不能在当前代码页(936)中表示的字符。请将该文件保存为 Unicode 格式以防止数据丢失 [F:\winDriver\te\Ophion-master\Ophion-master\Ophion.vcxproj]
+  (编译源文件“src/ept_hook.cpp”)
+  
+F:\winDriver\te\Ophion-master\Ophion-master\include\stealth.h(1,1): warning C4819: 该文件包含不能在当前代码页(936)中表示的字符。请将该文件保存为 Unicode 格式以防止数据丢失 [F:\winDriver\te\Ophion-master\Ophion-master\Ophion.vcxproj]
+  (编译源文件“src/ept_hook.cpp”)
+  
+F:\winDriver\te\Ophion-master\Ophion-master\src\ept_hook.cpp(699,1): warning C4819: 该文件包含不能在当前代码页(936)中表示的字符。请将该文件保存为 Unicode 格式以防止数据丢失 [F:\winDriver\te\Ophion-master\Ophion-master\Ophion.vcxproj]
+    正在创建库 F:\winDriver\te\Ophion-master\Ophion-master\build\bin\Debug\Ophion.lib 和对象 F:\winDriver\te\Ophion-master\Ophion-master\build\bin\Debug\Ophion.exp
+  Ophion.vcxproj -> F:\winDriver\te\Ophion-master\Ophion-master\build\bin\Debug\Ophion.sys
+  Done Adding Additional Store
+  Successfully signed: F:\winDriver\te\Ophion-master\Ophion-master\build\bin\Debug\Ophion.sys
+  
+  Inf2Cat task was skipped as there were no inf files to process
+  
+  DrvCat task was skipped as there was no catalog file to process
+  
+  客户端没有所需的特权。
+  'CSignTool.exe' 不是内部或外部命令，也不是可运行的程序
+  或批处理文件。
+  客户端没有所需的特权。
+  客户端没有所需的特权。
+  'CSignTool.exe' 不是内部或外部命令，也不是可运行的程序
+  或批处理文件。
+  客户端没有所需的特权。
+C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Microsoft\VC\v170\Microsoft.CppCommon.targets(166,5): error MSB3073: 命令“vmp_debug1.bat [F:\winDriver\te\Ophion-master\Ophion-master\Ophion.vcxproj]
+C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Microsoft\VC\v170\Microsoft.CppCommon.targets(166,5): error MSB3073: :VCEnd”已退出，代码为 1。 [F:\winDriver\te\Ophion-master\Ophion-master\Ophion.vcxproj]

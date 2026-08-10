@@ -1,0 +1,44 @@
+﻿# Test Plan: MODE_E State Machine Fix
+# Date: 2026-08-04 18:11
+# Goal: Verify MODE_E shadow CR3 ACTIVE/PENDING state machine fix prevents BSOD
+
+## Bug Fixed
+CR3-store exiting stayed ON when GoWR was context-switched away, causing ALL
+processes' CR3 reads to return GoWR's CR3 -> kernel page-table walk corruption -> BSOD.
+
+## Fix Applied
+1. hv_types.h: Added shadow_pending field to vcpu struct
+2. vmexit.cpp CR3-load handler: 
+   - ACTIVE->PENDING (switch away): disable CR3-store exiting, clear shadow_extended,
+     set shadow_pending, clear nx_timer_real_cr3/restore, set NX-fetch-only #PF
+   - PENDING->ACTIVE (switch back): enable CR3-store exiting, set shadow CR3,
+     clear shadow_pending, set shadow_extended, set all-#PF (mask=0/match=0),
+     re-arm nx_timer_real_cr3
+3. ept_stealth.cpp: stealth_pf_abort_shadow_window, stealth_clear_stale_window,
+   and #PF handler window-open path all clear shadow_pending
+
+## Test Steps
+1. [PRE] Services RMCore + RMCoreTst running (verified)
+2. Launch GoWR.exe, wait 60s for game to fully load
+3. Inject: Injector.exe GoWR.exe <renderdoc.dll> 0 (auto-scan mode)
+4. Wait 30s, check:
+   - System alive? (no BSOD, no freeze)
+   - GoWR alive? (Get-Process GoWR)
+   - TestDriver log: shadow CR3 build OK?
+   - Ophion log: any error?
+5. If stable for 30s: check for overlay (F12 prompt)
+6. If stable for 60s: try F12 frame capture
+7. If capture works: SUCCESS
+8. If BSOD: check C:\Windows\Minidump for new dump
+
+## Expected Behavior
+- First NX-fetch #PF opens shadow window (ACTIVE)
+- GoWR runs at native speed on shadow CR3
+- Context switches: ACTIVE->PENDING->ACTIVE (no BSOD)
+- Other processes run normally during PENDING
+- No freeze (CR3-store exiting OFF during PENDING)
+
+## Failure Indicators
+- Immediate BSOD -> CR3-store still corrupting (check vmexit.cpp)
+- Freeze -> CR3-load/store exiting storm or #PF loop
+- GoWR crash -> stale shadow data (known MODE_C limitation, not BSOD)

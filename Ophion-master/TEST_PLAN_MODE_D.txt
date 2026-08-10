@@ -1,0 +1,28 @@
+=== TEST PLAN: MODE_D shadow CR3 (code P=1/NX=0, data P=0) ===
+Date: 2026-08-04 11:39:21
+Driver: Ophion commit 9f8d515 + MODE_D changes
+  - stealth.h: SHADOW_PT_MODE_D=4, SHADOW_PT_MODE=MODE_D
+  - td_shadow.cpp: TdIsCodePage() + MODE_D branches in TdBuildShadowCR3/TdExtendShadowCR3
+  - td_ioctl.cpp: protect handler includes MODE_D
+  - ept_stealth.cpp: comment update
+
+Target: GoWR.exe PID=20284
+Action: Inject renderdoc.dll via Injector.exe
+  Injector: F:\winDriver\te\Ophion-master\Injector\x64\Release\Injector.exe
+  DLL: F:\winDriver\te\Ophion-master\renderdoc-1.36\x64\Release\renderdoc.dll
+  Command: Injector.exe GoWR.exe <dll> 0
+
+Expected:
+  - Injection succeeds (shadow CR3 built, stealth pages installed)
+  - VTable hijack applied (Present + ECL + CreateCommandList + CreateCommandAllocator)
+  - Game does NOT crash (previous crash was 0xc0000005 at renderdoc offset 0x1274F0)
+  - Game stable for >30 seconds after injection
+
+If stable:
+  - Create capture.flag to trigger .rdc capture
+  - Verify .rdc file is generated with draw calls
+
+If crash:
+  - Check WER for crash address
+  - Check T.log for [cl-diag] and injection status
+  - Check O.log for stealth sync errors

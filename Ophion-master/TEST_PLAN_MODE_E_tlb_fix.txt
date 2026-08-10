@@ -1,0 +1,28 @@
+﻿# Test Plan: MODE_E already_on_shadow TLB flush fix
+# Date: 2026-08-04 18:20
+# Goal: Verify INVVPID fix in already_on_shadow path prevents infinite #PF loop
+
+## Bug Fixed (NEW)
+already_on_shadow path (second NX-fetch while shadow ACTIVE) refreshed the
+shadow PTE but did NOT flush TLB. TLB held stale real-PT NX=1 translation ->
+guest re-fetch -> re-#PF -> infinite loop -> system freeze (no BSOD, hard reset).
+
+Previous fix (CR3-store exiting state machine) is also in this build.
+
+## Fix Applied
+Added INVVPID (individual-address when available) before return TRUE in the
+already_on_shadow branch of ept_stealth_handle_pf (ept_stealth.cpp ~line 1886).
+
+## Test Steps
+1. [PRE] Services running (verified)
+2. Wait 10s - system stable with no game? 
+3. Launch GoWR.exe, wait 60s
+4. If system alive: inject renderdoc
+5. If inject succeeds: wait 30s, check stability
+6. If stable 30s: check overlay
+7. If stable 60s: try F12 capture
+
+## Failure Indicators
+- Freeze after inject -> TLB flush still missing somewhere
+- BSOD -> CR3-store state machine issue
+- GoWR crash (not system) -> stale data (known, not fatal)

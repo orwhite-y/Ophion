@@ -1,0 +1,19 @@
+TEST PLAN: batch-refresh-fix
+Date: 2026-08-09 16:24:20
+Driver: Ophion (shadow-passthrough branch, batch refresh fix)
+Game: GoWR.exe PID 10764
+Inject: Injector.exe GoWR.exe F:\winDriver\te\renderdoc.dll 0
+
+Steps:
+1. Inject renderdoc into GoWR
+2. Wait 60s - check if game survives (previous AV crash was at 30-90s)
+3. If survives, attempt F12 frame capture (previous 0x1A BSOD was at ~3min during F12)
+4. Monitor for 5+ minutes total
+
+What changed:
+- stealth_batch_refresh_shadow_ptes(): refreshes ALL 512 PTEs per shadow PT page
+  from real PT before opening shadow window (eliminates stale PFNs)
+- Previous fix: data PTEs P=0 (reactive sync) - fixed AV crash
+- This fix: batch refresh ALL PTEs - should fix 0x1A BSOD
+
+If BSOD: check C:\Windows\Minidump\ for new dump

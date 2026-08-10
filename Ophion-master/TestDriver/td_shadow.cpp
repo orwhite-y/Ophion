@@ -4,7 +4,7 @@
 // =========================================================================
 //  shadow CR3: build shadow page tables with NX=0 for a VA range.
 //  supports multi-megabyte ranges spanning multiple PT/PD pages.
-//  only duplicates pages along the path 閿?all other entries share real pages.
+//  only duplicates pages along the path �?all other entries share real pages.
 //  must be called at PASSIVE_LEVEL while attached to target process.
 // =========================================================================
 
@@ -553,16 +553,18 @@ TdBuildShadowCR3(UINT64 cr3, UINT64 base_va, SIZE_T size)
 #if (SHADOW_PT_MODE == SHADOW_PT_MODE_A)
         shadow_pt[pt_idx] = 0;  // P=0: reactive sync on first access (no stale PFN)
 #elif (SHADOW_PT_MODE == SHADOW_PT_MODE_G)
-        // MODE_G (Passthrough): clear NX on ALL PTEs in the forked PT page (not just
-        // code entries). The entire 2MB range becomes NX=0 in the shadow PT.
-        // This is safe because stealth is about REAL PTEs (EAC reads real CR3),
-        // not shadow PTEs. Clearing NX on data PTEs in shadow just means they're
-        // also executable from the CPU's perspective under shadow CR3 -- harmless
-        // since the game doesn't jump to its own data pages. The benefit: the
-        // batch-sync in the #PF handler (stealth_sync_pt_batch) copies all 512
-        // PTEs from real and clears NX on all of them in one shot, eliminating
-        // per-PTE A2 heal complexity.
-        shadow_pt[pt_idx] = shadow_pt[pt_idx] & ~NX_BIT_;
+        // MODE_G (Passthrough Shadow): code PTEs P=1/NX=0 (direct execution),
+        // data PTEs P=0 (reactive sync from real PT on first access per window).
+        // Setting data PTEs to P=0 forces a #PF on first data access during the
+        // extended shadow window, which stealth_sync_data_pte_in_window handles
+        // by syncing the shadow PTE from the current real PTE. This eliminates
+        // the stale-PFN corruption that occurred when data PTEs were P=1/NX=0
+        // and the CPU accessed a repaged data page through a stale shadow PFN
+        // (root cause of the renderdoc-init AV crash).
+        if (shadow_pt[pt_idx] & NX_BIT_)
+            shadow_pt[pt_idx] = 0;  // data page (NX=1 in real): P=0 reactive sync
+        else
+            shadow_pt[pt_idx] = shadow_pt[pt_idx] & ~NX_BIT_;  // code page: P=1/NX=0
 #else
         // MODE_C (default): P=1/NX=0 from real snapshot. No #PF on first access.
         shadow_pt[pt_idx] = shadow_pt[pt_idx] & ~NX_BIT_;
@@ -724,6 +726,15 @@ TdExtendShadowCR3(UINT64 shadow_cr3_phys, UINT64 cr3, UINT64 base_va, SIZE_T siz
         // this is a no-op for the protect path.
 #if (SHADOW_PT_MODE == SHADOW_PT_MODE_A)
         shadow_pt[(va >> 12) & 0x1FF] = 0;  // P=0: reactive sync
+#elif (SHADOW_PT_MODE == SHADOW_PT_MODE_G)
+        // MODE_G: data PTEs P=0 (reactive sync), code PTEs P=1/NX=0.
+        {
+            UINT32 idx = (UINT32)((va >> 12) & 0x1FF);
+            if (shadow_pt[idx] & NX_BIT_)
+                shadow_pt[idx] = 0;  // data page: P=0
+            else
+                shadow_pt[idx] &= ~NX_BIT_;  // code page: P=1/NX=0
+        }
 #else
         // MODE_C (default): P=1/NX=0. No #PF on first access.
         shadow_pt[(va >> 12) & 0x1FF] &= ~NX_BIT_;

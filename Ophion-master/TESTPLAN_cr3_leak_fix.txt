@@ -1,0 +1,28 @@
+﻿
+# TESTPLAN - CR3 leak fix + triple fault bugcheck
+# Time: 2026-08-09 18:14:27
+# Branch: shadow-passthrough @ e383cda + 4 fixes
+
+## Changes under test (this run)
+1. ept_stealth.cpp Fix1: batch refresh walk-failure -> skip (not zero)
+2. ept_stealth.cpp Fix2: batch refresh fallback -> individual code PTE refresh
+3. ept_stealth.cpp Fix3: CR3 LEAK in stealth_refresh_shadow_code_pte line 1119
+   - Was: return FALSE without vmx_leave_guest_cr3 -> VMX root wrong CR3 -> WHEA
+   - Now: vmx_leave_guest_cr3(saved_cr3) before return FALSE
+4. vmexit.cpp Fix4: triple fault handler -> KeBugCheckEx(0xDEADC0DE) instead of no-op freeze
+
+## Previous crash analysis
+- 17:20:58 WHEA 0x124 (firmware hardware error)
+- T.log shows injection DID run at 17:20:42, stealth pages 2152/2152 installed
+- Crash 15s after injection = renderdoc code execution triggered #PF -> batch refresh
+  -> fallback -> CR3 leak -> WHEA
+
+## Test steps
+1. Launch E:\God of War Ragnarok\GoWR.exe, wait 25s
+2. Inject: Injector.exe GoWR.exe F:\winDriver\te\renderdoc.dll 0
+3. Wait 30s - game MUST survive
+4. Press F12 - frame capture
+5. Check for .rdc file
+
+## PASS: game alive >30s + F12 .rdc produced
+## FAIL: crash/BSOD/hang -> if triple fault, get 0xDEADC0DE dump; if WHEA, need deeper analysis

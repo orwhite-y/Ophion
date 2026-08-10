@@ -83,6 +83,41 @@ wedge_percpu_mark(UINT32 cpu, UCHAR val)
     UNREFERENCED_PARAMETER(val);
 }
 
+// ---------------------------------------------------------------------------
+// Livelock panic watchdog.
+//
+// The WEDGE CMOS diagnostics (wedge_cmos_* in hv.h) were stubbed out because
+// concurrent port-0x70/0x71 writes race and starve CPUs. The in-memory liveloop
+// detectors (g_wedge_reason_streak / g_wedge_rip_streak / g_wedge_reinj_streak)
+// still run every exit, but their only response was wedge_cmos_snap_reinj() --
+// a no-op. So a confirmed VMX-root liveloop (same exit reason / same RIP / same
+// #PF reinjected tens of thousands of times) spun forever -> silent hard hang ->
+// NO dump. Every 'rebooted, no dump, can't tell why' was this.
+//
+// This watchdog turns a detected liveloop into a KeBugCheckEx so we get a
+// minidump carrying the wedged exit reason + RIP. Purely additive: fires only
+// when a per-CPU streak exceeds the panic threshold (true liveloop -- normal
+// varied traffic never approaches it). Other CPUs freeze at their next VM-exit
+// via g_vmx_panic (checked at vmexit_handler entry).
+// ---------------------------------------------------------------------------
+#define WEDGE_LIVELOCK_PANIC_THRESHOLD 0x10000   // 65536 same-exit iterations
+static volatile LONG g_vmx_panic = 0;
+
+static __forceinline VOID
+vmx_livelock_panic(UINT32 cpu, UINT32 kind, UINT64 val, LONG streak)
+{
+    if (_InterlockedCompareExchange(&g_vmx_panic, 1, 0) != 0)
+    {
+        // another CPU is already bugchecking -- leave VMX and halt forever
+        __vmx_off();
+        for (;;) { YieldProcessor(); }
+    }
+    // first panic: exit VMX on this CPU so KeBugCheckEx runs in plain kernel mode
+    __vmx_off();
+    // kind: 1=reason-streak 2=rip-streak 3=reinj-streak ; val = stuck reason/RIP/addr
+    KeBugCheckEx(0xDEADC0DE, (ULONG_PTR)kind, (ULONG_PTR)val,
+                 ((ULONG_PTR)cpu << 32) | (ULONG_PTR)(ULONG)streak, 0);
+}
 static __forceinline VOID
 vmexit_advance_rip(VIRTUAL_MACHINE_STATE * vcpu)
 {
@@ -580,35 +615,48 @@ vmexit_handle_mov_cr(VIRTUAL_MACHINE_STATE * vcpu)
             UINT64  new_cr3_clean = new_cr3 & ~(1ULL << 63);
 
 #if (SHADOW_PT_MODE == SHADOW_PT_MODE_G)
-            // MODE_G extended shadow window state machine.
+            // MODE_G extended shadow window.
             if (vcpu->shadow_extended || vcpu->shadow_pending)
             {
                 UINT64 target_pfn = vcpu->shadow_real_cr3 & PFN_MASK;
                 UINT64 new_pfn    = new_cr3_clean & PFN_MASK;
 
-                if (new_pfn == target_pfn)
+                if (vcpu->shadow_extended && new_pfn == target_pfn)
                 {
-                    // Returning to target -> re-activate shadow.
+                    // Same-process CR3 reload (e.g. TLB flush) -> re-activate shadow.
                     __vmx_vmwrite(VMCS_GUEST_CR3, vcpu->shadow_cr3_val);
                     vcpu->shadow_extended = TRUE;
                     vcpu->shadow_pending  = FALSE;
-                    // No INVVPID: PCID isolates kernel/user TLB. Stale NX=1
-                    // entries handled by already_on_shadow (individual flush).
-
-                    // Restore guard state + widen #PF.
                     vcpu->nx_timer_real_cr3 = vcpu->shadow_real_cr3;
+                    // Widen #PF for extended window.
                     __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0);
                     __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0);
                 }
                 else
                 {
-                    // Other process/kernel CR3 -> PENDING.
+                    // Different process OR stale PENDING -> CLOSE shadow window.
+                    // Do NOT stay in PENDING: the target process may exit while
+                    // scheduled away, and a new process may reuse its CR3 PFN.
+                    // Re-activating a stale shadow on the wrong process walks
+                    // freed page-table pages -> BSOD. Instead, close fully; the
+                    // next code-fetch #PF on the target re-opens a fresh window
+                    // (cost: one #PF per scheduling quantum, ~10ms).
                     __vmx_vmwrite(VMCS_GUEST_CR3, new_cr3_clean);
                     vcpu->shadow_extended = FALSE;
-                    vcpu->shadow_pending  = TRUE;
-
-                    // Clear guard + narrow #PF (other processes must not VM-exit).
+                    vcpu->shadow_pending  = FALSE;
                     vcpu->nx_timer_real_cr3 = 0;
+                    vcpu->nx_timer_restore  = NULL;
+                    vcpu->shadow_real_cr3 = 0;
+                    vcpu->shadow_cr3_val  = 0;
+
+                    // Disable CR3-load/store exiting (no longer in shadow window).
+                    SIZE_T pc = 0;
+                    __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+                    pc &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_CR3_LOAD_EXITING;
+                    pc &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_CR3_STORE_EXITING;
+                    __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+
+                    // Restore normal #PF intercept.
                     ept_update_pf_intercept(vcpu);
 
                     if (!no_flush)
@@ -1556,6 +1604,15 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             regs->rax = (UINT64)STATUS_SUCCESS;
             break;
 
+        case VMCALL_GET_DIAG_STATE:
+        {
+            PVMX_DIAG_SNAPSHOT snap = (PVMX_DIAG_SNAPSHOT)regs->rdx;
+            if (snap)
+                ept_stealth_get_diag_snapshot(snap, vcpu);
+            regs->rax = (UINT64)STATUS_SUCCESS;
+            break;
+        }
+
         case VMCALL_EPT_SET_EXTERNAL_FIRED:
         {
             PVOID target_va = (PVOID)regs->rdx;
@@ -1862,7 +1919,25 @@ vmexit_handle_triple_fault(VIRTUAL_MACHINE_STATE * vcpu)
     // TFs again -> infinite loop = freeze. A host TF would reset (not freeze)
     // and would NOT reach this mark, so 0x0F cleanly separates the two modes.
     wedge_cmos_mark(0x0F);
-    vcpu->advance_rip = FALSE;
+
+    // Guest triple-faulted: the guest kernel is in an unrecoverable state.
+    // The old code was a no-op (advance_rip=FALSE) -> VMRESUME re-enters the
+    // same faulting RIP -> guest TFs again -> infinite loop = system freeze.
+    // This caused every guest-TF to become a silent hang with NO dump, making
+    // diagnosis impossible. Instead, bugcheck NOW to capture a minidump so we
+    // can trace what corrupted the guest (exception injection, EPT, CR3 switch).
+    SIZE_T tf_cr3 = 0, tf_rsp = 0;
+    __vmx_vmread(VMCS_GUEST_CR3, &tf_cr3);
+    __vmx_vmread(VMCS_GUEST_RSP, &tf_rsp);
+    HYPERPLATFORM_LOG_WARN_SAFE(
+    "[TRIPLE-FAULT] core=%u rip=%llx cr3=%llx sp=%llx exit_qual=%llx -- bugcheck for dump",
+    vcpu->core_id, vcpu->vmexit_rip, (UINT64)tf_cr3,
+    (UINT64)tf_rsp, vcpu->exit_qual);
+
+    // Freeze other CPUs then bugcheck. 0xDEADC0DE = hypervisor triple-fault.
+    InterlockedExchange(&g_vmx_panic, 1);
+    __vmx_off();
+    KeBugCheckEx(0xDEADC0DE, 0x0000000F, vcpu->vmexit_rip, (ULONG_PTR)tf_cr3, (ULONG_PTR)vcpu->exit_qual);
 }
 
 //
@@ -1983,6 +2058,15 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     exit_reason = (UINT32)(exit_raw & 0xFFFF);
     vcpu->exit_reason = exit_reason;
 
+    // Livelock panic: if another CPU already detected a liveloop and
+    // bugchecked, freeze this CPU now (leave VMX, spin) so it can't
+    // keep running the guest / corrupt the dump.
+    if (g_vmx_panic)
+    {
+        __vmx_off();
+        for (;;) { YieldProcessor(); }
+    }
+
     //
     // lazy per-CPU stealth setup DISABLED for now.
     // stealth only active on the install CPU. shellcode thread must be
@@ -2064,6 +2148,8 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
             LONG ws = g_wedge_reason_streak[wcpu];
             if (ws >= 1024 && (ws & 0x3FF) == 0)
                 wedge_cmos_snap_reinj((UINT32)ws, (UINT64)pcpu_byte);
+            if (ws >= WEDGE_LIVELOCK_PANIC_THRESHOLD)
+                vmx_livelock_panic(wcpu, 1, (UINT64)pcpu_byte, ws);
 
             // RIP-stuck detector (see g_wedge_rip_streak above). vcpu->vmexit_rip was
             // read earlier (VMCS_GUEST_RIP, line ~1465). Same RIP across 1024+ exits =
@@ -2080,6 +2166,8 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
             LONG wrs = g_wedge_rip_streak[wcpu];
             if (wrs >= 1024 && (wrs & 0x3FF) == 0)
                 wedge_cmos_snap_reinj((UINT32)wrs, (UINT64)wrip | 0x1);
+            if (wrs >= WEDGE_LIVELOCK_PANIC_THRESHOLD)
+                vmx_livelock_panic(wcpu, 2, (UINT64)wrip, wrs);
 
             // throttle CMOS snap+end to every 8th exit (see g_wedge_snap_ctr above)
             wedge_do_snap = (_InterlockedIncrement(&g_wedge_snap_ctr[wcpu]) % 8) == 0;
@@ -2475,6 +2563,8 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                         LONG ws = g_wedge_reinj_streak[wcpu];
                         if (ws >= 1024 && (ws & 0x3FF) == 0)
                             wedge_cmos_snap_reinj((UINT32)ws, wfa);
+                        if (ws >= WEDGE_LIVELOCK_PANIC_THRESHOLD)
+                            vmx_livelock_panic(wcpu, 3, wfa, ws);
                     }
                 }
             }

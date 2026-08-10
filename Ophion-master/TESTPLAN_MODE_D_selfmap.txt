@@ -1,0 +1,67 @@
+﻿MODE_D Shadow CR3 + Self-map PTE Walk - Test Plan
+=================================================
+Date: 2026-08-04
+Code: commit 9f8d515 + uncommitted pa_to_va->self-map fix in ept_stealth.cpp
+
+ROOT CAUSE OF PREVIOUS CRASHES (all BEFORE fix):
+- BSOD 0x101 CLOCK_WATCHDOG_TIMEOUT at 11:00 (minidump 080426-16390-01.dmp)
+  CPU 0 hung in VMX-root. pa_to_va (MmGetVirtualForPhysical) acquires PFN DB
+  lock -> deadlock under heavy renderdoc code load -> CPU stuck -> watchdog.
+- Freezes at 11:43, 13:10, 13:28 = manual restarts (no dump). Same root cause.
+- ALL crashes were with OLD code (source modified 13:44, all crashes before 13:44).
+
+FIX APPLIED (not yet tested):
+- stealth_walk_pte rewritten: uses PML4 self-map (g_self_map_index=503) instead
+  of pa_to_va. No lock acquisition. Lock-free page table walk.
+- CR3 leak fix: stealth_refresh_shadow_code_pte line 1070 now restores CR3
+  before returning FALSE (was bare return FALSE -> __writecr3(0) -> #GP -> triple fault).
+- guest_cr3 NULL check added (lines 771, 1005) to prevent vmx_enter_cr3(0).
+- All pa_to_va calls removed from VMX-root hot path.
+  Remaining pa_to_va: only in cleanup/unhook path (line 2112, not hot path).
+
+VERIFICATION DONE:
+1. g_self_map_index initialized: no ERROR in O.log (would show if failed).
+   T.log confirms TestDriver found idx=503. Ophion uses same Windows kernel
+   PML4 layout, so g_self_map_index=503 in Ophion too.
+2. Self-map VA arithmetic verified correct (PML4 self-referencing walk).
+3. All CR3 exit paths restore via vmx_leave_guest_cr3 (done: / leave: labels).
+4. No pa_to_va in stealth_walk_pte, stealth_sync_data_pte_in_window,
+   stealth_refresh_shadow_code_pte, or ept_stealth_handle_pf.
+5. stealth_walk_pt_page (uses pa_to_va) is DEAD CODE (never called).
+6. EPT_STEALTH_PAGE_INFO structs in stealth region -> mapped under private
+   host CR3 via hostcr3_map_va. Safe to access before vmx_enter_cr3.
+7. VMX-root runs with RFLAGS.IF=0 (VMCS_HOST_RFLAGS not explicitly set ->
+   defaults to 0). Interrupts disabled. vmx_enter_cr3 safe.
+8. Private IDT halts CPU on exceptions (defensive, not corruptive).
+
+POTENTIAL RISKS:
+- Performance: 8.5MB renderdoc DLL = ~2152 stealth pages. Each code instruction
+  causes 2+ VM exits (NX-fetch + MTF). ept_update_pf_intercept walks 2152
+  entries on every MTF. System may appear SLOW but should not crash.
+- NMI during vmx_enter_cr3 window: private IDT handler halts CPU (safety).
+  Unlikely to occur in practice.
+
+TEST STEPS:
+1. Verify drivers running: sc.exe query RMCore + RMCoreTst (both STATE=4)
+2. Launch GoWR: Start-Process "D:\God of War Ragnarok\GoWR.exe"
+3. Wait 60 seconds for game to stabilize
+4. Verify GoWR process alive: Get-Process GoWR
+5. Inject renderdoc:
+   $injector = "F:\winDriver\te\Ophion-master\Injector\x64\Release\Injector.exe"
+   $dll = "F:\winDriver\te\Ophion-master\renderdoc-1.36\x64\Release\renderdoc.dll"
+   Run as Job with 30s timeout. Injector.exe calls Sleep(INFINITE) after success.
+6. Monitor T.log for injection progress (TdInjectRenderdocShadow)
+7. Wait 30 seconds after injection
+8. Check game stable: Get-Process GoWR (alive = good)
+9. Check T.log for [cl-diag] or shadow CR3 build messages
+10. Check O.log for [stealth-a2] messages (code sync happening)
+11. If stable for 2+ minutes: trigger capture via Python
+    open("C:\\ProgramData\\WinComp\\capture.flag","w").close()
+12. Wait 10 seconds, check for .rdc file
+13. If .rdc exists and >100KB: SUCCESS
+14. If game crashes or system freezes: ABORT, check logs
+
+ABORT CONDITIONS:
+- Game process disappears within 30s of injection
+- System becomes unresponsive for >30 seconds
+- T.log shows repeated FAIL/error messages

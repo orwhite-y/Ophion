@@ -1,0 +1,45 @@
+# Test Plan: PTE-Remap Fix + Diagnostics
+# Date: 2026-08-04 17:20
+# Goal: Fix self-map VA computation bug in TdShadowMapRealPage PTE-remap fallback
+
+## Bugs Being Fixed
+1. CRITICAL: self-map PTE VA used g_self_map_index for ALL 4 levels (gives PML4 page, not leaf PTE)
+   Correct: sign_ext | (S<<39) | (p4<<30) | (p3<<21) | (p2<<12) | (p1<<3)
+2. CRITICAL: ExAllocatePool2 does NOT guarantee page alignment -> PTE remap corrupts neighbor pool data
+   Fix: use MmAllocateContiguousMemory (page-aligned, physically contiguous)
+3. CRITICAL: TdShadowUnmapRealPage calls MmUnmapIoSpace on PTE-remap VA (wrong)
+   Fix: restore original PTE, invlpg, MmFreeContiguousMemory
+4. Added orig_pte field to STEALTH_REAL_PAGE_ENTRY for PTE restoration
+
+## MDL path change
+- Try MmCached FIRST (RAM pages are normally WB, MmNonCached can conflict)
+- Fallback to MmNonCached
+- If both fail -> PTE-remap
+
+## Steps
+1. Stop services: sc stop RMCoreTst, 2s, sc stop RMCore, 3s
+2. Clean obj dir
+3. Build Ophion.sln (Debug, x64) with VS2022 MSBuild
+4. Sign .sys files (DSignTool, clock 2015-01-15)
+5. Deploy: deploy_drivers.ps1 -Start
+6. Clear T.log + O.log
+7. Launch GoWR.exe, wait 60s
+8. Inject: Injector.exe GoWR.exe <renderdoc.dll> 0
+9. Wait 15s, check:
+   - GoWR alive? (Get-Process GoWR)
+   - T.log: any FAIL? PTE-remap used? 
+   - O.log: any error?
+10. If stable: try .rdc capture
+11. If successful: commit + push
+
+## Expected T.log on success
+- MDL_IO_SPACE map ok for most pages
+- PTE-remap for ~10 pages that MDL fails on
+- shadow CR3 build OK
+- injection proceeds
+- GoWR survives
+
+## Failure indicators
+- immediate reboot -> PTE corruption (self-map VA still wrong)
+- GoWR crash -> shadow PT walk returns wrong data
+- freeze -> invlpg issue or contiguous memory exhaustion

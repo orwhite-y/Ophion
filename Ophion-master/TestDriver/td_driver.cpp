@@ -11,6 +11,14 @@ fn_PsResumeThread  g_pPsResumeThread  = NULL;
 BOOLEAN g_process_notify_registered = FALSE;
 BOOLEAN g_process_notify_ex_registered = FALSE;
 
+// ---- CMOS diagnostic readback (survives WHEA instant-kill) ----
+// Ophion writes last-position markers to RTC NVRAM (port 0x70/0x71) in
+// VMX-root. TestDriver reads them back at next boot to find crash position.
+KTIMER          g_diag_timer;
+KDPC            g_diag_dpc;
+volatile LONG   g_diag_timer_active = 0;
+
+
 // ---- Liveness check (named event, no vmcall) ----
 // Ophion creates + signals this event after VMX init succeeds on all cores.
 // TestDriver opens it read-only and checks state before any VMCALL.
@@ -55,8 +63,56 @@ BOOLEAN TdOphionAlive(VOID)
     return KeReadStateEvent(g_alive_evt) != 0;
 }
 
+// ---- CMOS raw read (no spinlock -- used at boot before VMX) ----
+static UCHAR
+TdCmosReadByte(UCHAR off)
+{
+    UCHAR v;
+    __outbyte(0x70, (UCHAR)(off | 0x80));   // disable NMI, select offset
+    v = __inbyte(0x71);
+    __outbyte(0x70, 0x0D);                   // restore NMI
+    return v;
+}
+
+// ---- DPC timer: poll VMX-root diag state every 500ms ----
+// Logs counters to T.log. If WHEA kills the machine, the last few
+// entries show the trajectory; CMOS has the exact last position.
+static VOID NTAPI
+TdDiagDpcRoutine(PKDPC dpc, PVOID deferred, PVOID sys1, PVOID sys2)
+{
+    UNREFERENCED_PARAMETER(dpc);
+    UNREFERENCED_PARAMETER(deferred);
+    UNREFERENCED_PARAMETER(sys1);
+    UNREFERENCED_PARAMETER(sys2);
+
+    TD_VMX_DIAG_SNAPSHOT snap;
+    RtlZeroMemory(&snap, sizeof(snap));
+
+    NTSTATUS st = hv_vmcall_ex(VMCALL_GET_DIAG_STATE,
+                               (UINT64)&snap, 0, 0, 0, 0, 0, 0, 0, 0);
+    if (NT_SUCCESS(st))
+    {
+        HYPERPLATFORM_LOG_WARN(
+            "[diag] pf=%llu/%llu sw=%llu rej=%llu mid=%llu "
+            "code_enter=%llu sync=%llu/%llu nomatch=%llu "
+            "stale=%llu already=%llu cmos=0x%02X sp=%llu "
+            "exit=0x%X cpu=%u rip=0x%llx",
+            snap.pf_seen, snap.pf_allowed, snap.pf_switched,
+            snap.pf_reject, snap.pf_midwin,
+            snap.code_enter, snap.code_synced, snap.data_synced,
+            snap.nomatch, snap.stale_p1, snap.already_on_shadow,
+            (UCHAR)snap.cmos_value, snap.stealth_page_count,
+            snap.exit_reason, snap.cpu, snap.vmx_rip);
+    }
+}
+
 VOID TdUnload(PDRIVER_OBJECT drv)
 {
+    // ---- Stop diag DPC timer ----
+    g_diag_timer_active = 0;
+    KeCancelTimer(&g_diag_timer);
+    KeFlushQueuedDpcs();
+
     TdAliveFini();
     TdMemCacheFini();
 
@@ -187,6 +243,61 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
         return (NTSTATUS)0xC0000362;  // STATUS_FAILED_DRIVER_ENTRY
     }
     HYPERPLATFORM_LOG_INFO("[td] Ophion alive -- TestDriver loading with VMX support");
+
+    // ---- CMOS crash-position readback ----
+    // Ophion writes last VMX-root position to RTC NVRAM before WHEA kills.
+    // Read it back here to find where the crash happened.
+    {
+        UCHAR cm_magic = TdCmosReadByte(0x50);
+        UCHAR cm_val   = TdCmosReadByte(0x51);
+        UCHAR cm_match = TdCmosReadByte(0x52);
+        UCHAR cm_trig  = TdCmosReadByte(0x53);
+        UINT32 cm_streak = 0;
+        UINT64 cm_reinj_addr = 0;
+        for (int i = 0; i < 4; i++)
+            cm_streak |= (UINT32)TdCmosReadByte((UCHAR)(0x54 + i)) << (i * 8);
+        for (int i = 0; i < 8; i++)
+            cm_reinj_addr |= (UINT64)TdCmosReadByte((UCHAR)(0x58 + i)) << (i * 8);
+
+        HYPERPLATFORM_LOG_WARN(
+            "[td-cmos] PREV-CRASH: magic=0x%02X val=0x%02X match=%u trig=%u "
+            "reinj_streak=%u reinj_addr=0x%llx",
+            cm_magic, cm_val, cm_match, cm_trig, cm_streak, cm_reinj_addr);
+
+        // Per-CPU markers (0x60-0x73)
+        for (int cpu = 0; cpu < 20; cpu++)
+        {
+            UCHAR pv = TdCmosReadByte((UCHAR)(0x60 + cpu));
+            if (pv)
+                HYPERPLATFORM_LOG_WARN("[td-cmos] cpu%d=0x%02X", cpu, pv);
+        }
+
+        // Preserved crash marker (0x74-0x7F, saved by Ophion before VMX init)
+        UCHAR pm_magic = TdCmosReadByte(0x74);
+        UCHAR pm_val   = TdCmosReadByte(0x75);
+        if (pm_magic == 0xA5 && pm_val != 0)
+        {
+            UINT32 pm_streak = 0;
+            UINT64 pm_addr = 0;
+            for (int i = 0; i < 4; i++)
+                pm_streak |= (UINT32)TdCmosReadByte((UCHAR)(0x76 + i)) << (i * 8);
+            for (int i = 0; i < 6; i++)
+                pm_addr |= (UINT64)TdCmosReadByte((UCHAR)(0x7A + i)) << (i * 8);
+            HYPERPLATFORM_LOG_WARN(
+                "[td-cmos] PRESERVED-CRASH: val=0x%02X reinj_streak=%u reinj_addr=0x%llx",
+                pm_val, pm_streak, pm_addr);
+        }
+    }
+
+    // ---- DPC timer: poll VMX-root diag state every 500ms ----
+    KeInitializeTimer(&g_diag_timer);
+    KeInitializeDpc(&g_diag_dpc, TdDiagDpcRoutine, NULL);
+    g_diag_timer_active = 1;
+    LARGE_INTEGER due;
+    due.QuadPart = -500 * 10000LL;   // 500ms relative
+    KeSetTimerEx(&g_diag_timer, due, 500, &g_diag_dpc);  // 500ms period
+    HYPERPLATFORM_LOG_INFO("[td] diag DPC timer started (500ms period)");
+
 
     UNICODE_STRING dev_name, sym_name;
     RtlInitUnicodeString(&dev_name, TD_DEVICE_NAME);

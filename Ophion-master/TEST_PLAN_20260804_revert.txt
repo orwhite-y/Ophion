@@ -1,0 +1,31 @@
+﻿# TEST_PLAN 2026-08-04 - Revert to 9f8d515 clean
+
+## Goal
+Verify commit 9f8d515 (last known working, rdc-capture-done) injects cleanly.
+Uncommitted changes (9 files) suspected of causing BSOD/reboot.
+
+## Steps
+1. git checkout -- . (revert 9 modified files to 9f8d515)
+2. Clean obj files for changed sources
+3. Build Ophion.sys + TestEptHook.sys (Debug, x64)
+4. Sign both (clock rollback 2015-01-15)
+5. Deploy: stop+delete RMCoreTst -> 2s -> RMCore -> 3s -> create RMCore -> 3s -> RMCoreTst -> 2s
+6. Clear O.log + T.log
+7. Start GoWR.exe, wait 60s
+8. Inject renderdoc.dll via Injector.exe
+9. Wait 25s, check T.log for "thread RESUMED"
+10. Check GoWR alive (Get-Process GoWR)
+11. If alive + RESUMED: SUCCESS, 9f8d515 is clean
+12. If reboot: go back to 64f971d
+
+## Reverted files
+- ept_stealth.cpp (#PF handler: in-place NX flip -> back to EPT swap)
+- ept_hook.cpp (g_split_list, MTF handler changes)
+- ept.cpp (g_split_list fallback)
+- pool_manager.cpp (split_count change)
+- td_pe_mapper.cpp (diagnostic logging)
+- td_ept_hook.cpp (diagnostic logging)
+- td_common.h, hv.h, TestDriver.vcxproj
+
+## Expected result
+9f8d515 was verified working on 08-03 22:44 (.rdc generated, game stable).

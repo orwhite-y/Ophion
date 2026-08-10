@@ -1,0 +1,8 @@
+适用于 .NET Framework MSBuild 版本 17.14.40+3e7442088
+
+  Building 'Ophion' with toolset 'WindowsKernelModeDriver10.0' and the 'Desktop' target platform.
+  Ophion.vcxproj -> F:\winDriver\te\Ophion-master\Ophion-master\build\bin\Debug\Ophion.sys
+  Inf2Cat task was skipped as there were no inf files to process
+  
+  DrvCat task was skipped as there was no catalog file to process
+  

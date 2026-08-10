@@ -1,0 +1,42 @@
+# RenderDoc Injection Test Plan - 2026-08-04
+
+## Changes Applied
+1. **Disabled fast path** (ept_stealth.cpp line 1477): `if (0 && ...)` 
+   - Fast path skipped target EPT split + shadow page, leaving execute_entry=0
+   - MTF handler if-else chain could drop stealth_pf_swapped when mtf_restore_page also pending
+   - Result: hard reboot after "about to resume"
+2. **Increased split pool** (pool_manager.cpp line 120): cpu*16 -> cpu*32 = 640
+   - Full path needs ~200 splits (PT-page + target-page per 2MB region * 20 CPUs)
+   - 640 gives 3x headroom
+3. **Added diagnostic logging** (td_pe_mapper.cpp):
+   - "post-detach, calling TdResumeThreadHandle"
+   - "pre-resume tid=..."
+   - "post-resume st=... prev=..."
+
+## Test Steps
+1. Clean obj files for changed source
+2. Build Ophion.sys + TestEptHook.sys (Debug, x64)
+3. Sign both drivers (clock rollback 2015-01-15)
+4. Deploy: stop+delete RMCoreTst -> RMCore -> create RMCore -> RMCoreTst -> start
+5. Clear O.log + T.log
+6. Start GoWR.exe
+7. Wait 60 seconds
+8. Check GoWR alive
+9. Inject renderdoc.dll via Injector.exe
+10. Wait 25 seconds
+11. Check GoWR alive
+12. Check T.log for: step6 installed count, trigger hook OK, post-detach, pre-resume, post-resume, thread RESUMED
+13. Check O.log for errors
+
+## Expected Result
+- 1629/1629 stealth pages installed (full path, no fast path)
+- No split pool exhaustion
+- "thread RESUMED" logged (no hard reboot)
+- GoWR stays alive
+- DllMain executes, renderdoc hooks installed
+
+## If Crash
+- Check T.log last line: if "post-detach" -> crash in KeUnstackDetachProcess or resume
+- If "pre-resume" -> crash in TdResumeThreadHandle
+- If "post-resume" -> crash after resume (trigger hook / stealth #PF)
+- Check for minidump in C:\Windows\Minidump

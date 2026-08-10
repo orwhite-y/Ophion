@@ -157,80 +157,191 @@ vmx_leave_guest_cr3(UINT64 saved)
 // else raw exit reason (<0x40). 0 = no VM-exit recorded on that CPU.
 #define WEDGE_CMOS_PERCPU_BASE  0x60
 
+// Spinlock for CMOS port access. Port 0x70/0x71 are GLOBAL shared across all CPUs.
+// Without a lock, concurrent writes race, corrupt the index register, and leave NMI
+// masked (bit7) -> CLOCK_WATCHDOG / hard hang. selectany ensures one copy across TUs.
+// Re-entrancy guard (g_cmos_holder_cpu) prevents deadlock if #PF fires during a CMOS
+// write on the same CPU (the #PF handler sees holder==self and skips). wedge_cmos_mark
+// is NOT on the hot path (called once per shadow window, not per exit) so spinlock
+// overhead (~3us hold) is negligible. wedge_percpu_mark (per-exit) stays stubbed.
+__declspec(selectany) volatile LONG g_cmos_spinlock = 0;
+__declspec(selectany) volatile LONG g_cmos_holder_cpu = -1;
+
+// Internal helpers -- called WHILE holding the spinlock (no lock inside).
+static __forceinline VOID
+wedge_cmos_putc(UCHAR off, UCHAR val)
+{
+    __outbyte(0x70, off | 0x80);
+    __outbyte(0x71, val);
+}
+static __forceinline UCHAR
+wedge_cmos_getc(UCHAR off)
+{
+    __outbyte(0x70, off | 0x80);
+    return __inbyte(0x71);
+}
+static __forceinline VOID
+wedge_cmos_lock_acquire(UINT32 cpu)
+{
+    while (_InterlockedCompareExchange(&g_cmos_spinlock, 1, 0) != 0)
+        _mm_pause();
+    g_cmos_holder_cpu = (LONG)cpu;
+}
+static __forceinline VOID
+wedge_cmos_lock_release(VOID)
+{
+    __outbyte(0x70, 0x0D);  // restore NMI (clear bit7)
+    g_cmos_holder_cpu = -1;
+    _InterlockedExchange(&g_cmos_spinlock, 0);
+}
+
 static __forceinline VOID
 wedge_cmos_mark(UCHAR v)
 {
-    UNREFERENCED_PARAMETER(v);
+    UINT32 cpu = KeGetCurrentProcessorNumberEx(NULL);
+    if (g_cmos_holder_cpu == (LONG)cpu)
+        return;  // re-entrancy guard
+    wedge_cmos_lock_acquire(cpu);
+    wedge_cmos_putc(WEDGE_CMOS_VALUE_OFF, v);
+    wedge_cmos_putc(WEDGE_CMOS_MAGIC_OFF, WEDGE_CMOS_MAGIC);
+    if (cpu < 32)
+        wedge_cmos_putc((UCHAR)(WEDGE_CMOS_PERCPU_BASE + cpu), v);
+    wedge_cmos_lock_release();
 }
 
 static __forceinline VOID
 wedge_cmos_read(UCHAR *magic, UCHAR *val)
 {
-    if (magic) *magic = 0;
-    if (val) *val = 0;
+    UINT32 cpu = KeGetCurrentProcessorNumberEx(NULL);
+    if (g_cmos_holder_cpu == (LONG)cpu) {
+        if (magic) *magic = 0;
+        if (val) *val = 0;
+        return;
+    }
+    wedge_cmos_lock_acquire(cpu);
+    UCHAR m = wedge_cmos_getc(WEDGE_CMOS_MAGIC_OFF);
+    UCHAR v = wedge_cmos_getc(WEDGE_CMOS_VALUE_OFF);
+    wedge_cmos_lock_release();
+    if (magic) *magic = m;
+    if (val) *val = v;
 }
 
 static __forceinline VOID
 wedge_cmos_clear(VOID)
 {
+    UINT32 cpu = KeGetCurrentProcessorNumberEx(NULL);
+    wedge_cmos_lock_acquire(cpu);
+    wedge_cmos_putc(WEDGE_CMOS_MAGIC_OFF, 0);
+    wedge_cmos_putc(WEDGE_CMOS_VALUE_OFF, 0);
+    wedge_cmos_putc(WEDGE_CMOS_MATCH_OFF, 0);
+    wedge_cmos_putc(WEDGE_CMOS_TRIG_OFF, 0);
+    for (UINT32 i = 0; i < 4; i++)
+        wedge_cmos_putc((UCHAR)(WEDGE_CMOS_REINJ_CNT_OFF + i), 0);
+    for (UINT32 i = 0; i < 8; i++)
+        wedge_cmos_putc((UCHAR)(WEDGE_CMOS_REINJ_ADDR_OFF + i), 0);
+    for (UINT32 i = 0; i < 32; i++)
+        wedge_cmos_putc((UCHAR)(WEDGE_CMOS_PERCPU_BASE + i), 0);
+    wedge_cmos_lock_release();
 }
 
-// Set the sticky "match seen" flag (idempotent). Called at WEDGE 0x0B.
 static __forceinline VOID
 wedge_cmos_set_match_seen(VOID)
 {
+    UINT32 cpu = KeGetCurrentProcessorNumberEx(NULL);
+    if (g_cmos_holder_cpu == (LONG)cpu)
+        return;
+    wedge_cmos_lock_acquire(cpu);
+    wedge_cmos_putc(WEDGE_CMOS_MATCH_OFF, 1);
+    wedge_cmos_lock_release();
 }
 
-// Read the sticky "match seen" flag (0 = no match this run, 1 = a stealth page
-// matched at some point before the reset).
 static __forceinline UCHAR
 wedge_cmos_read_match_seen(VOID)
 {
-    return 0;
+    UINT32 cpu = KeGetCurrentProcessorNumberEx(NULL);
+    if (g_cmos_holder_cpu == (LONG)cpu)
+        return 0;
+    wedge_cmos_lock_acquire(cpu);
+    UCHAR v = wedge_cmos_getc(WEDGE_CMOS_MATCH_OFF);
+    wedge_cmos_lock_release();
+    return v;
 }
 
-// Set the sticky "trigger seen" flag (idempotent). Called at WEDGE 0x01.
 static __forceinline VOID
 wedge_cmos_set_trig_seen(VOID)
 {
+    UINT32 cpu = KeGetCurrentProcessorNumberEx(NULL);
+    if (g_cmos_holder_cpu == (LONG)cpu)
+        return;
+    wedge_cmos_lock_acquire(cpu);
+    wedge_cmos_putc(WEDGE_CMOS_TRIG_OFF, 1);
+    wedge_cmos_lock_release();
 }
 
-// Read the sticky "trigger seen" flag (0 = trigger never fired this run, 1 = the
-// injection trigger fired at some point before the reset).
 static __forceinline UCHAR
 wedge_cmos_read_trig_seen(VOID)
 {
-    // disabled: CMOS port I/O races across CPUs. Return 0 (not seen).
-    return 0;
+    UINT32 cpu = KeGetCurrentProcessorNumberEx(NULL);
+    if (g_cmos_holder_cpu == (LONG)cpu)
+        return 0;
+    wedge_cmos_lock_acquire(cpu);
+    UCHAR v = wedge_cmos_getc(WEDGE_CMOS_TRIG_OFF);
+    wedge_cmos_lock_release();
+    return v;
 }
 
-// Snap the reinject livelock probe (streak + fault addr) to CMOS. Called ONLY when
-// a CPU's consecutive same-addr reinject streak hits a multiple of 1024 (i.e. only
-// by a livelocked CPU), so this is NOT on the hot #PF path - no per-#PF port I/O.
 static __forceinline VOID
 wedge_cmos_snap_reinj(UINT32 streak, UINT64 addr)
 {
-    // disabled: CMOS port I/O races across CPUs under load (see vmexit.cpp).
-    // livelock info is kept in-memory only; no port writes.
-    UNREFERENCED_PARAMETER(streak);
-    UNREFERENCED_PARAMETER(addr);
+    UINT32 cpu = KeGetCurrentProcessorNumberEx(NULL);
+    if (g_cmos_holder_cpu == (LONG)cpu)
+        return;
+    wedge_cmos_lock_acquire(cpu);
+    wedge_cmos_putc(WEDGE_CMOS_REINJ_CNT_OFF,     (UCHAR)(streak));
+    wedge_cmos_putc(WEDGE_CMOS_REINJ_CNT_OFF + 1, (UCHAR)(streak >> 8));
+    wedge_cmos_putc(WEDGE_CMOS_REINJ_CNT_OFF + 2, (UCHAR)(streak >> 16));
+    wedge_cmos_putc(WEDGE_CMOS_REINJ_CNT_OFF + 3, (UCHAR)(streak >> 24));
+    for (UINT32 i = 0; i < 8; i++)
+        wedge_cmos_putc((UCHAR)(WEDGE_CMOS_REINJ_ADDR_OFF + i),
+                        (UCHAR)(addr >> (i * 8)));
+    wedge_cmos_lock_release();
 }
 
-// Read back the reinject livelock probe. streak==0 (+ addr==0) = no livelock this
-// run; streak>=1024 + addr = #PF reinject livelock on that fault VA.
 static __forceinline VOID
 wedge_cmos_read_reinj(UINT32 *streak, UINT64 *addr)
 {
-    if (streak) *streak = 0;
-    if (addr) *addr = 0;
+    UINT32 cpu = KeGetCurrentProcessorNumberEx(NULL);
+    if (g_cmos_holder_cpu == (LONG)cpu) {
+        if (streak) *streak = 0;
+        if (addr) *addr = 0;
+        return;
+    }
+    wedge_cmos_lock_acquire(cpu);
+    UINT32 s = 0;
+    UINT64 a = 0;
+    s  = (UINT32)wedge_cmos_getc(WEDGE_CMOS_REINJ_CNT_OFF);
+    s |= (UINT32)wedge_cmos_getc(WEDGE_CMOS_REINJ_CNT_OFF + 1) << 8;
+    s |= (UINT32)wedge_cmos_getc(WEDGE_CMOS_REINJ_CNT_OFF + 2) << 16;
+    s |= (UINT32)wedge_cmos_getc(WEDGE_CMOS_REINJ_CNT_OFF + 3) << 24;
+    for (UINT32 i = 0; i < 8; i++)
+        a |= (UINT64)wedge_cmos_getc((UCHAR)(WEDGE_CMOS_REINJ_ADDR_OFF + i)) << (i * 8);
+    wedge_cmos_lock_release();
+    if (streak) *streak = s;
+    if (addr) *addr = a;
 }
 
-// Read one CPU's last-exit byte (0x60+cpu). Called from DriverEntry readback.
 static __forceinline UCHAR
 wedge_cmos_read_percpu(UINT32 cpu)
 {
-    UNREFERENCED_PARAMETER(cpu);
-    return 0;
+    if (cpu >= 32)
+        return 0;
+    UINT32 cur = KeGetCurrentProcessorNumberEx(NULL);
+    if (g_cmos_holder_cpu == (LONG)cur)
+        return 0;
+    wedge_cmos_lock_acquire(cur);
+    UCHAR v = wedge_cmos_getc((UCHAR)(WEDGE_CMOS_PERCPU_BASE + cpu));
+    wedge_cmos_lock_release();
+    return v;
 }
 
 //
@@ -361,6 +472,7 @@ BOOLEAN ept_stealth_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_
 // #PF handler â€?intercepts instruction-fetch page faults (NX violations)
 // temporarily swaps PT page EPT to real view so CPU page walk sees NX=0
 BOOLEAN ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error_code);
+VOID    ept_stealth_get_diag_snapshot(PVMX_DIAG_SNAPSHOT snap, VIRTUAL_MACHINE_STATE * vcpu);
 VOID    ept_update_pf_intercept(VIRTUAL_MACHINE_STATE * vcpu);
 VOID    stealth_clear_stale_window(VIRTUAL_MACHINE_STATE * vcpu);  // clear stale shadow-CR3 window (VMCALL_SHADOW_ABORT_ALL)
 

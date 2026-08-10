@@ -344,6 +344,33 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_WRITE_MEM_PTE    0x00000012   // R0: PTE-window write (same layout)
 #define VMCALL_SHADOW_ABORT_ALL 0x00000013   // R0: clear stale shadow-CR3 window on this vCPU (nx_timer_restore/real_cr3/MTF)
 #define VMCALL_STEALTH_FREE_ALL  0x00000014   // R0: remove ALL stealth page entries from g_ept->stealth_pages (pre-injection cleanup)
+#define VMCALL_GET_DIAG_STATE  0x00000015   // R0: rdx=&VMX_DIAG_SNAPSHOT -> hypervisor fills counters
+
+// Diagnostic snapshot -- filled by VMCALL_GET_DIAG_STATE. All counters from
+// ept_stealth.cpp + last VMX-root position. Used by TestDriver DPC timer to
+// poll VMX-root state to T.log (survives crash if >50ms before WHEA).
+typedef struct _VMX_DIAG_SNAPSHOT {
+    UINT64  pf_seen;            // g_dbg_shadow_pf_seen
+    UINT64  pf_allowed;         // g_dbg_shadow_pf_allowed
+    UINT64  pf_switched;        // g_dbg_shadow_pf_switched
+    UINT64  pf_reject;          // g_dbg_shadow_pf_reject
+    UINT64  pf_midwin;          // g_dbg_shadow_pf_midwin
+    UINT64  pf_synced;          // g_dbg_shadow_pf_synced
+    UINT64  code_enter;         // g_dbg_a2_code_enter
+    UINT64  code_synced;        // g_dbg_a2_code_synced
+    UINT64  ptpage_synced;      // g_dbg_a2_ptpage_synced
+    UINT64  data_synced;        // g_dbg_a2_data_synced
+    UINT64  abort_count;        // g_dbg_a2_abort
+    UINT64  spurious;           // g_dbg_a2_spurious
+    UINT64  nomatch;            // g_dbg_nomatch
+    UINT64  stale_p1;           // g_dbg_a2_stale_p1_total
+    UINT64  already_on_shadow;  // g_dbg_a2_already_on_shadow
+    UINT32  exit_reason;        // last VM-exit reason on calling CPU
+    UINT32  cpu;                // CPU number
+    UINT64  vmx_rip;            // last guest RIP on calling CPU
+    UINT64  cmos_value;         // last wedge_cmos_mark global byte
+    UINT64  stealth_page_count; // number of entries in g_ept->stealth_pages
+} VMX_DIAG_SNAPSHOT, *PVMX_DIAG_SNAPSHOT;
 
 #define HV_R3_MEM_MAX           262144        // max bytes per R3 read/write call (16 pages, prefetch batch)
 

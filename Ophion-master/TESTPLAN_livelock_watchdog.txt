@@ -1,0 +1,17 @@
+﻿TEST PLAN: livelock-watchdog
+Date: 2026-08-09 16:56:10
+Driver: Ophion.sys (shadow-passthrough, + liveloop KeBugCheckEx watchdog, NOT deployed yet)
+Goal: 部署带 watchdog 的驱动；若再 hang，应产生 0xDEADC0DE minidump（而非静默重启）
+
+Steps:
+1. deploy_drivers.ps1 -Start  (卸载旧服务 -> patch -> sign -> 部署 -> 启动 RMCore+RMCoreTst)
+2. 确认 RMCore / RMCoreTst 都 Running
+3. 启动 GoWR.exe，等 60s 看是否存活（16:24 的崩溃就在启动期）
+   - 若 hang -> 这次应有 0xDEADC0DE dump（或 CLOCK_WATCHDOG_TIMEOUT），等 30s+ 再判断
+4. 若存活 -> Injector.exe GoWR.exe <renderdoc.dll> 0  注入 renderdoc
+5. 等 60s 看游戏是否存活（之前的 AV crash 在 30-90s）
+6. 若存活 -> F12 截帧（之前 0x1A BSOD 在 ~3min F12 时）
+7. 监控 5min+
+
+关键：若重启，检查 C:\Windows\Minidump\ 最新 .dmp，bugcheck 应为 0xDEADC0DE
+      kind: 1=reason-streak 2=rip-streak 3=reinj-streak

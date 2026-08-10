@@ -1,4 +1,4 @@
-#ifndef PFN_MASK
+﻿#ifndef PFN_MASK
 #define PFN_MASK 0x000FFFFFFFFFF000ULL
 #endif
 /*
@@ -21,7 +21,7 @@
 *
 *   PHYSICAL LAYOUT:
 *     contiguous region: [shadow_0][shadow_1]...[fakePT_0][fakePT_1]...
-*     all at consecutive physical addresses 闂?looks like one normal allocation.
+*     all at consecutive physical addresses 锟?looks like one normal allocation.
 */
 #include "hv.h"
 #include "log.h"
@@ -92,6 +92,46 @@ dbg_log_distinct_rip(UINT64 rip)
         }
     }
     // table full -- hottest paths already logged
+}
+
+VOID
+ept_stealth_get_diag_snapshot(PVMX_DIAG_SNAPSHOT snap, VIRTUAL_MACHINE_STATE * vcpu)
+{
+    if (!snap)
+        return;
+    snap->pf_seen           = (UINT64)g_dbg_shadow_pf_seen;
+    snap->pf_allowed        = (UINT64)g_dbg_shadow_pf_allowed;
+    snap->pf_switched       = (UINT64)g_dbg_shadow_pf_switched;
+    snap->pf_reject         = (UINT64)g_dbg_shadow_pf_reject;
+    snap->pf_midwin         = (UINT64)g_dbg_shadow_pf_midwin;
+    snap->pf_synced         = (UINT64)g_dbg_shadow_pf_synced;
+    snap->code_enter        = (UINT64)g_dbg_a2_code_enter;
+    snap->code_synced       = (UINT64)g_dbg_a2_code_synced;
+    snap->ptpage_synced     = (UINT64)g_dbg_a2_ptpage_synced;
+    snap->data_synced       = (UINT64)g_dbg_a2_data_synced;
+    snap->abort_count       = (UINT64)g_dbg_a2_abort;
+    snap->spurious          = (UINT64)g_dbg_a2_spurious;
+    snap->nomatch           = (UINT64)g_dbg_nomatch;
+    snap->stale_p1          = (UINT64)g_dbg_a2_stale_p1_total;
+    snap->already_on_shadow = (UINT64)g_dbg_a2_already_on_shadow;
+    if (vcpu) {
+        snap->exit_reason = vcpu->exit_reason;
+        snap->cpu = vcpu->core_id;
+        snap->vmx_rip = vcpu->vmexit_rip;
+    } else {
+        snap->exit_reason = 0;
+        snap->cpu = 0;
+        snap->vmx_rip = 0;
+    }
+    UCHAR cm = 0;
+    wedge_cmos_read(NULL, &cm);
+    snap->cmos_value = (UINT64)cm;
+    UINT64 count = 0;
+    if (g_ept) {
+        PLIST_ENTRY cur = g_ept->stealth_pages.Flink;
+        while (cur != &g_ept->stealth_pages && count < 10000) { count++; cur = cur->Flink; }
+    }
+    snap->stealth_page_count = count;
 }
 
 VOID
@@ -370,7 +410,7 @@ stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, 
     if (!pt_page_va_hint) { pool_manager_release(fpt); return NULL; }
     RtlCopyMemory(fpt->fake_page_va, pt_page_va_hint, PAGE_SIZE);
 
-    // split EPT 2MB 闂?4KB for the PT page if needed
+    // split EPT 2MB 锟?4KB for the PT page if needed
     UINT64 pt_phys = pt_page_pfn << 12;
     PEPT_PML2_ENTRY pt_pml2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys);
     if (pt_pml2 && pt_pml2->LargePage)
@@ -389,7 +429,7 @@ stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, 
     fpt->pt_fake_entry.WriteAccess     = 1;    // allow A/D bit writes (no EPT violation on page walk)
     fpt->pt_fake_entry.PageFrameNumber = fpt->pfn_of_fake;
 
-    // activate fake view 闂?EPT now maps PT page to fake page
+    // activate fake view 锟?EPT now maps PT page to fake page
     pt_pte->AsUInt = fpt->pt_fake_entry.AsUInt;
 
     InsertHeadList(&g_ept->stealth_fake_pts, &fpt->fake_pt_list);
@@ -408,7 +448,7 @@ stealth_fake_pt_set_nx(PSTEALTH_FAKE_PT fpt, UINT32 pte_index)
 
 //
 // resync fake PT page from real PT page, then re-apply NX for all entries.
-// uses fpt->real_page_va (hostcr3-mapped) 闂?safe in VMX-root without pa_to_va.
+// uses fpt->real_page_va (hostcr3-mapped) 锟?safe in VMX-root without pa_to_va.
 // walks BOTH stealth_pages and hooked_pages to re-apply NX for all consumers.
 //
 VOID
@@ -1116,6 +1156,7 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
                 fault_addr, vcpu->vmexit_rip, real_cr3, (int)walk_ok, real_pte,
                 e0, e1, e2, e3);
         }
+        vmx_leave_guest_cr3(saved_cr3);  // FIX: restore CR3 before abort (was leaked)
         return FALSE;
     }
 
@@ -1142,7 +1183,7 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
                 HYPERPLATFORM_LOG_WARN_SAFE(
                     "[stealth-a2] code-refresh BAIL-noshadowpteva fa=%llx rip=%llx",
                     fault_addr, vcpu->vmexit_rip);
-            goto leave;
+            vmx_leave_guest_cr3(saved_cr3); return FALSE;  // abort: cannot refresh stale PTE
         }
 
         UINT64 s = *spte;
@@ -1302,7 +1343,7 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
             cur = cur->Flink;
             if (existing->pfn_of_target == target_pfn)
             {
-                // winner installed 闂?split this CPU's EPT
+                // winner installed 锟?split this CPU's EPT
                 if (!existing->no_ept_split)
                 {
                     PEPT_PML2_ENTRY tp2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
@@ -1371,7 +1412,7 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     UINT64 pt_page_pfn;
     UINT64 pt_idx;
 
-    // pt_precomputed MUST be TRUE 闂?callers fill pt_page_pfn/pt_pte_index/pt_page_va
+    // pt_precomputed MUST be TRUE 锟?callers fill pt_page_pfn/pt_pte_index/pt_page_va
     // at PASSIVE/DISPATCH level. NEVER walk guest page tables via pa_to_va in VMX-root
     // (deadlocks when KeGenericCallDpc puts all CPUs into VMX-root simultaneously).
     if (!req->pt_precomputed) { pool_manager_release(sp); return FALSE; }
@@ -1427,9 +1468,9 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
         //
         // fake PT mode: create shared fake PT page with NX=1 for our entry.
         // real PTE has NX=0 (cleared by caller at PASSIVE_LEVEL).
-        // anti-cheat reads fake PT 闂?sees NX=1 闂?page looks non-executable.
-        // CPU page walk 闂?#PF (NX=1 in fake PT) 闂?HV swaps to real PT (NX=0)
-        // 闂?TLB entry (NX=0) 闂?MTF 闂?swap back to fake PT.
+        // anti-cheat reads fake PT 锟?sees NX=1 锟?page looks non-executable.
+        // CPU page walk 锟?#PF (NX=1 in fake PT) 锟?HV swaps to real PT (NX=0)
+        // 锟?TLB entry (NX=0) 锟?MTF 锟?swap back to fake PT.
         //
         sp->fake_pt = stealth_get_or_create_fake_pt(
             vcpu, pt_page_pfn, req->pt_page_copy, req->pt_page_va);
@@ -1447,8 +1488,8 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     {
         //
         // EPT-only stealth: no fake PT page manipulation.
-        // execute 闂?EPT violation 闂?swap to shadow page (execute view)
-        // read/write 闂?sees original page (read view)
+        // execute 锟?EPT violation 锟?swap to shadow page (execute view)
+        // read/write 锟?sees original page (read view)
         // simpler and doesn't corrupt other PTEs in the same PT page.
         //
         sp->fake_pt = NULL;
@@ -1471,7 +1512,7 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     }
     else
     {
-        // copy original page content 闂?MUST use pre-computed VA, NEVER pa_to_va
+        // copy original page content 锟?MUST use pre-computed VA, NEVER pa_to_va
         if (req->target_page_copy)
             RtlCopyMemory(sp->shadow_page, req->target_page_copy, PAGE_SIZE);
 
@@ -1507,9 +1548,9 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     // shellcode inject (non-resident, shellcode_buffer != NULL):
     //   must keep ReadAccess=1 so shellcode can read its own embedded
     //   strings/data from the shadow page. with execute-only (R=0),
-    //   reads would EPT-violate 闂?swap to original page (zeros) 闂?crash.
+    //   reads would EPT-violate 锟?swap to original page (zeros) 锟?crash.
     //
-    // resident DLL mode: use execute-only if supported 闂?reads are served
+    // resident DLL mode: use execute-only if supported 锟?reads are served
     //   from the original (zeroed) page via EPT violation + MTF.
     //   DLL code reads its own data sections through separate VA ranges.
     //
@@ -1525,8 +1566,8 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
         //
         // RESIDENT: default = EXECUTE view
         //   CPU fetches from shadow page directly (TLB cached after first #PF)
-        //   reads trigger EPT violation 闂?temp swap to clean 闂?MTF 闂?back
-        //   #PF only fires on TLB miss (context switch, INVLPG) 闂?rare
+        //   reads trigger EPT violation 锟?temp swap to clean 锟?MTF 锟?back
+        //   #PF only fires on TLB miss (context switch, INVLPG) 锟?rare
         //
         target_pte->AsUInt = sp->execute_entry.AsUInt;
     }
@@ -1534,7 +1575,7 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     {
         //
         // ONESHOT: default = READ view
-        //   #PF on execute 闂?swap to execute view 闂?VMCALL/run 闂?swap back
+        //   #PF on execute 锟?swap to execute view 锟?VMCALL/run 锟?swap back
         //
         target_pte->ReadAccess    = 1;
         target_pte->WriteAccess   = 1;
@@ -1543,13 +1584,13 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
 
     //
     // enable #PF interception if fake PT is active.
-    // CPU page walk reads fake PT (NX=1) 闂?#PF with I/D bit (error code bit 4).
-    // HV intercepts #PF 闂?ept_stealth_handle_pf swaps to real PT (NX=0).
+    // CPU page walk reads fake PT (NX=1) 锟?#PF with I/D bit (error code bit 4).
+    // HV intercepts #PF 锟?ept_stealth_handle_pf swaps to real PT (NX=0).
     //
     //
     // enable #PF interception for NX cycle:
-    //   fake_pt mode: #PF 闂?swap to real PT (NX=0) 闂?MTF 闂?swap back
-    //   no-fake-pt mode: #PF 闂?clear NX in real PTE 闂?MTF 闂?restore NX
+    //   fake_pt mode: #PF 锟?swap to real PT (NX=0) 锟?MTF 锟?swap back
+    //   no-fake-pt mode: #PF 锟?clear NX in real PTE 锟?MTF 锟?restore NX
     // both require intercepting NX violations (P=1 + I/D=1).
     //
     InsertHeadList(&g_ept->stealth_pages, &sp->stealth_page_list);
@@ -1558,15 +1599,15 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
 
     //
     //
-    // only modify CURRENT CPU's EPT 闂?never touch other CPUs' EPT directly.
-    // modifying another CPU's EPT while it's walking it 闂?EPT misconfiguration
-    // 闂?VMRESUME failure 闂?CPU dies 闂?0x101 CLOCK_WATCHDOG.
+    // only modify CURRENT CPU's EPT 锟?never touch other CPUs' EPT directly.
+    // modifying another CPU's EPT while it's walking it 锟?EPT misconfiguration
+    // 锟?VMRESUME failure 锟?CPU dies 锟?0x101 CLOCK_WATCHDOG.
     //
     // other CPUs: lazy setup via ept_stealth_handle_violation on EPT violation,
     // or via the "already installed" path when this function is called again.
     //
     {
-        // split target page 2MB闂?KB
+        // split target page 2MB锟?KB
         PEPT_PML2_ENTRY tp2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
         if (tp2 && tp2->LargePage)
             ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
@@ -1598,7 +1639,7 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     return TRUE;
 
 fail_cleanup_fakept:
-    // error after fake_pt was acquired 闂?must release ref
+    // error after fake_pt was acquired 锟?must release ref
     if (sp->fake_pt)
     {
         sp->fake_pt->ref_count--;
@@ -1621,6 +1662,150 @@ fail_cleanup_fakept:
     return FALSE;
 }
 
+// =========================================================================
+//  VMX-root: batch refresh ALL shadow PT PTEs from real PT
+// =========================================================================
+//
+// The shadow PT is a build-time snapshot. Code PTEs (P=1/NX=0) keep stale PFNs
+// from build time. If the physical pages were freed and repurposed (e.g., as
+// page table pages), writing through stale writable PFNs corrupts the repurposed
+// pages -> 0x1A BSOD (PAGE_TABLE_RESERVED_BITS_SET, subtype 0x61941).
+//
+// This function refreshes ALL 512 PTEs in EVERY shadow PT page from the current
+// real PT before the shadow window opens, eliminating all stale PFNs.
+// Called once per shadow window open (!already_on_shadow path) in MODE_G.
+//
+static BOOLEAN
+stealth_batch_refresh_shadow_ptes(VIRTUAL_MACHINE_STATE * vcpu,
+                                  PEPT_STEALTH_PAGE_INFO fault_sp,
+                                  UINT64 real_cr3)
+{
+    if (!fault_sp || !fault_sp->shadow_cr3_phys || !fault_sp->guest_cr3 || !real_cr3)
+        return FALSE;
+
+    _InterlockedIncrement(&g_dbg_a2_code_enter);
+    dbg_log_distinct_rip(vcpu->vmexit_rip);
+
+    if ((_InterlockedIncrement(&g_dbg_a2_dump_tick) & 65535) == 0)
+    {
+        HYPERPLATFORM_LOG_WARN_SAFE(
+            "[stealth-diag] DUMP code_enter=%llu code_synced=%llu ptpage_synced=%llu "
+            "stale_p1=%llu data_synced=%llu abort=%llu spurious=%llu nomatch=%llu "
+            "pf_seen=%llu pf_switched=%llu a2shadow=%llu",
+            (UINT64)g_dbg_a2_code_enter, (UINT64)g_dbg_a2_code_synced,
+            (UINT64)g_dbg_a2_ptpage_synced, (UINT64)g_dbg_a2_stale_p1_total,
+            (UINT64)g_dbg_a2_data_synced, (UINT64)g_dbg_a2_abort,
+            (UINT64)g_dbg_a2_spurious, (UINT64)g_dbg_nomatch,
+            (UINT64)g_dbg_shadow_pf_seen, (UINT64)g_dbg_shadow_pf_switched,
+            (UINT64)g_dbg_a2_already_on_shadow);
+    }
+
+    UINT64 saved_cr3 = vmx_enter_cr3(fault_sp->guest_cr3);
+    wedge_cmos_mark(0x07);  // WEDGE-G: batch refresh CR3 switched
+
+    PVOID refreshed_pages[32];
+    UINT32 refreshed_count = 0;
+
+    PLIST_ENTRY cur = g_ept->stealth_pages.Flink;
+    while (cur != &g_ept->stealth_pages)
+    {
+        PEPT_STEALTH_PAGE_INFO sp = CONTAINING_RECORD(cur, EPT_STEALTH_PAGE_INFO, stealth_page_list);
+        cur = cur->Flink;
+
+        if (sp->shadow_cr3_phys != fault_sp->shadow_cr3_phys)
+            continue;
+        if (!sp->pt_page_va)
+            continue;
+
+        BOOLEAN already = FALSE;
+        for (UINT32 i = 0; i < refreshed_count; i++)
+        {
+            if (refreshed_pages[i] == sp->pt_page_va)
+            { already = TRUE; break; }
+        }
+        if (already)
+            continue;
+        if (refreshed_count >= 32)
+            break;
+        refreshed_pages[refreshed_count++] = sp->pt_page_va;
+        wedge_cmos_mark(0x08);  // WEDGE-H: batch refresh walk start
+        wedge_cmos_snap_reinj(refreshed_count, (UINT64)sp->pt_page_va);
+
+        UINT64 real_pt_page_va = 0;
+        UINT64 real_pte_sample = 0;
+        BOOLEAN walk_ok = stealth_walk_pt_page(sp, real_cr3, sp->guest_va,
+                                                &real_pt_page_va, &real_pte_sample);
+
+        PUINT64 shadow_pt = (PUINT64)sp->pt_page_va;
+
+        if (!walk_ok || !real_pt_page_va)
+        {
+            // Walk failed for this PT page: do NOT zero all 512 PTEs.
+            // Zeroing guarantees crash (wipes code PTEs that are P=1/NX=0
+            // from a prior window or from TdBuildShadowCR3). Instead SKIP
+            // the refresh for this PT page: keep existing shadow PTEs as-is.
+            // The individual-page fallback (stealth_refresh_shadow_code_pte)
+            // will fix the faulting page if its PTE is stale.
+            _InterlockedIncrement(&g_dbg_a2_abort);
+            wedge_cmos_mark(0x0D);  // WEDGE-K: batch refresh walk FAIL
+            continue;
+        }
+        wedge_cmos_mark(0x09);  // WEDGE-I: batch refresh walk OK
+
+        PUINT64 real_pt = (PUINT64)real_pt_page_va;
+        for (UINT32 i = 0; i < 512; i++)
+        {
+            UINT64 rp = real_pt[i];
+            if (!(rp & 1))
+            {
+                // Real page not present -> shadow P=0 (stale PFN eliminated)
+                shadow_pt[i] = 0;
+            }
+            else if (!(shadow_pt[i] & 1))
+            {
+                // Shadow PTE was P=0 (data page, reactive sync) -> keep P=0
+                shadow_pt[i] = 0;
+            }
+            else
+            {
+                // Shadow PTE was P=1 (code page or non-stealth page):
+                // refresh PFN from real PT, preserve shadow NX policy.
+                // Code pages: sp_old NX=0 -> rp & ~NX_BIT (P=1/NX=0, current PFN)
+                // Non-stealth data: sp_old NX=1 -> rp (exact real copy, current PFN)
+                shadow_pt[i] = (rp & ~NX_BIT) | (shadow_pt[i] & NX_BIT);
+            }
+        }
+
+        _InterlockedIncrement(&g_dbg_a2_ptpage_synced);
+    }
+    wedge_cmos_mark(0x0A);  // WEDGE-J: batch refresh PTE loop done
+
+    INVVPID_DESCRIPTOR desc = {0};
+    desc.Vpid = VPID_TAG;
+    asm_invvpid(InvvpidSingleContext, &desc);
+
+    vmx_leave_guest_cr3(saved_cr3);
+
+    PUINT64 fault_spte = (PUINT64)fault_sp->shadow_pte_va;
+    if (!fault_spte || !(*fault_spte & 1))
+    {
+        if (_InterlockedIncrement(&g_dbg_a2_code_enter_logged) <= 200)
+            HYPERPLATFORM_LOG_WARN_SAFE(
+                "[stealth-a2] batch-refresh BAIL-faultP0 fa=%llx rip=%llx",
+                fault_sp->guest_va, vcpu->vmexit_rip);
+        return FALSE;
+    }
+
+    _InterlockedIncrement(&g_dbg_a2_code_synced);
+    if (_InterlockedIncrement(&g_dbg_a2_code_synced_logged) <= 64)
+    {
+        HYPERPLATFORM_LOG_WARN_SAFE(
+            "[stealth-a2] batch-refresh OK fa=%llx rip=%llx sh_pml4=%llx pt_pages=%u",
+            fault_sp->guest_va, vcpu->vmexit_rip, fault_sp->shadow_cr3_phys, refreshed_count);
+    }
+
+    return TRUE;
+}
 // =========================================================================
 //  VMX-root: #PF handler (NX violation)
 // =========================================================================
@@ -1673,10 +1858,18 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             return FALSE;
     }
 #elif (SHADOW_PT_MODE == SHADOW_PT_MODE_G)
-    // MODE_G: shadow leaf PTEs start P=1/NX=0 (all PTEs in forked 2MB).
-    if (!(error_code & PFEC_PRESENT) ||
-        !(error_code & (PFEC_INSTR_FETCH | PFEC_WRITE)))
-        return FALSE;
+    // MODE_G: code PTEs P=1/NX=0, data PTEs P=0 (reactive sync, same as MODE_C).
+    // Allow ALL fetch #PFs through (P=1/NX=1 normal + P=0 demand on code page).
+    // Non-fetch: bail on P=0 (demand) or P=1/read (protection); allow P=1/write (COW).
+    if (!(error_code & PFEC_INSTR_FETCH))
+    {
+        if (!(error_code & PFEC_PRESENT) || !(error_code & PFEC_WRITE))
+        {
+            if (vcpu->nx_timer_real_cr3)
+                stealth_pf_abort_shadow_window(vcpu);
+            return FALSE;
+        }
+    }
 #else
     if (!(error_code & PFEC_PRESENT) ||
         !(error_code & (PFEC_INSTR_FETCH | PFEC_WRITE)))
@@ -1722,12 +1915,12 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
         //
         // two modes for making NX=0 visible to CPU page walker:
         //
-        // fake PT mode: swap PT page EPT 闂?real PT (NX=0 pre-cleared by caller)
+        // fake PT mode: swap PT page EPT 锟?real PT (NX=0 pre-cleared by caller)
         //   MTF: swap back to fake PT (NX=1)
         //
         // NX cycle mode (no fake PT): clear NX in real PTE from VMX-root
         //   MTF: restore NX=1 in real PTE, don't flush TLB
-        //   TLB keeps NX=0 闂?code continues. TLB eviction 闂?#PF 闂?repeat.
+        //   TLB keeps NX=0 锟?code continues. TLB eviction 锟?#PF 锟?repeat.
         //
         if (sp->shadow_cr3_phys)
         {
@@ -1802,16 +1995,36 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
                         // window, re-inject #PF under real CR3 for demand fault.
                         stealth_pf_abort_shadow_window(vcpu);
                         return FALSE;
-                    }
                 }
+            }
             }
             else
             {
+#if (SHADOW_PT_MODE == SHADOW_PT_MODE_G)
+                // MODE_G: batch refresh ALL shadow PT PTEs from real PT to
+                // eliminate stale PFNs in ALL 512 entries per shadow PT page
+                // (not just the faulting page). Stale code PTE PFNs that were
+                // freed + repurposed as page table pages cause 0x1A BSOD when
+                // the game writes through them under shadow CR3.
+                if (!stealth_batch_refresh_shadow_ptes(vcpu, sp, current_cr3))
+                {
+                    // Batch refresh failed: either first-open (all shadow
+                    // PTEs P=0 because renderdoc was mapped PAGE_READWRITE
+                    // -> NX=1 -> TdBuildShadowCR3 set P=0) OR walk-failure
+                    // on a PT page. Fall back to the proven individual-page
+                    // refresh which unconditionally sets *spte = real & ~NX
+                    // (P=1/NX=0, current PFN) regardless of prior shadow state.
+                    if (!stealth_refresh_shadow_code_pte(vcpu, sp, fault_addr, current_cr3))
+                    {
+                        return FALSE;
+                    }
+                }
+#else
                 if (!stealth_refresh_shadow_code_pte(vcpu, sp, fault_addr, current_cr3))
                 {
-                    // real PTE not present: genuine demand fault, let guest handle.
                     return FALSE;
                 }
+#endif
             }
 
             if (!already_on_shadow)
@@ -1824,6 +2037,7 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             if (!already_on_shadow)
             {
                 UINT64 shadow_cr3_val = (current_cr3 & ~PFN_MASK) | shadow_pfn;
+                wedge_cmos_mark(0x0E);  // WEDGE-L: pre-CR3-switch
                 __vmx_vmwrite(VMCS_GUEST_CR3, shadow_cr3_val);
                 _InterlockedIncrement(&g_dbg_shadow_pf_switched);
 
@@ -1945,6 +2159,7 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
                 asm_invvpid(InvvpidSingleContext, &desc);
         }
 
+        wedge_cmos_mark(0x14);  // WEDGE-M: handler complete, about to return TRUE
         return TRUE;
     }
 
@@ -2012,7 +2227,7 @@ ept_handle_stealth_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         if (sp->guest_va != rip_page) continue;
 
         //
-        // shellcode mode: handler_function is NULL 闂?VMCALL should not
+        // shellcode mode: handler_function is NULL 锟?VMCALL should not
         // redirect anywhere. skip this entry so it falls through to #UD.
         //
         if (!sp->handler_function) continue;
@@ -2048,12 +2263,12 @@ ept_handle_stealth_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 continue;
         }
 
-        // restore target page EPT 闂?read view
+        // restore target page EPT 锟?read view
         PEPT_PML1_ENTRY target_pte = ept_get_pml1(vcpu->ept_page_table,
             (SIZE_T)(sp->pfn_of_target << 12));
         if (target_pte) target_pte->AsUInt = sp->original_entry.AsUInt;
 
-        // restore PT page EPT 闂?fake view
+        // restore PT page EPT 锟?fake view
         if (sp->fake_pt)
         {
             PEPT_PML1_ENTRY pt_pte = ept_get_pml1(vcpu->ept_page_table,
@@ -2081,7 +2296,7 @@ ept_handle_stealth_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
     }
 
     //
-    // no match 闂?stealth page may have been freed between #PF and VMCALL.
+    // no match 锟?stealth page may have been freed between #PF and VMCALL.
     // clear stealth_pf_swapped to prevent use-after-free in MTF handler.
     //
     vcpu->stealth_pf_swapped = NULL;
@@ -2224,7 +2439,7 @@ ept_stealth_uninstall(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_FREE_PARAM req)
                 }
                 else
                 {
-                    // other pages still use this fake PT 闂?remove our NX entry
+                    // other pages still use this fake PT 锟?remove our NX entry
                     // (it was already restored in real PTE above)
                     // resync fake page from real
                     stealth_fake_pt_resync(sp->fake_pt);
@@ -2344,7 +2559,7 @@ ept_stealth_alloc(PVOID target_va, PVOID handler_function)
     req.handler_function = handler_function;
     req.target_phys      = target_phys;
 
-    // pre-compute PT info at PASSIVE level 闂?avoid pa_to_va in VMX-root
+    // pre-compute PT info at PASSIVE level 锟?avoid pa_to_va in VMX-root
     {
         PT_PAGE_INFO pti = {};
         if (stealth_find_pt_page(caller_cr3, (UINT64)target_va & ~0xFFFULL, &pti))
@@ -2400,7 +2615,7 @@ ept_stealth_inject(PVOID target_va, PVOID shellcode, UINT32 shellcode_size)
         req.shellcode_buffer = (PUINT8)shellcode + bytes_done;
         req.shellcode_size   = chunk;
 
-        // pre-compute PT info at PASSIVE level 闂?avoid pa_to_va in VMX-root
+        // pre-compute PT info at PASSIVE level 锟?avoid pa_to_va in VMX-root
         {
             PT_PAGE_INFO pti = {};
             if (stealth_find_pt_page(caller_cr3, (UINT64)current_va & ~0xFFFULL, &pti))
@@ -2456,7 +2671,7 @@ ept_stealth_free_range(PVOID target_va, SIZE_T size)
 }
 
 //
-// ept_stealth_map_resident 闂?RESIDENT mode for manually mapped DLLs
+// ept_stealth_map_resident 锟?RESIDENT mode for manually mapped DLLs
 //
 // the caller has already:
 //   1. allocated PAGE_READWRITE memory in target process
@@ -2467,8 +2682,8 @@ ept_stealth_free_range(PVOID target_va, SIZE_T size)
 //   - copies each page's content into a shadow page (execute view)
 //   - zeroes the original page (read view = clean for anti-cheat)
 //   - sets EPT: default = execute view (code runs at native speed)
-//   - reads trigger EPT violation 闂?temp show clean page 闂?MTF 闂?back
-//   - fake PT page hides NX=0 (TLB trick: #PF 闂?real PT 闂?TLB 闂?swap back)
+//   - reads trigger EPT violation 锟?temp show clean page 锟?MTF 锟?back
+//   - fake PT page hides NX=0 (TLB trick: #PF 锟?real PT 锟?TLB 锟?swap back)
 //
 // target_va: base VA of the mapped DLL (page-aligned)
 // size:      total size of the mapped image
@@ -2509,7 +2724,7 @@ ept_stealth_map_resident(PVOID target_va, SIZE_T size)
         req.shellcode_size   = 0;
         req.resident         = TRUE;    // resident mode
 
-        // pre-compute PT info at PASSIVE level 闂?avoid pa_to_va in VMX-root
+        // pre-compute PT info at PASSIVE level 锟?avoid pa_to_va in VMX-root
         {
             PT_PAGE_INFO pti = {};
             if (stealth_find_pt_page(caller_cr3, va, &pti))

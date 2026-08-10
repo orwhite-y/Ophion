@@ -1,0 +1,2 @@
+[+] Auto-scan mode: swapchain_ptr=0x0, renderdoc will self-scan
+[!] Process not found: GoWR.exe

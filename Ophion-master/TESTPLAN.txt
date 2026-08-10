@@ -1,0 +1,33 @@
+﻿# Test Plan - MODE_D Shadow CR3 BSOD Fix
+# Session: bsod-fix-cr3leak
+# Date: 2026-08-04
+
+## Fixes Applied This Session (ept_stealth.cpp)
+1. stealth_sync_data_pte_in_window L741: added || !sp->guest_cr3 to NULL check
+   - prevents vmx_enter_cr3(0) -> __writecr3(0) -> #GP -> triple fault
+2. stealth_refresh_shadow_code_pte L975: added || !sp->guest_cr3 to NULL check
+   - same prevention
+3. stealth_refresh_shadow_code_pte L1077: CR3 LEAK FIX
+   - was eturn FALSE; bypassing leave: label -> vmx_leave_guest_cr3 never called
+   - system kept running on guest_cr3 -> catastrophic corruption -> BSOD no dump
+   - now: mx_leave_guest_cr3(saved_cr3); return FALSE;
+4. L991: dump interval 65535 -> 0x3FFFFF (reduce VMX-root log contention under renderdoc load)
+
+## Test Steps
+1. Stop+delete RMCoreTst -> 2s -> delete RMCore -> 3s
+2. Build Ophion.sys + TestEptHook.sys (Debug x64)
+3. Sign both (clock rollback 2015-01-15)
+4. Create+start RMCore -> 3s -> create+start RMCoreTst -> 2s
+5. Clear T.log + O.log
+6. Launch GoWR.exe, wait 60s
+7. Inject renderdoc (Injector.exe GoWR.exe <dll> 0) as Job, timeout 30s
+8. Verify game stable 60s (check GoWR process alive, T.log growing normally)
+9. If stable 60s: create C:\ProgramData\WinComp\capture.flag
+10. Wait 10s, check captures\frame_capture.rdc exists + size > 100KB
+11. If .rdc OK: check T.log for [cl-diag] 32 CL hooks installed
+12. Report result
+
+## Abort Conditions
+- BSOD/reboot during inject -> check T.log last lines, analyze
+- Game crash -> check RenderDoc log + T.log
+- No .rdc after capture.flag -> CL hooks not installing, check lastFail

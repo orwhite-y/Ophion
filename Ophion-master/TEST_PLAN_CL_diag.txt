@@ -1,0 +1,24 @@
+﻿TEST PLAN: CL EPT Hook Diagnostic (2026-08-04 ~11:00)
+=====================================================
+Purpose: Identify why 28/32 CL method EPT hooks fail with 0xC0000001
+
+Steps:
+1. Deploy fresh Ophion.sys + TestEptHook.sys (with diagnostic logging)
+2. Launch GoWR.exe
+3. Wait 60 seconds for game to fully initialize D3D12
+4. Inject renderdoc.dll via xg (IOCTL_INJECT_RENDERDOC)
+5. Wait for Present+ECL EPT hooks to succeed (check renderdoc log)
+6. Create C:\ProgramData\WinComp\captures\capture.flag to trigger frame capture
+7. Wait 10 seconds for CL hooks to attempt
+8. Check O.log for [hook-diag], [pool-diag], [stealth-diag] messages
+9. Check renderdoc log for CL hook install results
+10. Collect .rdc file and verify draw call count
+
+Expected diagnostic output:
+- [hook-diag] enter target=... cr3=... is_r3=1  (for each CL hook attempt)
+- If phys_addr=0: MmGetPhysicalAddress fails under writecr3(caller_cr3) in VMX-root
+- If ept_split_large_page_pool FAILED: pool exhaustion
+- [pool-diag] pool exhausted type=N: pool_manager_request returns NULL
+- [stealth-diag] stealth_region_alloc_page EXHAUSTED: stealth region full
+
+Rollback: if BSOD/hang, reboot and revert to commit 9f8d515

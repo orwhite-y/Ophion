@@ -1,0 +1,38 @@
+﻿
+# TESTPLAN - batch-refresh fallback fix
+# Time: 2026-08-09 17:19:05
+# Branch: shadow-passthrough @ e383cda + uncommitted
+# Build: Ophion.sys just rebuilt + signed
+
+## Changes under test (this run)
+1. ept_stealth.cpp Fix1 (line ~1697): stealth_batch_refresh_shadow_ptes walk-failure
+   path NO LONGER zeroes all 512 shadow PTEs. Instead SKIPS refresh for that PT page
+   (keeps existing PTEs) + increments g_dbg_a2_abort. Prevents guaranteed crash.
+2. ept_stealth.cpp Fix2 (line ~1962): MODE_G #PF handler !already_on_shadow path:
+   if stealth_batch_refresh_shadow_ptes returns FALSE, fall back to
+   stealth_refresh_shadow_code_pte (sets *spte = real_pte & ~NX_BIT, P=1/NX=0
+   current PFN) for the faulting page. This fixes first-open where ALL renderdoc
+   shadow PTEs are P=0 (mapped PAGE_READWRITE -> NX=1 -> TdBuildShadowCR3 P=0).
+
+## Deploy
+  powershell -ExecutionPolicy Bypass -File F:\work\xg\deploy_drivers.ps1 -Start
+  (auto: stop+del RMCoreTst -> delay -> stop+del RMCore -> 3s -> install)
+
+## Test steps
+1. Confirm Ophion + TestDriver services running (sc query)
+2. Launch E:\God of War Ragnarok\GoWR.exe, wait for main game process
+3. Inject: F:\winDriver\te\Ophion-master\Injector\build\bin\Debug\Injector.exe GoWR.exe F:\winDriver\te\renderdoc.dll 0
+4. Wait 30s - game MUST survive (no crash, no BSOD, no hang)
+5. Press F12 in game window - frame capture
+6. Check for .rdc file produced
+7. Observe overlay (secondary goal)
+
+## PASS criteria
+- Injection succeeds, game alive >30s
+- F12 produces .rdc file (BASELINE - 截帧是底线)
+- No BSOD / no hang / no reboot
+
+## FAIL signals
+- AV crash (execute non-executable) = batch fallback not working
+- BSOD 0x1A = stale PFN still corrupting page tables
+- Hang/reboot = liveloop or other VMX-root fault

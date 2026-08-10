@@ -1,0 +1,30 @@
+﻿TESTPLAN: batch refresh NX inversion fix
+Date: 2026-08-09
+
+BUG: stealth_batch_refresh_shadow_ptes zeroed ALL NX=1 shadow PTEs.
+     After IOCTL_SHADOW_PROTECT_MEMORY, renderdoc code pages have NX=1 in real PT
+     (stealth) but P=1/NX=0 in shadow PT (executable). Batch refresh overwrote
+     these to P=0 -> fault_spte check failed -> #PF re-injected -> AV crash.
+
+FIX: batch refresh now preserves existing shadow PTE policy:
+     - real P=0 -> shadow P=0 (page freed)
+     - shadow P=0 -> keep P=0 (data page, reactive sync)
+     - shadow P=1 -> (rp & ~NX_BIT) | (sp_old & NX_BIT) (refresh PFN, keep NX policy)
+
+STEPS:
+1. Build Ophion.sys (Debug/x64)
+2. Deploy: deploy_drivers.ps1 -Start (uninstall old -> delay -> install new)
+3. Start GoWR.exe (E:\God of War Ragnarok\GoWR.exe)
+4. Wait for game to stabilize (10s)
+5. Inject: Injector.exe GoWR.exe F:\winDriver\te\renderdoc.dll 0
+6. Wait 30s - check game survives (no AV crash, no BSOD, no hang)
+7. If stable: test F12 frame capture
+8. If capture works: test overlay
+
+PASS CRITERIA:
+- Injection succeeds without game crash
+- Game survives >30s after injection
+- F12 frame capture produces .rdc file
+- No BSOD / system hang
+
+ROLLBACK: git checkout src/ept_stealth.cpp (revert batch refresh fix)

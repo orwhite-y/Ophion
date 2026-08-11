@@ -14,6 +14,10 @@
 #include "hv.h"
 #include "log.h"
 
+// In-memory heal markers (defined in vmexit.cpp). Replaces CMOS port I/O on hot path.
+extern volatile LONG g_wedge_heal_marker[64];
+extern volatile LONG g_wedge_trig_seen_flag;
+
 #define POOL_TAG_SPLIT       0
 #define POOL_TAG_HOOKED_PAGE 1
 #define POOL_TAG_HOOKED_FUNC 2
@@ -1062,6 +1066,19 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     pc &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
     __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
 
+    // Livelock breaker (session 17): #PF intercept was temporarily disabled
+    // in the #PF re-inject path after 32 same-addr re-injects. The guest ran
+    // one instruction of its KiPageFault handler natively. Now re-arm the
+    // #PF intercept via ept_update_pf_intercept (restores bitmap based on
+    // active stealth pages) and return. Must run before MODE_H / shadow-CR3
+    // restore paths so those are not disturbed by the passthrough window.
+    if (vcpu->pf_passthrough_armed)
+    {
+        vcpu->pf_passthrough_armed = FALSE;
+        ept_update_pf_intercept(vcpu);
+        return;
+    }
+
 #if (SHADOW_PT_MODE == SHADOW_PT_MODE_H)
     //
     // MODE_H: EPT write-protect re-sync. The OS just wrote to a protected
@@ -1099,6 +1116,15 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
                 }
             }
             vmx_leave_guest_cr3(saved_cr3);
+
+            // Flush stale TLB entries so guest re-walks the re-synced shadow PT.
+            // Without this, a cached stale translation could persist until the
+            // next INVLPG/CR3-load, causing one stale access after re-sync.
+            {
+                INVVPID_DESCRIPTOR desc = {0};
+                desc.Vpid = VPID_TAG;
+                asm_invvpid(InvvpidSingleContext, &desc);
+            }
 
             // Re-protect EPT: W=0 on the real PT page
             PEPT_PML1_ENTRY pt_p1 = ept_get_pml1(vcpu->ept_page_table,
@@ -1504,8 +1530,10 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                             _InterlockedExchange(fi->external_fired, 1);
                         ept_hook_fire_record((UINT64)fi->virtual_address, (UINT64)fi->handler_function);
                         __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
-                        wedge_cmos_mark(0x01);  // WEDGE-A (trigger fired -> redirected RIP to handler)
-                        wedge_cmos_set_trig_seen();  // sticky: the injection trigger fired this run
+                        g_wedge_heal_marker[KeGetCurrentProcessorNumberEx(NULL) & 0x3F] = 0x01;  // [in-mem]
+                        // Throttle: one-time CMOS write (trigger fires once per run)
+                        if (_InterlockedCompareExchange(&g_wedge_trig_seen_flag, 1, 0) == 0)
+                            wedge_cmos_set_trig_seen();  // sticky: the injection trigger fired this run
                         return TRUE;
                     }
 

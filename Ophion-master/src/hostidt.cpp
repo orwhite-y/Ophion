@@ -1,4 +1,4 @@
-/*
+﻿/*
 *   hostidt.c - private host IDT for VMX-root mode
 *   prevents NMI hijacking where guest corrupts OS IDT and triggers
 *   NMI while in host mode to execute attacker code in ring 0
@@ -109,8 +109,8 @@ hostidt_destroy(VOID)
  * ======================================================================== */
 
 #define HV_BUGCHECK_CODE      0xDEADC0DE
-#define HV_PANIC_HOST_PF      0xFF01u
-#define HV_PANIC_HOST_EXC     0xFF02u
+#define HV_BUGCHECK_HOST_PF      0xFF01u
+#define HV_BUGCHECK_HOST_EXC     0xFF02u
 
 #define W_CMOS_MAGIC_OFF      0x50
 #define W_CMOS_MAGIC          0xA5
@@ -156,7 +156,7 @@ hv_host_pf_panic(UINT64 cr2, UINT64 rip, UINT64 err, UINT64 cr3)
         w_cmos_dword(W_CMOS_ERR_OFF, (UINT32)err);
         w_cmos_qword(W_CMOS_CR3_OFF, cr3);
     }
-    KeBugCheckEx(HV_BUGCHECK_CODE, (ULONG_PTR)HV_PANIC_HOST_PF,
+    KeBugCheckEx(HV_BUGCHECK_CODE, (ULONG_PTR)HV_BUGCHECK_HOST_PF,
                  (ULONG_PTR)cr2, (ULONG_PTR)rip, (ULONG_PTR)err);
     _disable();
     for (;;) { __halt(); }
@@ -176,7 +176,7 @@ hv_host_exc_panic(UINT64 vector, UINT64 rip, UINT64 err)
         w_cmos_dword(W_CMOS_ERR_OFF, (UINT32)err);
         w_cmos_qword(W_CMOS_CR3_OFF, cr3);
     }
-    KeBugCheckEx(HV_BUGCHECK_CODE, (ULONG_PTR)HV_PANIC_HOST_EXC,
+    KeBugCheckEx(HV_BUGCHECK_CODE, (ULONG_PTR)HV_BUGCHECK_HOST_EXC,
                  (ULONG_PTR)vector, (ULONG_PTR)rip, (ULONG_PTR)err);
     _disable();
     for (;;) { __halt(); }

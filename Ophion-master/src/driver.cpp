@@ -96,6 +96,10 @@ DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
     g_vmx_active = FALSE;
     hv_alive_clear();          // tell clients to stop vmcalling BEFORE VMX goes off
 
+    // Final breadcrumb flush to BC.log before teardown
+    hv_breadcrumb_flush_now();
+    hv_breadcrumb_stop_flush();
+
     ept_stealth_free_all_broadcast();
     ept_stealth_region_destroy();
     hv_pid_cr3_fini();
@@ -436,7 +440,9 @@ DriverEntry(
         UCHAR wms = wedge_cmos_read_match_seen();  // sticky: did a stealth match happen this run?
         UCHAR wts = wedge_cmos_read_trig_seen();   // sticky: did the injection trigger fire this run?
         UINT32 wrc = 0; UINT64 wra = 0;
-        wedge_cmos_read_reinj(&wrc, &wra);  // reinject livelock probe (streak + fault VA)
+        wedge_cmos_read_reinj(&wrc, &wra);  // #PF fault VA + error code (or reinj streak)
+        UINT64 wpf_va = 0; UINT32 wpf_err = 0;
+        wedge_cmos_read_pf(&wpf_va, &wpf_err);
 
         // per-CPU last-VM-exit bytes (0x60..0x7F). Show which handler each CPU was
         // last in, breaking the #PF-storm masking that made the single global marker
@@ -467,16 +473,16 @@ DriverEntry(
             };
             const char *nm = (wv < sizeof(wn)/sizeof(wn[0])) ? wn[wv] : "(unknown)";
             RtlStringCbPrintfA(wbuf, sizeof(wbuf),
-                "[WEDGE-LAST] marker=0x%02x -> %s match_seen=%d trig_seen=%d reinj_streak=%lu reinj_addr=0x%I64x\r\n"
+                "[WEDGE-LAST] marker=0x%02x -> %s match_seen=%d trig_seen=%d reinj_streak=%lu reinj_addr=0x%I64x pf_va=0x%I64x pf_err=0x%lx\r\n"
                 "[WEDGE-PERCPU] %s(cpu0..cpu31 | 8E=#PF 8D=#GP 86=#UD | +0x40=stuck-in-handler | VMCALL-only: E0=hook E1=stealth E2=CPL E3=switch | else=completed)\r\n",
-                (ULONG)wv, nm, (ULONG)wms, (ULONG)wts, (ULONG)wrc, wra, pbuf);
+                (ULONG)wv, nm, (ULONG)wms, (ULONG)wts, (ULONG)wrc, wra, wpf_va, (ULONG)wpf_err, pbuf);
         }
         else
         {
             RtlStringCbPrintfA(wbuf, sizeof(wbuf),
-                "[WEDGE-LAST] no marker (magic=0x%02x) match_seen=%d trig_seen=%d reinj_streak=%lu reinj_addr=0x%I64x\r\n"
+                "[WEDGE-LAST] no marker (magic=0x%02x) match_seen=%d trig_seen=%d reinj_streak=%lu reinj_addr=0x%I64x pf_va=0x%I64x pf_err=0x%lx\r\n"
                 "[WEDGE-PERCPU] %s(cpu0..cpu31 | 8E=#PF 8D=#GP 86=#UD | +0x40=stuck-in-handler | VMCALL-only: E0=hook E1=stealth E2=CPL E3=switch | else=completed)\r\n",
-                (ULONG)wm, (ULONG)wms, (ULONG)wts, (ULONG)wrc, wra, pbuf);
+                (ULONG)wm, (ULONG)wms, (ULONG)wts, (ULONG)wrc, wra, wpf_va, (ULONG)wpf_err, pbuf);
         }
         // Write W.log FIRST; clear the CMOS only after a successful write, so a write
         // failure (rare) preserves the data for the next boot's retry. Always clear on
@@ -513,6 +519,17 @@ DriverEntry(
         }
     }
 
+    // Initialize breadcrumb ring buffer BEFORE vmx_init (must be allocated
+    // before hostcr3_build so it is mapped in the private host CR3).
+    {
+        NTSTATUS _bcst = hv_breadcrumb_init();
+        if (!NT_SUCCESS(_bcst))
+        {
+            HYPERPLATFORM_LOG_ERROR("[hv] breadcrumb init FAILED");
+            // non-fatal: VMX-root code checks g_bc_ring->magic before writing
+        }
+    }
+
     // find PML4 self-map index (must be before vmx_init / hostcr3_build).
     // used by hv_walk_va in VMX-root to read PTEs without pa_to_va (deadlock-safe).
     {
@@ -525,6 +542,7 @@ DriverEntry(
     }
 
     wedge_cmos_mark(0x10);
+    hv_breadcrumb(BC_EVT_HV_INIT_START, 0);
 
     if (!vmx_init())
     {
@@ -537,13 +555,18 @@ DriverEntry(
     }
 
     wedge_cmos_mark(0x11);  // VMX is ON
+    hv_breadcrumb(BC_EVT_HV_INIT_VMXON, 0);
     g_vmx_active = TRUE;
+
+    // Start BC.log flush worker thread (PASSIVE_LEVEL, flushes every 500ms)
+    hv_breadcrumb_start_flush();
     hv_alive_set();           // signal VMX active to all kernel clients
 
     if (ept_stealth_region_init())
     {
         HYPERPLATFORM_LOG_INFO("[hv] Stealth region initialized.");
         wedge_cmos_mark(0x12);
+        hv_breadcrumb(BC_EVT_HV_INIT_EPT, 0);
 
         // Allocate per-CPU PTE window pages for VMX-root memory access.
         // Must be after stealth region init (pages come from stealth region)

@@ -1,4 +1,4 @@
-/*
+﻿/*
 *   stealth.h - anti-detection stealth definitions and function prototypes
 */
 #pragma once
@@ -30,7 +30,7 @@ extern "C" {
 #define SHADOW_PT_MODE_C    3   // all P=1/NX=0 + fast-path heal: skip __writecr3 when PTE already present. Periodic re-sync (every 4096 hits) catches repage.
 #define SHADOW_PT_MODE_G    7   // Passthrough Shadow: PML4/PDPT/PD deep-copy, fork PT pages clearing NX on ALL PTEs. Extended window (no MTF), CR3-load/store exiting, individual INVVPID.
 #define SHADOW_PT_MODE_H    8   // EPT Write-Protect Shadow: same extended window as MODE_G (no MTF, CR3-load/store exiting, individual INVVPID), but EPT W=0 on real PT pages keeps shadow PT in sync. OS write to real PT -> EPT violation -> lift W + MTF -> re-sync shadow PT (copy 512 PTEs, clear NX) -> re-protect. Eliminates stale-PFN divergence without A2 heal.
-#define SHADOW_PT_MODE      SHADOW_PT_MODE_H
+#define SHADOW_PT_MODE      SHADOW_PT_MODE_G
 
 //
 // hide CR4.VMXE (bit 13) from guest reads

@@ -1,4 +1,4 @@
-#ifndef PFN_MASK
+﻿#ifndef PFN_MASK
 #define PFN_MASK 0x000FFFFFFFFFF000ULL
 #endif
 /*
@@ -772,6 +772,21 @@ stealth_walk_pt_page(PEPT_STEALTH_PAGE_INFO sp, UINT64 cr3, UINT64 va,
     *out_pte = entry;
     *out_pt_page_va = (UINT64)pt_page;
     return TRUE;
+}
+
+// Set the host #PF safe-recovery range to bracket the self-map walk functions.
+// A host #PF with RIP in [g_pf_safe_start, g_pf_safe_end) recovers (RAX=0, skip 3)
+// instead of BSODing. This catches direct-memory-access #PFs inside the walk
+// (e.g. reading a not-present self-map PTE). #PFs inside pa_to_va (ntoskrnl)
+// are OUTSIDE this range -> BSOD (desired: diagnostic dump). Called from vmx.cpp.
+// Note: g_pf_safe_start=0 (unset) means ALL host #PF -> BSOD. We set a generous
+// range here so walk-internal faults recover gracefully.
+void ept_stealth_init_pf_safe_range(void)
+{
+    UINT64 a = (UINT64)&stealth_walk_pte;
+    UINT64 b = (UINT64)&stealth_walk_pt_page;
+    g_pf_safe_start = (a < b) ? a : b;
+    g_pf_safe_end   = ((a > b) ? a : b) + 0x1000;  // generous: covers both fns
 }
 
 static BOOLEAN

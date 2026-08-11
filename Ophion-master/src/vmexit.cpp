@@ -64,6 +64,19 @@ static UINT32        g_wedge_rip_last[64];
 // exit path is lock-free, ruling out deadlocks).
 static volatile LONG g_wedge_snap_ctr[64];
 
+// In-memory heal markers (replaces CMOS port I/O on hot path).
+// Per-CPU last heal step marker. Read by PF-loop detector when it snaps to CMOS.
+volatile LONG g_wedge_heal_marker[64];
+// In-memory sticky flags (replaces per-match CMOS writes)
+volatile LONG g_wedge_match_seen_flag;
+volatile LONG g_wedge_trig_seen_flag;
+
+// PF-loop detector: catches TRUE-loops (heal returns TRUE but fault repeats)
+// that reinj_streak misses (it only counts FALSE/re-inject path).
+// Snaps to CMOS at threshold 32 (fast detection, minimal port I/O).
+static volatile LONG g_wedge_pfloop_streak[64];
+static UINT64        g_wedge_pfloop_addr[64];
+
 // WEDGE per-CPU last-exit byte (throttle cache). Each CPU owns CMOS[0x60+cpu]; the
 // byte is rewritten only when the value changes, so a #PF storm (constant 0x8E)
 // costs ~1 write/CPU total, not 1 write/#PF. This breaks the multi-CPU masking that
@@ -591,6 +604,7 @@ vmexit_handle_mov_cr(VIRTUAL_MACHINE_STATE * vcpu)
                     // Returning to target -> re-activate shadow.
                     __vmx_vmwrite(VMCS_GUEST_CR3, vcpu->shadow_cr3_val);
                     vcpu->shadow_extended = TRUE;
+                    hv_breadcrumb_cpu(BC_EVT_SHADOW_REACTIVATE, vcpu->core_id, new_cr3_clean);
                     vcpu->shadow_pending  = FALSE;
                     // No INVVPID: PCID isolates kernel/user TLB. Stale NX=1
                     // entries handled by already_on_shadow (individual flush).
@@ -606,6 +620,7 @@ vmexit_handle_mov_cr(VIRTUAL_MACHINE_STATE * vcpu)
                     __vmx_vmwrite(VMCS_GUEST_CR3, new_cr3_clean);
                     vcpu->shadow_extended = FALSE;
                     vcpu->shadow_pending  = TRUE;
+                    hv_breadcrumb_cpu(BC_EVT_SHADOW_PENDING, vcpu->core_id, new_cr3_clean);
 
                     // Clear guard + narrow #PF (other processes must not VM-exit).
                     vcpu->nx_timer_real_cr3 = 0;
@@ -1862,6 +1877,11 @@ vmexit_handle_triple_fault(VIRTUAL_MACHINE_STATE * vcpu)
     // TFs again -> infinite loop = freeze. A host TF would reset (not freeze)
     // and would NOT reach this mark, so 0x0F cleanly separates the two modes.
     wedge_cmos_mark(0x0F);
+    hv_breadcrumb_cpu(BC_EVT_TRIPLE_FAULT, vcpu->core_id, vcpu->vmexit_rip);
+    /* Guest triple-faulted: bugcheck immediately with guest RIP so we get a dump
+     * instead of the old no-op re-entry freeze (which only yielded a 0x101 watchdog
+     * after ~10s with no fault RIP). KeBugCheckEx never returns. */
+    hv_panic(HV_PANIC_TRIPLE_FAULT, vcpu->vmexit_rip, (UINT64)vcpu->core_id, (UINT64)vcpu->exit_reason);
     vcpu->advance_rip = FALSE;
 }
 
@@ -1983,6 +2003,18 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     exit_reason = (UINT32)(exit_raw & 0xFFFF);
     vcpu->exit_reason = exit_reason;
 
+    /* Bit 31 of VMCS_EXIT_REASON = VM-entry failure (the guest was NOT entered).
+     * Masking with 0xFFFF above silently treats entry failures as normal exits
+     * -> VMRESUME -> fail again -> hang/loop. Bugcheck now with the VM-instruction
+     * error so the cause (invalid guest state) is captured in a dump instead of a
+     * mystery freeze. KeBugCheckEx never returns. */
+    if (exit_raw & 0x80000000ULL)
+    {
+        size_t _vm_instr_err = 0;
+        __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &_vm_instr_err);
+        hv_panic(HV_PANIC_ENTRY_FAILURE, (UINT64)exit_reason, (UINT64)_vm_instr_err, (UINT64)vcpu->core_id);
+    }
+
     //
     // lazy per-CPU stealth setup DISABLED for now.
     // stealth only active on the install CPU. shellcode thread must be
@@ -2062,7 +2094,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                 _InterlockedExchange(&g_wedge_reason_streak[wcpu], 1);
             }
             LONG ws = g_wedge_reason_streak[wcpu];
-            if (ws >= 1024 && (ws & 0x3FF) == 0)
+            if (ws >= 128 && (ws & 0x7F) == 0)
                 wedge_cmos_snap_reinj((UINT32)ws, (UINT64)pcpu_byte);
 
             // RIP-stuck detector (see g_wedge_rip_streak above). vcpu->vmexit_rip was
@@ -2078,7 +2110,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                 _InterlockedExchange(&g_wedge_rip_streak[wcpu], 1);
             }
             LONG wrs = g_wedge_rip_streak[wcpu];
-            if (wrs >= 1024 && (wrs & 0x3FF) == 0)
+            if (wrs >= 128 && (wrs & 0x7F) == 0)
                 wedge_cmos_snap_reinj((UINT32)wrs, (UINT64)wrip | 0x1);
 
             // throttle CMOS snap+end to every 8th exit (see g_wedge_snap_ctr above)
@@ -2272,8 +2304,10 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         // the guest didn't cause this and can't handle it.
         // enter shutdown state �?system will triple-fault cleanly.
         //
-        __vmx_vmwrite(VMCS_CTRL_VMENTRY_INTERRUPTION_INFORMATION_FIELD, 0);
-        __vmx_vmwrite(VMCS_GUEST_ACTIVITY_STATE, GUEST_ACTIVITY_STATE_SHUTDOWN);
+        /* EPT misconfig is a host-side fault (bad EPT entry: reserved bits, write-only,
+         * etc). Old code set guest SHUTDOWN -> hang -> 0x101 watchdog with no info.
+         * Bugcheck now with guest RIP + exit_qual so the bad GPA is recoverable. */
+        hv_panic(HV_PANIC_EPT_MISCONFIG, vcpu->vmexit_rip, vcpu->exit_qual, (UINT64)vcpu->core_id);
         vcpu->advance_rip = FALSE;
         break;
     }
@@ -2424,9 +2458,48 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                 // and must reach the handler's mid-window guard to be serviced under the
                 // REAL CR3. without this, such a #PF would be re-injected under the
                 // shadow CR3 and MmAccessFault would run on the stale shadow PT (0x1A).
+                {
+                    // PF-loop detector: counts ALL consecutive same-address #PFs
+                    // (both TRUE and FALSE paths). reinj_streak only counts FALSE
+                    // (re-inject). A TRUE-loop (heal returns TRUE but shadow PTE is
+                    // wrong -> fault repeats) is invisible to reinj_streak. Snap at
+                    // 32 for fast detection. Uses in-memory tracking (no CMOS I/O
+                    // on hot path); only snaps to CMOS at threshold.
+                    ULONG wcpu_pf = KeGetCurrentProcessorNumberEx(NULL);
+                    if (wcpu_pf < 64)
+                    {
+                        UINT64 pfa = vcpu->exit_qual;
+                        if (pfa == g_wedge_pfloop_addr[wcpu_pf])
+                            _InterlockedIncrement(&g_wedge_pfloop_streak[wcpu_pf]);
+                        else
+                        {
+                            g_wedge_pfloop_addr[wcpu_pf] = pfa;
+                            _InterlockedExchange(&g_wedge_pfloop_streak[wcpu_pf], 1);
+                        }
+                        LONG wps = g_wedge_pfloop_streak[wcpu_pf];
+                        // Lowered from 32 to 8 for faster livelock detection.
+                        // Also snap for kernel-address #PFs (bit 47 = 1) at
+                        // threshold 2 -- these indicate a shadow-window leak
+                        // into kernel space (the session-16 hang root cause).
+                        if ((pfa >> 47) & 1) {
+                            if (wps >= 2 && (wps & 0x1) == 0)
+                                wedge_cmos_snap_reinj((UINT32)wps, pfa);
+                        } else if (wps >= 8 && (wps & 0x7) == 0)
+                            wedge_cmos_snap_reinj((UINT32)wps, pfa);
+                    }
+                }
+
                 if ((pf_error_code & (0x10 | 0x02)) || vcpu->nx_timer_real_cr3)
                 {
                     UINT64 fault_addr = vcpu->exit_qual;
+
+                    // REMOVED: wedge_cmos_snap_pf was here -- it did 12 cmos_write_byte
+                    // calls (36 port I/O ops) on EVERY #PF during the shadow window's
+                    // widened intercept. At 10K+ #PFs/sec this consumed 100% CPU -> hang.
+                    // PF-loop detector above + streak snaps provide the same info at
+                    // threshold only (rare CMOS I/O). hv_breadcrumb (in-memory) still
+                    // logs every #PF for BC.log.
+                    hv_breadcrumb_cpu(BC_EVT_PF_ENTRY, vcpu->core_id, fault_addr);
 
                     if (ept_stealth_handle_pf(vcpu, fault_addr, (UINT32)pf_error_code))
                     {
@@ -2459,7 +2532,8 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                 // re-injects -> tight loop) reaches 1024 and snaps to CMOS. Normal activity
                 // resolves each NX #PF -> next #PF is a different addr -> streak resets ->
                 // never snaps -> zero hot-path port I/O. FETCH-gated (bit4=0x10) as before.
-                if (pf_error_code & 0x10)
+                // Track ALL re-injected #PFs (not just fetch). Data #PF livelocks
+                // were invisible with the old FETCH-only gate (bit4=0x10).
                 {
                     ULONG wcpu = KeGetCurrentProcessorNumberEx(NULL);
                     if (wcpu < 64)
@@ -2473,8 +2547,44 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                             _InterlockedExchange(&g_wedge_reinj_streak[wcpu], 1);
                         }
                         LONG ws = g_wedge_reinj_streak[wcpu];
-                        if (ws >= 1024 && (ws & 0x3FF) == 0)
+                        if (ws >= 128 && (ws & 0x7F) == 0)
                             wedge_cmos_snap_reinj((UINT32)ws, wfa);
+                        // Diagnostic: capture fault addr / RIP / error code at streak>=8
+                        // (0x0106=addr 0x0107=RIP 0x0108=errcode) -- the actual #PF error
+                        // code was never logged before; W.log pf_err was the streak, not ec.
+                        if (ws >= 8 && (ws & 0x7) == 0) {
+                            size_t guest_rip = 0;
+                            __vmx_vmread(VMCS_GUEST_RIP, &guest_rip);
+                            size_t pf_ec = 0;
+                            __vmx_vmread(VMCS_VMEXIT_INTERRUPTION_ERROR_CODE, &pf_ec);
+                            hv_breadcrumb_cpu(0x0106, vcpu->core_id, wfa);
+                            hv_breadcrumb_cpu(0x0107, vcpu->core_id, guest_rip);
+                            hv_breadcrumb_cpu(0x0108, vcpu->core_id, pf_ec);
+                        }
+                        // Livelock breaker: after 32 re-injected #PFs at the same address,
+                        // the guest cannot resolve the fault through HV re-injection
+                        // (each re-inject VM-exits -> tight loop -> system hang, as seen
+                        // with the NULL-page 0x12 fault: reinj_streak=2176).
+                        // Disable #PF interception so the guest KiPageFault handler runs
+                        // natively. Set MTF to re-arm the intercept after 1 instruction.
+                        // The re-inject below still delivers the #PF, but without a VM-exit
+                        // on re-fault, letting the handler dispatch the exception (SEH /
+                        // thread termination) instead of livelocking inside the HV.
+                        if (ws >= 32) {
+                            size_t exc_bm = 0;
+                            __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bm);
+                            exc_bm &= ~(1ULL << EXCEPTION_VECTOR_PAGE_FAULT);
+                            __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bm);
+                        
+                            SIZE_T pc2 = 0;
+                            __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc2);
+                            pc2 |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+                            __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc2);
+                        
+                            vcpu->pf_passthrough_armed = TRUE;
+                            _InterlockedExchange(&g_wedge_reinj_streak[wcpu], 0);
+                            hv_breadcrumb_cpu(0x0109, vcpu->core_id, wfa);
+                        }
                     }
                 }
             }

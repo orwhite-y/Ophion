@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Release|x64">
@@ -127,6 +127,7 @@
     <ClCompile Include="src\ept_hook.cpp" />
     <ClCompile Include="src\pool_manager.cpp" />
     <ClCompile Include="src\ept_stealth.cpp" />
+    <ClCompile Include="src\breadcrumb.cpp" />
     <ClCompile Include="src\log.cpp" />
   </ItemGroup>
   <!-- Assembly Files (MASM x64) -->
@@ -147,6 +148,7 @@
     <ClInclude Include="include\hv_types.h" />
     <ClInclude Include="include\asm_prototypes.h" />
     <ClInclude Include="include\stealth.h" />
+    <ClInclude Include="include\breadcrumb.h" />
     <ClInclude Include="src\log.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

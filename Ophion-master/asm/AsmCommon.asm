@@ -52,5 +52,16 @@ asm_write_cr2 PROC
     ret
 asm_write_cr2 ENDP
 
+PUBLIC asm_selfmap_read
 
-END
+; UINT64 asm_selfmap_read(UINT64 addr)
+; rcx = address to read. Returns [rcx] in rax.
+; MUST be exactly: mov rax,[rcx] (3 bytes: 48 8B 01) + ret (1 byte: C3)
+; The host #PF handler matches this exact instruction: sets rax=0, advances RIP by 3.
+asm_selfmap_read PROC
+    mov     rax, [rcx]
+    ret
+asm_selfmap_read ENDP
+
+
+END

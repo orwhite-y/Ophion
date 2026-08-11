@@ -524,6 +524,9 @@ vmx_init(VOID)
     stealth_init_cpuid_cache();
 #endif
 
+    // Initialize safe walk range for host #PF recovery (stealth_walk_pte_selfmap).
+    ept_stealth_init_pf_safe_range();
+
     if (!ept_init())
     {
         HYPERPLATFORM_LOG_ERROR("[hv] EPT initialization failed!");

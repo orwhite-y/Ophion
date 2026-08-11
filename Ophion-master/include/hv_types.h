@@ -329,6 +329,8 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     UINT64  host_pf_rip;
     UINT32  host_pf_count;
     UINT64  host_pf_cr2;
+    BOOLEAN     pf_passthrough_armed;   // livelock breaker: #PF intercept temporarily
+                                        // disabled; MTF re-arms via ept_update_pf_intercept
 } VIRTUAL_MACHINE_STATE, *PVIRTUAL_MACHINE_STATE;
 
 #define VMCALL_TEST             0x00000001

@@ -53,6 +53,15 @@ static UINT32        g_wedge_reason_last[64];
 static volatile LONG g_wedge_rip_streak[64];
 static UINT32        g_wedge_rip_last[64];
 
+// VMCALL #UD livelock breaker: VMCALL is excluded from the global reason-streak
+// bugcheck (to allow legitimate injection VMCALL storms). But an unrecognized VMCALL
+// (#UD + advance_rip=FALSE) livelocks because the guest returns to the same VMCALL
+// instruction. This per-CPU counter tracks consecutive unrecognized VMCALLs from the
+// same RIP. At threshold, bugcheck for a dump instead of watchdog hard-reset.
+#define VMCALL_UD_BREAK_THRESHOLD 16
+static volatile LONG g_vmcall_ud_streak[64];
+static UINT32        g_vmcall_ud_last_rip[64];
+
 // WEDGE CMOS snap+end throttle. wedge_percpu_mark is 3 RTC port writes (~3us) each,
 // called twice per exit (entry snap + end clear) = ~6us/exit. On a VARIED-reason
 // storm (NMI/INIT/CPUID mixed, as EAC probes) the per-CPU byte value changes every
@@ -1901,6 +1910,34 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
     //
     // not our VMCALL and not an EPT hook/stealth page (already checked above)
     //
+    //
+    // VMCALL livelock breaker: if the same unrecognized VMCALL RIP repeats
+    // 16+ times, bugcheck for a dump. VMCALL is excluded from the global streak
+    // breaker, so without this a trigger VMCALL that doesn't match
+    // ept_handle_vmcall_hook livelocks until watchdog hard-reset (no dump).
+    //
+    {
+        ULONG vcpu_id = KeGetCurrentProcessorNumberEx(NULL);
+        if (vcpu_id < 64)
+        {
+            UINT32 cur_rip32 = (UINT32)vcpu->vmexit_rip;
+            if (g_vmcall_ud_last_rip[vcpu_id] == cur_rip32)
+                _InterlockedIncrement(&g_vmcall_ud_streak[vcpu_id]);
+            else
+            {
+                g_vmcall_ud_last_rip[vcpu_id] = cur_rip32;
+                _InterlockedExchange(&g_vmcall_ud_streak[vcpu_id], 1);
+            }
+            if (g_vmcall_ud_streak[vcpu_id] >= VMCALL_UD_BREAK_THRESHOLD)
+            {
+                wedge_cmos_mark(0x26);
+                hv_panic(HV_PANIC_UNHANDLED_EXIT,
+                         (UINT64)VMX_EXIT_REASON_EXECUTE_VMCALL,
+                         vcpu->vmexit_rip,
+                         (UINT64)g_vmcall_ud_streak[vcpu_id]);
+            }
+        }
+    }
     vmexit_inject_ud();
     vcpu->advance_rip = FALSE;
 }

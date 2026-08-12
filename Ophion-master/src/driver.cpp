@@ -469,7 +469,9 @@ DriverEntry(
                 /*10*/ "S1-pre-vmxinit", "S2-vmx-on", "S3-ept-done", "S4-ready",
                 /*14*/ "(rsv14)", "(rsv15)", "(rsv16)", "(rsv17)",
                 /*18*/ "(rsv18)", "(rsv19)", "(rsv1A)", "(rsv1B)",
-                /*1C*/ "(rsv1C)", "(rsv1D)", "S-ept-fail", "S-vmx-fail"
+                /*1C*/ "(rsv1C)", "(rsv1D)", "S-ept-fail", "S-vmx-fail",
+                /*20*/ "EPT-violation", "(rsv21)", "(rsv22)", "trig-TID-match",
+                /*24*/ "(rsv24)", "stealth-EPT-viol", "VMCALL-livelock"
             };
             const char *nm = (wv < sizeof(wn)/sizeof(wn[0])) ? wn[wv] : "(unknown)";
             RtlStringCbPrintfA(wbuf, sizeof(wbuf),

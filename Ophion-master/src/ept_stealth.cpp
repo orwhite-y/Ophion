@@ -64,6 +64,7 @@ volatile LONG g_dbg_a2_stale_p1_total = 0;         // A2: total silent P=1/wrong
 volatile LONG g_dbg_a2_dump_tick = 0;              // A2: periodic counter-dump tick (diagnostic)
 volatile LONG g_dbg_a2_already_on_shadow = 0;      // A2: mid-window NX-fetch #PF hitting the already_on_shadow branch (stale-gap suspect)
 volatile LONG g_dbg_a2_pml4_synced = 0;            // A2: stale shadow PML4 entries synced from real (non-DLL range fix)
+volatile LONG g_dbg_real_nx_cleared = 0;  // latch: NX cleared on real PTE to break livelock
 
 //
 // DIAG: capture the first distinct renderdoc code RIPs that open an NX-fetch
@@ -1741,6 +1742,54 @@ fail_cleanup_fakept:
     return FALSE;
 }
 
+//
+// stealth_clear_real_nx: clear the NX bit on the REAL (guest) PTE for a stealth
+// page. Used when the near-NULL latch is set: the shadow window cannot be
+// re-opened (would re-trigger the NULL-deref livelock), but the real PTE still
+// has NX=1, causing NX-fetch #PF -> AV -> SEH retry -> livelock -> crash.
+// Clearing NX on the real PTE lets the code execute without VM-exit. The NULL
+// deref becomes a normal data #PF handled by the guest (thread termination or
+// SEH). Stealth is sacrificed for this page; system stability is preserved.
+//
+static BOOLEAN
+stealth_clear_real_nx(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_PAGE_INFO sp, UINT64 fault_addr)
+{
+    if (!sp || !sp->guest_cr3 || !sp->guest_va || !g_ept)
+        return FALSE;
+
+    UINT64 saved_cr3 = vmx_enter_cr3(sp->guest_cr3);
+
+    UINT64 real_pte = 0;
+    UINT64 pt_page_va = 0;
+    BOOLEAN walk_ok = stealth_walk_pt_page(sp, sp->guest_cr3, fault_addr, &pt_page_va, &real_pte);
+
+    if (!walk_ok || !pt_page_va || !(real_pte & 1))
+    {
+        vmx_leave_guest_cr3(saved_cr3);
+        return FALSE;
+    }
+
+    // Clear NX bit (bit 63) on the real PTE via the MDL-mapped PT page VA.
+    UINT64 pt_index = (fault_addr >> 12) & 0x1FF;
+    PUINT64 pte_ptr = (PUINT64)(pt_page_va + pt_index * 8);
+    *pte_ptr = real_pte & ~NX_BIT;
+
+    vmx_leave_guest_cr3(saved_cr3);
+
+    // Flush TLB for this address so the CPU re-walks with NX=0.
+    INVVPID_DESCRIPTOR desc = {0};
+    desc.Vpid = VPID_TAG;
+    if (g_ept->invvpid_individual_addr)
+    {
+        desc.LinearAddress = fault_addr;
+        asm_invvpid(InvvpidIndividualAddress, &desc);
+    }
+    else
+        asm_invvpid(InvvpidSingleContext, &desc);
+
+    return TRUE;
+}
+
 // =========================================================================
 //  VMX-root: #PF handler (NX violation)
 // =========================================================================
@@ -1760,6 +1809,44 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
     {
         if (vcpu->nx_timer_real_cr3)
             stealth_pf_abort_shadow_window(vcpu);
+
+        // Latch is set: a previous near-NULL data #PF (VA < 0x10000) occurred
+        // under the shadow window. Re-opening the shadow would re-trigger the
+        // NULL-deref livelock. But the real PTE still has NX=1, so every fetch
+        // from this stealth page causes an NX-fetch #PF that gets re-injected
+        // -> guest AV -> SEH retry -> livelock -> system crash.
+        //
+        // Fix: for NX-fetch #PFs matching a stealth page, clear NX on the REAL
+        // PTE. The code can then execute without VM-exit. The NULL deref becomes
+        // a normal data #PF handled by the guest (thread termination or SEH).
+        // Stealth is sacrificed for this page; system stability is preserved.
+        if (error_code & PFEC_INSTR_FETCH)
+        {
+            UINT64 fault_page_latch = fault_addr & ~0xFFFULL;
+            PLIST_ENTRY cur_latch = g_ept->stealth_pages.Flink;
+            while (cur_latch != &g_ept->stealth_pages)
+            {
+                PEPT_STEALTH_PAGE_INFO sp_latch =
+                    CONTAINING_RECORD(cur_latch, EPT_STEALTH_PAGE_INFO, stealth_page_list);
+                cur_latch = cur_latch->Flink;
+                if (sp_latch->guest_va != fault_page_latch) continue;
+
+                if (sp_latch->target_pid != 0)
+                {
+                    UINT64 current_pid = (UINT64)(ULONG_PTR)PsGetCurrentProcessId();
+                    if (current_pid != sp_latch->target_pid) continue;
+                }
+
+                if (stealth_clear_real_nx(vcpu, sp_latch, fault_addr))
+                {
+                    _InterlockedIncrement(&g_dbg_real_nx_cleared);
+                    wedge_cmos_mark(0x09);
+                    return TRUE;
+                }
+                break;
+            }
+        }
+
         return FALSE;
     }
 

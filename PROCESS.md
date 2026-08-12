@@ -4,14 +4,37 @@
 
 ## 当前状态
 - **项目路径**：F:\winDriver\te\Ophion-master (驱动) + F:\winDriver\te\Ophion-master\renderdoc-1.36 (renderdoc)
-- **最近更新**：2026-08-12 14:18
-- **最近会话**：session-48
-- **基线**：HEAD = 041ccc9
-- **工作树**：clean（已提交 session 48 修复）
-- **进行中**：KPTI CR3 修复已编译，待部署测试
+- **最近更新**：2026-08-12 15:30
+- **最近会话**：session-49
+- **基线**：HEAD = 87c2a00
+- **工作树**：clean（已提交 session 49 修复）
+- **进行中**：near-NULL triple fault 修复已编译，待部署测试
 - **下一步**：部署测试（停驱动 -> kill游戏 -> 部署新驱动 -> 启动Ophion -> 启动TestEptHook -> 模块快照 -> 启动游戏 -> 注入）
 
 ## 变更日志
+### 2026-08-12 15:30  [session 49]
+- 动作：接管 + 分析 hard-reboot crash + 修复 near-NULL triple fault + 编译 + 提交
+- 根因分析（He 的问题：注入后直接硬重启）：
+  - W.log: marker=0x0B, trig_seen=1, match_seen=1, reinj_streak=2176, pf_va=0x12, pf_err=0x880
+  - BC.log: 1128 entries, all PF_ENTRY (evt=0x002a), mostly cpu=6
+  - Per-CPU: cpu0=0x08, cpu4=0x10, cpu6=0x08, cpu19=0x0B (all completed, no stuck)
+  - 根因：stealth_sync_data_pte_in_window 对 VA 0x12 (NULL+0x12 deref) 同步 PML4[0]
+    - 返回 TRUE -> shadow CR3 保持活跃 -> guest 重试真正未映射的地址
+    - fetch<->data-#PF livelock (reinj_streak=2176) -> 最终 triple fault
+    - Triple fault 原因：shadow PML4 内核映射过时，异常分发时 double fault -> triple fault
+- 修复：
+  - Fix 1（根因 - near-NULL PML4 sync）：ept_stealth.cpp stealth_sync_data_pte_in_window L869
+    - fault_addr < 0x10000 立即 return FALSE
+    - Near-NULL 地址是真正的 NULL dereference，不是过时的 shadow PML4 条目
+    - 同步 PML4[0] 会返回 TRUE，保持 shadow CR3 活跃 -> livelock -> triple fault
+  - Fix 2（诊断）：ept_stealth_handle_pf mid-window guard L1771
+    - Near-NULL data #PF 时，通过 hv_breadcrumb_cpu 记录 RIP+error_code 到 BC.log
+    - 不受 stealth_diag_midwin_pf 的 32 事件上限限制
+    - 然后立即 abort shadow window + return FALSE -> #PF 在 real CR3 下重注入
+- 文件：Ophion-master/src/ept_stealth.cpp (20 insertions)
+- 编译：Ophion.sys + TestEptHook.sys 成功签名
+- 提交：87c2a00
+- 结论：等待 He 决定是否测试
 ### 2026-08-12 14:18  [session 48]
 - 动作：接管 + 分析 W.log/T.log/BC.log + 修复 KPTI CR3 mismatch + 编译 + 提交
 - 根因分析（He 的问题：注入后系统卡死）：
@@ -121,6 +144,8 @@
 - VMCALL streak 排除修复
 
 ## 关键发现
+- **【session 49】near-NULL data #PF (VA 0x12) 导致 triple fault**：stealth_sync_data_pte_in_window 对 near-NULL 地址同步 PML4[0] 返回 TRUE，保持 shadow CR3 活跃。Guest 重试真正未映射的地址 -> fetch<->data-#PF livelock -> shadow PML4 内核映射过时 -> 异常分发时 double fault -> triple fault -> 硬重启（无 dump）。修复：fault_addr < 0x10000 时 return FALSE。
+- **【session 49】PML4 sync 可能破坏 stealth**：PML4 sync 替换 shadow PML4 条目为 real PML4 条目。如果 stealth 页在同一 PML4 区域，sync 会用 real PDPT 替换 shadow PDPT，破坏 stealth。当前 near-NULL check 只防 VA < 0x10000。
 - **【session 38】CR3 窗口内禁止 HYPERPLATFORM_LOG_WARN_SAFE**：vmx_enter_cr3/vmx_leave_guest_cr3 窗口内只能有 stealth_walk_pte（安全范围）、shadow PTE 写（NonPaged pool）、INVVPID（VMX 指令）、CMOS markers（端口 I/O）、计数器自增（互锁内存写）。任何其他函数调用都可能触发不可恢复的 host #PF -> pf_panic -> jmp $ -> CPU 卡死。
 - **【session 38】W.log pf_err 字段存储 streak 值**：wedge_cmos_snap_reinj 存储 pf_va=addr, pf_err=streak。pfloop 检测器和 reinj 检测器都写同一 CMOS 字段。pf_err=0x180=384 是 pfloop_streak。
 - **【session 38】FALSE-path breaker 必须重置 pfloop_streak**：之前只重置 reinj_streak 和 reinj_total，导致 pfloop_streak 持续增长，每 8 次 #PF 触发一次 CMOS snap。

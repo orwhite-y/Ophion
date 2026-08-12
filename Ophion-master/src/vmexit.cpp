@@ -10,6 +10,7 @@
 extern volatile LONG g_dbg_shadow_pf_seen;
 extern volatile LONG g_dbg_shadow_pf_allowed;
 extern volatile LONG g_dbg_shadow_pf_switched;
+extern volatile LONG g_near_null_shadow_disabled;  // latch: near-NULL data #PF -> keep NX-fetch-only intercept
 
 static volatile LONG g_dbg_shadow_timer_restore = 0;
 static volatile LONG g_dbg_shadow_timer_skip = 0;
@@ -610,10 +611,16 @@ vmexit_handle_mov_cr(VIRTUAL_MACHINE_STATE * vcpu)
                     // No INVVPID: PCID isolates kernel/user TLB. Stale NX=1
                     // entries handled by already_on_shadow (individual flush).
 
-                    // Restore guard state + widen #PF.
+                    // Restore guard state.
                     vcpu->nx_timer_real_cr3 = vcpu->shadow_real_cr3;
-                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0);
-                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0);
+                    // When near-NULL latch is set, keep NX-fetch-only intercept
+                    // so data #PFs (NULL deref 0x12) don't VM-exit during the
+                    // shadow window. Guest handles them under shadow CR3 directly.
+                    if (!g_near_null_shadow_disabled)
+                    {
+                        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0);
+                        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0);
+                    }
                 }
                 else
                 {

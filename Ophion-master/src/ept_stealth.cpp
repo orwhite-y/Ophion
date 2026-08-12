@@ -1760,7 +1760,20 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
     {
         if (vcpu->nx_timer_real_cr3)
             stealth_pf_abort_shadow_window(vcpu);
-        return FALSE;
+
+        // Latch is set: a previous near-NULL data #PF (VA < 0x10000) occurred
+        // under the shadow window. The real PTE still has NX=1 (NEVER clear it -
+        // that would break stealth). For NX-fetch #PFs, fall through to normal
+        // stealth matching and open the shadow window. But the shadow is opened
+        // WITHOUT widening the #PF intercept (see g_near_null_shadow_disabled
+        // check at the widening code below). Data #PFs during the shadow window
+        // (including the NULL deref at 0x12) do NOT VM-exit - the guest handles
+        // them directly under the shadow CR3. Data pages don't need NX=0 anyway.
+        // This breaks the livelock: code executes (shadow NX=0), NULL deref is
+        // handled by guest (no VM-exit), no re-inject storm, system survives.
+        if (!(error_code & PFEC_INSTR_FETCH))
+            return FALSE;  // data #PF: re-inject under real CR3 (rare after latch)
+        // NX-fetch #PF: fall through to normal stealth page matching
     }
 
     // WEDGE-B (0x02) removed: per-CPU exit-reason snap in vmexit_handler records
@@ -1995,9 +2008,16 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
                 else
                     asm_invvpid(InvvpidSingleContext, &desc);
 
-                // Widen #PF to all-faults for extended window.
-                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0);
-                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0);
+                // Widen #PF to all-faults for extended window -- UNLESS the
+                // near-NULL latch is set. When latched, keep NX-fetch-only
+                // intercept so data #PFs (including NULL deref at 0x12) are
+                // handled by the guest under the shadow CR3 without VM-exit.
+                // This breaks the fetch<->data-#PF livelock.
+                if (!g_near_null_shadow_disabled)
+                {
+                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0);
+                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0);
+                }
 
                 // CR3-load + CR3-store exiting for extended window.
                 SIZE_T pc = 0;

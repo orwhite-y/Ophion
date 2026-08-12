@@ -18,6 +18,10 @@
 extern volatile LONG g_wedge_heal_marker[64];
 extern volatile LONG g_wedge_trig_seen_flag;
 
+// EPT violation / MTF throttle counters (defined in vmexit.cpp)
+extern volatile LONG g_ept_violation_ctr[64];
+extern volatile LONG g_mtf_ctr[64];
+
 #define POOL_TAG_SPLIT       0
 #define POOL_TAG_HOOKED_PAGE 1
 #define POOL_TAG_HOOKED_FUNC 2
@@ -1063,6 +1067,10 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
             }
 
             // target process (or R0 hook): swap to fake page (hook visible)
+            // KEY DIAGNOSTIC: trigger thread EPT violation handled, swapping to fake page
+            // Non-throttled (fires once per trigger). If marker=0x23 in CMOS after hang,
+            // the trigger thread's EPT violation WAS handled. If absent, it wasn't.
+            wedge_cmos_mark(0x23);
             ept_swap_page(my_pte, hp->changed_entry, vcpu->ept_pointer);
             return TRUE;
         }
@@ -1074,6 +1082,13 @@ VOID
 ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
 {
     SIZE_T pc = 0;
+    // Throttled CMOS marker: confirms MTF exits are happening.
+    {
+        UINT32 mcpu = KeGetCurrentProcessorNumberEx(NULL);
+        ULONG mcnt = _InterlockedIncrement(&g_mtf_ctr[mcpu & 0x3F]);
+        if ((mcnt & 0x3FF) == 0)
+            wedge_cmos_mark(0x30);
+    }
     __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
     pc &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
     __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
@@ -1105,6 +1120,13 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     {
         UINT64 wp_pfn = vcpu->shadow_ept_wp_pt_pfn;
         vcpu->shadow_ept_wp_pending = FALSE;
+        // Throttled marker: MODE_H EPT W=0 re-sync (PT page write storm)
+        {
+            UINT32 hcpu = KeGetCurrentProcessorNumberEx(NULL);
+            ULONG hcnt = _InterlockedIncrement(&g_mtf_ctr[hcpu & 0x3F]);
+            if ((hcnt & 0xFF) == 0)
+                wedge_cmos_mark(0x31);
+        }
         vcpu->shadow_ept_wp_pt_pfn = 0;
 
         // Find the stealth page for this PT page
@@ -1165,6 +1187,10 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     // Shadow-CR3 restore must run first. The same MTF exit can also carry
     // other restore state, and we do not want a prior branch to skip this one.
     //
+    // Non-throttled: shadow CR3 restore (rare, only on NX-fetch #PF)
+    if (vcpu->nx_timer_restore)
+        wedge_cmos_mark(0x32);
+
     if (vcpu->nx_timer_restore)
     {
         //
@@ -1187,6 +1213,10 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
         // "all" for the duration of the window.
         ept_update_pf_intercept(vcpu);
     }
+
+    // Non-throttled: EPT hook page restore via MTF
+    if (vcpu->mtf_restore_page)
+        wedge_cmos_mark(0x33);
 
     if (vcpu->mtf_restore_page)
     {

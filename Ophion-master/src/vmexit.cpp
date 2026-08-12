@@ -79,6 +79,24 @@ volatile LONG g_wedge_trig_seen_flag;
 static volatile LONG g_wedge_pfloop_streak[64];
 static UINT64        g_wedge_pfloop_addr[64];
 
+// EPT violation / MFT throttle counters for CMOS diagnostics.
+// cmos_write_byte has a spinlock (g_cmos_lock) so multi-CPU race is safe,
+// but port I/O is ~3us per byte (9us per wedge_cmos_mark). Throttle to
+// every 1024th exit to keep overhead < 0.01us/exit on average.
+// Marker values:
+//   0x20 = EPT violation entry (throttled)
+//   0x21 = EPT violation MODE_H W=0 path (throttled)
+//   0x22 = EPT violation hook page execute (non-throttled, rare)
+//   0x23 = EPT violation trigger TID match -> swap to fake (non-throttled, KEY)
+//   0x24 = EPT violation unhandled (non-throttled, rare)
+//   0x25 = EPT violation stealth page path (throttled)
+//   0x30 = MTF entry (throttled)
+//   0x31 = MTF MODE_H re-sync (throttled)
+//   0x32 = MTF shadow CR3 restore (non-throttled, rare)
+//   0x33 = MTF mtf_restore_page (non-throttled, rare)
+volatile LONG g_ept_violation_ctr[64];
+volatile LONG g_mtf_ctr[64];
+
 // WEDGE per-CPU last-exit byte (throttle cache). Each CPU owns CMOS[0x60+cpu]; the
 // byte is rewritten only when the value changes, so a #PF storm (constant 0x8E)
 // costs ~1 write/CPU total, not 1 write/#PF. This breaks the multi-CPU masking that
@@ -816,6 +834,16 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
     UINT64 guest_phys = 0;
     __vmx_vmread(VMCS_GUEST_PHYSICAL_ADDRESS, &guest_phys);
 
+    // Throttled CMOS marker: confirms EPT violations are happening.
+    // Every 1024th per CPU. If marker=0x20 after a hang, EPT violations
+    // were occurring. If absent, EPT was inactive or no thread ran.
+    {
+        UINT32 ecpu = KeGetCurrentProcessorNumberEx(NULL);
+        ULONG ecnt = _InterlockedIncrement(&g_ept_violation_ctr[ecpu & 0x3F]);
+        if ((ecnt & 0x3FF) == 0)
+            wedge_cmos_mark(0x20);
+    }
+
     //
     // try to handle as an EPT hook violation (split-TLB page swap)
     //
@@ -831,6 +859,13 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
     //
     if (ept_stealth_handle_violation(vcpu, guest_phys, vcpu->exit_qual))
     {
+        // Throttled marker for stealth page EPT violations
+        {
+            UINT32 scpu = KeGetCurrentProcessorNumberEx(NULL);
+            ULONG scnt = _InterlockedIncrement(&g_ept_violation_ctr[scpu & 0x3F]);
+            if ((scnt & 0xFF) == 0)
+                wedge_cmos_mark(0x25);
+        }
         vcpu->advance_rip = FALSE;
         return;
     }
@@ -874,6 +909,8 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
         }
     }
 
+    // Non-throttled: unhandled EPT violations are rare and indicate a problem
+    wedge_cmos_mark(0x24);
     ept_invept_single(vcpu->ept_pointer);
     vcpu->advance_rip = FALSE;
 }

@@ -541,6 +541,10 @@ DriverEntry(
         }
     }
 
+    // Clear ALL stale CMOS diagnostic data from previous runs/crashes.
+    // Without this, reinj_streak/pf_va/pf_err from a previous BSOD persist
+    // across reboots (CMOS is battery-backed) and contaminate post-hang diagnosis.
+    wedge_cmos_clear();
     wedge_cmos_mark(0x10);
     hv_breadcrumb(BC_EVT_HV_INIT_START, 0);
 

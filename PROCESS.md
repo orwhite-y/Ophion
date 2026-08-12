@@ -3,15 +3,39 @@
 > 记录已完成、进行中、待办的工作。上下文压缩后必读。
 
 ## 当前状态
+## 当前状态
 - **项目路径**：F:\winDriver\te\Ophion-master (驱动) + F:\winDriver\te\Ophion-master\renderdoc-1.36 (renderdoc)
-- **最近更新**：2026-08-12 16:57
-- **最近会话**：session-54
-- **HEAD**：97c0bef (fix: preserve stealth - never clear real PTE NX)
+- **最近更新**：2026-08-12 17:21
+- **最近会话**：session-55
+- **HEAD**：2f59ff1 (fix: remove #PF widening entirely -- data #PFs handled by guest under shadow CR3)
 - **工作树**：clean（已提交）
-- **进行中**：near-NULL livelock 修复 v2（保持隐匿性版），已编译，待部署测试
+- **进行中**：移除 #PF 展宽，已编译+签名，待部署测试
 - **下一步**：部署测试（停驱动 -> kill游戏 -> 部署新驱动 -> 启动Ophion -> 启动TestEptHook -> 模块快照 -> 启动游戏 -> 注入）
 - **铁律**：永远不在 real PTE 上清 NX 位（隐匿性不可丢失），只改 shadow PT 副本
 ## 变更日志
+### 2026-08-12 17:21  [session 55]
+- 动作：接管 + 分析 #PF 展宽根因 + 完全移除 #PF 展宽 + 编译 + 提交
+- 背景：He 指出 data 页就是读写，为什么 #PF 要拦截，直接丢给 guest 处理
+- 根因分析：
+  - #PF 展宽（mask=0/match=0）把所有 #PF 都拉进 VM-exit
+  - reinj breaker (ws>=32) 和 pfloop breaker (wps>=128) 关闭 shadow 窗口时不调 ept_update_pf_intercept()
+  - #PF mask/match 停在 0/0（展宽状态），data #PF 继续 VM-exit + reinject
+  - reinj_streak=2432 -> triple fault -> 硬重启
+- 修复：完全移除 #PF 展宽，#PF intercept 永远保持 NX-fetch-only (mask=0x15, match=0x15)
+  - data #PF（读写、NULL deref）不 VM-exit，guest 的 KiPageFault 在 shadow CR3 下直接处理
+  - 安全性：
+    - 已 present 的 data 页：不会 #PF（shadow PT == real PT for data pages）
+    - NULL deref (VA<0x10000)：PML4[0] not present -> access violation，无 demand paging，无 PFN 腐败
+    - 罕见 demand fault：MmAccessFault 改 shadow PTE（副本），real PTE 不动，隐匿性完好
+  - latch (g_near_null_shadow_disabled) 和 breaker 代码保留但变成死代码/无害
+- 移除 3 处展宽：
+  1. ept_stealth.cpp MODE_G/H shadow-open 路径
+  2. ept_stealth.cpp MODE_C shadow-open 路径
+  3. vmexit.cpp CR3-load reactivate 路径
+- 文件：ept_stealth.cpp, vmexit.cpp
+- 编译：Ophion.sys + TestEptHook.sys 成功签名
+- 提交：2f59ff1
+- 结论：等待 He 决定是否测试
 ### 2026-08-12 16:57  [session 54]
 - 动作：接管 + 移除 real PTE NX 清除死代码 + 修复 latch 路径保持隐匿性 + 编译 + 提交
 - 背景：commit 438e950 清除 real PTE NX 位破隐匿性，He 明确禁止
@@ -116,7 +140,8 @@
 - Bug 1（根因 - CR3 泄漏）：ept_stealth.cpp stealth_refresh_shadow_code_pte L1163
   - mx_enter_cr3(sp->guest_cr3) 在 L1099 切换 CR3 + 禁中断 + 刷 TLB
   - stealth_walk_pte 失败（real PTE not present，renderdoc 页被 page out）时
-  - eturn FALSE 在 L1163 跳过了 leave: 标签的 mx_leave_guest_cr3(saved_cr3)
+  - 
+eturn FALSE 在 L1163 跳过了 leave: 标签的 mx_leave_guest_cr3(saved_cr3)
   - 结果：中断永久禁用 + CR3 停在 guest 进程 CR3 + TLB 全刷 -> 系统卡死
   - 修复：在 return FALSE 前加 mx_leave_guest_cr3(saved_cr3);
 - Bug 2（用户态 livelock breaker 缺 total 计数）：vmexit.cpp L2653
@@ -188,12 +213,14 @@
 
 ## 关键发现
 - **【session 54】永远不在 real PTE 上清 NX 位**：He 明确禁止。real PTE NX=1 保持隐匿性（anti-cheat 看到 NX=1）。shadow PT 副本上 NX=0 即可让代码执行。latch 后开 shadow 不展宽 #PF 拦截，data #PF 由 guest 直接处理（不 VM-exit），打破 livelock。
-- **【session 52】TdStealthAllocPage 硬编码 target_pid=0 是 match 失败根因**：td_inject.cpp L1019 eq->target_pid = 0 导致所有 stealth page 走 CR3 fallback，KPTI 下 user CR3 ≠ kernel CR3 -> 匹配失败 -> NX #PF 未处理 -> 游戏崩。修复：传 target_pid 参数，PID 在 KPTI 下不变。- **【session 49】near-NULL data #PF (VA 0x12) 导致 triple fault**：stealth_sync_data_pte_in_window 对 near-NULL 地址同步 PML4[0] 返回 TRUE，保持 shadow CR3 活跃。Guest 重试真正未映射的地址 -> fetch<->data-#PF livelock -> shadow PML4 内核映射过时 -> 异常分发时 double fault -> triple fault -> 硬重启（无 dump）。修复：fault_addr < 0x10000 时 return FALSE。
+- **【session 52】TdStealthAllocPage 硬编码 target_pid=0 是 match 失败根因**：td_inject.cpp L1019 
+eq->target_pid = 0 导致所有 stealth page 走 CR3 fallback，KPTI 下 user CR3 ≠ kernel CR3 -> 匹配失败 -> NX #PF 未处理 -> 游戏崩。修复：传 target_pid 参数，PID 在 KPTI 下不变。- **【session 49】near-NULL data #PF (VA 0x12) 导致 triple fault**：stealth_sync_data_pte_in_window 对 near-NULL 地址同步 PML4[0] 返回 TRUE，保持 shadow CR3 活跃。Guest 重试真正未映射的地址 -> fetch<->data-#PF livelock -> shadow PML4 内核映射过时 -> 异常分发时 double fault -> triple fault -> 硬重启（无 dump）。修复：fault_addr < 0x10000 时 return FALSE。
 - **【session 49】PML4 sync 可能破坏 stealth**：PML4 sync 替换 shadow PML4 条目为 real PML4 条目。如果 stealth 页在同一 PML4 区域，sync 会用 real PDPT 替换 shadow PDPT，破坏 stealth。当前 near-NULL check 只防 VA < 0x10000。
 - **【session 38】CR3 窗口内禁止 HYPERPLATFORM_LOG_WARN_SAFE**：vmx_enter_cr3/vmx_leave_guest_cr3 窗口内只能有 stealth_walk_pte（安全范围）、shadow PTE 写（NonPaged pool）、INVVPID（VMX 指令）、CMOS markers（端口 I/O）、计数器自增（互锁内存写）。任何其他函数调用都可能触发不可恢复的 host #PF -> pf_panic -> jmp $ -> CPU 卡死。
 - **【session 38】W.log pf_err 字段存储 streak 值**：wedge_cmos_snap_reinj 存储 pf_va=addr, pf_err=streak。pfloop 检测器和 reinj 检测器都写同一 CMOS 字段。pf_err=0x180=384 是 pfloop_streak。
 - **【session 38】FALSE-path breaker 必须重置 pfloop_streak**：之前只重置 reinj_streak 和 reinj_total，导致 pfloop_streak 持续增长，每 8 次 #PF 触发一次 CMOS snap。
-- **【session 37】CR3 泄漏 = 系统卡死根因**：stealth_refresh_shadow_code_pte 的 eturn FALSE 跳过 mx_leave_guest_cr3。renderdoc 页 page out 后触发。所有 vmx_enter_cr3/vmx_leave_guest_cr3 对之间的 early return 都必须先调 leave。
+- **【session 37】CR3 泄漏 = 系统卡死根因**：stealth_refresh_shadow_code_pte 的 
+eturn FALSE 跳过 mx_leave_guest_cr3。renderdoc 页 page out 后触发。所有 vmx_enter_cr3/vmx_leave_guest_cr3 对之间的 early return 都必须先调 leave。
 - **【session 37】FALSE-path breaker 必须独立清 shadow window**：不能全调 stealth_pf_abort_shadow_window（会冲突 MTF 和 #PF interception），需要手动恢复 CR3 + 清状态 + 禁 CR3-load/store exiting。
 - **【session 37】write-protected reject 路径 (L1836) 是 shadow window 泄漏的边界 case**：ept_stealth_handle_pf 中唯一的 return FALSE 不 abort 路径（已修）。
 - **【session 37】用户态 livelock breaker 缺 total 兜底**：内核态有 wtotal>=4，用户态只有 ws>=32。交替地址永远到不了。

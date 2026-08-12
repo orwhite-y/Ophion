@@ -3,16 +3,37 @@
 > 记录已完成、进行中、待办的工作。上下文压缩后必读。
 
 ## 当前状态
-## 当前状态
 - **项目路径**：F:\winDriver\te\Ophion-master (驱动) + F:\winDriver\te\Ophion-master\renderdoc-1.36 (renderdoc)
-- **最近更新**：2026-08-12 17:21
-- **最近会话**：session-55
-- **HEAD**：2f59ff1 (fix: remove #PF widening entirely -- data #PFs handled by guest under shadow CR3)
+- **最近更新**：2026-08-12 19:30
+- **最近会话**：session-57
+- **HEAD**：71c82c2 (fix: add VMCALL #UD livelock breaker)
 - **工作树**：clean（已提交）
-- **进行中**：移除 #PF 展宽，已编译+签名，待部署测试
+- **进行中**：VMCALL #UD livelock breaker 已编译+签名，待部署测试
 - **下一步**：部署测试（停驱动 -> kill游戏 -> 部署新驱动 -> 启动Ophion -> 启动TestEptHook -> 模块快照 -> 启动游戏 -> 注入）
 - **铁律**：永远不在 real PTE 上清 NX 位（隐匿性不可丢失），只改 shadow PT 副本
+
 ## 变更日志
+### 2026-08-12 19:30  [session 57]
+- 动作：接管 + 分析 VMCALL livelock 根因 + 添加 VMCALL #UD streak breaker + 编译 + 签名 + 提交
+- 背景：注入后硬重启（无 dump），W.log 显示 marker=0x23 (trigger TID match), trig_seen=0, reinj_streak=384 at 0x12 (VMCALL exit reason 18)
+- 根因分析：
+  - VMCALL 被排除在全局 reason-streak bugcheck 之外 (L2186: exit_reason != VMX_EXIT_REASON_EXECUTE_VMCALL)
+  - VMCALL handler 对不认识的 VMCALL 注入 #UD + advance_rip=FALSE (L1904)
+  - #UD 不被 hypervisor 拦截 -> guest #UD handler 运行 -> 返回同一 VMCALL 指令 -> 无限循环
+  - 现有 RIP-stuck breaker 在 wrs>=512 (user-mode) 应该能捕获，但系统在到达 512 之前硬重启
+  - 384 = 3*128 是 reason_streak 的 snap 点，说明至少 384 次连续 VMCALL exit
+- 修复（VMCALL #UD livelock breaker）：
+  - 新增 per-CPU 计数器 g_vmcall_ud_streak[64] + g_vmcall_ud_last_rip[64]
+  - 在 VMCALL handler 的 #UD 路径 (vmexit_inject_ud 之前) 检查连续未识别 VMCALL
+  - 同一 RIP 连续 16 次未识别 VMCALL -> wedge_cmos_mark(0x26) + hv_panic -> KeBugCheckEx (获取 dump)
+  - 16 次远在 watchdog 超时之内，确保在硬重启前获取 dump
+  - VMCALL_UD_BREAK_THRESHOLD=16
+- 额外：driver.cpp wn[] 数组扩展到 0x26 (0x20=EPT-violation, 0x23=trig-TID-match, 0x25=stealth-EPT-viol, 0x26=VMCALL-livelock)
+- 文件：vmexit.cpp, driver.cpp
+- 编译：Ophion.sys + TestEptHook.sys 成功签名
+- 提交：71c82c2
+- 结论：等待部署测试。dump 将显示 VMCALL RIP，可与 NtTestAlert (0x7FFFDB870DC0) 对比确定匹配失败原因
+
 ### 2026-08-12 17:21  [session 55]
 - 动作：接管 + 分析 #PF 展宽根因 + 完全移除 #PF 展宽 + 编译 + 提交
 - 背景：He 指出 data 页就是读写，为什么 #PF 要拦截，直接丢给 guest 处理

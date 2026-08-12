@@ -4,14 +4,43 @@
 
 ## 当前状态
 - **项目路径**：F:\winDriver\te\Ophion-master (驱动) + F:\winDriver\te\Ophion-master\renderdoc-1.36 (renderdoc)
-- **最近更新**：2026-08-12 12:45
-- **最近会话**：session-41
-- **基线**：HEAD = 020ec66
-- **工作树**：ept_stealth.cpp + vmexit.cpp + ept_hook.cpp + breadcrumb.cpp + PROCESS.md 有未提交改动
-- **进行中**：triple fault修复已验证成功（系统不再硬重启），转向调查shellcode access violation
-- **下一步**：调查为什么shellcode在RESIDENT+0x400处access violation，#PF没VM-exit
+- **最近更新**：2026-08-12 14:18
+- **最近会话**：session-48
+- **基线**：HEAD = 041ccc9
+- **工作树**：clean（已提交 session 48 修复）
+- **进行中**：KPTI CR3 修复已编译，待部署测试
+- **下一步**：部署测试（停驱动 -> kill游戏 -> 部署新驱动 -> 启动Ophion -> 启动TestEptHook -> 模块快照 -> 启动游戏 -> 注入）
 
 ## 变更日志
+### 2026-08-12 14:18  [session 48]
+- 动作：接管 + 分析 W.log/T.log/BC.log + 修复 KPTI CR3 mismatch + 编译 + 提交
+- 根因分析（He 的问题：注入后系统卡死）：
+  - W.log: marker=0x13 (boot), trig_seen=0, match_seen=0
+  - T.log: cleanup 在 thread resume 后 2ms 执行（13:35:16.733 -> .735）
+  - BC.log: 只有 3 个 init 事件，无 #PF 事件
+  - 根因：KPTI 使 user/kernel CR3 有不同的 PML4 物理地址
+  - EPT violation handler (L1004) 和 VMCALL handler (L1490) 比较 guest_cr3 (user) 和 target_cr3 (kernel)
+  - 不匹配 -> trigger 线程被当非目标进程 passthrough -> VMCALL 永远不触发
+- 修复：
+  - Bug 1（根因 - KPTI CR3 mismatch）：ept_hook.cpp + hv_types.h
+    - 新增 has_tid_filter 字段到 EPT_HOOKED_PAGE_INFO
+    - 3 处 hook install 路径设置 has_tid_filter
+    - EPT violation handler (L1007) + VMCALL handler (L1493) 跳过 CR3 预过滤
+    - TID 过滤是 TID-filtered hook 的权威过滤器
+  - Bug 2（cleanup poll 太快）：td_pe_mapper.cpp
+    - -1ms/10000 -> -10ms/2000 (20s max)
+    - LOG_INFO -> LOG_WARN (fired= 消息可见)
+  - Bug 3（VMCALL 无诊断标记）：ept_hook.cpp
+    - wedge_cmos_mark(0x01) 在 trigger fire 后写入
+  - Bug 4（#PF safe range 不够）：ept_stealth.cpp
+    - 扩展包含 stealth_sync_data_pte_in_window + stealth_refresh_shadow_code_pte
+    - 加了前向声明
+  - Bug 5（PML4 sync 无 KPTI fallback）：ept_stealth.cpp L927
+    - stealth_real_va(sp, real_cr3) 返回 NULL 时 fallback 到 sp->guest_cr3
+- 文件：hv_types.h, ept_hook.cpp, ept_stealth.cpp, td_pe_mapper.cpp, td_common.h, td_inject.cpp, td_shadow.cpp, vmexit.cpp
+- 编译：Ophion.sys + TestEptHook.sys 成功签名
+- 提交：041ccc9
+- 结论：等待 He 决定是否测试
 ### 2026-08-12 14:30  [session 37]
 - 动作：接管 + 分析 stealth #PF handler + 修复4个 bug + 编译
 - 根因分析（He 的问题：stealth #PF handler 为什么不判断是不是目标页）：

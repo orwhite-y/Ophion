@@ -498,7 +498,6 @@ stealth_pf_abort_shadow_window(VIRTUAL_MACHINE_STATE * vcpu)
 #endif
 }
 
-
 //
 // Public wrapper for stealth_pf_abort_shadow_window - called from vmexit.cpp
 // liveloop breakers when a shadow window is stuck in a #PF or MOV_CR loop.
@@ -583,7 +582,6 @@ stealth_clear_stale_window(VIRTUAL_MACHINE_STATE * vcpu)
     }
 #endif
 }
-
 
 // =========================================================================
 //  VMX-root diagnostic: mid-window data-#PF forensics
@@ -718,8 +716,10 @@ stealth_real_va(PEPT_STEALTH_PAGE_INFO sp, UINT64 pa)
                 return rpm[i].va;
         }
     }
-    // Fallback: pa_to_va (single-CPU VMX-root only, NOT safe under KeGenericCallDpc)
-    return pa_to_va(page_pa);
+    // Fallback: return NULL instead of pa_to_va. MmGetVirtualForPhysical can
+    // deadlock on PFN DB lock in VMX-root -> WHEA 0x124 hard reset (no dump).
+    // Caller (stealth_walk_pte) handles NULL by returning FALSE -> abort+reinject.
+    return NULL;
 }
 
 //
@@ -922,11 +922,8 @@ stealth_sync_data_pte_in_window(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr,
         {
             *cow_spte = cow_want;
             _InterlockedIncrement(&g_dbg_a2_data_synced);
-            if (_InterlockedIncrement(&g_dbg_a2_data_synced_logged) <= 64)
-                HYPERPLATFORM_LOG_WARN_SAFE(
-                    "[stealth-a2] cow-fix fa=%llx ec=%x rip=%llx real_pte=%llx "
-                    "cow_want=%llx",
-                    fault_addr, error_code, vcpu->vmexit_rip, real_pte, cow_want);
+            _InterlockedIncrement(&g_dbg_a2_data_synced_logged);  // cow-fix (logging removed: unsafe under guest CR3)
+
         }
         result = TRUE;
         goto done;
@@ -951,11 +948,8 @@ stealth_sync_data_pte_in_window(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr,
     {
         *spte = want;
         _InterlockedIncrement(&g_dbg_a2_data_synced);
-        if (_InterlockedIncrement(&g_dbg_a2_data_synced_logged) <= 64)
-            HYPERPLATFORM_LOG_WARN_SAFE(
-                "[stealth-a2] data-sync fa=%llx ec=%x rip=%llx real_pte=%llx "
-                "shadow_was=%llx want=%llx",
-                fault_addr, error_code, vcpu->vmexit_rip, real_pte, old, want);
+        _InterlockedIncrement(&g_dbg_a2_data_synced_logged);  // data-sync (logging removed: unsafe under guest CR3)
+
     }
 
     result = TRUE;
@@ -1103,15 +1097,7 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
     // the shadow PML4 (a NonPaged-pool page, resolved via system PTE in the kernel
     // half) must return non-NULL. NULL means the guest kernel CR3 does not map the
     // kernel half (e.g. wrong CR3 captured) and the heal cannot proceed.
-    static volatile LONG s_shpml4_diag_done = 0;
-    if (!_InterlockedExchange(&s_shpml4_diag_done, 1))
-    {
-        PVOID shpml4_va = (PVOID)(sp->shadow_cr3_phys ? (sp->shadow_cr3_phys & PFN_MASK) : 0);  // skip pa_to_va in VMX-root
-        HYPERPLATFORM_LOG_WARN_SAFE(
-            "[stealth-a2] DIAG shadow-pml4 pa=%llx va=%llx (NULL=kernel-cr3-broken) "
-            "guest_cr3=%llx real_cr3=%llx fa=%llx",
-            sp->shadow_cr3_phys & PFN_MASK, (UINT64)shpml4_va, sp->guest_cr3, real_cr3, fault_addr);
-    }
+    // shadow-pml4 diag removed: HYPERPLATFORM_LOG_WARN_SAFE under guest CR3 can host-#PF -> pf_panic
 
     UINT64 real_pte = 0;
     wedge_cmos_mark(0x05);  // WEDGE-E (pre-walk)
@@ -1124,45 +1110,13 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
         // to localize the failure: 0xDEAD = stealth_real_va NULL at that level
         // (real page not in the map), 0 = not-present entry, non-zero with bit7
         // = large page.
-        if (_InterlockedIncrement(&g_dbg_a2_code_enter_logged) <= 200)
-        {
-            static const UINT32 dsh[4] = { 39, 30, 21, 12 };
-            UINT64 dpa = real_cr3 & PFN_MASK;
-            UINT64 e0 = 0, e1 = 0, e2 = 0, e3 = 0;
-            for (UINT32 lvl = 0; lvl < 4; lvl++)
-            {
-                PUINT64 t = (PUINT64)stealth_real_va(sp, dpa);
-                UINT64 ev;
-                if (!t) { ev = 0xDEADULL; }
-                else
-                {
-                    ev = t[(fault_addr >> dsh[lvl]) & 0x1FF];
-                    if (!(ev & 1) || (ev & (1ULL << 7)))
-                    {
-                        if (lvl == 0) e0 = ev;
-                        else if (lvl == 1) e1 = ev;
-                        else if (lvl == 2) e2 = ev;
-                        else e3 = ev;
-                        break;
-                    }
-                    if (lvl == 3) { e3 = ev; break; }
-                    dpa = ev & PFN_MASK;
-                    continue;
-                }
-                if (lvl == 0) e0 = ev;
-                else if (lvl == 1) e1 = ev;
-                else if (lvl == 2) e2 = ev;
-                else e3 = ev;
-                break;
-            }
-            HYPERPLATFORM_LOG_WARN_SAFE(
-                "[stealth-a2] code-refresh BAIL-realwalk fa=%llx rip=%llx cr3=%llx ok=%d pte=%llx pml4=%llx pdpt=%llx pd=%llx pt=%llx",
-                fault_addr, vcpu->vmexit_rip, real_cr3, (int)walk_ok, real_pte,
-                e0, e1, e2, e3);
-        }
+        _InterlockedIncrement(&g_dbg_a2_code_enter_logged);  // bail-realwalk (diag logging removed: unsafe under guest CR3)
+
+        vmx_leave_guest_cr3(saved_cr3);
         return FALSE;
     }
 
+    wedge_cmos_mark(0x07);  // WEDGE-E3 (pre-shadow-write)
     {
         // Direct shadow-PTE write via the pre-computed NonPaged-pool VA the
         // TestDriver passed at install (sp->shadow_pte_va). This replaces the
@@ -1182,10 +1136,8 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
 
         if (!spte)
         {
-            if (_InterlockedIncrement(&g_dbg_a2_code_enter_logged) <= 200)
-                HYPERPLATFORM_LOG_WARN_SAFE(
-                    "[stealth-a2] code-refresh BAIL-noshadowpteva fa=%llx rip=%llx",
-                    fault_addr, vcpu->vmexit_rip);
+            _InterlockedIncrement(&g_dbg_a2_code_enter_logged);  // BAIL-noshadowpteva (logging removed)
+
             goto leave;
         }
 
@@ -1207,31 +1159,22 @@ stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu,
                 asm_invvpid(InvvpidSingleContext, &desc);
 
             _InterlockedIncrement(&g_dbg_a2_code_synced);
-            if (_InterlockedIncrement(&g_dbg_a2_code_synced_logged) <= 64)
-            {
-                HYPERPLATFORM_LOG_WARN_SAFE(
-                    "[stealth-a2] code-sync fa=%llx rip=%llx "
-                    "real_pte=%llx shadow_was=%llx want=%llx sh_pml4=%llx",
-                    fault_addr, vcpu->vmexit_rip, real_pte, s, want,
-                    sp->shadow_cr3_phys);
-            }
+            _InterlockedIncrement(&g_dbg_a2_code_synced_logged);  // code-sync (logging removed)
+
         }
         else
         {
             // shadow PTE already matches real PFN (NX cleared): no staleness
             // detectable by PFN compare. Logging this proves the refresh
             // path IS reached and the comparison ran.
-            if (_InterlockedIncrement(&g_dbg_a2_code_enter_logged) <= 200)
-                HYPERPLATFORM_LOG_WARN_SAFE(
-                    "[stealth-a2] code-refresh MATCH fa=%llx rip=%llx "
-                    "real_pte=%llx shadow_pte=%llx",
-                    fault_addr, vcpu->vmexit_rip, real_pte, s);
+            _InterlockedIncrement(&g_dbg_a2_code_enter_logged);  // MATCH (logging removed)
+
         }
     }
 
+    wedge_cmos_mark(0x08);  // WEDGE-E4 (post-shadow-write, pre-leave)
 
     // P=0 reactive sync: no cross-2MB scan needed. Data PTEs start P=0 and
-    // are synced on first access via stealth_sync_data_pte_in_window.
     // Code PTEs are synced on every code-enter above (individual refresh).
     // Stale PFN is impossible: P=0 forces a fresh read from real PT on every
     // first access. The only sync needed is the single code PTE refresh above.
@@ -1832,6 +1775,8 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             {
                 _InterlockedIncrement(&g_dbg_shadow_pf_reject);
                 stealth_diag_midwin_pf(vcpu, fault_addr, error_code, "reject", sp);
+                if (vcpu->nx_timer_real_cr3)
+                    stealth_pf_abort_shadow_window(vcpu);
                 return FALSE;
             }
             _InterlockedIncrement(&g_dbg_shadow_pf_allowed);
@@ -2666,3 +2611,4 @@ rollback:
         ept_stealth_free_range(target_va, (SIZE_T)page_count * PAGE_SIZE);
     return FALSE;
 }
+

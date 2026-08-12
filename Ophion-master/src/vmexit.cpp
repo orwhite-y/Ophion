@@ -2474,6 +2474,12 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
             if (int_info.Vector == EXCEPTION_VECTOR_PAGE_FAULT &&
                 int_info.InterruptionType == INTERRUPT_TYPE_HARDWARE_EXCEPTION)
             {
+                // One-shot CMOS marker: record that #PF handler was entered.
+                // Interlocked compare-exchange writes only once to avoid port
+                // I/O storm during #PF livelock.
+                static volatile LONG g_pf_entry_marked = 0;
+                if (_InterlockedCompareExchange(&g_pf_entry_marked, 1, 0) == 0)
+                    wedge_cmos_mark(0x0E);
                 size_t pf_error_code = 0;
                 __vmx_vmread(VMCS_VMEXIT_INTERRUPTION_ERROR_CODE, &pf_error_code);
                 // bit 4 = instruction fetch (I/D flag), bit 1 = write access.
@@ -2515,6 +2521,31 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                                 wedge_cmos_snap_reinj((UINT32)wps, pfa);
                         } else if (wps >= 8 && (wps & 0x7) == 0)
                             wedge_cmos_snap_reinj((UINT32)wps, pfa);
+                        // Pfloop breaker: if same-address #PF streak >= 128,
+                        // the fault is unrecoverable. Close shadow window and
+                        // reset streaks. #PF stays intercepted (no passthrough ->
+                        // no triple fault). Re-inject path below delivers #PF
+                        // to guest under real CR3 where page tables are correct.
+                        if (wps >= 128) {
+                            if (vcpu->nx_timer_real_cr3) {
+                                __vmx_vmwrite(VMCS_GUEST_CR3, vcpu->nx_timer_real_cr3);
+                                vcpu->nx_timer_restore = NULL;
+                                vcpu->nx_timer_real_cr3 = 0;
+                                vcpu->shadow_extended = FALSE;
+                                vcpu->shadow_pending = FALSE;
+                                vcpu->shadow_real_cr3 = 0;
+                                vcpu->shadow_cr3_val = 0;
+                                SIZE_T _pc4 = 0;
+                                __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &_pc4);
+                                _pc4 &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_CR3_LOAD_EXITING;
+                                _pc4 &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_CR3_STORE_EXITING;
+                                __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, _pc4);
+                            }
+                            wedge_cmos_mark(0x0C);
+                            _InterlockedExchange(&g_wedge_pfloop_streak[wcpu_pf], 0);
+                            _InterlockedExchange(&g_wedge_reinj_streak[wcpu_pf], 0);
+                            _InterlockedExchange(&g_wedge_reinj_total[wcpu_pf], 0);
+                        }
                     }
                 }
 
@@ -2545,20 +2576,15 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                         ULONG _bcpu = KeGetCurrentProcessorNumberEx(NULL);
                         if (_bcpu < 64 && g_wedge_pfloop_streak[_bcpu] >= 48)
                         {
+                            // Abort shadow window only. DO NOT clear exception
+                            // bitmap or set MTF (passthrough): passthrough lets
+                            // guest run KiPageFault natively, but if the fault is
+                            // unrecoverable (near-NULL deref 0x12) -> double fault
+                            // -> triple fault -> hard reset (no dump). Instead keep
+                            // #PF intercepted, abort shadow window, fall through to
+                            // re-inject so guest handles under real CR3.
                             ept_stealth_abort_shadow_window(vcpu);
-                            {
-                                size_t _ebm = 0;
-                                __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &_ebm);
-                                _ebm &= ~(1ULL << EXCEPTION_VECTOR_PAGE_FAULT);
-                                __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, _ebm);
-                            }
-                            {
-                                SIZE_T _pc = 0;
-                                __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &_pc);
-                                _pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
-                                __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, _pc);
-                            }
-                            vcpu->pf_passthrough_armed = TRUE;
+                            wedge_cmos_mark(0x0A);
                             _InterlockedExchange(&g_wedge_pfloop_streak[_bcpu], 0);
                             _InterlockedExchange(&g_wedge_reinj_streak[_bcpu], 0);
                             _InterlockedExchange(&g_wedge_reinj_total[_bcpu], 0);
@@ -2650,22 +2676,33 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
                         if ((wfa >> 47) & 1) {
                             if (wtotal >= 4 || ws >= 32) do_reinj_break = TRUE;
                         } else {
-                            if (ws >= 32) do_reinj_break = TRUE;
+                            if (ws >= 32 || wtotal >= 64) do_reinj_break = TRUE;
                         }
                         if (do_reinj_break) {
-                            size_t exc_bm = 0;
-                            __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bm);
-                            exc_bm &= ~(1ULL << EXCEPTION_VECTOR_PAGE_FAULT);
-                            __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bm);
-                        
-                            SIZE_T pc2 = 0;
-                            __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc2);
-                            pc2 |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
-                            __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc2);
-                        
-                            vcpu->pf_passthrough_armed = TRUE;
+                            // DO NOT clear exception bitmap / set MTF (passthrough):
+                            // passthrough -> guest runs KiPageFault natively -> if
+                            // fault is unrecoverable (near-NULL 0x12) -> double fault
+                            // -> triple fault -> hard reset (no dump). Instead keep
+                            // #PF intercepted, close shadow window, re-inject so guest
+                            // handles under real CR3 where page tables are correct.
+                            if (vcpu->nx_timer_real_cr3) {
+                                __vmx_vmwrite(VMCS_GUEST_CR3, vcpu->nx_timer_real_cr3);
+                                vcpu->nx_timer_restore = NULL;
+                                vcpu->nx_timer_real_cr3 = 0;
+                                vcpu->shadow_extended = FALSE;
+                                vcpu->shadow_pending = FALSE;
+                                vcpu->shadow_real_cr3 = 0;
+                                vcpu->shadow_cr3_val = 0;
+                                SIZE_T pc3 = 0;
+                                __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc3);
+                                pc3 &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_CR3_LOAD_EXITING;
+                                pc3 &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_CR3_STORE_EXITING;
+                                __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc3);
+                            }
+                            wedge_cmos_mark(0x0B);
                             _InterlockedExchange(&g_wedge_reinj_streak[wcpu], 0);
                             _InterlockedExchange(&g_wedge_reinj_total[wcpu], 0);
+                            _InterlockedExchange(&g_wedge_pfloop_streak[wcpu], 0);
                             hv_breadcrumb_cpu(0x0109, vcpu->core_id, wfa);
                         }
                     }

@@ -69,23 +69,22 @@ static NTSTATUS hv_breadcrumb_write_log(VOID)
         OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
     IO_STATUS_BLOCK iosb = {};
     HANDLE h = NULL;
-    NTSTATUS st = ZwCreateFile(&h, FILE_GENERIC_WRITE, &oa, &iosb,
-        NULL, FILE_ATTRIBUTE_NORMAL, 0, FILE_OVERWRITE_IF,
-        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_WRITE_THROUGH, NULL, 0);
-    /* FILE_WRITE_THROUGH: every write is flushed to disk before completing, so BC.log
-     * survives a hard reset (triple-fault) up to the last 500ms flush cycle. */
-    if (!NT_SUCCESS(st) || !h)
-    {
-        static volatile LONG _bc_log_fail_logged = 0;
-        if (_InterlockedCompareExchange(&_bc_log_fail_logged, 1, 0) == 0)
-            HYPERPLATFORM_LOG_ERROR("[hv] BC.log ZwCreateFile FAILED st=0x%lx", (ULONG)st);
-        return st;
-    }
-
-    // Wrap writes in SEH: ZwWriteFile -> NtWriteFile -> Ntfs can AV if the
-    // hypervisor EPT/shadow corrupts FS internal structures. BC.log is
-    // debug-only; swallow exceptions rather than 0x1E BSOD.
+    // Wrap ENTIRE file operation in SEH: ZwCreateFile -> NtCreateFile ->
+    // Ntfs can AV/GP during create (NtfsCommitCurrentTransaction -> LfsFlush ->
+    // NtfsTransformUsaBlock -> memcpy GP fault). BC.log is debug-only;
+    // swallow ALL exceptions rather than 0x1E BSOD.
     __try {
+        NTSTATUS st = ZwCreateFile(&h, FILE_GENERIC_WRITE, &oa, &iosb,
+            NULL, FILE_ATTRIBUTE_NORMAL, 0, FILE_OVERWRITE_IF,
+            FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_WRITE_THROUGH, NULL, 0);
+        if (!NT_SUCCESS(st) || !h)
+        {
+            static volatile LONG _bc_log_fail_logged = 0;
+            if (_InterlockedCompareExchange(&_bc_log_fail_logged, 1, 0) == 0)
+                HYPERPLATFORM_LOG_ERROR("[hv] BC.log ZwCreateFile FAILED st=0x%lx", (ULONG)st);
+            return st;
+        }
+
         // Write header
         char hdr[128];
         LARGE_INTEGER off = { 0 };
@@ -126,12 +125,17 @@ static NTSTATUS hv_breadcrumb_write_log(VOID)
                 ZwWriteFile(h, NULL, NULL, NULL, &iosb, line, (ULONG)ll, &off, NULL);
             off.QuadPart += ll;
         }
+
+        ZwClose(h);
+        h = NULL;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Ntfs AV during ZwWriteFile. Skip remaining writes.
+        // Ntfs AV/GP during ZwCreateFile or ZwWriteFile. BC.log is debug-only.
+        if (h) {
+            __try { ZwClose(h); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
     }
 
-    __try { ZwClose(h); } __except (EXCEPTION_EXECUTE_HANDLER) {}
     return STATUS_SUCCESS;
 }
 

@@ -2136,8 +2136,22 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
             // legitimately issues thousands of consecutive VMCALLs from
             // hv_vmcall_simple (same reason+RIP) without other exit types in
             // between. wrs>=65536 still catches genuine VMCALL liveloops (~130ms).
-            if ((ws >= 4096 && exit_reason != VMX_EXIT_REASON_EXECUTE_VMCALL) || wrs >= 65536)
+            //
+            // RIP-stuck livelock breaker (user-mode): the stealth shadow-CR3
+            // fetch<->data #PF cycle (fetch on NX stealth page -> shadow window
+            // opens -> data #PF on stale shadow PML4 -> abort+reinject -> resolve
+            // -> back to fetch) has the SAME guest RIP for both #PFs. The per-
+            // address breakers (reinj/pfloop) never fire because the addresses
+            // differ. The RIP-stuck streak grows unbounded -> system hard reset.
+            // At wrs>=512 for user-mode RIP (bit47=0), bugcheck for a dump before
+            // the watchdog hard-reset (which produces no dump).
+            BOOLEAN user_mode_rip_snap = ((vcpu->vmexit_rip >> 47) & 1) == 0;
+            if ((ws >= 4096 && exit_reason != VMX_EXIT_REASON_EXECUTE_VMCALL) ||
+                wrs >= 65536 ||
+                (wrs >= 512 && user_mode_rip_snap))
             {
+                if (wrs >= 512 && wrs < 65536 && user_mode_rip_snap)
+                    wedge_cmos_mark(0x0D);
                 hv_panic(HV_PANIC_UNHANDLED_EXIT, (UINT64)exit_reason,
                          vcpu->vmexit_rip, (UINT64)wcpu);
             }

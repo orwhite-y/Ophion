@@ -388,6 +388,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
                     efi->handler_function = req->proxy_function;
                     efi->oneshot = req->oneshot;
                     efi->expected_tid = req->expected_tid;
+        existing->has_tid_filter = (req->expected_tid != 0);
                     efi->hook_type = req->hook_type;
                     efi->external_fired = req->external_fired;
 
@@ -488,6 +489,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
             fi->handler_function   = req->proxy_function;
             fi->oneshot            = req->oneshot;
             fi->expected_tid       = req->expected_tid;
+            existing->has_tid_filter = (req->expected_tid != 0);
             fi->hook_type          = req->hook_type;
             fi->external_fired     = req->external_fired;
 
@@ -628,6 +630,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     fi->handler_function   = req->proxy_function;
     fi->oneshot            = req->oneshot;
     fi->expected_tid       = req->expected_tid;
+    hp->has_tid_filter     = (req->expected_tid != 0);
     fi->hook_type          = req->hook_type;
     fi->external_fired     = req->external_fired;
 
@@ -1001,7 +1004,7 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
             // other processes get a temporary RWX pass-through via MTF single-step,
             // executing original code transparently.
             //
-            if (hp->target_cr3 != 0)
+            if (hp->target_cr3 != 0 && !hp->has_tid_filter)
             {
                 UINT64 guest_cr3 = 0;
                 __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
@@ -1487,7 +1490,7 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
         // non-target processes should never reach here (violation handler
         // gives them original code), but check CR3 as safety net.
         //
-        if (hp->target_cr3 != 0)
+        if (hp->target_cr3 != 0 && !hp->has_tid_filter)
         {
             UINT64 guest_cr3 = 0;
             __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
@@ -1554,7 +1557,10 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                         g_wedge_heal_marker[KeGetCurrentProcessorNumberEx(NULL) & 0x3F] = 0x01;  // [in-mem]
                         // Throttle: one-time CMOS write (trigger fires once per run)
                         if (_InterlockedCompareExchange(&g_wedge_trig_seen_flag, 1, 0) == 0)
+                        {
                             wedge_cmos_set_trig_seen();  // sticky: the injection trigger fired this run
+                            wedge_cmos_mark(0x01);       // A-trig-fire: per-CPU + global CMOS diagnostic
+                        }
                         return TRUE;
                     }
 

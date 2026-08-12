@@ -2,7 +2,7 @@
 #include <stealth.h>
 
 // =========================================================================
-//  DLL gap finder ÈóÅ?find unused page-aligned gap in an image's VA range.
+//  DLL gap finder Èó?find unused page-aligned gap in an image's VA range.
 //
 //  walks PE section headers to find alignment padding between sections
 //  or after the last section. returns a committed page of zeros that
@@ -12,7 +12,7 @@
 // =========================================================================
 
 //
-// find section tail padding in a DLL ÈóÅ?unused zero bytes at the end of
+// find section tail padding in a DLL Èó?unused zero bytes at the end of
 // a section's last page. no full-page gap needed.
 //
 // returns page-aligned VA of the page containing padding.
@@ -45,7 +45,7 @@ TdFindSectionPadding(PVOID image_base, SIZE_T min_size, ULONG * out_offset, ULON
 
         //
         // find section with most tail padding on its last page.
-        // prefer executable sections (.text) ÈóÅ?shellcode blends in better.
+        // prefer executable sections (.text) Èó?shellcode blends in better.
         //
         for (i = 0; i < num_sections; i++)
         {
@@ -170,18 +170,18 @@ TdFindGapInProcess(SIZE_T min_size, ULONG * out_offset, ULONG * out_avail)
 }
 
 // =========================================================================
-//  PE Manual Mapper ÈóÅ?kernel-side DLL loading, zero R3 API calls
+//  PE Manual Mapper Èó?kernel-side DLL loading, zero R3 API calls
 //
 //  flow:
-//    1. injector reads DLL file ÈóÅ?sends raw bytes via IOCTL_INJECT_DLL
+//    1. injector reads DLL file Èó?sends raw bytes via IOCTL_INJECT_DLL
 //    2. driver attaches to target process
 //    3. ZwAllocateVirtualMemory(PAGE_READWRITE) for image
 //    4. copy sections, apply relocations, resolve imports (PEB walk)
 //    5. build DllMain stub at image base (overwrites DOS header)
 //    6. clear PE signature from header
-//    7. ZwProtectVirtualMemory ÈóÅ?PAGE_EXECUTE_READ for executable sections
-//    8. EPT hook NtTestAlert ÈóÅ?DllMain stub (oneshot, per-process CR3 filter)
-//    9. create thread at NtTestAlert ÈóÅ?DllMain runs ÈóÅ?thread exits
+//    7. ZwProtectVirtualMemory Èó?PAGE_EXECUTE_READ for executable sections
+//    8. EPT hook NtTestAlert Èó?DllMain stub (oneshot, per-process CR3 filter)
+//    9. create thread at NtTestAlert Èó?DllMain runs Èó?thread exits
 //
 //  result: DLL is loaded without LoadLibrary, no module list entry,
 //  no load image notification, no file access from target process.
@@ -209,8 +209,8 @@ TdFindGapInProcess(SIZE_T min_size, ULONG * out_offset, ULONG * out_avail)
 //
 
 //
-// TdFindModuleBaseA ÈóÅ?find loaded module by ASCII name via PEB walk.
-// walks PEB ÈóÅ?Ldr ÈóÅ?InMemoryOrderModuleList. compares BaseDllName
+// TdFindModuleBaseA Èó?find loaded module by ASCII name via PEB walk.
+// walks PEB Èó?Ldr Èó?InMemoryOrderModuleList. compares BaseDllName
 // (Unicode) with the given ASCII name (case-insensitive).
 // must be called while attached to the target process.
 //
@@ -278,7 +278,7 @@ TdFindModuleBaseA(const char * name_ascii, ULONG * out_size)
                 else
                 {
                     // match without extension: BaseDllName could be "foo.dll"
-                    // name_ascii is "foo" ÈóÅ?compare first name_len chars,
+                    // name_ascii is "foo" Èó?compare first name_len chars,
                     // then check remaining is ".dll"
                     if (wchar_count == name_len + 4)
                     {
@@ -333,7 +333,7 @@ TdFindModuleBaseA(const char * name_ascii, ULONG * out_size)
 }
 
 //
-// TdFindExportByName ÈóÅ?find export by name from a module's export table.
+// TdFindExportByName Èó?find export by name from a module's export table.
 // walks PE export directory. returns function VA. skips forwarded exports
 // (returns NULL for forwards).
 //
@@ -476,7 +476,7 @@ TdFindExportByNameEx(PVOID module_base, const char * func_name, ULONG depth)
 
                 // check for forwarded export (RVA points inside export directory)
                 if (func_rva >= exp_rva && func_rva < exp_rva + exp_size)
-                    return NULL;  // forwarded ÈóÅ?skip
+                    return NULL;  // forwarded Èó?skip
 
                 return (PUINT8)module_base + func_rva;
             }
@@ -651,7 +651,7 @@ TdResolveDefaultTrigger(PEPROCESS proc, const char * log_prefix)
 }
 
 //
-// TdFindExportByOrdinal ÈóÅ?find export by ordinal from a module's export table.
+// TdFindExportByOrdinal Èó?find export by ordinal from a module's export table.
 //
 PVOID
 TdFindExportByOrdinal(PVOID module_base, USHORT ordinal)
@@ -691,7 +691,7 @@ TdFindExportByOrdinal(PVOID module_base, USHORT ordinal)
 }
 
 //
-// TdPeCopySections ÈóÅ?copy PE headers and sections from raw DLL to mapped image.
+// TdPeCopySections Èó?copy PE headers and sections from raw DLL to mapped image.
 //
 BOOLEAN
 TdPeCopySections(PVOID mapped_base, PUINT8 raw_dll, SIZE_T raw_size)
@@ -715,7 +715,7 @@ TdPeCopySections(PVOID mapped_base, PUINT8 raw_dll, SIZE_T raw_size)
 
             if (sec[i].SizeOfRawData == 0)
             {
-                // BSS ÈóÅ?zero the virtual range
+                // BSS Èó?zero the virtual range
                 ULONG virt_sz = sec[i].Misc.VirtualSize;
                 if (virt_sz > 0)
                     RtlZeroMemory(dst, virt_sz);
@@ -747,7 +747,7 @@ TdPeCopySections(PVOID mapped_base, PUINT8 raw_dll, SIZE_T raw_size)
 }
 
 //
-// TdPeRelocate ÈóÅ?apply base relocations.
+// TdPeRelocate Èó?apply base relocations.
 // returns TRUE on success, FALSE if no relocation table and delta != 0.
 //
 BOOLEAN
@@ -764,13 +764,13 @@ TdPeRelocate(PVOID mapped_base, PUINT8 raw_dll, UINT64 delta)
 
         if (!reloc_rva || !reloc_size)
         {
-            // no relocation table ÈóÅ?check if DLL has RELOCS_STRIPPED
+            // no relocation table Èó?check if DLL has RELOCS_STRIPPED
             if (nt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED)
             {
                 HYPERPLATFORM_LOG_ERROR("[td-map] no reloc table and delta != 0");
                 return FALSE;
             }
-            // relocation directory empty but delta != 0 and not stripped ÈóÅ?fail
+            // relocation directory empty but delta != 0 and not stripped Èó?fail
             HYPERPLATFORM_LOG_ERROR("[td-map] no reloc directory, delta=0x%llX", delta);
             return FALSE;
         }
@@ -792,7 +792,7 @@ TdPeRelocate(PVOID mapped_base, PUINT8 raw_dll, UINT64 delta)
                 switch (type)
                 {
                 case IMAGE_REL_BASED_ABSOLUTE:
-                    // padding ÈóÅ?skip
+                    // padding Èó?skip
                     break;
 
                 case IMAGE_REL_BASED_DIR64:
@@ -820,7 +820,7 @@ TdPeRelocate(PVOID mapped_base, PUINT8 raw_dll, UINT64 delta)
 }
 
 //
-// TdPeResolveImports ÈóÅ?resolve imports manually via PEB walk.
+// TdPeResolveImports Èó?resolve imports manually via PEB walk.
 // must be called while attached to the target process.
 //
 BOOLEAN
@@ -835,7 +835,7 @@ TdPeResolveImports(PVOID mapped_base)
 
         if (!imp_rva || !imp_size)
         {
-            HYPERPLATFORM_LOG_INFO("[td-map] no import directory ÈóÅ?nothing to resolve");
+            HYPERPLATFORM_LOG_INFO("[td-map] no import directory Èó?nothing to resolve");
             return TRUE;
         }
 
@@ -897,7 +897,7 @@ TdPeResolveImports(PVOID mapped_base)
 }
 
 //
-// TdBuildDllMainStub ÈóÅ?build a small x64 stub that calls DllMain(base, DLL_PROCESS_ATTACH, NULL).
+// TdBuildDllMainStub Èó?build a small x64 stub that calls DllMain(base, DLL_PROCESS_ATTACH, NULL).
 // placed at image base (overwrites DOS header). returns stub size.
 //
 // stub:
@@ -972,15 +972,15 @@ TdBuildDllMainStub(PVOID stub_addr, UINT64 image_base, UINT64 entry_point,
 }
 
 //
-// TdManualMapInProcess ÈóÅ?main manual map function.
+// TdManualMapInProcess Èó?main manual map function.
 // must be called while attached to the target process.
 //
 // parameters:
-//   proc       ÈóÅ?PEPROCESS (already attached)
-//   raw_dll    ÈóÅ?raw DLL file bytes (kernel buffer)
-//   dll_size   ÈóÅ?size of raw DLL
-//   out_base   ÈóÅ?receives mapped image base (user VA)
-//   out_entry  ÈóÅ?receives DllMain VA (user VA)
+//   proc       Èó?PEPROCESS (already attached)
+//   raw_dll    Èó?raw DLL file bytes (kernel buffer)
+//   dll_size   Èó?size of raw DLL
+//   out_base   Èó?receives mapped image base (user VA)
+//   out_entry  Èó?receives DllMain VA (user VA)
 //
 NTSTATUS
 TdManualMapInProcess(
@@ -1063,7 +1063,7 @@ TdManualMapInProcess(
             return STATUS_UNSUCCESSFUL;
         }
 
-        // 6. resolve imports (requires PEB walk ÈóÅ?must be attached)
+        // 6. resolve imports (requires PEB walk Èó?must be attached)
         if (!TdPeResolveImports(base))
         {
             HYPERPLATFORM_LOG_WARN("[td-map] TdPeResolveImports had errors (continuing)");
@@ -1168,7 +1168,7 @@ TdManualMapInProcess(
 }
 
 // =========================================================================
-//  TdInjectRenderdocShadow ÈóÅ?automated renderdoc injection via LoadImage callback
+//  TdInjectRenderdocShadow Èó?automated renderdoc injection via LoadImage callback
 // =========================================================================
 //
 // Called from TdLoadImageNotify when user32.dll loads in a recorded target.
@@ -1668,9 +1668,9 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
             auto * c = (struct _RW_CLEANUP_CTX *)context;
 
             LARGE_INTEGER poll_interval;
-            poll_interval.QuadPart = -1LL * 10000LL;
+            poll_interval.QuadPart = -10LL * 10000LL;
 
-            for (ULONG i = 0; i < 10000 && c->fired_signal == 0; i++)
+            for (ULONG i = 0; i < 2000 && c->fired_signal == 0; i++)
             {
                 if (KeDelayExecutionThread(KernelMode, FALSE, &poll_interval) != STATUS_SUCCESS)
                     break;
@@ -1679,7 +1679,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
             if (c->thread_handle)
                 TdCloseCreatedThreadHandle(c->thread_handle, TRUE);
 
-            HYPERPLATFORM_LOG_INFO("[td-inj-shadow] cleanup: unhooking trigger (fired=%ld), inject stays resident",
+            HYPERPLATFORM_LOG_WARN("[td-inj-shadow] cleanup: unhooking trigger (fired=%ld), inject stays resident",
                 c->fired_signal);
 
             // Unhook trigger. If the process is still alive, attach and unhook by VA.

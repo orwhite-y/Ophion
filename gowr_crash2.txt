@@ -1,0 +1,1 @@
+Opened log file 'F:\winDriver\te\Ophion-master\gowr_crash2.txt'

@@ -1,0 +1,781 @@
+Opened log file 'F:\winDriver\te\Ophion-master\gowr_crash3.txt'
+
+************* Preparing the environment for Debugger Extensions Gallery repositories **************
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+
+   EnableRedirectToV8JsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.000 seconds
+
+************* Waiting for Debugger Extensions Gallery to Initialize **************
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.016 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 29
+
+Microsoft (R) Windows Debugger Version 10.0.26100.6584 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+
+Loading Dump File [C:\Users\Administrator\AppData\Local\CrashDumps\GoWR.exe.9800.dmp]
+User Mini Dump File: Only registers, stack and portions of memory are available
+
+
+************* Path validation summary **************
+Response                         Time (ms)     Location
+Deferred                                       srv*C:\Symbols*https://msdl.microsoft.com/download/symbols
+OK                                             F:\winDriver\te\Ophion-master\Ophion-master\build\bin\Debug
+Deferred                                       srv*d:\symbols*http://msdl.microsoft.com/download/symbols
+DBGHELP: Symbol Search Path: srv*c:\symbols*https://msdl.microsoft.com/download/symbols;f:\windriver\te\ophion-master\ophion-master\build\bin\debug;srv*d:\symbols*http://msdl.microsoft.com/download/symbols
+Symbol search path is: srv*C:\Symbols*https://msdl.microsoft.com/download/symbols;F:\winDriver\te\Ophion-master\Ophion-master\build\bin\Debug;srv*d:\symbols*http://msdl.microsoft.com/download/symbols
+Executable search path is: 
+Windows 10 Version 19045 MP (20 procs) Free x64
+Product: WinNt, suite: SingleUserTS
+Edition build lab: 19041.1.amd64fre.vb_release.191206-1406
+Debug session time: Tue Aug 11 14:43:04.000 2026 (UTC + 8:00)
+System Uptime: 0 days 1:05:27.325
+Process Uptime: 0 days 0:00:22.000
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\atlmfc.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\ObjectiveC.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\concurrency.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\cpp_rest.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\stl.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Data.Json.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
+NatVis script successfully loaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+..
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+..
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+..
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+.
+DBGHELP: Module is not fully loaded into memory.
+DBGHELP: Searching for symbols using debugger-provided data.
+
+Loading unloaded module list
+................
+This dump file has an exception of interest stored in it.
+The stored exception information can be accessed via .ecxr.
+(2648.32bc): Security check failure or stack buffer overrun - code c0000409 (first/second chance not available)
+Subcode: 0xa FAST_FAIL_GUARD_ICALL_CHECK_FAILURE 
+
++------------------------------------------------------------------------+
+| This target supports Hardware-enforced Stack Protection. A HW based    |
+| "Shadow Stack" may be available to assist in debugging and analysis.   |
+| See aka.ms/userhsp for more info.                                      |
+|                                                                        |
+| dps @ssp                                                               |
+|                                                                        |
++------------------------------------------------------------------------+
+
+SYMSRV:  BYINDEX: 0x1
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         ntdll.dll
+         7EC9C15D1f8000
+SYMSRV:  PATH: c:\symbols\ntdll.dll\7EC9C15D1f8000\ntdll.dll
+SYMSRV:  RESULT: 0x00000000
+DBGHELP: c:\symbols\ntdll.dll\7EC9C15D1f8000\ntdll.dll - OK
+DBGENG:  c:\symbols\ntdll.dll\7EC9C15D1f8000\ntdll.dll - Mapped image memory
+For analysis of this file, run !analyze -v
+SYMSRV:  BYINDEX: 0x2
+         c:\symbols*https://msdl.microsoft.com/download/symbols
+         ntdll.pdb
+         180BF1B90AA75697D0EFEA5E5630AC7E1
+SYMSRV:  PATH: c:\symbols\ntdll.pdb\180BF1B90AA75697D0EFEA5E5630AC7E1\ntdll.pdb
+SYMSRV:  RESULT: 0x00000000
+DBGHELP: ntdll - public symbols  
+        c:\symbols\ntdll.pdb\180BF1B90AA75697D0EFEA5E5630AC7E1\ntdll.pdb
+ntdll!LdrpICallHandler+0xf:
+00007ff8`102bcc4f cd29            int     29h
+0:082> .ecxr
+rax=00007ff8102bcc40 rbx=0000000000000000 rcx=000000000000000a
+rdx=0000000000000000 rsi=000000367fea7e70 rdi=0000000000000000
+rip=00007ff8102bcc4f rsp=000000367fea7238 rbp=000000367fea77b0
+ r8=000000367fea7980  r9=000000367fea7800 r10=000000367fea72e0
+r11=000000367fea7260 r12=00007ff8102bcc40 r13=0000000000000000
+r14=000000367fea72b0 r15=000000367fea7980
+iopl=0         nv up ei pl zr na po nc
+cs=0033  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00000246
+ntdll!LdrpICallHandler+0xf:
+00007ff8`102bcc4f cd29            int     29h
+0:082> kb
+  *** Stack trace for last set context - .thread/.cxr resets it
+RetAddr               : Args to Child                                                           : Call Site
+00007ff8`102d296f     : 00007ff8`102bcc40 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpICallHandler+0xf
+00007ff8`10282554     : 00000000`00000000 00000036`7fea77b0 00000036`7fea7e70 00000000`00000000 : ntdll!RtlpExecuteHandlerForException+0xf
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x244
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fea8830 00000036`7fea8340 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fea91f0 00000036`7fea8d00 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fea9bb0 00000036`7fea96c0 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feaa570 00000036`7feaa080 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feaaf30 00000036`7feaaa40 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feab8f0 00000036`7feab400 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feac2b0 00000036`7feabdc0 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feacc70 00000036`7feac780 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fead630 00000036`7fead140 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feadff0 00000036`7feadb00 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feae9b0 00000036`7feae4c0 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feaf370 00000036`7feaee80 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feafd30 00000036`7feaf840 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feb06f0 00000036`7feb0200 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feb10b0 00000036`7feb0bc0 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feb1a70 00000036`7feb1580 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feb2430 00000036`7feb1f40 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feb2df0 00000036`7feb2900 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feb37b0 00000036`7feb32c0 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feb4170 00000036`7feb3c80 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feb4b30 00000036`7feb4640 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feb54f0 00000036`7feb5000 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feb5eb0 00000036`7feb59c0 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feb6870 00000036`7feb6380 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feb7230 00000036`7feb6d40 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feb7bf0 00000036`7feb7700 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feb85b0 00000036`7feb80c0 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feb8f70 00000036`7feb8a80 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feb9930 00000036`7feb9440 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feba2f0 00000036`7feb9e00 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7febacb0 00000036`7feba7c0 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7febb670 00000036`7febb180 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7febc030 00000036`7febbb40 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7febc9f0 00000036`7febc500 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7febd3b0 00000036`7febcec0 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7febdd70 00000036`7febd880 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7febe730 00000036`7febe240 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7febf0f0 00000036`7febec00 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7febfab0 00000036`7febf5c0 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fec0470 00000036`7febff80 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fec0e30 00000036`7fec0940 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fec17f0 00000036`7fec1300 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fec21b0 00000036`7fec1cc0 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fec2b70 00000036`7fec2680 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fec3530 00000036`7fec3040 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fec3ef0 00000036`7fec3a00 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fec48b0 00000036`7fec43c0 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fec5270 00000036`7fec4d80 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fec5c30 00000036`7fec5740 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fec65f0 00000036`7fec6100 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fec6fb0 00000036`7fec6ac0 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fec7970 00000036`7fec7480 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fec8330 00000036`7fec7e40 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fec8cf0 00000036`7fec8800 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fec96b0 00000036`7fec91c0 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7feca070 00000036`7fec9b80 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fecaa30 00000036`7feca540 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fecb3f0 00000036`7fecaf00 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fecbdb0 00000036`7fecb8c0 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fecc770 00000036`7fecc280 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fecd130 00000036`7feccc40 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fecdaf0 00000036`7fecd600 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+00007ff8`102a9b4c     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!LdrpDispatchUserCallTarget+0xe
+00007ff8`10282376     : 00000036`7fece4b0 00000036`7fecdfc0 00000000`00000000 00000000`00000000 : ntdll!RtlpCallVectoredHandlers+0x108
+00007ff8`102d147e     : 00000000`00000000 00000000`00000000 7dc41da5`57b2e44c 00000000`00000000 : ntdll!RtlDispatchException+0x66
+00007ff8`102bcd0e     : 00007ff8`102a9b4c 00000000`00000000 00000000`00000000 00000000`00000000 : ntdll!KiUserExceptionDispatch+0x2e
+0:082> q
+quit:
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\atlmfc.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\ObjectiveC.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\concurrency.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\cpp_rest.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\stl.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Data.Json.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'

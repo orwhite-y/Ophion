@@ -1,0 +1,191 @@
+/*
+*   breadcrumb.cpp - ring buffer allocation, flush worker thread, CMOS globals
+*
+*   Ring buffer: pre-allocated NonPagedPool (before hostcr3_build so it is
+*   mapped in the private host CR3). Written from VMX-root via hv_breadcrumb()
+*   (interlocked + memory write only). Flushed to \SystemRoot\BC.log by a
+*   PASSIVE_LEVEL worker thread every 500ms.
+*
+*   CMOS globals: g_cmos_lock (spinlock), g_cmos_percpu_cache (throttle cache).
+*/
+#include "hv.h"
+
+// CMOS globals (referenced by inline functions in breadcrumb.h)
+volatile LONG g_cmos_lock = 0;
+volatile UCHAR g_cmos_percpu_cache[64] = {0};
+
+// Ring buffer global
+BC_RING *g_bc_ring = NULL;
+
+// Worker thread state
+static HANDLE g_bc_thread_handle = NULL;
+static PKTHREAD g_bc_thread_obj = NULL;
+static volatile BOOLEAN g_bc_thread_run = FALSE;
+static KEVENT g_bc_flush_event;
+
+#define BC_LOG_PATH L"\SystemRoot\BC.log"
+#define BC_MAGIC_INIT 0xBCBC0001
+
+// Allocate ring buffer. Must be called at PASSIVE_LEVEL BEFORE vmx_init
+// (so the allocation is mapped in the private host CR3).
+NTSTATUS hv_breadcrumb_init(VOID)
+{
+    SIZE_T size = sizeof(BC_RING);
+    g_bc_ring = (BC_RING *)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, size, 'bcHO');
+    if (!g_bc_ring)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    RtlZeroMemory(g_bc_ring, size);
+    g_bc_ring->write_idx = 0;
+    g_bc_ring->seq_counter = 0;
+    _mm_sfence();
+    g_bc_ring->magic = BC_MAGIC_INIT;
+
+    KeInitializeEvent(&g_bc_flush_event, NotificationEvent, FALSE);
+    return STATUS_SUCCESS;
+}
+
+// Write the ring buffer contents to BC.log as text.
+// Called at PASSIVE_LEVEL from the worker thread.
+static NTSTATUS hv_breadcrumb_write_log(VOID)
+{
+    if (!g_bc_ring || g_bc_ring->magic != BC_MAGIC_INIT)
+        return STATUS_NOT_FOUND;
+
+    UNICODE_STRING path = RTL_CONSTANT_STRING(BC_LOG_PATH);
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &path,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    IO_STATUS_BLOCK iosb = {};
+    HANDLE h = NULL;
+    NTSTATUS st = ZwCreateFile(&h, FILE_GENERIC_WRITE, &oa, &iosb,
+        NULL, FILE_ATTRIBUTE_NORMAL, 0, FILE_OVERWRITE_IF,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, NULL, 0);
+    if (!NT_SUCCESS(st) || !h)
+        return st;
+
+    // Write header
+    char hdr[128];
+    LARGE_INTEGER off = { 0 };
+    int hl = 0;
+    // Read the current write position atomically
+    LONG cur_write = _InterlockedAdd(&g_bc_ring->write_idx, 0);
+    hl = _snprintf_s(hdr, sizeof(hdr), _TRUNCATE,
+        "=== BC.log ring dump === write_idx=%ld seq=%ld\r\n",
+        cur_write, g_bc_ring->seq_counter);
+    if (hl > 0)
+        ZwWriteFile(h, NULL, NULL, NULL, &iosb, hdr, (ULONG)hl, &off, NULL);
+    off.QuadPart += hl;
+
+    // Dump all entries (newest first = reverse from write_idx)
+    // We dump the full ring; entries with seq=0 are empty/never written.
+    char line[160];
+    for (LONG i = 0; i < BC_RING_ENTRIES; i++)
+    {
+        LONG idx = (cur_write - 1 - i) & (BC_RING_ENTRIES - 1);
+        BC_ENTRY *e = &g_bc_ring->entries[idx];
+        UINT32 seq = e->seq;
+        if (seq == 0)
+            continue;  // empty slot
+        // Re-read to check consistency (seq might have changed if overwritten)
+        _mm_lfence();
+        UINT16 eid = e->event_id;
+        UINT8 cpu = e->cpu;
+        UINT8 flg = e->flags;
+        UINT64 dat = e->data;
+        _mm_lfence();
+        if (e->seq != seq)
+            continue;  // entry was overwritten during read, skip
+
+        int ll = _snprintf_s(line, sizeof(line), _TRUNCATE,
+            "[%6lu] cpu=%-2u evt=0x%04x data=0x%016I64x flg=%u\r\n",
+            seq, cpu, eid, dat, flg);
+        if (ll > 0)
+            ZwWriteFile(h, NULL, NULL, NULL, &iosb, line, (ULONG)ll, &off, NULL);
+        off.QuadPart += ll;
+    }
+
+    ZwClose(h);
+    return STATUS_SUCCESS;
+}
+
+// Immediate flush (PASSIVE_LEVEL). Can be called from IOCTL handler.
+VOID hv_breadcrumb_flush_now(VOID)
+{
+    hv_breadcrumb_write_log();
+}
+
+// Worker thread: flush ring buffer to BC.log every 500ms.
+static VOID bc_worker_thread(PVOID context)
+{
+    UNREFERENCED_PARAMETER(context);
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = -5000000LL;  // 500ms in 100ns units (relative)
+
+    // Set priority to low to avoid interfering with system
+    KeSetPriorityThread(KeGetCurrentThread(), LowRealtimePriority);
+
+    while (g_bc_thread_run)
+    {
+        // Wait for timeout or explicit flush signal
+        KeWaitForSingleObject(&g_bc_flush_event, Executive, KernelMode,
+                              FALSE, &timeout);
+        KeClearEvent(&g_bc_flush_event);
+
+        if (!g_bc_thread_run)
+            break;
+
+        hv_breadcrumb_write_log();
+    }
+
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+// Start the BC.log flush worker thread. Must be called at PASSIVE_LEVEL.
+VOID hv_breadcrumb_start_flush(VOID)
+{
+    if (g_bc_thread_handle)
+        return;
+
+    g_bc_thread_run = TRUE;
+    KeInitializeEvent(&g_bc_flush_event, NotificationEvent, FALSE);
+
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, NULL,
+        OBJ_KERNEL_HANDLE, NULL, NULL);
+    NTSTATUS st = PsCreateSystemThread(
+        &g_bc_thread_handle, THREAD_ALL_ACCESS, &oa,
+        NULL, NULL, bc_worker_thread, NULL);
+    if (!NT_SUCCESS(st))
+    {
+        g_bc_thread_run = FALSE;
+        g_bc_thread_handle = NULL;
+        return;
+    }
+
+    // Get thread object for waiting on stop
+    ObReferenceObjectByHandle(g_bc_thread_handle,
+        THREAD_ALL_ACCESS, *PsThreadType, KernelMode,
+        (PVOID *)&g_bc_thread_obj, NULL);
+    ZwClose(g_bc_thread_handle);
+    g_bc_thread_handle = NULL;
+}
+
+// Stop the BC.log flush worker thread. Must be called at PASSIVE_LEVEL.
+VOID hv_breadcrumb_stop_flush(VOID)
+{
+    if (!g_bc_thread_obj)
+        return;
+
+    g_bc_thread_run = FALSE;
+    KeSetEvent(&g_bc_flush_event, IO_NO_INCREMENT, FALSE);
+
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = -10000000LL;  // 1 second timeout
+    KeWaitForSingleObject(g_bc_thread_obj, Executive,
+        KernelMode, FALSE, &timeout);
+
+    ObDereferenceObject(g_bc_thread_obj);
+    g_bc_thread_obj = NULL;
+}

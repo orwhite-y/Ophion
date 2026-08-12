@@ -1,0 +1,8 @@
+cmd : 'F:\winDriver\te\Ophion-master\_build2.bat' is not recognized as an internal or external command,
+At line:3 char:1
++ cmd /c "F:\winDriver\te\Ophion-master\_build2.bat" 2>&1 | Out-File -F ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ('F:\winDriver\t...ternal command,:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+operable program or batch file.

@@ -1,0 +1,246 @@
+
+************* Preparing the environment for Debugger Extensions Gallery repositories **************
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+
+   EnableRedirectToV8JsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.000 seconds
+
+************* Waiting for Debugger Extensions Gallery to Initialize **************
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.015 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 29
+
+Microsoft (R) Windows Debugger Version 10.0.26100.6584 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+
+Loading Dump File [C:\Windows\Minidump\081226-11203-01.dmp]
+Mini Kernel Dump File: Only registers and stack trace are available
+
+
+************* Path validation summary **************
+Response                         Time (ms)     Location
+Deferred                                       srv*srv*C:\Symbols*https://msdl.microsoft.com/download/symbols
+OK                                             F:\winDriver\te\Ophion-master\Ophion-master\build\bin\Debug
+Deferred                                       srv*d:\symbols*http://msdl.microsoft.com/download/symbols
+Symbol search path is: srv*srv*C:\Symbols*https://msdl.microsoft.com/download/symbols;F:\winDriver\te\Ophion-master\Ophion-master\build\bin\Debug;srv*d:\symbols*http://msdl.microsoft.com/download/symbols
+Executable search path is: 
+DBGHELP: srv*c:\symbols*https://msdl.microsoft.com/download/symbols is not a valid store
+DBGHELP: srv*c:\symbols*https://msdl.microsoft.com/download/symbols is not a valid store
+Windows 10 Kernel Version 19041 MP (20 procs) Free x64
+Product: WinNt, suite: TerminalServer SingleUserTS
+Kernel base = 0xfffff805`27800000 PsLoadedModuleList = 0xfffff805`2842a420
+Debug session time: Wed Aug 12 08:55:36.831 2026 (UTC + 8:00)
+System Uptime: 0 days 1:16:49.500
+DBGHELP: srv*c:\symbols*https://msdl.microsoft.com/download/symbols is not a valid store
+DBGHELP: srv*c:\symbols*https://msdl.microsoft.com/download/symbols is not a valid store
+Loading Kernel Symbols
+.
+DBGHELP: srv*c:\symbols*https://msdl.microsoft.com/download/symbols is not a valid store
+.
+DBGHELP: srv*c:\symbols*https://msdl.microsoft.com/download/symbols is not a valid store
+DBGHELP: srv*c:\symbols*https://msdl.microsoft.com/download/symbols is not a valid store
+DBGHELP: srv*c:\symbols*https://msdl.microsoft.com/download/symbols is not a valid store
+DBGHELP: srv*c:\symbols*https://msdl.microsoft.com/download/symbols is not a valid store
+.............................................................
+................................................................
+................................................................
+............
+Loading User Symbols
+PEB is paged out (Peb.Ldr = 0000008b`0485e018).  Type ".hh dbgerr001" for details
+Loading unloaded module list
+........
+For analysis of this file, run !analyze -v
+0: kd> cdb: Reading initial command '!analyze -v; kb; q'
+*******************************************************************************
+*                                                                             *
+*                        Bugcheck Analysis                                    *
+*                                                                             *
+*******************************************************************************
+
+SYSTEM_SERVICE_EXCEPTION (3b)
+An exception happened while executing a system service routine.
+Arguments:
+Arg1: 00000000c0000005, Exception code that caused the BugCheck
+Arg2: fffff805a2bd3395, Address of the instruction which caused the BugCheck
+Arg3: ffffaa0258356160, Address of the context record for the exception that caused the BugCheck
+Arg4: 0000000000000000, zero.
+
+Debugging Details:
+------------------
+
+DBGHELP: srv*c:\symbols*https://msdl.microsoft.com/download/symbols is not a valid store
+DBGHELP: srv*c:\symbols*https://msdl.microsoft.com/download/symbols is not a valid store
+
+KEY_VALUES_STRING: 1
+
+    Key  : Analysis.CPU.mSec
+    Value: 1374
+
+    Key  : Analysis.Elapsed.mSec
+    Value: 1453
+
+    Key  : Analysis.IO.Other.Mb
+    Value: 0
+
+    Key  : Analysis.IO.Read.Mb
+    Value: 0
+
+    Key  : Analysis.IO.Write.Mb
+    Value: 0
+
+    Key  : Analysis.Init.CPU.mSec
+    Value: 296
+
+    Key  : Analysis.Init.Elapsed.mSec
+    Value: 1949
+
+    Key  : Analysis.Memory.CommitPeak.Mb
+    Value: 83
+
+    Key  : Bugcheck.Code.LegacyAPI
+    Value: 0x3b
+
+    Key  : Dump.Attributes.AsUlong
+    Value: 8
+
+    Key  : Dump.Attributes.KernelGeneratedTriageDump
+    Value: 1
+
+    Key  : Failure.Bucket
+    Value: AV_TestEptHook!RtlSecureZeroMemory
+
+    Key  : Failure.Hash
+    Value: {9c73ebb1-129e-3b34-89b4-77cfbd7473fd}
+
+
+BUGCHECK_CODE:  3b
+
+BUGCHECK_P1: c0000005
+
+BUGCHECK_P2: fffff805a2bd3395
+
+BUGCHECK_P3: ffffaa0258356160
+
+BUGCHECK_P4: 0
+
+FILE_IN_CAB:  081226-11203-01.dmp
+
+DUMP_FILE_ATTRIBUTES: 0x8
+  Kernel Generated Triage Dump
+
+CONTEXT:  ffffaa0258356160 -- (.cxr 0xffffaa0258356160)
+rax=0000000000000000 rbx=0000000000000000 rcx=0000000000001000
+rdx=0000000000001000 rsi=ffffe18fd70d8580 rdi=ffffe181e62fe000
+rip=fffff805a2bd3395 rsp=ffffaa0258356b60 rbp=ffffaa0258357669
+ r8=ffffe1833ea01280  r9=0000000000000000 r10=ffffe18fbf010160
+r11=0000000000000001 r12=0000000000000001 r13=0000000000000000
+r14=000000000000000c r15=fffff805284ec840
+iopl=0         nv up ei pl zr na po nc
+cs=0010  ss=0018  ds=002b  es=002b  fs=0053  gs=002b             efl=00050246
+TestEptHook!RtlSecureZeroMemory+0x25:
+fffff805`a2bd3395 488b442420      mov     rax,qword ptr [rsp+20h] ss:0018:ffffaa02`58356b80=ffffe181e62fe000
+Resetting default scope
+
+BLACKBOXBSD: 1 (!blackboxbsd)
+
+
+BLACKBOXNTFS: 1 (!blackboxntfs)
+
+
+BLACKBOXWINLOGON: 1
+
+CUSTOMER_CRASH_COUNT:  1
+
+PROCESS_NAME:  GoWR.exe
+
+STACK_TEXT:  
+ffffaa02`58356b60 fffff805`a2bd2e45     : ffffe181`e62fe000 00000000`00001000 00000000`00000000 fffff805`27c06fa5 : TestEptHook!RtlSecureZeroMemory+0x25
+ffffaa02`58356b80 fffff805`a2bd2d45     : ffffaa02`58356c20 00000000`00000008 00000000`00000000 00000000`00000000 : TestEptHook!TdShadowFreePageList+0x55
+ffffaa02`58356bc0 fffff805`a2be62fd     : 00000007`5cdff000 00000009`e3252000 ffffaa02`583574d0 00000000`00001cbc : TestEptHook!TdShadowFreeCr3+0x175
+ffffaa02`58357440 fffff805`a2be6c9c     : ffffe18f`d68b4080 00000000`00001cbc fffff805`a2bec890 00000000`00001cbc : TestEptHook!TdCleanupStealthForProcess+0x49d
+ffffaa02`583575b0 fffff805`27e1b51f     : ffffe18f`d68b4080 00000000`00001cbc 00000000`00000000 ffffe18f`d68b4080 : TestEptHook!TdProcessNotify+0xac
+ffffaa02`58357600 fffff805`27e2fc8c     : ffffe18f`d68b4000 ffffe18f`d68b4080 00000000`00000000 00000000`00000000 : nt!PspCallProcessNotifyRoutines+0x213
+ffffaa02`583576d0 fffff805`27ec3baa     : ffffe18f`d28fc4b8 00000000`00000000 ffffaa02`58357899 00000000`00000000 : nt!PspExitProcess+0x70
+ffffaa02`58357700 fffff805`27e88708     : ffffe18f`c0000409 fffff805`27ac6701 00000000`00000012 0000008b`04933000 : nt!PspExitThread+0x5b2
+ffffaa02`58357800 fffff805`27a4a6cd     : ffffe18f`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : nt!KiSchedulerApcTerminate+0x38
+ffffaa02`58357840 fffff805`27c02c60     : 00000000`00000000 ffffaa02`58357900 ffffaa02`58357a40 00000000`00000000 : nt!KiDeliverApc+0x60d
+ffffaa02`58357900 fffff805`27c115af     : ffffe18f`d28fc080 00000000`001f0003 00000000`00000000 00000000`00000000 : nt!KiInitiateUserApc+0x70
+ffffaa02`58357a40 00007ffb`5eb0d624     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : nt!KiSystemServiceExit+0x9f
+0000008b`259ff958 00000000`00000000     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : 0x00007ffb`5eb0d624
+
+
+FAULTING_SOURCE_LINE:  C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\km\wdm.h
+
+FAULTING_SOURCE_FILE:  C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\km\wdm.h
+
+FAULTING_SOURCE_LINE_NUMBER:  14855
+
+SYMBOL_NAME:  TestEptHook!RtlSecureZeroMemory+25
+
+MODULE_NAME: TestEptHook
+
+IMAGE_NAME:  TestEptHook.sys
+
+STACK_COMMAND:  .cxr 0xffffaa0258356160 ; kb
+
+BUCKET_ID_FUNC_OFFSET:  25
+
+FAILURE_BUCKET_ID:  AV_TestEptHook!RtlSecureZeroMemory
+
+OSPLATFORM_TYPE:  x64
+
+OSNAME:  Windows 10
+
+FAILURE_ID_HASH:  {9c73ebb1-129e-3b34-89b4-77cfbd7473fd}
+
+Followup:     MachineOwner
+---------
+
+ # RetAddr               : Args to Child                                                           : Call Site
+00 fffff805`27c11da9     : 00000000`0000003b 00000000`c0000005 fffff805`a2bd3395 ffffaa02`58356160 : nt!KeBugCheckEx
+01 fffff805`27c10efc     : ffffaa02`58356928 fffff805`278e3fac ffffaa02`58355a50 00000000`00000000 : nt!KiBugCheckDispatch+0x69
+02 fffff805`27c080ff     : fffff805`27c10e80 00000000`00000000 00000000`00000000 00000000`00000000 : nt!KiSystemServiceHandler+0x7c
+03 fffff805`27b3e817     : ffffaa02`58355f50 00000000`00000000 ffffaa02`58357a40 fffff805`27c115af : nt!RtlpExecuteHandlerForException+0xf
+04 fffff805`27b3c4b6     : ffffaa02`58356928 ffffaa02`58356660 ffffaa02`58356928 ffffe181`e62fe000 : nt!RtlDispatchException+0x297
+05 fffff805`27c11eec     : ffff940d`00000000 ffffe18f`dd232a20 ffffe18f`d651eb20 ffff940d`4b8293e0 : nt!KiDispatchException+0x186
+06 fffff805`27c0d2ef     : 00000000`00000000 00000000`00000000 ffffe181`e62fd000 00000000`00000000 : nt!KiExceptionDispatch+0x12c
+07 fffff805`a2bd3395     : ffffe181`e62fe000 00000000`00000000 fffff805`a2bf08c8 fffff805`a2bd2e45 : nt!KiGeneralProtectionFault+0x32f
+08 fffff805`a2bd2e45     : ffffe181`e62fe000 00000000`00001000 00000000`00000000 fffff805`27c06fa5 : TestEptHook!RtlSecureZeroMemory+0x25
+09 fffff805`a2bd2d45     : ffffaa02`58356c20 00000000`00000008 00000000`00000000 00000000`00000000 : TestEptHook!TdShadowFreePageList+0x55
+0a fffff805`a2be62fd     : 00000007`5cdff000 00000009`e3252000 ffffaa02`583574d0 00000000`00001cbc : TestEptHook!TdShadowFreeCr3+0x175
+0b fffff805`a2be6c9c     : ffffe18f`d68b4080 00000000`00001cbc fffff805`a2bec890 00000000`00001cbc : TestEptHook!TdCleanupStealthForProcess+0x49d
+0c fffff805`27e1b51f     : ffffe18f`d68b4080 00000000`00001cbc 00000000`00000000 ffffe18f`d68b4080 : TestEptHook!TdProcessNotify+0xac
+0d fffff805`27e2fc8c     : ffffe18f`d68b4000 ffffe18f`d68b4080 00000000`00000000 00000000`00000000 : nt!PspCallProcessNotifyRoutines+0x213
+0e fffff805`27ec3baa     : ffffe18f`d28fc4b8 00000000`00000000 ffffaa02`58357899 00000000`00000000 : nt!PspExitProcess+0x70
+0f fffff805`27e88708     : ffffe18f`c0000409 fffff805`27ac6701 00000000`00000012 0000008b`04933000 : nt!PspExitThread+0x5b2
+10 fffff805`27a4a6cd     : ffffe18f`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : nt!KiSchedulerApcTerminate+0x38
+11 fffff805`27c02c60     : 00000000`00000000 ffffaa02`58357900 ffffaa02`58357a40 00000000`00000000 : nt!KiDeliverApc+0x60d
+12 fffff805`27c115af     : ffffe18f`d28fc080 00000000`001f0003 00000000`00000000 00000000`00000000 : nt!KiInitiateUserApc+0x70
+13 00007ffb`5eb0d624     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : nt!KiSystemServiceExit+0x9f
+14 00000000`00000000     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : 0x00007ffb`5eb0d624
+quit:
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\atlmfc.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\ObjectiveC.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\concurrency.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\cpp_rest.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Kernel.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\stl.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Data.Json.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Usb4Kd.natvis'

@@ -1,0 +1,9 @@
+**********************************************************************
+** Visual Studio 2022 Developer Command Prompt v17.14.31
+** Copyright (c) 2025 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+适用于 .NET Framework MSBuild 版本 17.14.40+3e7442088
+
+  inject_renderdoc.cpp
+  Injector.vcxproj -> F:\winDriver\te\Ophion-master\Injector\build\bin\Debug\Injector.exe

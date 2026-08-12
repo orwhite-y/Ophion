@@ -862,6 +862,13 @@ stealth_sync_data_pte_in_window(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr,
     if (!sp || !sp->shadow_cr3_phys || !vcpu->nx_timer_real_cr3 || !sp->guest_va)
         return FALSE;
 
+    // Near-NULL addresses (VA < 0x10000) are genuine NULL dereferences, not
+    // stale shadow PML4 entries. Syncing PML4[0] for them returns TRUE and
+    // keeps the shadow CR3 active while the guest retries a genuinely
+    // unmapped access -> fetch<->data-#PF livelock -> triple fault.
+    if (fault_addr < 0x10000)
+        return FALSE;
+
     // P=0 data faults are the stale-shadow case we heal below. A P=1 WRITE fault
     // is also frequently healable: the snapshot captured the page read-only (or
     // pre-COW) and real has since made it writable, so the shadow's R/W bit is
@@ -1757,6 +1764,19 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
     //
     if (vcpu->nx_timer_real_cr3 && !(error_code & PFEC_INSTR_FETCH))
     {
+        // Near-NULL data #PF under shadow CR3: genuine NULL dereference.
+        // Log RIP+EC for diagnosis, then abort shadow and re-inject under
+        // real CR3. Do NOT attempt PML4 sync (returns TRUE -> keeps shadow
+        // CR3 active -> livelock -> triple fault).
+        if (fault_addr < 0x10000)
+        {
+            hv_breadcrumb_cpu(0x010E, vcpu->core_id, fault_addr);
+            hv_breadcrumb_cpu(0x010F, vcpu->core_id, vcpu->vmexit_rip);
+            hv_breadcrumb_cpu(0x0110, vcpu->core_id, (UINT64)error_code);
+            stealth_pf_abort_shadow_window(vcpu);
+            return FALSE;
+        }
+
         // A2: try to service the data #PF INSIDE the shadow window by syncing the
         // stale shadow PT entry from the real CR3 (stealth-preserving: real PTEs
         // are never touched). on success resume in shadow; on any failure (genuine

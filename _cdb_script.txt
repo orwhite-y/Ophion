@@ -1,0 +1,7 @@
+.sympath srv*C:\Symbols*https://msdl.microsoft.com/download/symbols
+.reload /f ntoskrnl.exe
+u nt+0xffbc4 L5
+u nt+0x1002e0 L5
+u nt+0x1033a0 L5
+!dh nt -f
+q

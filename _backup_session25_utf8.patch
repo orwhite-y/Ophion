@@ -1,0 +1,1018 @@
+diff --git a/Ophion-master/Ophion.vcxproj b/Ophion-master/Ophion.vcxproj
+index 6a12024..b3cfc91 100644
+--- a/Ophion-master/Ophion.vcxproj
++++ b/Ophion-master/Ophion.vcxproj
+@@ -1,4 +1,4 @@
+-<?xml version="1.0" encoding="utf-8"?>
++﻿<?xml version="1.0" encoding="utf-8"?>
+ <Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+   <ItemGroup Label="ProjectConfigurations">
+     <ProjectConfiguration Include="Release|x64">
+@@ -127,6 +127,7 @@
+     <ClCompile Include="src\ept_hook.cpp" />
+     <ClCompile Include="src\pool_manager.cpp" />
+     <ClCompile Include="src\ept_stealth.cpp" />
++    <ClCompile Include="src\breadcrumb.cpp" />
+     <ClCompile Include="src\log.cpp" />
+   </ItemGroup>
+   <!-- Assembly Files (MASM x64) -->
+@@ -147,6 +148,7 @@
+     <ClInclude Include="include\hv_types.h" />
+     <ClInclude Include="include\asm_prototypes.h" />
+     <ClInclude Include="include\stealth.h" />
++    <ClInclude Include="include\breadcrumb.h" />
+     <ClInclude Include="src\log.h" />
+   </ItemGroup>
+   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+diff --git a/Ophion-master/asm/AsmCommon.asm b/Ophion-master/asm/AsmCommon.asm
+index a60404b..8ad6ff0 100644
+--- a/Ophion-master/asm/AsmCommon.asm
++++ b/Ophion-master/asm/AsmCommon.asm
+@@ -52,5 +52,16 @@ asm_write_cr2 PROC
+     ret
+ asm_write_cr2 ENDP
+ 
++PUBLIC asm_selfmap_read
+ 
+-END
++; UINT64 asm_selfmap_read(UINT64 addr)
++; rcx = address to read. Returns [rcx] in rax.
++; MUST be exactly: mov rax,[rcx] (3 bytes: 48 8B 01) + ret (1 byte: C3)
++; The host #PF handler matches this exact instruction: sets rax=0, advances RIP by 3.
++asm_selfmap_read PROC
++    mov     rax, [rcx]
++    ret
++asm_selfmap_read ENDP
++
++
++END
+\ No newline at end of file
+diff --git a/Ophion-master/asm/AsmHostIdt.asm b/Ophion-master/asm/AsmHostIdt.asm
+index bbadd09..d5e4906 100644
+--- a/Ophion-master/asm/AsmHostIdt.asm
++++ b/Ophion-master/asm/AsmHostIdt.asm
+@@ -8,11 +8,14 @@ PUBLIC asm_host_pf_handler
+ PUBLIC asm_host_default_handler
+ 
+ EXTERN g_host_nmi_pending:DWORD
++EXTERN g_pf_safe_start:QWORD
++EXTERN g_pf_safe_end:QWORD
++EXTERN g_pf_recovery_count:DWORD
+ 
+ .code _text
+ 
+ 
+-; NMI handler ??sets per-cpu pending flag, vmexit handler injects to guest
++; NMI handler sets per-cpu pending flag, vmexit handler injects to guest
+ 
+ asm_host_nmi_handler PROC
+ 
+@@ -67,7 +70,7 @@ asm_host_default_handler PROC
+ asm_host_default_handler ENDP
+ 
+ 
+-; #PF in host mode = skip faulting instruction (best effort survival)
++; #PF in host mode
+ ; Stack frame (64-bit, IST=0):
+ ;   [rsp+0]  = error code
+ ;   [rsp+8]  = RIP
+@@ -75,13 +78,49 @@ asm_host_default_handler ENDP
+ ;   [rsp+24] = RFLAGS
+ ;   [rsp+32] = RSP
+ ;   [rsp+40] = SS
++;
++; If RIP is in [g_pf_safe_start, g_pf_safe_end) (stealth self-map walk range):
++;   recover: RAX=0 (not-present PTE), advance RIP by 3 (past 3-byte mov reg,[reg])
++;   The faulting instruction inside stealth_walk_pte_selfmap / stealth_walk_pt_page_selfmap
++;   is a 3-byte "mov rax,[reg]" (48 8B 00 / 48 8B 01 / etc). Setting RAX=0 makes the
++;   caller see P=0 (not-present), which the retry loop + fallback handles.
++; Otherwise: halt (unrecoverable #PF in VMX-root)
+ 
+ asm_host_pf_handler PROC
+ 
+-    add     qword ptr [rsp + 8], 1     ; advance RIP past faulting instr
+-    add     rsp, 8                     ; discard error code
++    mov     rax, [rsp + 8]              ; faulting RIP (before any push)
++    push    r10
++    push    r11
++
++    ; Check RIP >= g_pf_safe_start
++    lea     r10, g_pf_safe_start
++    mov     r11, [r10]
++    cmp     rax, r11
++    jb      pf_halt
++
++    ; Check RIP < g_pf_safe_end
++    lea     r10, g_pf_safe_end
++    mov     r11, [r10]
++    cmp     rax, r11
++    jae     pf_halt
++
++    ; In safe range: recover
++    xor     rax, rax                    ; RAX=0 (not-present PTE for caller)
++    lea     r10, g_pf_recovery_count
++    lock inc dword ptr [r10]            ; increment recovery counter
++    pop     r11
++    pop     r10
++    add     qword ptr [rsp + 8], 3      ; advance RIP by 3 (past 3-byte mov)
++    add     rsp, 8                      ; discard error code
+     iretq
+ 
++pf_halt:
++    pop     r11
++    pop     r10
++    cli
++    hlt
++    jmp     $
++
+ asm_host_pf_handler ENDP
+ 
+-END
++END
+\ No newline at end of file
+diff --git a/Ophion-master/include/hv.h b/Ophion-master/include/hv.h
+index b5e712d..8ca9d8c 100644
+--- a/Ophion-master/include/hv.h
++++ b/Ophion-master/include/hv.h
+@@ -1,5 +1,5 @@
+ /*
+-*   hv.h - master hypervisor header �?includes everything needed
++*   hv.h - master hypervisor header 锟?includes everything needed
+ */
+ #pragma once
+ 
+@@ -43,7 +43,7 @@ VOID hv_pte_window_init(ULONG cpu_count);
+ // (allocated before hostcr3_build, mapped in both private and system CR3).
+ //
+ // IMPORTANT: read all values from VMM stack (regs->xxx) BEFORE switching CR3.
+-// the compiler may reorder reads across __writecr3 �?use _mm_mfence if needed.
++// the compiler may reorder reads across __writecr3 锟?use _mm_mfence if needed.
+ //
+ static __forceinline UINT64
+ vmx_enter_guest_cr3(VOID)
+@@ -95,10 +95,28 @@ static __forceinline UINT64
+ vmx_enter_cr3(UINT64 cr3)
+ {
+ #if USE_PRIVATE_HOST_CR3
++    UINT64 rflags = __readeflags();
++    _disable();  /* block interrupts during CR3 switch + walk (TOCTOU fix) */
+     UINT64 saved = __readcr3();
+     __writecr3(cr3);
++    /* Full TLB + PWC flush: toggle CR4.PGE to invalidate ALL
++     * entries (including global pages and paging-structure caches).
++     * __writecr3 alone does NOT flush global TLB/PWC entries. If the
++     * self-map PML4[S] entry has G=1 (common on Windows), stale entries
++     * from the previous CR3 survive __writecr3 and cause the self-map
++     * walk to read the WRONG page tables -> host #PF -> BSOD.
++     * __invlpg per-read is insufficient on some CPUs (PWC not fully
++     * invalidated). CR4.PGE toggle is the only guaranteed full flush. */
++    {
++        UINT64 cr4 = __readcr4();
++        if (cr4 & (1ULL << 7)) {      /* CR4.PGE set? */
++            __writecr4(cr4 & ~(1ULL << 7));  /* clear PGE -> flush ALL TLB+PWC */
++            __writecr4(cr4);                 /* restore PGE */
++        }
++    }
+     _mm_mfence();
+-    return saved;
++    /* Pack IF (RFLAGS bit 9) into bit 62 of return so leave can restore it. */
++    return saved | ((rflags & (1ULL << 9)) << 53);
+ #else
+     UNREFERENCED_PARAMETER(cr3);
+     return 0;
+@@ -110,128 +128,17 @@ vmx_leave_guest_cr3(UINT64 saved)
+ {
+ #if USE_PRIVATE_HOST_CR3
+     _mm_mfence();
+-    __writecr3(saved);
++    UINT64 if_flag = saved & (1ULL << 62);
++    __writecr3(saved & ~(1ULL << 62));
++    if (if_flag)
++        _enable();  /* restore interrupt state */
+ #else
+     UNREFERENCED_PARAMETER(saved);
+ #endif
+ }
+ 
+ // ---------------------------------------------------------------------------
+-// WEDGE CMOS diagnostic marker: writes a 1-byte progress marker to battery-backed
+-// RTC NVRAM (CMOS) so it survives a triple-fault reset (the RAM log buffer is lost
+-// on reset). Port 0x70 = index (bit7 = NMI disable), 0x71 = data. Offsets 0x50/0x51
+-// are in extended CMOS (usually free on modern 256-byte RTC). Host port IO in
+-// VMX-root is never intercepted, so __outbyte / __inbyte work directly. The trailing
+-// __outbyte(0x70, 0x0D) clears bit7 to re-enable NMI after each access.
+-//
+-#define WEDGE_CMOS_MAGIC_OFF  0x50
+-#define WEDGE_CMOS_VALUE_OFF  0x51
+-#define WEDGE_CMOS_MAGIC      0xA5
+-// Sticky "match seen" flag: set once (at WEDGE 0x0B) the first time a stealth page
+-// matches, never cleared during the run. Survives reset alongside the marker so the
+-// readback can tell "shellcode matched+healed then a later nomatch killed it" apart
+-// from "shellcode never matched at all". Cleared by wedge_cmos_clear on readback.
+-#define WEDGE_CMOS_MATCH_OFF  0x52
+-// Sticky "trigger seen" flag: set once (at WEDGE 0x01) the first time the injection
+-// trigger fires. Survives reset. Tells "shellcode ran but didn't match" (trig=1,
+-// match=0 -> target filter wrong for this process) apart from "shellcode never ran"
+-// (trig=0 -> the fetch #PFs are EAC/kernel NX code, not the shellcode).
+-#define WEDGE_CMOS_TRIG_OFF   0x53
+-// WEDGE reinject livelock probe (replaces the old per-#PF 0x0E mark, which did
+-// port I/O on EVERY fetch-#PF reinject -> hot path under EAC's #PF storm). A
+-// per-CPU consecutive same-address reinject streak is tracked in memory (no
+-// per-#PF port I/O); only when a CPU's streak hits 1024 (pathological = guest
+-// re-#PFs the same instruction, HV re-injects, tight loop = livelock) does that
+-// CPU snap to CMOS. Normal activity never reaches 1024 consecutive same-addr
+-// reinjects (each NX #PF is resolved by the guest handler -> next #PF is a
+-// different addr -> streak resets), so normal CPUs never write. On a 卡死 (freeze)
+-// boot: streak>=1024 + addr = #PF reinject livelock on addr; streak=0 = no
+-// livelock (deadlock, or normal activity). 4-byte streak @ 0x54, 8-byte VA @ 0x58.
+-#define WEDGE_CMOS_REINJ_CNT_OFF   0x54
+-#define WEDGE_CMOS_REINJ_ADDR_OFF  0x58
+-
+-// per-CPU last-VM-exit byte (0x60..0x7F, up to 32 CPUs). Each CPU owns its byte so
+-// the #PF storm on other CPUs can't mask the handler a wedged/TFing CPU is actually
+-// in. Throttled (write only on value change): hot path costs ~1 write/CPU, not
+-// 1 write/#PF. Encoding: 0x80|vector for exceptions (0x8E=#PF,0x8D=#GP,0x86=#UD);
+-// else raw exit reason (<0x40). 0 = no VM-exit recorded on that CPU.
+-#define WEDGE_CMOS_PERCPU_BASE  0x60
+-
+-static __forceinline VOID
+-wedge_cmos_mark(UCHAR v)
+-{
+-    UNREFERENCED_PARAMETER(v);
+-}
+-
+-static __forceinline VOID
+-wedge_cmos_read(UCHAR *magic, UCHAR *val)
+-{
+-    if (magic) *magic = 0;
+-    if (val) *val = 0;
+-}
+-
+-static __forceinline VOID
+-wedge_cmos_clear(VOID)
+-{
+-}
+-
+-// Set the sticky "match seen" flag (idempotent). Called at WEDGE 0x0B.
+-static __forceinline VOID
+-wedge_cmos_set_match_seen(VOID)
+-{
+-}
+-
+-// Read the sticky "match seen" flag (0 = no match this run, 1 = a stealth page
+-// matched at some point before the reset).
+-static __forceinline UCHAR
+-wedge_cmos_read_match_seen(VOID)
+-{
+-    return 0;
+-}
+-
+-// Set the sticky "trigger seen" flag (idempotent). Called at WEDGE 0x01.
+-static __forceinline VOID
+-wedge_cmos_set_trig_seen(VOID)
+-{
+-}
+-
+-// Read the sticky "trigger seen" flag (0 = trigger never fired this run, 1 = the
+-// injection trigger fired at some point before the reset).
+-static __forceinline UCHAR
+-wedge_cmos_read_trig_seen(VOID)
+-{
+-    // disabled: CMOS port I/O races across CPUs. Return 0 (not seen).
+-    return 0;
+-}
+-
+-// Snap the reinject livelock probe (streak + fault addr) to CMOS. Called ONLY when
+-// a CPU's consecutive same-addr reinject streak hits a multiple of 1024 (i.e. only
+-// by a livelocked CPU), so this is NOT on the hot #PF path - no per-#PF port I/O.
+-static __forceinline VOID
+-wedge_cmos_snap_reinj(UINT32 streak, UINT64 addr)
+-{
+-    // disabled: CMOS port I/O races across CPUs under load (see vmexit.cpp).
+-    // livelock info is kept in-memory only; no port writes.
+-    UNREFERENCED_PARAMETER(streak);
+-    UNREFERENCED_PARAMETER(addr);
+-}
+-
+-// Read back the reinject livelock probe. streak==0 (+ addr==0) = no livelock this
+-// run; streak>=1024 + addr = #PF reinject livelock on that fault VA.
+-static __forceinline VOID
+-wedge_cmos_read_reinj(UINT32 *streak, UINT64 *addr)
+-{
+-    if (streak) *streak = 0;
+-    if (addr) *addr = 0;
+-}
+-
+-// Read one CPU's last-exit byte (0x60+cpu). Called from DriverEntry readback.
+-static __forceinline UCHAR
+-wedge_cmos_read_percpu(UINT32 cpu)
+-{
+-    UNREFERENCED_PARAMETER(cpu);
+-    return 0;
+-}
++#include "breadcrumb.h"
+ 
+ //
+ // private host page tables (hostcr3.c)
+@@ -310,16 +217,16 @@ VOID vpid_invvpid_single(UINT16 vpid);
+ //   hook_type: 0 = absolute jump (14B), 1 = VMCALL (3B), 2 = INT3 (1B)
+ //
+ 
+-// VMX-root internal �?called from VMCALL handler (guest CR3 must be active)
++// VMX-root internal 锟?called from VMCALL handler (guest CR3 must be active)
+ BOOLEAN ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req);
+ BOOLEAN ept_unhook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_UNHOOK_VMCALL_PARAM req);
+ VOID    ept_unhook_all(VOID);
+ VOID    ept_unhook_by_cr3(VIRTUAL_MACHINE_STATE * vcpu, UINT64 target_cr3);
+ 
+-// VMX-root safe EPT 2MB�?KB split (uses pre-allocated pool, NOT ExAllocatePool2)
++// VMX-root safe EPT 2MB锟?KB split (uses pre-allocated pool, NOT ExAllocatePool2)
+ PVMM_EPT_DYNAMIC_SPLIT ept_split_large_page_pool(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
+ 
+-// VMX-root handlers �?called from vmexit dispatch
++// VMX-root handlers 锟?called from vmexit dispatch
+ BOOLEAN ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exit_qual);
+ VOID    ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu);
+ BOOLEAN ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu);
+@@ -327,14 +234,14 @@ BOOLEAN ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu);
+ //
+ // stealth memory allocation (ept_stealth.cpp)
+ //   allocates PAGE_READWRITE memory with hidden execute capability via EPT split
+-//   read �?clean data (no exec attr), execute �?VMCALL �?handler dispatch
++//   read 锟?clean data (no exec attr), execute 锟?VMCALL 锟?handler dispatch
+ //
+ 
+-// stealth region �?contiguous physical memory for shadow/fake pages
++// stealth region 锟?contiguous physical memory for shadow/fake pages
+ BOOLEAN ept_stealth_region_init(VOID);
+ VOID    ept_stealth_region_destroy(VOID);
+ 
+-// public API �?PASSIVE_LEVEL
++// public API 锟?PASSIVE_LEVEL
+ BOOLEAN ept_stealth_alloc(PVOID target_va, PVOID handler_function);
+ BOOLEAN ept_stealth_inject(PVOID target_va, PVOID shellcode, UINT32 shellcode_size);
+ BOOLEAN ept_stealth_map_resident(PVOID target_va, SIZE_T size);
+@@ -352,13 +259,13 @@ ept_stealth_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM req)
+ BOOLEAN ept_stealth_uninstall(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_FREE_PARAM req);
+ VOID    ept_stealth_free_all(VOID);
+ 
+-// VMX-root handler �?check if VMCALL came from a stealth page
++// VMX-root handler 锟?check if VMCALL came from a stealth page
+ BOOLEAN ept_handle_stealth_vmcall(VIRTUAL_MACHINE_STATE * vcpu);
+ 
+ // EPT violation handler for stealth pages (target page + PT page writes)
+ BOOLEAN ept_stealth_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exit_qual);
+ 
+-// #PF handler �?intercepts instruction-fetch page faults (NX violations)
++// #PF handler 锟?intercepts instruction-fetch page faults (NX violations)
+ // temporarily swaps PT page EPT to real view so CPU page walk sees NX=0
+ BOOLEAN ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error_code);
+ VOID    ept_update_pf_intercept(VIRTUAL_MACHINE_STATE * vcpu);
+diff --git a/Ophion-master/include/hv_types.h b/Ophion-master/include/hv_types.h
+index 3ff3252..3abf11e 100644
+--- a/Ophion-master/include/hv_types.h
++++ b/Ophion-master/include/hv_types.h
+@@ -329,6 +329,8 @@ typedef struct _VIRTUAL_MACHINE_STATE {
+     UINT64  host_pf_rip;
+     UINT32  host_pf_count;
+     UINT64  host_pf_cr2;
++    BOOLEAN     pf_passthrough_armed;   // livelock breaker: #PF intercept temporarily
++                                        // disabled; MTF re-arms via ept_update_pf_intercept
+ } VIRTUAL_MACHINE_STATE, *PVIRTUAL_MACHINE_STATE;
+ 
+ #define VMCALL_TEST             0x00000001
+diff --git a/Ophion-master/include/stealth.h b/Ophion-master/include/stealth.h
+index 1bd19ca..9a1c684 100644
+--- a/Ophion-master/include/stealth.h
++++ b/Ophion-master/include/stealth.h
+@@ -1,4 +1,4 @@
+-/*
++﻿/*
+ *   stealth.h - anti-detection stealth definitions and function prototypes
+ */
+ #pragma once
+@@ -10,7 +10,7 @@ extern "C" {
+ #endif
+ 
+ //
+-// master stealth switch �?set to 0 to disable all stealth globally
++// master stealth switch �?set to 0 to disable all stealth globally
+ //
+ #define STEALTH_ENABLED                     1
+ 
+@@ -30,7 +30,7 @@ extern "C" {
+ #define SHADOW_PT_MODE_C    3   // all P=1/NX=0 + fast-path heal: skip __writecr3 when PTE already present. Periodic re-sync (every 4096 hits) catches repage.
+ #define SHADOW_PT_MODE_G    7   // Passthrough Shadow: PML4/PDPT/PD deep-copy, fork PT pages clearing NX on ALL PTEs. Extended window (no MTF), CR3-load/store exiting, individual INVVPID.
+ #define SHADOW_PT_MODE_H    8   // EPT Write-Protect Shadow: same extended window as MODE_G (no MTF, CR3-load/store exiting, individual INVVPID), but EPT W=0 on real PT pages keeps shadow PT in sync. OS write to real PT -> EPT violation -> lift W + MTF -> re-sync shadow PT (copy 512 PTEs, clear NX) -> re-protect. Eliminates stale-PFN divergence without A2 heal.
+-#define SHADOW_PT_MODE      SHADOW_PT_MODE_H
++#define SHADOW_PT_MODE      SHADOW_PT_MODE_G
+ 
+ //
+ // hide CR4.VMXE (bit 13) from guest reads
+@@ -45,7 +45,7 @@ extern "C" {
+ //
+ // approach: after CPUID exit, dynamically enable RDTSC exiting for one
+ // instruction. the trapped RDTSC returns a compensated value that hides
+-// the VM-exit overhead, then RDTSC exiting is disabled. zero drift �?
++// the VM-exit overhead, then RDTSC exiting is disabled. zero drift �?
+ // TSC_OFFSET is never modified, only one RDTSC per CPUID is trapped.
+ //
+ #define STEALTH_COMPENSATE_TIMING           1
+@@ -59,7 +59,7 @@ extern "C" {
+ //
+ // use private (deep-copied) host page tables for VMCS_HOST_CR3
+ // protects host-mode from guest/anti-cheat page table corruption
+-// disabled by default �?enable once base hv is verified stable
++// disabled by default �?enable once base hv is verified stable
+ //
+ // Private host CR3 now works with EPT hooks:
+ //   - All VMM memory (pool, stacks, EPT tables) allocated BEFORE hostcr3_build()
+@@ -72,7 +72,7 @@ extern "C" {
+ // prevents NMI hijacking (attacker corrupts OS IDT vector 2, triggers
+ // NMI from another core while in VMX-root -> code execution in ring 0)
+ //
+-// SEH note: windows SEH cannot work in VMX-root mode �?we use a private
++// SEH note: windows SEH cannot work in VMX-root mode �?we use a private
+ // stack, private CR3, and private IDT. the OS exception dispatcher cannot
+ // unwind our stack or find our exception handlers. the only solution is
+ // defensive coding: never cause exceptions in host mode. if one occurs
+@@ -86,14 +86,14 @@ extern "C" {
+ #define USE_PRIVATE_HOST_GDT                1
+ 
+ //
+-// CR4.VMXE �?bit 13 (may already be defined in ia32.h)
++// CR4.VMXE �?bit 13 (may already be defined in ia32.h)
+ //
+ #ifndef CR4_VMX_ENABLE_FLAG
+ #define CR4_VMX_ENABLE_FLAG                 0x2000ULL
+ #endif
+ 
+ //
+-// CR4.LAM_SUP �?bit 28 (supervisor linear address masking)
++// CR4.LAM_SUP �?bit 28 (supervisor linear address masking)
+ // not masked in guest/host mask, passes through transparently
+ //
+ #ifndef CR4_LAM_SUP_FLAG
+@@ -102,7 +102,7 @@ extern "C" {
+ 
+ //
+ // estimated hardware VM-exit + VM-entry transition overhead (cycles)
+-// used only for the old accumulating approach �?no longer needed
++// used only for the old accumulating approach �?no longer needed
+ //
+ // #define VM_EXIT_ENTRY_OVERHEAD_ESTIMATE     900
+ // #define BARE_METAL_CPUID_CYCLES             80
+@@ -135,7 +135,7 @@ typedef struct _STEALTH_CPUID_CACHE {
+ 
+     //
+     // TRUE if the CPU forces RDTSC exiting as a must-be-1 bit.
+-    // if forced, we can't toggle it off �?just use the armed flag.
++    // if forced, we can't toggle it off �?just use the armed flag.
+     //
+     BOOLEAN rdtsc_exiting_forced;
+ 
+diff --git a/Ophion-master/src/driver.cpp b/Ophion-master/src/driver.cpp
+index bb31080..2cb5a9f 100644
+--- a/Ophion-master/src/driver.cpp
++++ b/Ophion-master/src/driver.cpp
+@@ -96,6 +96,10 @@ DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
+     g_vmx_active = FALSE;
+     hv_alive_clear();          // tell clients to stop vmcalling BEFORE VMX goes off
+ 
++    // Final breadcrumb flush to BC.log before teardown
++    hv_breadcrumb_flush_now();
++    hv_breadcrumb_stop_flush();
++
+     ept_stealth_free_all_broadcast();
+     ept_stealth_region_destroy();
+     hv_pid_cr3_fini();
+@@ -436,7 +440,9 @@ DriverEntry(
+         UCHAR wms = wedge_cmos_read_match_seen();  // sticky: did a stealth match happen this run?
+         UCHAR wts = wedge_cmos_read_trig_seen();   // sticky: did the injection trigger fire this run?
+         UINT32 wrc = 0; UINT64 wra = 0;
+-        wedge_cmos_read_reinj(&wrc, &wra);  // reinject livelock probe (streak + fault VA)
++        wedge_cmos_read_reinj(&wrc, &wra);  // #PF fault VA + error code (or reinj streak)
++        UINT64 wpf_va = 0; UINT32 wpf_err = 0;
++        wedge_cmos_read_pf(&wpf_va, &wpf_err);
+ 
+         // per-CPU last-VM-exit bytes (0x60..0x7F). Show which handler each CPU was
+         // last in, breaking the #PF-storm masking that made the single global marker
+@@ -467,16 +473,16 @@ DriverEntry(
+             };
+             const char *nm = (wv < sizeof(wn)/sizeof(wn[0])) ? wn[wv] : "(unknown)";
+             RtlStringCbPrintfA(wbuf, sizeof(wbuf),
+-                "[WEDGE-LAST] marker=0x%02x -> %s match_seen=%d trig_seen=%d reinj_streak=%lu reinj_addr=0x%I64x\r\n"
++                "[WEDGE-LAST] marker=0x%02x -> %s match_seen=%d trig_seen=%d reinj_streak=%lu reinj_addr=0x%I64x pf_va=0x%I64x pf_err=0x%lx\r\n"
+                 "[WEDGE-PERCPU] %s(cpu0..cpu31 | 8E=#PF 8D=#GP 86=#UD | +0x40=stuck-in-handler | VMCALL-only: E0=hook E1=stealth E2=CPL E3=switch | else=completed)\r\n",
+-                (ULONG)wv, nm, (ULONG)wms, (ULONG)wts, (ULONG)wrc, wra, pbuf);
++                (ULONG)wv, nm, (ULONG)wms, (ULONG)wts, (ULONG)wrc, wra, wpf_va, (ULONG)wpf_err, pbuf);
+         }
+         else
+         {
+             RtlStringCbPrintfA(wbuf, sizeof(wbuf),
+-                "[WEDGE-LAST] no marker (magic=0x%02x) match_seen=%d trig_seen=%d reinj_streak=%lu reinj_addr=0x%I64x\r\n"
++                "[WEDGE-LAST] no marker (magic=0x%02x) match_seen=%d trig_seen=%d reinj_streak=%lu reinj_addr=0x%I64x pf_va=0x%I64x pf_err=0x%lx\r\n"
+                 "[WEDGE-PERCPU] %s(cpu0..cpu31 | 8E=#PF 8D=#GP 86=#UD | +0x40=stuck-in-handler | VMCALL-only: E0=hook E1=stealth E2=CPL E3=switch | else=completed)\r\n",
+-                (ULONG)wm, (ULONG)wms, (ULONG)wts, (ULONG)wrc, wra, pbuf);
++                (ULONG)wm, (ULONG)wms, (ULONG)wts, (ULONG)wrc, wra, wpf_va, (ULONG)wpf_err, pbuf);
+         }
+         // Write W.log FIRST; clear the CMOS only after a successful write, so a write
+         // failure (rare) preserves the data for the next boot's retry. Always clear on
+@@ -513,6 +519,17 @@ DriverEntry(
+         }
+     }
+ 
++    // Initialize breadcrumb ring buffer BEFORE vmx_init (must be allocated
++    // before hostcr3_build so it is mapped in the private host CR3).
++    {
++        NTSTATUS _bcst = hv_breadcrumb_init();
++        if (!NT_SUCCESS(_bcst))
++        {
++            HYPERPLATFORM_LOG_ERROR("[hv] breadcrumb init FAILED");
++            // non-fatal: VMX-root code checks g_bc_ring->magic before writing
++        }
++    }
++
+     // find PML4 self-map index (must be before vmx_init / hostcr3_build).
+     // used by hv_walk_va in VMX-root to read PTEs without pa_to_va (deadlock-safe).
+     {
+@@ -525,6 +542,7 @@ DriverEntry(
+     }
+ 
+     wedge_cmos_mark(0x10);
++    hv_breadcrumb(BC_EVT_HV_INIT_START, 0);
+ 
+     if (!vmx_init())
+     {
+@@ -537,13 +555,18 @@ DriverEntry(
+     }
+ 
+     wedge_cmos_mark(0x11);  // VMX is ON
++    hv_breadcrumb(BC_EVT_HV_INIT_VMXON, 0);
+     g_vmx_active = TRUE;
++
++    // Start BC.log flush worker thread (PASSIVE_LEVEL, flushes every 500ms)
++    hv_breadcrumb_start_flush();
+     hv_alive_set();           // signal VMX active to all kernel clients
+ 
+     if (ept_stealth_region_init())
+     {
+         HYPERPLATFORM_LOG_INFO("[hv] Stealth region initialized.");
+         wedge_cmos_mark(0x12);
++        hv_breadcrumb(BC_EVT_HV_INIT_EPT, 0);
+ 
+         // Allocate per-CPU PTE window pages for VMX-root memory access.
+         // Must be after stealth region init (pages come from stealth region)
+diff --git a/Ophion-master/src/ept_hook.cpp b/Ophion-master/src/ept_hook.cpp
+index 378c054..6abc38d 100644
+--- a/Ophion-master/src/ept_hook.cpp
++++ b/Ophion-master/src/ept_hook.cpp
+@@ -14,6 +14,10 @@
+ #include "hv.h"
+ #include "log.h"
+ 
++// In-memory heal markers (defined in vmexit.cpp). Replaces CMOS port I/O on hot path.
++extern volatile LONG g_wedge_heal_marker[64];
++extern volatile LONG g_wedge_trig_seen_flag;
++
+ #define POOL_TAG_SPLIT       0
+ #define POOL_TAG_HOOKED_PAGE 1
+ #define POOL_TAG_HOOKED_FUNC 2
+@@ -1062,6 +1066,19 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
+     pc &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+     __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+ 
++    // Livelock breaker (session 17): #PF intercept was temporarily disabled
++    // in the #PF re-inject path after 32 same-addr re-injects. The guest ran
++    // one instruction of its KiPageFault handler natively. Now re-arm the
++    // #PF intercept via ept_update_pf_intercept (restores bitmap based on
++    // active stealth pages) and return. Must run before MODE_H / shadow-CR3
++    // restore paths so those are not disturbed by the passthrough window.
++    if (vcpu->pf_passthrough_armed)
++    {
++        vcpu->pf_passthrough_armed = FALSE;
++        ept_update_pf_intercept(vcpu);
++        return;
++    }
++
+ #if (SHADOW_PT_MODE == SHADOW_PT_MODE_H)
+     //
+     // MODE_H: EPT write-protect re-sync. The OS just wrote to a protected
+@@ -1100,6 +1117,15 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
+             }
+             vmx_leave_guest_cr3(saved_cr3);
+ 
++            // Flush stale TLB entries so guest re-walks the re-synced shadow PT.
++            // Without this, a cached stale translation could persist until the
++            // next INVLPG/CR3-load, causing one stale access after re-sync.
++            {
++                INVVPID_DESCRIPTOR desc = {0};
++                desc.Vpid = VPID_TAG;
++                asm_invvpid(InvvpidSingleContext, &desc);
++            }
++
+             // Re-protect EPT: W=0 on the real PT page
+             PEPT_PML1_ENTRY pt_p1 = ept_get_pml1(vcpu->ept_page_table,
+                 (SIZE_T)((UINT64)wp_pfn << 12));
+@@ -1504,8 +1530,10 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
+                             _InterlockedExchange(fi->external_fired, 1);
+                         ept_hook_fire_record((UINT64)fi->virtual_address, (UINT64)fi->handler_function);
+                         __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
+-                        wedge_cmos_mark(0x01);  // WEDGE-A (trigger fired -> redirected RIP to handler)
+-                        wedge_cmos_set_trig_seen();  // sticky: the injection trigger fired this run
++                        g_wedge_heal_marker[KeGetCurrentProcessorNumberEx(NULL) & 0x3F] = 0x01;  // [in-mem]
++                        // Throttle: one-time CMOS write (trigger fires once per run)
++                        if (_InterlockedCompareExchange(&g_wedge_trig_seen_flag, 1, 0) == 0)
++                            wedge_cmos_set_trig_seen();  // sticky: the injection trigger fired this run
+                         return TRUE;
+                     }
+ 
+diff --git a/Ophion-master/src/ept_stealth.cpp b/Ophion-master/src/ept_stealth.cpp
+index a9ec2db..e422ee5 100644
+--- a/Ophion-master/src/ept_stealth.cpp
++++ b/Ophion-master/src/ept_stealth.cpp
+@@ -1,4 +1,4 @@
+-#ifndef PFN_MASK
++﻿#ifndef PFN_MASK
+ #define PFN_MASK 0x000FFFFFFFFFF000ULL
+ #endif
+ /*
+diff --git a/Ophion-master/src/vmexit.cpp b/Ophion-master/src/vmexit.cpp
+index e09c40e..5eab861 100644
+--- a/Ophion-master/src/vmexit.cpp
++++ b/Ophion-master/src/vmexit.cpp
+@@ -64,6 +64,19 @@ static UINT32        g_wedge_rip_last[64];
+ // exit path is lock-free, ruling out deadlocks).
+ static volatile LONG g_wedge_snap_ctr[64];
+ 
++// In-memory heal markers (replaces CMOS port I/O on hot path).
++// Per-CPU last heal step marker. Read by PF-loop detector when it snaps to CMOS.
++volatile LONG g_wedge_heal_marker[64];
++// In-memory sticky flags (replaces per-match CMOS writes)
++volatile LONG g_wedge_match_seen_flag;
++volatile LONG g_wedge_trig_seen_flag;
++
++// PF-loop detector: catches TRUE-loops (heal returns TRUE but fault repeats)
++// that reinj_streak misses (it only counts FALSE/re-inject path).
++// Snaps to CMOS at threshold 32 (fast detection, minimal port I/O).
++static volatile LONG g_wedge_pfloop_streak[64];
++static UINT64        g_wedge_pfloop_addr[64];
++
+ // WEDGE per-CPU last-exit byte (throttle cache). Each CPU owns CMOS[0x60+cpu]; the
+ // byte is rewritten only when the value changes, so a #PF storm (constant 0x8E)
+ // costs ~1 write/CPU total, not 1 write/#PF. This breaks the multi-CPU masking that
+@@ -591,6 +604,7 @@ vmexit_handle_mov_cr(VIRTUAL_MACHINE_STATE * vcpu)
+                     // Returning to target -> re-activate shadow.
+                     __vmx_vmwrite(VMCS_GUEST_CR3, vcpu->shadow_cr3_val);
+                     vcpu->shadow_extended = TRUE;
++                    hv_breadcrumb_cpu(BC_EVT_SHADOW_REACTIVATE, vcpu->core_id, new_cr3_clean);
+                     vcpu->shadow_pending  = FALSE;
+                     // No INVVPID: PCID isolates kernel/user TLB. Stale NX=1
+                     // entries handled by already_on_shadow (individual flush).
+@@ -606,6 +620,7 @@ vmexit_handle_mov_cr(VIRTUAL_MACHINE_STATE * vcpu)
+                     __vmx_vmwrite(VMCS_GUEST_CR3, new_cr3_clean);
+                     vcpu->shadow_extended = FALSE;
+                     vcpu->shadow_pending  = TRUE;
++                    hv_breadcrumb_cpu(BC_EVT_SHADOW_PENDING, vcpu->core_id, new_cr3_clean);
+ 
+                     // Clear guard + narrow #PF (other processes must not VM-exit).
+                     vcpu->nx_timer_real_cr3 = 0;
+@@ -1862,6 +1877,11 @@ vmexit_handle_triple_fault(VIRTUAL_MACHINE_STATE * vcpu)
+     // TFs again -> infinite loop = freeze. A host TF would reset (not freeze)
+     // and would NOT reach this mark, so 0x0F cleanly separates the two modes.
+     wedge_cmos_mark(0x0F);
++    hv_breadcrumb_cpu(BC_EVT_TRIPLE_FAULT, vcpu->core_id, vcpu->vmexit_rip);
++    /* Guest triple-faulted: bugcheck immediately with guest RIP so we get a dump
++     * instead of the old no-op re-entry freeze (which only yielded a 0x101 watchdog
++     * after ~10s with no fault RIP). KeBugCheckEx never returns. */
++    hv_panic(HV_PANIC_TRIPLE_FAULT, vcpu->vmexit_rip, (UINT64)vcpu->core_id, (UINT64)vcpu->exit_reason);
+     vcpu->advance_rip = FALSE;
+ }
+ 
+@@ -1983,6 +2003,18 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
+     exit_reason = (UINT32)(exit_raw & 0xFFFF);
+     vcpu->exit_reason = exit_reason;
+ 
++    /* Bit 31 of VMCS_EXIT_REASON = VM-entry failure (the guest was NOT entered).
++     * Masking with 0xFFFF above silently treats entry failures as normal exits
++     * -> VMRESUME -> fail again -> hang/loop. Bugcheck now with the VM-instruction
++     * error so the cause (invalid guest state) is captured in a dump instead of a
++     * mystery freeze. KeBugCheckEx never returns. */
++    if (exit_raw & 0x80000000ULL)
++    {
++        size_t _vm_instr_err = 0;
++        __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &_vm_instr_err);
++        hv_panic(HV_PANIC_ENTRY_FAILURE, (UINT64)exit_reason, (UINT64)_vm_instr_err, (UINT64)vcpu->core_id);
++    }
++
+     //
+     // lazy per-CPU stealth setup DISABLED for now.
+     // stealth only active on the install CPU. shellcode thread must be
+@@ -2062,7 +2094,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
+                 _InterlockedExchange(&g_wedge_reason_streak[wcpu], 1);
+             }
+             LONG ws = g_wedge_reason_streak[wcpu];
+-            if (ws >= 1024 && (ws & 0x3FF) == 0)
++            if (ws >= 128 && (ws & 0x7F) == 0)
+                 wedge_cmos_snap_reinj((UINT32)ws, (UINT64)pcpu_byte);
+ 
+             // RIP-stuck detector (see g_wedge_rip_streak above). vcpu->vmexit_rip was
+@@ -2078,7 +2110,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
+                 _InterlockedExchange(&g_wedge_rip_streak[wcpu], 1);
+             }
+             LONG wrs = g_wedge_rip_streak[wcpu];
+-            if (wrs >= 1024 && (wrs & 0x3FF) == 0)
++            if (wrs >= 128 && (wrs & 0x7F) == 0)
+                 wedge_cmos_snap_reinj((UINT32)wrs, (UINT64)wrip | 0x1);
+ 
+             // throttle CMOS snap+end to every 8th exit (see g_wedge_snap_ctr above)
+@@ -2272,8 +2304,10 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
+         // the guest didn't cause this and can't handle it.
+         // enter shutdown state �?system will triple-fault cleanly.
+         //
+-        __vmx_vmwrite(VMCS_CTRL_VMENTRY_INTERRUPTION_INFORMATION_FIELD, 0);
+-        __vmx_vmwrite(VMCS_GUEST_ACTIVITY_STATE, GUEST_ACTIVITY_STATE_SHUTDOWN);
++        /* EPT misconfig is a host-side fault (bad EPT entry: reserved bits, write-only,
++         * etc). Old code set guest SHUTDOWN -> hang -> 0x101 watchdog with no info.
++         * Bugcheck now with guest RIP + exit_qual so the bad GPA is recoverable. */
++        hv_panic(HV_PANIC_EPT_MISCONFIG, vcpu->vmexit_rip, vcpu->exit_qual, (UINT64)vcpu->core_id);
+         vcpu->advance_rip = FALSE;
+         break;
+     }
+@@ -2424,10 +2458,49 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
+                 // and must reach the handler's mid-window guard to be serviced under the
+                 // REAL CR3. without this, such a #PF would be re-injected under the
+                 // shadow CR3 and MmAccessFault would run on the stale shadow PT (0x1A).
++                {
++                    // PF-loop detector: counts ALL consecutive same-address #PFs
++                    // (both TRUE and FALSE paths). reinj_streak only counts FALSE
++                    // (re-inject). A TRUE-loop (heal returns TRUE but shadow PTE is
++                    // wrong -> fault repeats) is invisible to reinj_streak. Snap at
++                    // 32 for fast detection. Uses in-memory tracking (no CMOS I/O
++                    // on hot path); only snaps to CMOS at threshold.
++                    ULONG wcpu_pf = KeGetCurrentProcessorNumberEx(NULL);
++                    if (wcpu_pf < 64)
++                    {
++                        UINT64 pfa = vcpu->exit_qual;
++                        if (pfa == g_wedge_pfloop_addr[wcpu_pf])
++                            _InterlockedIncrement(&g_wedge_pfloop_streak[wcpu_pf]);
++                        else
++                        {
++                            g_wedge_pfloop_addr[wcpu_pf] = pfa;
++                            _InterlockedExchange(&g_wedge_pfloop_streak[wcpu_pf], 1);
++                        }
++                        LONG wps = g_wedge_pfloop_streak[wcpu_pf];
++                        // Lowered from 32 to 8 for faster livelock detection.
++                        // Also snap for kernel-address #PFs (bit 47 = 1) at
++                        // threshold 2 -- these indicate a shadow-window leak
++                        // into kernel space (the session-16 hang root cause).
++                        if ((pfa >> 47) & 1) {
++                            if (wps >= 2 && (wps & 0x1) == 0)
++                                wedge_cmos_snap_reinj((UINT32)wps, pfa);
++                        } else if (wps >= 8 && (wps & 0x7) == 0)
++                            wedge_cmos_snap_reinj((UINT32)wps, pfa);
++                    }
++                }
++
+                 if ((pf_error_code & (0x10 | 0x02)) || vcpu->nx_timer_real_cr3)
+                 {
+                     UINT64 fault_addr = vcpu->exit_qual;
+ 
++                    // REMOVED: wedge_cmos_snap_pf was here -- it did 12 cmos_write_byte
++                    // calls (36 port I/O ops) on EVERY #PF during the shadow window's
++                    // widened intercept. At 10K+ #PFs/sec this consumed 100% CPU -> hang.
++                    // PF-loop detector above + streak snaps provide the same info at
++                    // threshold only (rare CMOS I/O). hv_breadcrumb (in-memory) still
++                    // logs every #PF for BC.log.
++                    hv_breadcrumb_cpu(BC_EVT_PF_ENTRY, vcpu->core_id, fault_addr);
++
+                     if (ept_stealth_handle_pf(vcpu, fault_addr, (UINT32)pf_error_code))
+                     {
+                         //
+@@ -2459,7 +2532,8 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
+                 // re-injects -> tight loop) reaches 1024 and snaps to CMOS. Normal activity
+                 // resolves each NX #PF -> next #PF is a different addr -> streak resets ->
+                 // never snaps -> zero hot-path port I/O. FETCH-gated (bit4=0x10) as before.
+-                if (pf_error_code & 0x10)
++                // Track ALL re-injected #PFs (not just fetch). Data #PF livelocks
++                // were invisible with the old FETCH-only gate (bit4=0x10).
+                 {
+                     ULONG wcpu = KeGetCurrentProcessorNumberEx(NULL);
+                     if (wcpu < 64)
+@@ -2473,8 +2547,44 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
+                             _InterlockedExchange(&g_wedge_reinj_streak[wcpu], 1);
+                         }
+                         LONG ws = g_wedge_reinj_streak[wcpu];
+-                        if (ws >= 1024 && (ws & 0x3FF) == 0)
++                        if (ws >= 128 && (ws & 0x7F) == 0)
+                             wedge_cmos_snap_reinj((UINT32)ws, wfa);
++                        // Diagnostic: capture fault addr / RIP / error code at streak>=8
++                        // (0x0106=addr 0x0107=RIP 0x0108=errcode) -- the actual #PF error
++                        // code was never logged before; W.log pf_err was the streak, not ec.
++                        if (ws >= 8 && (ws & 0x7) == 0) {
++                            size_t guest_rip = 0;
++                            __vmx_vmread(VMCS_GUEST_RIP, &guest_rip);
++                            size_t pf_ec = 0;
++                            __vmx_vmread(VMCS_VMEXIT_INTERRUPTION_ERROR_CODE, &pf_ec);
++                            hv_breadcrumb_cpu(0x0106, vcpu->core_id, wfa);
++                            hv_breadcrumb_cpu(0x0107, vcpu->core_id, guest_rip);
++                            hv_breadcrumb_cpu(0x0108, vcpu->core_id, pf_ec);
++                        }
++                        // Livelock breaker: after 32 re-injected #PFs at the same address,
++                        // the guest cannot resolve the fault through HV re-injection
++                        // (each re-inject VM-exits -> tight loop -> system hang, as seen
++                        // with the NULL-page 0x12 fault: reinj_streak=2176).
++                        // Disable #PF interception so the guest KiPageFault handler runs
++                        // natively. Set MTF to re-arm the intercept after 1 instruction.
++                        // The re-inject below still delivers the #PF, but without a VM-exit
++                        // on re-fault, letting the handler dispatch the exception (SEH /
++                        // thread termination) instead of livelocking inside the HV.
++                        if (ws >= 32) {
++                            size_t exc_bm = 0;
++                            __vmx_vmread(VMCS_CTRL_EXCEPTION_BITMAP, &exc_bm);
++                            exc_bm &= ~(1ULL << EXCEPTION_VECTOR_PAGE_FAULT);
++                            __vmx_vmwrite(VMCS_CTRL_EXCEPTION_BITMAP, exc_bm);
++                        
++                            SIZE_T pc2 = 0;
++                            __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc2);
++                            pc2 |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
++                            __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc2);
++                        
++                            vcpu->pf_passthrough_armed = TRUE;
++                            _InterlockedExchange(&g_wedge_reinj_streak[wcpu], 0);
++                            hv_breadcrumb_cpu(0x0109, vcpu->core_id, wfa);
++                        }
+                     }
+                 }
+             }
+diff --git a/Ophion-master/src/vmx.cpp b/Ophion-master/src/vmx.cpp
+index 38fff76..fcf4edb 100644
+--- a/Ophion-master/src/vmx.cpp
++++ b/Ophion-master/src/vmx.cpp
+@@ -524,6 +524,9 @@ vmx_init(VOID)
+     stealth_init_cpuid_cache();
+ #endif
+ 
++    // Initialize safe walk range for host #PF recovery (stealth_walk_pte_selfmap).
++    ept_stealth_init_pf_safe_range();
++
+     if (!ept_init())
+     {
+         HYPERPLATFORM_LOG_ERROR("[hv] EPT initialization failed!");
+diff --git a/PROCESS.md b/PROCESS.md
+index 2e4d9f9..447d60a 100644
+--- a/PROCESS.md
++++ b/PROCESS.md
+@@ -1,51 +1,108 @@
+-# Codex 工作流程记录 (Ophion/renderdoc 注入项目)
++# Codex 工作流程记录 (Ophion/renderdoc 注入)
+ 
+ > 记录已完成、进行中、待办的工作。上下文压缩后必读。
+ 
+ ## 当前状态
+-- **项目路径**：F:\winDriver\te\Ophion-master (驱动) + F:\winDriver\te\Ophion-master\renderdoc-1.36 (renderdoc)
+-- **最近更新**：2026-08-04 20:01
+-- **最近会话**：renderdoc-capture-fix-mode-f
+-- **进行中**：MODE_F 全部修复完成（3 个致命 bug + INVVPID 风暴），Debug 编译+签名通过
+-- **下一步**：等 He 确认再部署测试截帧
++- **项目路径**：F:\winDriver\te\Ophion-master
++- **最近更新**：2026-08-11 11:25
++- **最近会话**：session 22 (接管, 部署 CR4.PGE toggle 修复)
++- **进行中**：CR4.PGE toggle 修复已部署+服务 RUNNING，等待 He 启动 GoWR 注入测试
++- **下一步**：He 启动 GoWR -> 运行 inject_renderdoc.exe -> 检查系统是否存活
+ 
+ ## 变更日志
+-### 2026-08-04 20:01  [session renderdoc-capture-fix-mode-f]
+-- 动作：接管 + 修复 MODE_F 三个致命 bug + INVVPID 风暴根因
++### 2026-08-11 11:25  [session 22]
++- 动作：接管（新会话已读取 PROCESS.md，恢复上下文）
++- 结论：已确认进度 / 待办 = 部署 session 21 的 CR4.PGE toggle 修复并测试
++
++### 2026-08-11 11:26  [session 22]
++- 动作：部署 CR4.PGE toggle 修复 + 保存模块快照 + 启动服务
++- 文件：
++  - 部署 Ophion.sys + TestEptHook.sys (build/bin/Debug -> System32/drivers)
++  - C:\Windows\MOD_SNAPSHOT.txt 已刷新（含 Ophion/TestEptHook）
++- 验证：
++  - hv.h L112-114: CR4.PGE toggle 确认在位
++  - Ophion + TestEptHook 服务均 RUNNING
++  - BC.log seq=3: HV_INIT(0x01) -> VMXON(0x02) -> EPT(0x03)，无 PF
++- 结论：驱动已部署运行，系统稳定，等待注入测试
++- 关键模块基址（本次启动）：
++  ntoskrnl.exe    0xFFFFF80747000000
++  Ophion.sys      0xFFFFF807C7AD0000
++  TestEptHook.sys 0xFFFFF807C7B20000
++  dxgkrnl.sys     0xFFFFF8075D050000
++  nvlddmkm.sys    0xFFFFF80772D80000
++
++### 2026-08-11 10:30  [session 19]
++- 动作：接管（新会话已读取 PROCESS.md，恢复上下文）
++- 结论：已确认进度 / 待办 = 分析 BSOD 并修复
++
++### 2026-08-11 10:32  [session 19]
++- 动作：分析 BSOD minidump 081126-10250-01.dmp + 实现修复
+ - 文件：
+-  - src/ept_stealth.cpp：first-swap 加 #PF widen + INVVPID 改单地址
+-  - src/vmexit.cpp：PENDING 清 guard + 收窄 #PF；re-activate 恢复 guard + widen #PF + 去掉全量 INVVPID
+-  - include/stealth.h, include/hv_types.h：MODE_F 定义和状态字段
+-- 结论：Debug 编译+签名通过，等 He 确认部署
+-
+-## 关键发现（根因分析 - MODE_F 卡死/BSOD 根因）
+-- **Bug 1（BSOD）**：first-swap 没 widen #PF -> 数据 #PF 直达 guest MmAccessFault 在影子 PT
+-  上跑 -> PFN 数据库腐败 -> 0x1A/BSOD。修复：widen #PF 到 all-faults。
+-- **Bug 2（BSOD）**：PENDING 路径没清 nx_timer_real_cr3 + 没收窄 #PF -> 其他进程 #PF 误触发
+-  guard -> abort 写回目标 CR3 -> BSOD。修复：清 guard + ept_update_pf_intercept。
+-- **Bug 3（硬 hang）**：INVVPID 风暴。first-swap 和 re-activate 都用 InvvpidSingleContext
+-  （全量 TLB flush）。非 stealth 数据页在 stale 2MB 区域 -> 数据 #PF -> abort+reinject ->
+-  re-open(first-swap) -> 全量 INVVPID -> TLB 全刷 -> 百万级 TLB miss/秒 -> 硬卡死。
+-  修复：first-swap 改 InvvpidIndividualAddress（单地址）；re-activate 去掉 INVVPID
+-  （PCID 下不冲突，stale 条目由 already_on_shadow 逐个处理）。
+-- **MODE_F 正确数据流（修复后）**：
+-  1. 首次 NX-fetch #PF -> swap 影子 CR3 + 单地址 INVVPID + widen #PF + CR3-load/store exiting
+-  2. 代码执行 NX=0（零 #PF，零 VM-exit）
+-  3. stealth 数据页 stale #PF -> A2 heal（写 shadow PTE + 单地址 INVVPID）-> 继续执行
+-  4. 非 stealth 数据页 stale #PF -> A2 bail -> abort+reinject+reopen（单地址 INVVPID，低开销）
+-  5. 上下文切换 CR3-load -> PENDING（真实 CR3，收窄 #PF，清 guard）
+-  6. 回到目标 -> re-activate（影子 CR3，widen #PF，恢复 guard，无 INVVPID）
+-  7. 首次代码执行后 re-activate -> already_on_shadow（单地址 INVVPID）
+-- **TdBuildShadowCR3**：影子 PML4/PDPT/PD 是 real 深拷贝。非 DLL 范围指向 real 下级页。
+-  一个进程一个 shadow CR3（TdStealthFindShadowCr3ForPid 复用 + TdExtendShadowCR3 扩展）。
+-- **A2 heal**：stealth 数据页写 shadow_pte_va + 单地址 INVVPID（已实现）。非 stealth 数据页
+-  bail -> abort+reinject（低开销因单地址 INVVPID）。
+-- **构建**：Debug 配置，deploy_drivers.ps1 用 build\bin\Debug。TrustAsia 签名在 post-build。
+-- **不得回退**：He 明确要求未经允许不要回退代码。
++  - include/hv.h: vmx_enter_cr3 加 _disable() 禁中断 + 打包 IF 到 bit 62；vmx_leave_guest_cr3 恢复
++  - src/ept_stealth.cpp: stealth_walk_pte_selfmap + stealth_walk_pt_page_selfmap 每次读前加 __invlpg (8处)
++- 根因分析：
++  - BSOD: 0xDEADC0DE (HV_PANIC_HOST_PF), CR2=0xFFFFFF00BFDFE028, RIP=stealth_walk_pte_selfmap+0xdc
++  - CR2 解码: p4=2, p3=510, p2=510, p1=5, 原始 VA=0x17FBFE05000 (GoWR 用户空间)
++  - 崩在 PT 级 self-map 读 (mov rax,[rax])，error code=0 (not-present, read, supervisor)
++  - 问题1: vmx_enter_cr3 切到 guest CR3 后没禁中断，走页表期间定时器中断可能触发 working set trim -> TOCTOU
++  - 问题2: PML4 self-map (PML4[510]) 有 G=1 (global)，__writecr3 不刷全局 TLB -> stale TLB
++- 修复：_disable() 禁中断 + __invlpg 刷每次 self-map 读前 TLB + IF 打包到返回值 bit 62
++- 结论：Build 成功，已部署，服务 RUNNING，BC.log seq=3 (无 PF)
++
++### 2026-08-11 10:52  [session 21]
++- 动作：分析 BSOD minidump 081126-12484-01.dmp + 实现 CR4.PGE toggle 修复
++- 文件：include/hv.h: vmx_enter_cr3 中 __writecr3 后加 CR4.PGE toggle
++- 根因分析：
++  - session 19 的 __invlpg 修复无效，BSOD 仍在 stealth_walk_pte_selfmap+0xdc
++  - 根因：PWC (页表遍历缓存) 陈旧，__invlpg 在某些 CPU 上不完全刷新 PWC
++  - CR4.PGE 清零是 x86 上唯一保证全量 TLB+PWC 刷新的方法
++- 修复：__writecr3(cr3) 后 toggle CR4.PGE (清零再恢复) -> 刷所有 TLB+PWC (含全局)
++- 结论：Build 成功，已签名，待部署（本次 session 22 已部署）
++
++### 2026-08-11 09:55  [session 17]
++- 动作：接管 + 实现 livelock breaker
++- 文件：hv_types.h (pf_passthrough_armed), vmexit.cpp (streak>=32 breaker), ept_hook.cpp (MTF 检查)
++- 结论：Build 成功，已部署
++
++## 关键发现
++- **pa_to_va (MmGetVirtualForPhysical) 在 VMX-root 下会返回 NULL** -> session 14 用 self-map walk 修复
++- **CMOS port I/O 热路径风暴** -> session 15 用内存写替代
++- **内核地址 #PF 卡死系统** (session 16): ept_stealth_handle_pf 顶部加 bit47 检查
++- **NULL 页 0x12 #PF livelock** (session 17): streak>=32 时禁用 #PF bitmap + MTF
++- **BSOD in stealth_walk_pte_selfmap** (session 19-21 根因链):
++  - session 19: _disable() 禁中断 + __invlpg 刷 TLB -> 仍然 BSOD
++  - session 21: 根因是 PWC 陈旧，__invlpg 不完全刷新 PWC -> CR4.PGE toggle 全量刷新
++  - 修复: __writecr3 后 toggle CR4.PGE (清零->恢复) 刷所有 TLB+PWC
++- **wedge_percpu_mark 是 no-op** -> PERCPU 数据在 VM-exit 时不更新
++- **系统卡死的诊断方法**：BC.log ring buffer (in-memory, 每 #PF 记录)
++  seq 小 (<100) 且只有 PF_ENTRY = handler 卡死，无循环
++  seq 大 (>1000) = 循环 livelock
++- **3 个内核地址**：0xfffff80484affbc4/b002e0/b033a0，在同一 2MB 范围
++- .cpp/.h 文件有双 CR 行尾 (\r\r\n)，用 regex 替换可绕过
++- VMX-root 禁止：API 调用、文件 I/O、DbgPrint。只能 interlocked + 内存写 + VMX 指令 + port I/O + __invlpg + __writecr4
++- 日志读取需要用 [System.IO.File]::Open(path, Open, Read, ReadWrite)
++- BC.log 是文本格式 ring buffer: "[seq] cpu=N evt=0xXXXX data=0x... flg=N"
++- BC_EVT: 0x01=HV_INIT 0x02=VMXON 0x03=EPT 0x14=PF_ENTRY 0x15=PF_SHADOW_OPEN 0x17=PF_A2_HEAL 0x18=PF_A2_BAIL 0x19=PF_ABORT 0x2C=ALREADY_ON_SHADOW
++- mod_snapshot 需用 EnumDeviceDrivers API + BitConverter 转 UInt64
++- **renderdoc.dll 路径**: F:\winDriver\te\renderdoc.dll (不是 Ophion-master 下)
++- **注入器**: F:\winDriver\te\Ophion-master\Injector\inject_renderdoc.exe
++- **游戏路径**: E:\God of War Ragnarok\GoWR.exe
++- **WinDbg/kd**: C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\kd.exe
++- **符号路径**: srv*C:\Symbols*https://msdl.microsoft.com/download/symbols;F:\winDriver\te\Ophion-master\Ophion-master\build\bin\Debug
++- **备选方案** (如果 CR4.PGE toggle 无效):
++  1. 用 stealth_walk_pte (pa_to_va 版本，L1671) 替代 self-map walk
++  2. 在 hv_host_pf_panic 中检查 RIP 是否在 stealth_walk_pte_selfmap 范围，是则跳过崩溃
++  3. 完全避免 CR3 切换，用 EPT 映射 guest 物理页
+ 
+ ## 待办 / 下一步
+-1. 等 He 确认 -> 部署驱动（deploy_drivers.ps1 -Start）
+-2. 启动 GoWR -> 注入 renderdoc -> 触发 capture.flag -> 验证 .rdc > 1.5MB 有 draw call
+-3. 验证无 BSOD/卡死
+-4. 如果截帧成功，提交代码
+-5. shadow CR3 只 shadow 代码页、数据页用真实 PTE 的优化（后续）
+\ No newline at end of file
++1. He 启动 GoWR.exe
++2. 运行 inject_renderdoc.exe GoWR.exe F:\winDriver\te\renderdoc.dll
++3. 如果系统存活：
++   - 检查 BC.log 是否有 PF_ENTRY / A2 heal breadcrumb
++   - 确认 renderdoc 是否加载 (Process Explorer / 任务管理器)
++4. 如果卡死/蓝屏：
++   - 重启后读 BC.log（看 seq 和 evt 类型）
++   - 读 W.log (reinj_streak, reinj_addr)
++   - 读 MOD_SNAPSHOT.txt，用 kd.exe 把 RIP 映射到模块/函数
++   - 注意：本次 Ophion 基址 = 0xFFFFF807C7AD0000
++5. 更新 PROCESS.md
+\ No newline at end of file

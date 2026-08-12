@@ -1,0 +1,14 @@
+﻿fix(hypervisor): SEH + liveloop breakers + safety-net fixes (session 29-31)
+
+Session 30:
+- MTF handler direction fix (shadow->shadow not real->shadow)
+- PF TRUE-path + MOV_CR liveloop breakers
+- Safety-net bugcheck for unhandled exit liveloops
+- TdShadowFreePageList + TdShadowUnmapRealPage SEH fixes
+- Public abort wrapper ept_stealth_abort_shadow_window
+
+Session 31:
+- Safety-net VMCALL false positive fix (exclude VMCALL from streak)
+- BC.log SEH fix (ZwWriteFile Ntfs AV caused 0x1E BSOD)
+
+Test results: injection OK, system stable 15+ min, no BSOD

@@ -909,8 +909,6 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
         }
     }
 
-    // Non-throttled: unhandled EPT violations are rare and indicate a problem
-    wedge_cmos_mark(0x24);
     ept_invept_single(vcpu->ept_pointer);
     vcpu->advance_rip = FALSE;
 }

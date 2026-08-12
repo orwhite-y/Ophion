@@ -47,6 +47,7 @@ volatile LONG g_dbg_shadow_pf_synced_logged = 0;  // verbose-log cap counter for
 volatile LONG g_dbg_a2_abort = 0;                 // A2: fallbacks to abort+reinject (any reason)
 volatile LONG g_dbg_a2_spurious = 0;              // A2: SPURIOUS aborts (real state != error code -> the crash class)
 volatile LONG g_dbg_a2_spurious_logged = 0;       // verbose-log cap counter for spurious aborts (diagnostic only)
+volatile LONG g_near_null_shadow_disabled = 0;  // latch: near-NULL data #PF under shadow -> disable shadow re-open
 volatile LONG g_dbg_nomatch = 0;                  // mid-window FETCH #PF to non-stealth NX page (clobber signal)
 volatile LONG g_dbg_nomatch_logged = 0;           // verbose-log cap counter for nomatch (diagnostic only)
 volatile LONG g_dbg_a2_code_synced = 0;           // NX-open: shadow CODE PTE re-synced from real (repaged code page fix)
@@ -1749,6 +1750,19 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
 {
     if (!g_ept || IsListEmpty(&g_ept->stealth_pages)) return FALSE;
 
+    // Near-NULL latch: if a previous data #PF at VA < 0x10000 occurred under
+    // the shadow window, the renderdoc code is dereferencing NULL. Re-opening
+    // the shadow window creates a livelock (NX #PF -> shadow -> NULL deref
+    // -> abort -> reinject -> guest handles -> NX #PF -> ...). Stop opening
+    // shadow windows; let the NX #PF be delivered to the guest as an access
+    // violation (NX=1 in real CR3) so the renderdoc thread terminates.
+    if (g_near_null_shadow_disabled)
+    {
+        if (vcpu->nx_timer_real_cr3)
+            stealth_pf_abort_shadow_window(vcpu);
+        return FALSE;
+    }
+
     // WEDGE-B (0x02) removed: per-CPU exit-reason snap in vmexit_handler records
     // #PF as 0x8E per-CPU now. This global mark was a per-#PF port-I/O confound
     // (it + 0x0D were why the global marker always read 0x0d under the storm).
@@ -1774,6 +1788,8 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             hv_breadcrumb_cpu(0x010F, vcpu->core_id, vcpu->vmexit_rip);
             hv_breadcrumb_cpu(0x0110, vcpu->core_id, (UINT64)error_code);
             stealth_pf_abort_shadow_window(vcpu);
+            _InterlockedExchange(&g_near_null_shadow_disabled, 1);
+            wedge_cmos_mark(0x07);
             return FALSE;
         }
 

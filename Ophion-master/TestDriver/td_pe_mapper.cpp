@@ -1328,7 +1328,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
         NTSTATUS ss = TdStealthAllocPage(
             caller_cr3, page_va, page_phys,
             NULL, 0, TRUE, pt_pfn, pt_idx,
-            FALSE, shadow_cr3, TRUE, FALSE);
+            FALSE, shadow_cr3, TRUE, FALSE, target_pid);
 
         if (!NT_SUCCESS(ss))
         {

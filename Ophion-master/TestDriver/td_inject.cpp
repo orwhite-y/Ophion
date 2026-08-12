@@ -984,7 +984,8 @@ TdStealthAllocPage(
     BOOLEAN use_fake_pt = FALSE,  // TRUE = create fake PT (NX hiding)
     UINT64  shadow_cr3_phys = 0,  // shadow CR3 phys (NX=0 for target, 0=not used)
     BOOLEAN no_ept_split = FALSE, // TRUE = shadow CR3 only, no EPT page split
-    BOOLEAN intercept_write = FALSE)
+    BOOLEAN intercept_write = FALSE,
+    UINT64  target_pid)
 {
     TD_STEALTH_PARAM * req = (TD_STEALTH_PARAM *)ExAllocatePool2(
         POOL_FLAG_NON_PAGED, sizeof(TD_STEALTH_PARAM), TD_STEALTH_REQ_TAG);
@@ -1017,7 +1018,7 @@ TdStealthAllocPage(
     }
 
     req->caller_cr3       = caller_cr3;
-    req->target_pid       = 0;
+    req->target_pid       = target_pid;
     req->target_va        = page_va;
     req->handler_function = NULL;
     req->target_phys      = page_phys;
@@ -1188,7 +1189,8 @@ TdStealthInjectPages(
             FALSE,
             0,
             FALSE,
-            FALSE);
+            FALSE,
+            (UINT64)PsGetCurrentProcessId());
 
         if (!NT_SUCCESS(stealth_st))
         {

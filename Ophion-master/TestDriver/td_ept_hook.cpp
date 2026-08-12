@@ -16,7 +16,7 @@ PVOID           g_hooked_target     = NULL;
 volatile LONG   g_hook_log_count    = 0;
 
 //
-// proxy function 鈥?called instead of NtCreateFile when EPT hook is active.
+// proxy function �?called instead of NtCreateFile when EPT hook is active.
 // logs the file path via DbgPrint, then calls original via trampoline.
 //
 // Pid of the Box.exe process we injected via CreateFile("test"). Re-armed on
@@ -64,7 +64,7 @@ HookedNtCreateFile(
         goto call_original;
 
     //
-    // 鍖归厤鏂囦欢鍚嶆槸鍚︿负 "test"锛岃Е鍙?renderdoc 娉ㄥ叆
+    // 鍖归厤鏂囦欢鍚嶆槸鍚︿负 "test"锛岃Е�?renderdoc 娉ㄥ�?
     //
     if (ObjectAttributes && ObjectAttributes->ObjectName &&
         ObjectAttributes->ObjectName->Buffer && ObjectAttributes->ObjectName->Length >= 4 * sizeof(WCHAR))
@@ -78,10 +78,10 @@ HookedNtCreateFile(
             (buf[name_len - 2] == L's' || buf[name_len - 2] == L'S') &&
             (buf[name_len - 1] == L't' || buf[name_len - 1] == L'T'))
         {
-            // 纭鍓嶉潰鏄矾寰勫垎闅旂鎴栧紑澶达紙閬垮厤鍖归厤鍒?"test.exe" 绛夛級
+            // 纭鍓嶉潰鏄矾寰勫垎闅旂鎴栧紑澶达紙閬垮厤鍖归厤鍒?"test.exe" 绛夛�?
             if (name_len == 4 || buf[name_len - 5] == L'\\')
             {
-                HYPERPLATFORM_LOG_WARN_SAFE("[td-hook] CreateFile(\"test\") detected 鈥?triggering renderdoc injection!");
+                HYPERPLATFORM_LOG_WARN_SAFE("[td-hook] CreateFile(\"test\") detected �?triggering renderdoc injection!");
 
                 PEPROCESS current_proc = PsGetCurrentProcess();
                 HANDLE current_pid = PsGetProcessId(current_proc);
@@ -99,13 +99,13 @@ HookedNtCreateFile(
 
                 if (is_box)
                 {
-                    // 姣忎釜 Box.exe 杩涚▼鍙敞鍏ヤ竴娆? 璁板綍宸叉敞鍏ョ殑 pid;璇ヨ繘绋嬮€€鍑烘椂鍦?
-                    // TdProcessNotify 閲岄噸缃?杩欐牱鍏抽棴 Box 鍐嶅紑鏂?Box 浼氶噸鏂版敞鍏?
-                    // (鍘熸潵鐨?g_test_file_fired 鏄?driver 鐢熷懡鍛ㄦ湡 flag,鍙敞鍏ョ涓€娆?銆?
+                    // 姣忎�?Box.exe 杩涚▼鍙敞鍏ヤ竴娆? 璁板綍宸叉敞鍏ョ�?pid;璇ヨ繘绋嬮€€鍑烘椂�?
+                    // TdProcessNotify 閲岄噸缃?杩欐牱鍏抽棴 Box 鍐嶅紑鏂?Box 浼氶噸鏂版敞�?
+                    // (鍘熸潵鐨?g_test_file_fired �?driver 鐢熷懡鍛ㄦ湡 flag,鍙敞鍏ョ涓€�?�?
                     LONG64 prev_pid = _InterlockedExchange64(&g_test_injected_pid, (LONG64)current_pid);
                     if (prev_pid != (LONG64)current_pid)
                     {
-                        HYPERPLATFORM_LOG_INFO("[td-hook] Box.exe pid=%llu 鈥?starting renderdoc inject via shadow CR3",
+                        HYPERPLATFORM_LOG_INFO("[td-hook] Box.exe pid=%llu �?starting renderdoc inject via shadow CR3",
                             (UINT64)current_pid);
 
                         // 鐩存帴鐢ㄥ浐瀹氳矾寰?C:\Users\q\Desktop\d\renderdoc.dll
@@ -327,7 +327,7 @@ TdEptUnhookNtCreateFile(VOID)
 }
 
 // =========================================================================
-//  R3 EPT Hook 閳?per-process, user-mode trampoline, MDL-locked
+//  R3 EPT Hook �?per-process, user-mode trampoline, MDL-locked
 // =========================================================================
 
 //
@@ -712,7 +712,7 @@ TdEptHookR3(
                 tramp_pa,
                 NULL, 0, TRUE,
                 pt_pfn, pt_idx,
-                FALSE, tramp_shadow, TRUE, FALSE);
+                FALSE, tramp_shadow, TRUE, FALSE, target_pid);
             if (!NT_SUCCESS(sp_st))
             {
                 HYPERPLATFORM_LOG_ERROR(
@@ -768,7 +768,7 @@ TdEptHookR3(
     else
     {
         //
-        // failed 閳?clean up: free trampoline, unlock MDL
+        // failed �?clean up: free trampoline, unlock MDL
         //
         KeStackAttachProcess(proc, &apc);
         ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
@@ -863,7 +863,7 @@ TdEptUnhookAllR3(VOID)
 
         //
         // for inject hooks (target_mdl == NULL): the target process may have
-        // already exited. don't attach 閳?just VMCALL unhook by VA + clear entry.
+        // already exited. don't attach �?just VMCALL unhook by VA + clear entry.
         // EPT unhook only needs the VA to find the PFN in the hooked_pages list.
         // the VMCALL runs under system CR3, which is fine for EPT-only operations.
         //
@@ -871,14 +871,14 @@ TdEptUnhookAllR3(VOID)
         //
         if (g_r3_hooks[i].target_mdl == NULL)
         {
-            // inject hook 閳?lightweight unhook (no attach needed)
+            // inject hook �?lightweight unhook (no attach needed)
             PEPROCESS proc = NULL;
             NTSTATUS st = PsLookupProcessByProcessId(
                 (HANDLE)g_r3_hooks[i].target_pid, &proc);
 
             if (NT_SUCCESS(st))
             {
-                // process still alive 閳?attach to resolve VA 閳?PA for unhook
+                // process still alive �?attach to resolve VA �?PA for unhook
                 KAPC_STATE apc;
                 KeStackAttachProcess(proc, &apc);
 
@@ -890,7 +890,7 @@ TdEptUnhookAllR3(VOID)
                 KeUnstackDetachProcess(&apc);
                 ObDereferenceObject(proc);
             }
-            // else: process dead 閳?EPT pages are orphaned but harmless.
+            // else: process dead �?EPT pages are orphaned but harmless.
             // the PFN won't be reused for anything meaningful until
             // ept_unhook_all() on HV unload restores all PTEs to RWX.
 
@@ -898,7 +898,7 @@ TdEptUnhookAllR3(VOID)
         }
         else
         {
-            // real R3 hook 閳?full cleanup
+            // real R3 hook �?full cleanup
             TdEptUnhookR3(g_r3_hooks[i].target_pid, g_r3_hooks[i].target_va);
         }
     }
@@ -923,7 +923,7 @@ TdCreateThread(PEPROCESS process, PVOID entry)
         if (!NT_SUCCESS(st)) return st;
 
         //
-        // create thread NOT suspended 閳?runs immediately.
+        // create thread NOT suspended �?runs immediately.
         // all CPUs have EPT split (DPC broadcast), no affinity pinning needed.
         // NtResumeThread/ZwResumeThread may not be exported by ntoskrnl,
         // so avoid suspend+resume pattern entirely.
@@ -943,7 +943,7 @@ TdCreateThread(PEPROCESS process, PVOID entry)
 
     //
     // fallback: attach to process, use RtlCreateUserThread
-    // create SUSPENDED 閳?pin to install CPU 閳?resume
+    // create SUSPENDED �?pin to install CPU �?resume
     //
     KAPC_STATE apc;
     KeStackAttachProcess(process, &apc);
@@ -952,7 +952,7 @@ TdCreateThread(PEPROCESS process, PVOID entry)
     CLIENT_ID cid = {};
     //
     // pin CURRENT kernel thread to install CPU first.
-    // then create user thread (not suspended) 閳?it inherits scheduling
+    // then create user thread (not suspended) �?it inherits scheduling
     // affinity from the current processor context.
     //
     ULONG cpu = KeGetCurrentProcessorNumberEx(NULL);

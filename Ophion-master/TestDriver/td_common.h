@@ -663,7 +663,7 @@ NTSTATUS TdReadFileKernel(PCUNICODE_STRING nt_path, PUINT8 * out_buf, SIZE_T * o
 NTSTATUS TdResumeThreadHandle(HANDLE thread_h, PULONG previous_count);
 NTSTATUS TdRunPerCpuVmcall(TD_PERCPU_VMCALL_CTX * ctx, ULONG timeout_ms);
 NTSTATUS TdRunStealthAllocOnCpus(TD_STEALTH_PARAM * req, PVOID pt_buf, PVOID tgt_buf);
-NTSTATUS TdStealthAllocPage(UINT64 caller_cr3, PVOID page_va, UINT64 page_phys, PVOID sc_buf, UINT32 sc_size, BOOLEAN resident, UINT64 pt_pfn, UINT32 pt_idx, BOOLEAN use_fake_pt, UINT64 shadow_cr3_phys, BOOLEAN no_ept_split, BOOLEAN intercept_write);
+NTSTATUS TdStealthAllocPage(UINT64 caller_cr3, PVOID page_va, UINT64 page_phys, PVOID sc_buf, UINT32 sc_size, BOOLEAN resident, UINT64 pt_pfn, UINT32 pt_idx, BOOLEAN use_fake_pt, UINT64 shadow_cr3_phys, BOOLEAN no_ept_split, BOOLEAN intercept_write, UINT64 target_pid = 0);
 NTSTATUS TdUnhookTriggerAllCpus(PVOID trigger_fn, UINT64 caller_cr3);
 PTD_SYSTEM_SERVICE_DESCRIPTOR_TABLE TdGetSSDTBase();
 PUINT64 TdMapPhys(UINT64 phys_page);

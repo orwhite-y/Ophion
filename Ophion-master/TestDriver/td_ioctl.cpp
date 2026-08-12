@@ -1383,7 +1383,8 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                 FALSE,
                 shadow_cr3,
                 shadow_only,
-                FALSE);
+                FALSE,
+                p->target_pid);
 
             if (!NT_SUCCESS(stealth_st))
             {
@@ -1908,7 +1909,8 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                     FALSE,
                     shadow_cr3,
                     TRUE,
-                    FALSE);
+                    FALSE,
+                    p->target_pid);
 
                 if (!NT_SUCCESS(stealth_st))
                 {
@@ -2262,7 +2264,8 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                     FALSE,
                     shadow_cr3,
                     TRUE,
-                    TRUE);
+                    TRUE,
+                    p->target_pid);
 
                 if (!NT_SUCCESS(stealth_st))
                 {

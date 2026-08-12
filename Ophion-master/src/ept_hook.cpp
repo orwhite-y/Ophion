@@ -923,6 +923,17 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
                 _mm_mfence();
                 ept_invept_single(vcpu->ept_pointer);
 
+                // Restore EPT W=0 on the previous pending page before overwriting
+                if (vcpu->shadow_ept_wp_pending && vcpu->shadow_ept_wp_pt_pfn)
+                {
+                    PEPT_PML1_ENTRY prev_p1 = ept_get_pml1(vcpu->ept_page_table,
+                        (SIZE_T)((UINT64)vcpu->shadow_ept_wp_pt_pfn << 12));
+                    if (prev_p1)
+                    {
+                        prev_p1->WriteAccess = 0;
+                        _mm_mfence();
+                    }
+                }
                 vcpu->shadow_ept_wp_pending = TRUE;
                 vcpu->shadow_ept_wp_pt_pfn = pfn;
 
@@ -1146,7 +1157,13 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
                 asm_invvpid(InvvpidSingleContext, &desc);
             }
 
-            // Re-protect EPT: W=0 on the real PT page
+            break;
+        }
+
+        // Always re-protect EPT W=0 on the PT page, even if no stealth page
+        // matched (e.g., stealth page torn down between violation and MTF).
+        // Leaving W=1 would permanently leak the write-protect.
+        {
             PEPT_PML1_ENTRY pt_p1 = ept_get_pml1(vcpu->ept_page_table,
                 (SIZE_T)((UINT64)wp_pfn << 12));
             if (pt_p1)
@@ -1155,7 +1172,6 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
                 _mm_mfence();
                 ept_invept_single(vcpu->ept_pointer);
             }
-            break;
         }
         // DO NOT return: mtf_restore_page may also be pending. Fall through.
     }

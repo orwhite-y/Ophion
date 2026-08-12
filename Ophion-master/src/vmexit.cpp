@@ -613,14 +613,9 @@ vmexit_handle_mov_cr(VIRTUAL_MACHINE_STATE * vcpu)
 
                     // Restore guard state.
                     vcpu->nx_timer_real_cr3 = vcpu->shadow_real_cr3;
-                    // When near-NULL latch is set, keep NX-fetch-only intercept
-                    // so data #PFs (NULL deref 0x12) don't VM-exit during the
-                    // shadow window. Guest handles them under shadow CR3 directly.
-                    if (!g_near_null_shadow_disabled)
-                    {
-                        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0);
-                        __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0);
-                    }
+                    // NEVER widen #PF intercept on reactivate -- data #PFs
+                    // are handled by guest directly under shadow CR3 (see
+                    // ept_stealth.cpp shadow-open path for full rationale).
                 }
                 else
                 {

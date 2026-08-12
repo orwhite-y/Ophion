@@ -156,8 +156,8 @@ ept_update_pf_intercept(VIRTUAL_MACHINE_STATE * vcpu)
         // Only intercept USER-mode NX fetch #PFs (stealth targets are user-mode).
         // Kernel NX fetch #PFs (no USER bit, e.g. clipsp.sys code/data) pass
         // directly to the guest KiPageFault handler - no VM-exit, no reinject
-        // livelock. The shadow window widened intercept (mask=0/match=0)
-        // still catches kernel #PFs during the window for abort handling.
+        // livelock. #PF intercept is NEVER widened -- data #PFs during the
+        // shadow window are handled by guest directly under shadow CR3.
         __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, PFEC_PRESENT | PFEC_INSTR_FETCH | PFEC_USER);
         __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, PFEC_PRESENT | PFEC_INSTR_FETCH | PFEC_USER);
     }
@@ -2008,16 +2008,23 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
                 else
                     asm_invvpid(InvvpidSingleContext, &desc);
 
-                // Widen #PF to all-faults for extended window -- UNLESS the
-                // near-NULL latch is set. When latched, keep NX-fetch-only
-                // intercept so data #PFs (including NULL deref at 0x12) are
-                // handled by the guest under the shadow CR3 without VM-exit.
-                // This breaks the fetch<->data-#PF livelock.
-                if (!g_near_null_shadow_disabled)
-                {
-                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0);
-                    __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0);
-                }
+                // NEVER widen #PF intercept. Keep NX-fetch-only (mask=0x15,
+                // match=0x15) at all times. Data #PFs (reads, writes, NULL
+                // derefs) do NOT VM-exit -- the guest's KiPageFault runs
+                // directly under shadow CR3 and handles them. This is safe
+                // because:
+                //  - For present data pages: no #PF at all (shadow PT ==
+                //    real PT for data pages; only stealth CODE pages have
+                //    NX cleared in shadow).
+                //  - For NULL deref (VA<0x10000): PML4[0] not present in
+                //    both real and shadow -> access violation, no demand
+                //    paging, no PFN database corruption.
+                //  - For rare demand faults: MmAccessFault modifies the
+                //    shadow PTE (a copy), real PTE is untouched. Minor
+                //    PFN db stale reference is far less fatal than the
+                //    guaranteed livelock from widening + reinject storm.
+                // Widening was the root cause of reinj_streak=2432 ->
+                // triple fault -> hard reset.
 
                 // CR3-load + CR3-store exiting for extended window.
                 SIZE_T pc = 0;
@@ -2053,17 +2060,8 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
                 __vmx_vmwrite(VMCS_GUEST_CR3, shadow_cr3_val);
                 _InterlockedIncrement(&g_dbg_shadow_pf_switched);
 
-                //
-                // widen #PF interception to ALL faults for this one-instruction
-                // window. normally only NX-fetch #PFs VM-exit (PRESENT|FETCH), so a
-                // data #PF during the window would reach the guest's MmAccessFault
-                // running UNDER shadow CR3 and corrupt the PFN database (0x1A).
-                // catching every #PF lets the mid-window guard above abort the
-                // window and service the fault under the real CR3 instead. the
-                // window is closed (mask restored) by MTF or the abort path.
-                //
-                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MASK, 0);
-                __vmx_vmwrite(VMCS_CTRL_PAGEFAULT_ERROR_CODE_MATCH, 0);
+                // NEVER widen #PF intercept -- see comment above in MODE_G/H.
+                // Data #PFs are handled by guest under shadow CR3 directly.
             }
 
             if (error_code & PFEC_WRITE)

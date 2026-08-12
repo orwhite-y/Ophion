@@ -82,58 +82,63 @@ static NTSTATUS hv_breadcrumb_write_log(VOID)
         return st;
     }
 
-    // Write header
-    char hdr[128];
-    LARGE_INTEGER off = { 0 };
-    int hl = 0;
-    // Read the current write position atomically (add 0 = read without modify)
-    LONG cur_write = _InterlockedExchangeAdd(&g_bc_ring->write_idx, 0);
-    if (NT_SUCCESS(RtlStringCbPrintfA(hdr, sizeof(hdr),
-            "=== BC.log ring dump === write_idx=%ld seq=%ld\r\n",
-            cur_write, (LONG)g_bc_ring->seq_counter)))
-        hl = (int)strlen(hdr);
-    if (hl > 0)
-        ZwWriteFile(h, NULL, NULL, NULL, &iosb, hdr, (ULONG)hl, &off, NULL);
-    off.QuadPart += hl;
+    // Wrap writes in SEH: ZwWriteFile -> NtWriteFile -> Ntfs can AV if the
+    // hypervisor EPT/shadow corrupts FS internal structures. BC.log is
+    // debug-only; swallow exceptions rather than 0x1E BSOD.
+    __try {
+        // Write header
+        char hdr[128];
+        LARGE_INTEGER off = { 0 };
+        int hl = 0;
+        LONG cur_write = _InterlockedExchangeAdd(&g_bc_ring->write_idx, 0);
+        if (NT_SUCCESS(RtlStringCbPrintfA(hdr, sizeof(hdr),
+                "=== BC.log ring dump === write_idx=%ld seq=%ld\r\n",
+                cur_write, (LONG)g_bc_ring->seq_counter)))
+            hl = (int)strlen(hdr);
+        if (hl > 0)
+            ZwWriteFile(h, NULL, NULL, NULL, &iosb, hdr, (ULONG)hl, &off, NULL);
+        off.QuadPart += hl;
 
-    // Dump all entries (newest first = reverse from write_idx)
-    // We dump the full ring; entries with seq=0 are empty/never written.
-    char line[160];
-    for (LONG i = 0; i < BC_RING_ENTRIES; i++)
-    {
-        LONG idx = (cur_write - 1 - i) & (BC_RING_ENTRIES - 1);
-        BC_ENTRY *e = &g_bc_ring->entries[idx];
-        UINT32 seq = e->seq;
-        if (seq == 0)
-            continue;  // empty slot
-        // Re-read to check consistency (seq might have changed if overwritten)
-        _mm_lfence();
-        UINT16 eid = e->event_id;
-        UINT8 cpu = e->cpu;
-        UINT8 flg = e->flags;
-        UINT64 dat = e->data;
-        _mm_lfence();
-        if (e->seq != seq)
-            continue;  // entry was overwritten during read, skip
+        // Dump all entries (newest first = reverse from write_idx)
+        char line[160];
+        for (LONG i = 0; i < BC_RING_ENTRIES; i++)
+        {
+            LONG idx = (cur_write - 1 - i) & (BC_RING_ENTRIES - 1);
+            BC_ENTRY *e = &g_bc_ring->entries[idx];
+            UINT32 seq = e->seq;
+            if (seq == 0)
+                continue;
+            _mm_lfence();
+            UINT16 eid = e->event_id;
+            UINT8 cpu = e->cpu;
+            UINT8 flg = e->flags;
+            UINT64 dat = e->data;
+            _mm_lfence();
+            if (e->seq != seq)
+                continue;
 
-        int ll = 0;
-        if (NT_SUCCESS(RtlStringCbPrintfA(line, sizeof(line),
-                "[%6lu] cpu=%-2u evt=0x%04x data=0x%016I64x flg=%u\r\n",
-                (unsigned long)seq, (unsigned)cpu, (unsigned)eid, dat, (unsigned)flg)))
-            ll = (int)strlen(line);
-        if (ll > 0)
-            ZwWriteFile(h, NULL, NULL, NULL, &iosb, line, (ULONG)ll, &off, NULL);
-        off.QuadPart += ll;
+            int ll = 0;
+            if (NT_SUCCESS(RtlStringCbPrintfA(line, sizeof(line),
+                    "[%6lu] cpu=%-2u evt=0x%04x data=0x%016I64x flg=%u\r\n",
+                    (unsigned long)seq, (unsigned)cpu, (unsigned)eid, dat, (unsigned)flg)))
+                ll = (int)strlen(line);
+            if (ll > 0)
+                ZwWriteFile(h, NULL, NULL, NULL, &iosb, line, (ULONG)ll, &off, NULL);
+            off.QuadPart += ll;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Ntfs AV during ZwWriteFile. Skip remaining writes.
     }
 
-    ZwClose(h);
+    __try { ZwClose(h); } __except (EXCEPTION_EXECUTE_HANDLER) {}
     return STATUS_SUCCESS;
 }
 
 // Immediate flush (PASSIVE_LEVEL). Can be called from IOCTL handler.
 VOID hv_breadcrumb_flush_now(VOID)
 {
-    hv_breadcrumb_write_log();
+        __try { hv_breadcrumb_write_log(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 // Worker thread: flush ring buffer to BC.log every 500ms.
@@ -156,7 +161,7 @@ static VOID bc_worker_thread(PVOID context)
         if (!g_bc_thread_run)
             break;
 
-        hv_breadcrumb_write_log();
+        __try { hv_breadcrumb_write_log(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 
     PsTerminateSystemThread(STATUS_SUCCESS);

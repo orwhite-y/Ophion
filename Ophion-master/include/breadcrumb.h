@@ -335,6 +335,23 @@ hv_breadcrumb_cpu(UINT16 event_id, UINT32 cpu, UINT64 data)
     e->seq = (UINT32)_InterlockedIncrement(&r->seq_counter);
 }
 
+/* VMX-root safe: breadcrumb with explicit CPU + error code stored in flags field */
+static __forceinline VOID
+hv_breadcrumb_cpu_ec(UINT16 event_id, UINT32 cpu, UINT64 data, UINT8 ec)
+{
+    BC_RING *r = g_bc_ring;
+    if (!r || r->magic != 0xBCBC0001) return;
+    LONG idx = _InterlockedIncrement(&r->write_idx) - 1;
+    idx &= (BC_RING_ENTRIES - 1);
+    BC_ENTRY *e = &r->entries[idx];
+    e->event_id = event_id;
+    e->cpu = (UINT8)(cpu & 0xFF);
+    e->flags = ec;
+    e->data = data;
+    _mm_sfence();
+    e->seq = (UINT32)_InterlockedIncrement(&r->seq_counter);
+}
+
 /* PASSIVE_LEVEL API (breadcrumb.cpp) */
 NTSTATUS hv_breadcrumb_init(VOID);           /* allocate ring buffer (before vmx_init) */
 VOID     hv_breadcrumb_start_flush(VOID);     /* start BC.log flush worker thread */

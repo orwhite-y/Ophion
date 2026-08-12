@@ -123,6 +123,7 @@ typedef struct _TD_STEALTH_PARAM {
     UINT32  pt_pte_index;       // index within PT page (0-511)
     PVOID   pt_page_copy;       // NonPaged buffer with PT page content (4KB)
     PVOID   pt_page_va;         // shadow mode: shadow PT page VA; else real PT page VA (for MTF resync)
+    PVOID   real_pt_page_va;    // system VA of real PT page (pre-computed at PASSIVE, avoids pa_to_va in VMX-root)
     PVOID   target_page_copy;   // NonPaged buffer with target page content (4KB)
     BOOLEAN pt_precomputed;     // TRUE = caller filled above fields at PASSIVE_LEVEL
     BOOLEAN use_fake_pt;        // TRUE = create fake PT page (NX hiding)

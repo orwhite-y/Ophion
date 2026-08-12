@@ -35,8 +35,19 @@ TdShadowFreePageList(PVOID * pages, UINT32 page_count)
     {
         if (pages[i])
         {
-            RtlSecureZeroMemory(pages[i], PAGE_SIZE);
-            ExFreePoolWithTag(pages[i], 'wdhS');
+            // Wrap zeroing+free in SEH: during process-exit cleanup, a shadow
+            // page VA may be stale (double-free, unmapped MDL alias, or pool
+            // reuse). Without this, RtlSecureZeroMemory on an invalid VA causes
+            // BSOD 0x3B (AV_TestEptHook!RtlSecureZeroMemory+0x25). The zeroing
+            // is a security wipe, not functional -- leaking is acceptable.
+            __try {
+                RtlSecureZeroMemory(pages[i], PAGE_SIZE);
+                ExFreePoolWithTag(pages[i], 'wdhS');
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                // Stale/invalid page during process-exit cleanup.
+                // Leak the page rather than crashing.
+            }
             pages[i] = NULL;
         }
     }
@@ -108,10 +119,15 @@ TdShadowUnmapRealPage(STEALTH_REAL_PAGE_ENTRY * e)
 {
     if (!e || !e->va || !e->mdl)
         return;
-    MmUnmapLockedPages(e->va, (PMDL)e->mdl);
-    // NO MmUnlockPages: MDL_IO_SPACE + manual-PFN touched no PFN refcount. The
-    // page-table page's refcount is untouched (pure read-only alias).
-    IoFreeMdl((PMDL)e->mdl);
+    __try {
+        MmUnmapLockedPages(e->va, (PMDL)e->mdl);
+        // NO MmUnlockPages: MDL_IO_SPACE + manual-PFN touched no PFN refcount. The
+        // page-table page's refcount is untouched (pure read-only alias).
+        IoFreeMdl((PMDL)e->mdl);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Stale MDL/VA during process-exit cleanup. Leak rather than crash.
+    }
     e->va  = NULL;
     e->mdl = NULL;
 }

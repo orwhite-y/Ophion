@@ -270,6 +270,7 @@ BOOLEAN ept_stealth_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_
 BOOLEAN ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error_code);
 VOID    ept_update_pf_intercept(VIRTUAL_MACHINE_STATE * vcpu);
 VOID    stealth_clear_stale_window(VIRTUAL_MACHINE_STATE * vcpu);  // clear stale shadow-CR3 window (VMCALL_SHADOW_ABORT_ALL)
+VOID    ept_stealth_abort_shadow_window(VIRTUAL_MACHINE_STATE * vcpu);  // abort shadow window (livelock breaker)
 
 // shared fake PT page management (VMX-root safe)
 PSTEALTH_FAKE_PT stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, PVOID pt_page_va_hint, PVOID real_page_va);

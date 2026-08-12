@@ -708,6 +708,15 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
 
     _mm_mfence();
     ept_invept_single(vcpu->ept_pointer);
+
+    // Also flush combined TLB entries (guest VA -> HPA). INVEPT only flushes
+    // EPT-derived entries; combined translations persist on some CPUs, causing
+    // stale Execute=1 cached entries -> EPT hook not triggered -> flaky trigger.
+    {
+        INVVPID_DESCRIPTOR desc = {0};
+        desc.Vpid = VPID_TAG;
+        asm_invvpid(InvvpidSingleContext, &desc);
+    }
     return TRUE;
 
     #undef HOOK_RESTORE_CR3_AND_RETURN
@@ -1076,7 +1085,10 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     {
         vcpu->pf_passthrough_armed = FALSE;
         ept_update_pf_intercept(vcpu);
-        return;
+        // DO NOT return: mtf_restore_page may also be pending (EPT hook
+        // passthrough from a non-target thread). Early return leaves EPT in
+        // passthrough state (Execute=1 original) -> hook disabled on this CPU
+        // -> trigger misses when target thread runs here. Fall through.
     }
 
 #if (SHADOW_PT_MODE == SHADOW_PT_MODE_H)
@@ -1142,7 +1154,7 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
             }
             break;
         }
-        return;
+        // DO NOT return: mtf_restore_page may also be pending. Fall through.
     }
 #endif
 
@@ -1177,45 +1189,45 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     {
         PEPT_HOOKED_PAGE_INFO hp = vcpu->mtf_restore_page;
 
+        vcpu->mtf_restore_page = NULL;  // clear early to prevent double-processing
+
         if (!ept_hook_page_has_active_function(hp))
         {
             ept_hook_restore_current_vcpu(vcpu, hp);
-            vcpu->mtf_restore_page = NULL;
-            return;
         }
-
-        // restore target page EPT
-        PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,
-            (SIZE_T)(hp->pfn_of_hooked_page << 12));
-        if (my_pte)
+        else
         {
-            if (hp->fake_pt)
-                ept_swap_page(my_pte, hp->changed_entry, vcpu->ept_pointer);
-            else
-                ept_swap_page(my_pte, hp->original_entry, vcpu->ept_pointer);
-        }
-
-        // restore fake page EPT to X-only (in case it was opened for phys scan read)
-        if (hp->fake_page_va)
-        {
-            PEPT_PML1_ENTRY fake_pte = ept_get_pml1(vcpu->ept_page_table,
-                (SIZE_T)(hp->pfn_of_fake_page_contents << 12));
-            if (fake_pte && fake_pte->ReadAccess)
+            // restore target page EPT
+            PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,
+                (SIZE_T)(hp->pfn_of_hooked_page << 12));
+            if (my_pte)
             {
-                fake_pte->ReadAccess = 0; fake_pte->WriteAccess = 0; fake_pte->ExecuteAccess = 1;
-                fake_pte->PageFrameNumber = hp->pfn_of_fake_page_contents;
-                _mm_mfence();
-                ept_invept_single(vcpu->ept_pointer);
+                if (hp->fake_pt)
+                    ept_swap_page(my_pte, hp->changed_entry, vcpu->ept_pointer);
+                else
+                    ept_swap_page(my_pte, hp->original_entry, vcpu->ept_pointer);
+            }
+
+            // restore fake page EPT to X-only (in case it was opened for phys scan read)
+            if (hp->fake_page_va)
+            {
+                PEPT_PML1_ENTRY fake_pte = ept_get_pml1(vcpu->ept_page_table,
+                    (SIZE_T)(hp->pfn_of_fake_page_contents << 12));
+                if (fake_pte && fake_pte->ReadAccess)
+                {
+                    fake_pte->ReadAccess = 0; fake_pte->WriteAccess = 0; fake_pte->ExecuteAccess = 1;
+                    fake_pte->PageFrameNumber = hp->pfn_of_fake_page_contents;
+                    _mm_mfence();
+                    ept_invept_single(vcpu->ept_pointer);
+                }
             }
         }
-
-        vcpu->mtf_restore_page = NULL;
     }
 
     //
     // stealth target page MTF: swap back to read-only view (no execute)
     //
-    else if (vcpu->mtf_restore_stealth)
+    if (vcpu->mtf_restore_stealth)
     {
         PEPT_STEALTH_PAGE_INFO sp = vcpu->mtf_restore_stealth;
         PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,

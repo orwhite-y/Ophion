@@ -1,108 +1,134 @@
-ï»¿# Codex å·¥ä½œæµç¨‹è®°å½• (Ophion/renderdoc æ³¨å…¥é¡¹ç›®)
+# Codex ¹¤×÷Á÷³Ì¼ÇÂ¼ (Ophion/renderdoc ×¢ÈëÏîÄ¿)
 
-> è®°å½•å·²å®Œæˆã€è¿›è¡Œä¸­ã€å¾…åŠžçš„å·¥ä½œã€‚ä¸Šä¸‹æ–‡åŽ‹ç¼©åŽå¿…è¯»ã€‚
+> ¼ÇÂ¼ÒÑÍê³É¡¢½øÐÐÖÐ¡¢´ý°ìµÄ¹¤×÷¡£ÉÏÏÂÎÄÑ¹Ëõºó±Ø¶Á¡£
 
-## å½“å‰çŠ¶æ€
-- **é¡¹ç›®è·¯å¾„**ï¼šF:\winDriver\te\Ophion-master (é©±åŠ¨) + F:\winDriver\te\Ophion-master\renderdoc-1.36 (renderdoc)
-- **æœ€è¿‘æ›´æ–°**ï¼š2026-08-12 10:15
-- **æœ€è¿‘ä¼šè¯**ï¼šsession-32-process-commit
-- **åŸºçº¿**ï¼šHEAD = b5c2e07 (session 29-31 å…¨éƒ¨ä¿®å¤å·²æäº¤)
-- **å·¥ä½œæ ‘**ï¼šå¹²å‡€ï¼ˆä»… untracked ä¸´æ—¶æ–‡ä»¶ï¼‰
-- **è¿›è¡Œä¸­**ï¼šæ— ã€‚é©±åŠ¨æºç å·²å…¨éƒ¨æäº¤ï¼Œæ³¨å…¥ç¨³å®šã€‚
-- **ä¸‹ä¸€æ­¥**ï¼šHe å†³å®šæ˜¯å¦é‡æ–°å¯åŠ¨æ¸¸æˆæµ‹è¯•æˆªå¸§ï¼ˆç”¨ flag file è§¦å‘ï¼Œä¸è¦ç”¨ F12ï¼‰ã€‚
+## µ±Ç°×´Ì¬
+- **ÏîÄ¿Â·¾¶**£ºF:\winDriver\te\Ophion-master (Çý¶¯) + F:\winDriver\te\Ophion-master\renderdoc-1.36 (renderdoc)
+- **×î½ü¸üÐÂ**£º2026-08-12 12:45
+- **×î½ü»á»°**£ºsession-41
+- **»ùÏß**£ºHEAD = 020ec66
+- **¹¤×÷Ê÷**£ºept_stealth.cpp + vmexit.cpp + ept_hook.cpp + breadcrumb.cpp + PROCESS.md ÓÐÎ´Ìá½»¸Ä¶¯
+- **½øÐÐÖÐ**£ºtriple faultÐÞ¸´ÒÑÑéÖ¤³É¹¦£¨ÏµÍ³²»ÔÙÓ²ÖØÆô£©£¬×ªÏòµ÷²éshellcode access violation
+- **ÏÂÒ»²½**£ºµ÷²éÎªÊ²Ã´shellcodeÔÚRESIDENT+0x400´¦access violation£¬#PFÃ»VM-exit
 
-## å˜æ›´æ—¥å¿—
+## ±ä¸üÈÕÖ¾
+### 2026-08-12 14:30  [session 37]
+- ¶¯×÷£º½Ó¹Ü + ·ÖÎö stealth #PF handler + ÐÞ¸´4¸ö bug + ±àÒë
+- ¸ùÒò·ÖÎö£¨He µÄÎÊÌâ£ºstealth #PF handler ÎªÊ²Ã´²»ÅÐ¶ÏÊÇ²»ÊÇÄ¿±êÒ³£©£º
+  - handler È·ÊµÔÚ L1789 ¼ì²é sp->guest_va != fault_page£¬µ«ÓÃµÄÊÇ O(n) Á´±í±éÀú£¨2152+ ÌõÄ¿£©
+  - He µÄ½¨Òé£¨ÓÃ shadow CR3 PTE NX Î»×ö O(1) ¿ìËÙÅÐ¶Ï£©ÊÇÓÐÐ§µÄÓÅ»¯·½Ïò£¬µ«²»ÊÇµ±Ç°±ÀÀ£µÄÖ±½ÓÔ­Òò
+  - µ±Ç°±ÀÀ£¸ùÒòÊÇ stealth_refresh_shadow_code_pte µÄ CR3 Ð¹Â©
+- Bug 1£¨¸ùÒò - CR3 Ð¹Â©£©£ºept_stealth.cpp stealth_refresh_shadow_code_pte L1163
+  - mx_enter_cr3(sp->guest_cr3) ÔÚ L1099 ÇÐ»» CR3 + ½ûÖÐ¶Ï + Ë¢ TLB
+  - stealth_walk_pte Ê§°Ü£¨real PTE not present£¬renderdoc Ò³±» page out£©Ê±
+  - eturn FALSE ÔÚ L1163 Ìø¹ýÁË leave: ±êÇ©µÄ mx_leave_guest_cr3(saved_cr3)
+  - ½á¹û£ºÖÐ¶ÏÓÀ¾Ã½ûÓÃ + CR3 Í£ÔÚ guest ½ø³Ì CR3 + TLB È«Ë¢ -> ÏµÍ³¿¨ËÀ
+  - ÐÞ¸´£ºÔÚ return FALSE Ç°¼Ó mx_leave_guest_cr3(saved_cr3);
+- Bug 2£¨ÓÃ»§Ì¬ livelock breaker È± total ¼ÆÊý£©£ºvmexit.cpp L2653
+  - ÄÚºËÌ¬ÓÐ wtotal >= 4 ¶µµ×£¬ÓÃ»§Ì¬Ö»ÓÐ ws >= 32£¨per-address streak£©
+  - Á½¸öÓÃ»§Ì¬µØÖ·½»Ìæ #PF -> per-address streak ·´¸´ÖØÖÃ -> ÓÀÔ¶µ½²»ÁË 32
+  - ÐÞ¸´£ºif (ws >= 32 || wtotal >= 64) do_reinj_break = TRUE;
+- Bug 3£¨breaker ²»Çå shadow window ×´Ì¬£©£ºvmexit.cpp L2666-2685
+  - FALSE-path breaker ÖØÖÃ streak/total µ«²»Çå nx_timer_restore/nx_timer_real_cr3
+  - MTF handler (session 35 fall-through fix) ´¦Àí nx_timer_restore -> »Ö¸´ shadow CR3
+  - -> #PF Á¢¼´¸´·¢ -> breaker ÔÙ´¥·¢ -> Ñ­»· -> streak ÔÚ 0?32 Õñµ´ -> µ½ 128/256 ´¥·¢ CMOS snap
+  - ÐÞ¸´£ºbreaker ÖÐ¼Ó if (vcpu->nx_timer_real_cr3) ¿é£º»Ö¸´ real CR3 + Çå×´Ì¬ + ½û CR3-load/store exiting
+  - ×¢Òâ£º²»È«µ÷ stealth_pf_abort_shadow_window£¨»á³åÍ» MTF ºÍ #PF interception ÉèÖÃ£©
+- Bug 4£¨write-protected reject ²» abort shadow window£©£ºept_stealth.cpp L1836
+  - write #PF µ½ W=0 µÄ stealth Ò³ -> reject -> return FALSE ²» abort
+  - mid-window Ê± -> shadow PTE W=0 -> write #PF µÝ¹é -> livelock
+  - ÐÞ¸´£ºreturn FALSE Ç°¼Ó if (vcpu->nx_timer_real_cr3) stealth_pf_abort_shadow_window(vcpu);
+- ÎÄ¼þ£ºOphion-master/src/ept_stealth.cpp, Ophion-master/src/vmexit.cpp
+- ±àÒë£º_build2.bat ³É¹¦£¬Ophion.sys + TestEptHook.sys Ç©ÃûÍ¨¹ý
+- ½áÂÛ£º4 ¸ö bug ÒÑÐÞ¸´²¢±àÒë£¬µÈ´ý He ¾ö¶¨ÊÇ·ñ²âÊÔ
+
+### 2026-08-12 12:11  [session 38]
+- ¶¯×÷£º½Ó¹Ü + ·ÖÎö W.log (7 CPU ¿¨ÔÚ 0x06) + ÐÞ¸´¸ùÒò + ±àÒë
+- ¸ùÒò·ÖÎö£¨7 CPU ¿¨ÔÚ marker 0x06£©£º
+  - stealth_refresh_shadow_code_pte ºÍ stealth_sync_data_pte_in_window ÖÐ
+  - vmx_enter_cr3/vmx_leave_guest_cr3 ´°¿ÚÄÚÓÐ HYPERPLATFORM_LOG_WARN_SAFE µ÷ÓÃ
+  - host #PF °²È«·¶Î§Ö»¸²¸Ç stealth_walk_pte + stealth_walk_pt_page
+  - ÈÕÖ¾´úÂëµ÷ÓÃ LogpMakePrefix -> PsGetProcessImageFileName µÈ
+  - Èç¹ûÕâÐ©º¯ÊýÔÚ guest CR3 + ÖÐ¶Ï½ûÓÃÏÂ´¥·¢ host #PF
+  - RIP ²»ÔÚ°²È«·¶Î§ -> pf_panic -> jmp $ (ËÀÑ­»·) -> CPU ¿¨ËÀ
+  - 7 ¸ö CPU Í¬Ê±¿¨ËÀ = ÏµÍ³¶³½á
+- ÐÞ¸´1£¨¸ùÒò£©£ºÒÆ³ýÁ½¸ö CR3 ´°¿ÚÄÚµÄËùÓÐ HYPERPLATFORM_LOG_WARN_SAFE µ÷ÓÃ
+  - stealth_refresh_shadow_code_pte: 5 ´¦ÈÕÖ¾ÒÆ³ý (shadow-pml4 diag, bail-realwalk, BAIL-noshadowpteva, code-sync, MATCH)
+  - stealth_sync_data_pte_in_window: 2 ´¦ÈÕÖ¾ÒÆ³ý (cow-fix, data-sync)
+  - ±£Áô£ºstealth_walk_pte (°²È«·¶Î§), shadow PTE Ð´ (NonPaged pool), INVVPID (VMXÖ¸Áî), CMOS markers (¶Ë¿ÚI/O), ¼ÆÊýÆ÷×ÔÔö (»¥ËøÄÚ´æÐ´)
+  - ÐÂÔö CMOS markers 0x07 (pre-shadow-write) ºÍ 0x08 (post-shadow-write) ÓÃÓÚÕï¶Ï
+- ÐÞ¸´2£¨´ÎÒª£©£ºFALSE-path breaker ÖØÖÃ g_wedge_pfloop_streak
+  - Ö®Ç° FALSE-path breaker Ö»ÖØÖÃ reinj_streak ºÍ reinj_total£¬²»ÖØÖÃ pfloop_streak
+  - µ¼ÖÂ pfloop_streak ³ÖÐøÔö³¤ -> Ã¿ 8 ´Î #PF ´¥·¢Ò»´Î CMOS snap (¶Ë¿Ú I/O)
+  - 384 ´Î #PF = 48 ´Î CMOS snap = 576 ´Î¶Ë¿Ú I/O
+  - W.log ÖÐ pf_err=0x180=384 Êµ¼ÊÊÇ pfloop_streak£¬²»ÊÇ reinj_streak
+- ¹Ø¼ü·¢ÏÖ£ºW.log ÖÐ pf_err ×Ö¶Î´æ´¢µÄÊÇ streak Öµ£¨²»ÊÇ´íÎóÂë£©
+  - wedge_cmos_snap_reinj ´æ´¢ pf_va=addr, pf_err=streak
+  - pfloop ¼ì²âÆ÷ºÍ reinj ¼ì²âÆ÷¶¼Ð´Í¬Ò» CMOS ×Ö¶Î
+  - pf_err=0x180=384 ÊÇ pfloop_streak£¨Î´±» FALSE breaker ÖØÖÃ£©£¬²»ÊÇ reinj_streak
+  - reinj_streak ÔÚ 0?32 Ö®¼äÕñµ´£¨breaker Õý³£¹¤×÷£©
+- ÎÄ¼þ£ºOphion-master/src/ept_stealth.cpp, Ophion-master/src/vmexit.cpp
+- ±àÒë£º_build2.bat ³É¹¦£¬Ophion.sys + TestEptHook.sys Ç©ÃûÍ¨¹ý
+- ½áÂÛ£ºCR3 ´°¿ÚÈÕÖ¾ÒÆ³ýÐÞ¸´ÒÑÍê³É£¬µÈ´ý²¿Êð²âÊÔ
+### 2026-08-12 13:45  [session 35]
+- ¶¯×÷£º·ÖÎö trigger Ê±ÁéÊ±²»Áé¸ùÒò + ÐÞ¸´ + ±àÒë
+- ¸ùÒò£ºMTF handler ÓÅÏÈ¼¶·´×ª£¨ept_hook.cpp ept_handle_mtf£©
+- ÐÞ¸´£ºpf_passthrough_armed + shadow_ept_wp_pending handler ÒÆ³ý early return£¬fall through µ½ mtf_restore_page
+- ÎÄ¼þ£ºOphion-master/src/ept_hook.cpp
+- ±àÒë£º_build2.bat ³É¹¦
+- ½áÂÛ£ºtrigger flaky ¸ùÒòÒÑÐÞ¸´£¬µÈ´ý He ¾ö¶¨ÊÇ·ñ²âÊÔ
+
+### 2026-08-12 10:26  [session 33]
+- ¶¯×÷£º½Ó¹Ü + ·ÖÎö dump 081226-10578-01 + ×¼±¸²âÊÔ
+- Dump ·ÖÎö£º0x0A IRQL_NOT_LESS_OR_EQUAL at nt!KeFlushMultipleRangeTb+0x142
+- ¸ùÒòÁ´£º#PF@0x12 (shadow PT bug) -> WEDGE C-heal -> ÓÎÏ·±ÀÀ£ -> VAD teardown BSOD -> ÏµÍ³ reset
+
 ### 2026-08-12 10:15  [session 32]
-- åŠ¨ä½œï¼šæŽ¥ç®¡ + æ£€æŸ¥ git çŠ¶æ€ + ä¿®å¤ PROCESS.md ç¼–ç æŸå + æäº¤
-- å‘çŽ°ï¼šb5c2e07 æäº¤æ—¶ PROCESS.md è¢« GBK åŒé‡ç¼–ç æŸåï¼ˆUTF-8 BOM + GBK å­—èŠ‚ï¼‰ï¼Œä»Ž 8f7be9c æ¢å¤å¹²å‡€ç‰ˆæœ¬
-- æ–‡ä»¶ï¼šPROCESS.mdï¼ˆé‡å†™ä¸ºæ­£ç¡® UTF-8 BOM + CRLFï¼‰
-- ç»“è®ºï¼šé©±åŠ¨æºç å·²åœ¨ b5c2e07 æäº¤ï¼Œå·¥ä½œæ ‘å¹²å‡€ã€‚PROCESS.md ç¼–ç ä¿®å¤åŽå¾…æäº¤ã€‚
+- ¶¯×÷£º½Ó¹Ü + ¼ì²é git ×´Ì¬ + ÐÞ¸´ PROCESS.md ±àÂëËð»µ + Ìá½»
 
 ### 2026-08-12 09:51  [session 31]
-- åŠ¨ä½œï¼šæŽ¥ç®¡ + åˆ†æžè“å± dump + ä¿®å¤ SEH + ç¼–è¯‘éƒ¨ç½²æµ‹è¯•
-- è“å±åˆ†æžï¼š081226-10703-01.dmp (09:30:58)
-  - BUGCHECK: KMODE_EXCEPTION_NOT_HANDLED (0x1E)
-  - Arg1: 0xC0000005 (STATUS_ACCESS_VIOLATION)
-  - Arg2: fffff8024d3e4957 (Ntfs.sys)
-  - æ ˆï¼šbc_worker_thread -> hv_breadcrumb_write_log+0x41f -> NtWriteFile -> Ntfs -> AV
-  - æ ¹å› ï¼šBC.log åŽå°çº¿ç¨‹å†™ ZwWriteFile æ—¶ Ntfs å†…éƒ¨ AVã€‚BC.log åªæ˜¯è°ƒè¯•æ—¥å¿—ï¼Œå¤±è´¥ä¸åº”æ‹–åž® OS
-- ä¿®å¤ï¼šbreadcrumb.cpp
-  - hv_breadcrumb_write_log: __try/__except(EXCEPTION_EXECUTE_HANDLER) åŒ…è£¹ ZwWriteFile
-  - ZwClose ä¹ŸåŒ…äº† SEH
-  - bc_worker_thread å’Œ hv_breadcrumb_flush_now çš„è°ƒç”¨ä¹ŸåŒ…äº† SEH (é˜²å¾¡)
-  - æ–‡ä»¶ç”¨ UTF-8 BOM + LFï¼Œä½¿ç”¨ UTF-8 ç¼–ç ç¼–è¾‘
-- VMCALL è¯¯æŠ¥ä¿®å¤ï¼šTdStealthFreePageSafe æ¯é¡µå¯¹å…¨éƒ¨ CPU å‘ VMCALLï¼Œrenderdoc.dll=2094 é¡µ -> 2094 VMCALLs/CPUã€‚safety-net streak è®¡æ•°æŽ’é™¤ VMCALLã€‚
-- é‡é‡çº§è®°å½•ï¼š
-  - Ophion.sys@FFFFF8024A700000, TestEptHook.sys@FFFFF8024AC0000
-  - ntoskrnl@FFFFF8057D800000
-  - GoWR PID=12248 WS=1786MB Threads=79
-  - BC.log: 2024 EPT violation, 22 EPT misconfig, 1 VMCALL, 1 MOV_CR breaker, 0 panic
-  - ç³»ç»Ÿç¨³å®š 15+ åˆ†é’Ÿï¼Œæ— æ–° dump
-- ç¼–è¯‘ï¼š_build2.bat æˆåŠŸï¼Œç­¾åé€šè¿‡
-- æµ‹è¯•ç»“æžœï¼šæ³¨å…¥æˆåŠŸï¼Œç³»ç»Ÿç¨³å®š 15+ åˆ†é’Ÿï¼Œæ—  BSOD
-- æäº¤ï¼šb5c2e07ï¼ˆæºç  + PROCESS.md ä¸€èµ·æäº¤ï¼Œä½† PROCESS.md ç¼–ç æŸåï¼‰
+- ¶¯×÷£º½Ó¹Ü + ·ÖÎöÀ¶ÆÁ dump + ÐÞ¸´ SEH + ±àÒë²¿Êð²âÊÔ
+- ÐÞ¸´£ºbreadcrumb.cpp SEH °ü¹ü ZwWriteFile
+- VMCALL streak ÅÅ³ýÐÞ¸´
 
-### 2026-08-11 17:01  [session 30]
-- åŠ¨ä½œï¼šæŽ¥ç®¡ + MTF handler æ–¹å‘åè½¬ä¿®å¤ + ç¼–è¯‘é€šè¿‡
-- ä¿®å¤ï¼šept_hook.cpp ~L1109 MTF handler ç”¨ sp->pt_page_va (shadow->shadow) è€Œéž sp->real_pt_page_va (real->shadow)ã€‚æ—§ä»£ç å¯¼è‡´æ— é™ EPT W=0 é‡è§¦å‘ -> ç³»ç»Ÿå¡æ­»ã€‚
-- å…¶ä»–ä¿®å¤ï¼ˆå‡åœ¨ b5c2e07ï¼‰ï¼š
-  - #PF TRUE-path liveloop breaker (vmexit.cpp ~L2530)
-  - MOV_CR liveloop breaker (vmexit.cpp ~L2117)ï¼šè¿žç»­ 1024 æ¬¡ MOV_CR åŽä¸­æ­¢
-  - Safety-net bugcheck (vmexit.cpp ~L2130)ï¼šws>=4096(éžVMCALL) æˆ– wrs>=65536 -> hv_panic
-  - TdShadowFreePageList SEH (td_shadow.cpp ~L42)ï¼šstale VA æ¸…ç† -> BSOD 0x3B
-  - TdShadowUnmapRealPage SEH (td_shadow.cpp ~L121)
-  - ept_stealth_abort_shadow_window å…¬å¼€æŽ¥å£ (ept_stealth.cpp ~L505)
-
-### 2026-08-11 15:18  [session 28]
-- åŠ¨ä½œï¼šæŽ¥ç®¡ï¼ˆæ–°ä¼šè¯å·²è¯» PROCESS.mdï¼Œæ¢å¤ä¸Šä¸‹æ–‡ï¼‰+ ä¿®å¤ MODE_G->MODE_H å›žå½’ + ç¼–è¯‘éƒ¨ç½²æµ‹è¯•
-- æ–‡ä»¶ï¼š
-  - Ophion-master/include/stealth.h L33ï¼š#define SHADOW_PT_MODE SHADOW_PT_MODE_G -> SHADOW_PT_MODE_Hï¼ˆbeeb4a5 å¤‡ä»½è¡¥ä¸æ„å¤–å›žé€€çš„å›žå½’ï¼Œstale PFN æ ¹å› ï¼‰
-- ç¼–è¯‘ï¼š_build2.bat æˆåŠŸï¼ŒOphion.sys(134760)/TestEptHook.sys(137832) ç­¾åé€šè¿‡
-- éƒ¨ç½²æµ‹è¯•ç»“æžœï¼š**å…¨éƒ¨é€šè¿‡** âœ…
-  - Ophion(VMXON) -> TestEptHook(VMCALL) -> GoWR(pid=5524) -> inject_renderdoc -> "Inject successful!"
-  - æ³¨å…¥åŽ GoWR å­˜æ´» 87s+ï¼ˆä¸Šæ¬¡ä¼šè¯ 22s å°± CFG å´©æºƒï¼‰ï¼Œworking set 3.7GB->4.9GBï¼ˆrenderdoc hook ä¸­ï¼‰
-  - æ—  BSODã€æ— å¡æ­»ã€æ—  GoWR å´©æºƒã€æ— æ–° crash dump
-  - BC.log æ­£å¸¸ stealth äº‹ä»¶ï¼ˆevt 0x14/0x2a/0x2bï¼‰ï¼Œæ—  panic
-- ç»“è®ºï¼šMODE_H ä¿®å¤åŒæ—¶è§£å†³äº† (1) BSOD/å¡æ­» å’Œ (2) CFG å´©æºƒã€‚CFG å´©æºƒæ˜¯ stale PFN çš„ç—‡çŠ¶ï¼ˆCPU æ‰§è¡Œé”™è¯¯å­—èŠ‚ -> è™šå‡é—´æŽ¥è°ƒç”¨ -> CFG æ£€æŸ¥å¤±è´¥ï¼‰ï¼Œæ­£å¦‚ session 27 æŽ¨æµ‹ã€‚He ç”¨ trigger ç»• CFG çš„åˆ¤æ–­æ­£ç¡®ï¼Œä¸éœ€è¦ç¢° CFGã€‚
-
-### 2026-08-11 14:26  [session 26]
-- åŠ¨ä½œï¼šæŽ¥ç®¡ + å›žé€€åˆ° HEAD(27279a8 MODE_H) + åŠ  VMX-root è“å±æœºåˆ¶ + æäº¤
-- ç»“è®ºï¼šæäº¤ä¸º da8fe39ã€‚å¾…åŠž = é‡æ–°åº”ç”¨å‘ä¿®å¤åˆ° MODE_Hã€‚
-
-## å…³é”®å‘çŽ°
-- **ã€session 31ã€‘BC.log åŽå°çº¿ç¨‹ Ntfs AV**ï¼šbc_worker_thread å†™ BC.log æ—¶ ZwWriteFile -> Ntfs å†…éƒ¨ AVã€‚SEH åŒ…è£¹è§£å†³ã€‚ç¡®åˆ‡æ ¹å› æœªå®šã€‚
-- **ã€session 31ã€‘AutoReboot=1**ï¼šè“å±ä¸€åˆ†é’Ÿè‡ªåŠ¨é‡å¯ï¼ŒHe çœ‹åˆ°çš„æ˜¯ç›´æŽ¥é‡å¯ã€‚Dump ä»ç„¶ç”Ÿæˆåœ¨ C:\Windows\Minidump\ã€‚
-- **ã€session 31ã€‘breadcrumb.cpp æ˜¯ UTF-8 BOM + LF**ï¼šä¸æ˜¯ CRLF+GBKã€‚ç¼–è¾‘ç”¨ UTF-8ã€‚
-- **ã€session 31ã€‘VMCALL streak**ï¼šTdStealthFreePageSafe ç”¨ KeGenericCallDpc -> hv_vmcall_simple å¯¹å…¨éƒ¨ CPU æ¯é¡µå‘ VMCALLã€‚renderdoc.dll=2094 é¡µ -> 2094 VMCALLs/CPUã€‚safety-net å¿…é¡»æŽ’é™¤ VMCALLã€‚
-- **ã€session 31ã€‘renderdoc æˆªå¸§è§¦å‘**ï¼šä¸è¦ç”¨ F12ï¼F12 å¯ç”¨ overlay -> late-wrap æ¨¡å¼ä¸‹ GPU device removalã€‚æ­£ç¡®æ–¹å¼ï¼šåˆ›å»º flag file C:\ProgramData\WinComp\capture.flagã€‚CheckCaptureTrigger() æ¯æ¬¡ Present æ£€æŸ¥æ­¤æ–‡ä»¶ï¼Œåˆ é™¤åŽè®¾ g_captureStarted=trueï¼Œä¸‹ä¸€å¸§ EndFrameCapture å†™ C:\ProgramData\WinComp\captures\frame_XXXXXX.bmpã€‚
-- **ã€session 30ã€‘MTF handler æ–¹å‘åè½¬ = å¡æ­»æ ¹å› **ï¼šMODE_H ä¸‹ MTF handler å¿…é¡» shadow->shadowï¼ˆç”¨ sp->pt_page_vaï¼‰ï¼Œä¸èƒ½ç”¨ sp->real_pt_page_vaï¼ˆreal->shadow è¦†ç›– OS å†™å…¥ -> æ— é™å¾ªçŽ¯å¡æ­»ï¼‰ã€‚
-- **ä¸å¾—å›žé€€ï¼ˆå…¨å±€è§„åˆ™ï¼‰**ï¼šHe æ˜Žç¡®è¦æ±‚æœªç»å…è®¸ä¸è¦å›žé€€ä»£ç ã€‚å·²å†™å…¥ C:\Users\Administrator\.codex\AGENTS.mdã€‚
-- **æœ¬æ¬¡å›žé€€æ˜¯ He æ˜Žç¡®æŽˆæƒ**ï¼šä¼šè¯ 26 He è¯´"ä½ ç›´æŽ¥å›žé€€åˆ°headæŠŠ"ã€‚è¿™æ˜¯ç‰¹ä¾‹ï¼Œä¸æ˜¯å…ˆä¾‹ã€‚
-- **ã€å·²éªŒè¯ã€‘MODE_G->MODE_H å›žå½’æ˜¯ stale PFN æ ¹å› **ï¼šbeeb4a5 çš„å¤‡ä»½è¡¥ä¸ï¼ˆåŸºäºŽ MODE_G worktree 6232bd0ï¼‰é‡åº”ç”¨æ—¶æœªæŽ’é™¤ stealth.hï¼ŒæŠŠ MODE_H æ”¹å›ž MODE_Gã€‚MODE_G æ—  EPT W=0 è‡ªåŠ¨åŒæ­¥ -> ä»£ç é¡µ repage åŽ shadow PT æŒ‡å‘æ—§ PFN -> CPU è¯»é”™è¯¯å­—èŠ‚ -> æ‰§è¡Œåžƒåœ¾ -> è™šå‡é—´æŽ¥è°ƒç”¨ -> CFG æ£€æŸ¥å¤±è´¥ï¼ˆ0xc0000409 fast fail 10ï¼‰ã€‚æ”¹å›ž MODE_H åŽå…¨éƒ¨æ¶ˆå¤±ã€‚
-- **CFG ä¸ç”¨ç¢°**ï¼šHe ç”¨ trigger ç»•è¿‡çº¿ç¨‹å…¥å£ CFGã€‚å†…éƒ¨é—´æŽ¥è°ƒç”¨çš„ CFG å¤±è´¥æ˜¯ stale PFN çš„ç—‡çŠ¶ï¼Œä¿®äº† MODE_H å°±æ²¡äº†ã€‚ä¸è¦åŠ  CFG call target æ³¨å†Œã€‚
-- **VMX-root çº¦æŸ**ï¼šæ—  API è°ƒç”¨ã€æ— æ–‡ä»¶ I/Oã€æ—  DbgPrintã€‚åªèƒ½ç”¨äº’é” + å†…å­˜å†™ + VMX æŒ‡ä»¤ + ç«¯å£ I/O + __invlpg + __writecr4ã€‚
-- **USE_PRIVATE_HOST_CR3 = 1**ï¼šVMX-root è·‘åœ¨ç§æœ‰ host CR3 ä¸Šã€‚hostcr3_build æ·±æ‹·è´ç³»ç»Ÿ PML4 256-511 -> ntoskrnl + KeBugCheckEx åœ¨ VMX-root æœ‰æ˜ å°„ -> è“å±æœºåˆ¶èƒ½äº§ç”ŸçœŸæ­£ minidumpã€‚
-- **BSOD æœºåˆ¶ï¼ˆda8fe39ï¼‰**ï¼šBugcheck=0xDEADC0DEã€‚å‚æ•°1=0xFF01(#PF)/0xFF02(å…¶å®ƒ)ï¼Œå‚æ•°2=cr2/å‘é‡ï¼Œå‚æ•°3=RIPï¼Œå‚æ•°4=errã€‚CMOS 0x50-0x6F å´©æºƒè®°å½•ï¼ˆç”µæ± å¤‡ä»½ï¼‰ã€‚
-- **asm_host_pf_handler ç¬¦å·**ï¼šg_pf_safe_start/g_pf_safe_end/g_pf_recovery_count å®šä¹‰åœ¨ breadcrumb.cppï¼ˆåˆå€¼0ï¼‰ã€‚safe-range åŒ…ä½ stealth_walk_pte/stealth_walk_pt_pageï¼Œç”± ept_stealth_init_pf_safe_range() åœ¨ vmx.cpp:528 è®¾ç½®ã€‚handler ç»“æž„æ­£ç¡®ï¼Œæ— éœ€æ”¹åŠ¨ã€‚
-- **dual-EPT ä¸èƒ½æ›¿ä»£ shadow CR3**ï¼šguest PTE NX åœ¨ EPT ä¹‹å‰è¢« CPU ç¡¬ä»¶ PT walk å¼ºåˆ¶æ£€æŸ¥ï¼ŒEPT ç›–ä¸è¿‡ guest NXã€‚è¦ã€Œguest è‡ªçœè§ NX=1 + å®žé™…å¯æ‰§è¡Œã€å¿…é¡»è§£è€¦ä¸¤ä»½ PT è§†å›¾ = shadow CR3ï¼ˆæˆ– EPT çº§å…¨ SPTï¼Œæ›´å¤æ‚ï¼‰ã€‚MODE_H æ€è·¯æ­£ç¡®ã€‚
-- **TdNeuterCFG / trigger ä¸è¦ç¢°**ï¼šHe æ˜Žç¡®æ‹’ç»ã€‚He ç”¨ trigger ç»• CFGã€‚
-- **æž„å»º**ï¼š_build2.batï¼ˆ/t:Rebuildï¼‰ï¼ŒDebug é…ç½®ï¼Œè¾“å‡º build\bin\Debugã€‚TrustAsia ç­¾ååœ¨ post-buildã€‚ç­¾åå·¥å…·ä¼šæŠŠæ–‡ä»¶ mtime è®¾æˆ 2015ï¼ˆæ­£å¸¸çŽ°è±¡ï¼Œçœ‹ CreationTime åˆ¤æ–­æ–°é²œåº¦ï¼‰ã€‚
-- **å¯åŠ¨é¡ºåº**ï¼šå¿…é¡» Ophion å…ˆ(VMXON) å† TestEptHook(VMCALL)ã€‚å¦åˆ™ VMCALL -> #UDã€‚
-- **AsmHostIdt.asm å¿…é¡» æ—  BOM**ï¼ˆMASM ä¸è®¤ UTF-8 BOMï¼‰ã€‚
-- **å…³é”®è·¯å¾„**ï¼š
-  - é¡¹ç›® F:\winDriver\te\Ophion-master
-  - æž„å»º Ophion-master\_build2.bat
-  - é©±åŠ¨ build\bin\Debug\Ophion.sys, TestEptHook.sys
-  - æ³¨å…¥å™¨ F:\winDriver\te\Ophion-master\Injector\inject_renderdoc.exe
+## ¹Ø¼ü·¢ÏÖ
+- **¡¾session 38¡¿CR3 ´°¿ÚÄÚ½ûÖ¹ HYPERPLATFORM_LOG_WARN_SAFE**£ºvmx_enter_cr3/vmx_leave_guest_cr3 ´°¿ÚÄÚÖ»ÄÜÓÐ stealth_walk_pte£¨°²È«·¶Î§£©¡¢shadow PTE Ð´£¨NonPaged pool£©¡¢INVVPID£¨VMX Ö¸Áî£©¡¢CMOS markers£¨¶Ë¿Ú I/O£©¡¢¼ÆÊýÆ÷×ÔÔö£¨»¥ËøÄÚ´æÐ´£©¡£ÈÎºÎÆäËûº¯Êýµ÷ÓÃ¶¼¿ÉÄÜ´¥·¢²»¿É»Ö¸´µÄ host #PF -> pf_panic -> jmp $ -> CPU ¿¨ËÀ¡£
+- **¡¾session 38¡¿W.log pf_err ×Ö¶Î´æ´¢ streak Öµ**£ºwedge_cmos_snap_reinj ´æ´¢ pf_va=addr, pf_err=streak¡£pfloop ¼ì²âÆ÷ºÍ reinj ¼ì²âÆ÷¶¼Ð´Í¬Ò» CMOS ×Ö¶Î¡£pf_err=0x180=384 ÊÇ pfloop_streak¡£
+- **¡¾session 38¡¿FALSE-path breaker ±ØÐëÖØÖÃ pfloop_streak**£ºÖ®Ç°Ö»ÖØÖÃ reinj_streak ºÍ reinj_total£¬µ¼ÖÂ pfloop_streak ³ÖÐøÔö³¤£¬Ã¿ 8 ´Î #PF ´¥·¢Ò»´Î CMOS snap¡£
+- **¡¾session 37¡¿CR3 Ð¹Â© = ÏµÍ³¿¨ËÀ¸ùÒò**£ºstealth_refresh_shadow_code_pte µÄ eturn FALSE Ìø¹ý mx_leave_guest_cr3¡£renderdoc Ò³ page out ºó´¥·¢¡£ËùÓÐ vmx_enter_cr3/vmx_leave_guest_cr3 ¶ÔÖ®¼äµÄ early return ¶¼±ØÐëÏÈµ÷ leave¡£
+- **¡¾session 37¡¿FALSE-path breaker ±ØÐë¶ÀÁ¢Çå shadow window**£º²»ÄÜÈ«µ÷ stealth_pf_abort_shadow_window£¨»á³åÍ» MTF ºÍ #PF interception£©£¬ÐèÒªÊÖ¶¯»Ö¸´ CR3 + Çå×´Ì¬ + ½û CR3-load/store exiting¡£
+- **¡¾session 37¡¿write-protected reject Â·¾¶ (L1836) ÊÇ shadow window Ð¹Â©µÄ±ß½ç case**£ºept_stealth_handle_pf ÖÐÎ¨Ò»µÄ return FALSE ²» abort Â·¾¶£¨ÒÑÐÞ£©¡£
+- **¡¾session 37¡¿ÓÃ»§Ì¬ livelock breaker È± total ¶µµ×**£ºÄÚºËÌ¬ÓÐ wtotal>=4£¬ÓÃ»§Ì¬Ö»ÓÐ ws>=32¡£½»ÌæµØÖ·ÓÀÔ¶µ½²»ÁË¡£
+- **¡¾session 37¡¿stealth #PF handler È·Êµ¼ì²éÄ¿±êÒ³**£ºL1789 sp->guest_va != fault_page¡£µ«ÓÃ O(n) Á´±í±éÀú£¨2152+ ÌõÄ¿£©¡£ÓÃ shadow CR3 PTE NX Î»×ö O(1) ÅÐ¶ÏÊÇÓÐÐ§ÓÅ»¯·½Ïò£¨Éè¼Æ¸Ä½ø£¬·Ç bug£©¡£
+- **¡¾session 31¡¿BC.log ºóÌ¨Ïß³Ì Ntfs AV**£ºSEH °ü¹ü½â¾ö¡£
+- **¡¾session 31¡¿AutoReboot=1**£ºÀ¶ÆÁÒ»·ÖÖÓ×Ô¶¯ÖØÆô¡£Dump ÈÔÉú³É¡£
+- **¡¾session 31¡¿breadcrumb.cpp ÊÇ UTF-8 BOM + LF**¡£
+- **¡¾session 31¡¿VMCALL streak**£ºTdStealthFreePageSafe Ã¿Ò³¶ÔÈ«²¿ CPU ·¢ VMCALL¡£
+- **¡¾session 31¡¿renderdoc ½ØÖ¡´¥·¢**£ºflag file C:\ProgramData\WinComp\capture.flag£¬²»ÒªÓÃ F12¡£
+- **¡¾session 30¡¿MTF handler ·½Ïò·´×ª = ¿¨ËÀ¸ùÒò**£ºMODE_H ÏÂ MTF handler ±ØÐë shadow->shadow¡£
+- **¡¾ÒÑÑéÖ¤¡¿MODE_G->MODE_H »Ø¹éÊÇ stale PFN ¸ùÒò**¡£
+- **CFG ²»ÓÃÅö**£ºHe ÓÃ trigger ÈÆ CFG¡£
+- **VMX-root Ô¼Êø**£ºÎÞ API¡¢ÎÞÎÄ¼þ I/O¡¢ÎÞ DbgPrint¡£Ö»ÄÜ»¥Ëø + ÄÚ´æÐ´ + VMX Ö¸Áî + ¶Ë¿Ú I/O + __invlpg + __writecr4¡£
+- **USE_PRIVATE_HOST_CR3 = 1**£ºVMX-root ÅÜÔÚË½ÓÐ host CR3 ÉÏ¡£
+- **BSOD »úÖÆ£¨da8fe39£©**£ºBugcheck=0xDEADC0DE¡£CMOS 0x50-0x6F ±ÀÀ£¼ÇÂ¼¡£
+- **dual-EPT ²»ÄÜÌæ´ú shadow CR3**£ºguest PTE NX ÔÚ EPT Ö®Ç°±» CPU Ó²¼þ¼ì²é¡£
+- **TdNeuterCFG / trigger ²»ÒªÅö**¡£
+- **¹¹½¨**£º_build2.bat£¨/t:Rebuild£©£¬Debug ÅäÖÃ¡£
+- **Æô¶¯Ë³Ðò**£º±ØÐë Ophion ÏÈ(VMXON) ÔÙ TestEptHook(VMCALL)¡£
+- **AsmHostIdt.asm ±ØÐë ÎÞ BOM**¡£
+- **¹Ø¼üÂ·¾¶**£º
+  - ÏîÄ¿ F:\winDriver\te\Ophion-master
+  - ¹¹½¨ Ophion-master\_build2.bat
+  - Çý¶¯ build\bin\Debug\Ophion.sys, TestEptHook.sys
+  - ×¢ÈëÆ÷ F:\winDriver\te\Ophion-master\Injector\inject_renderdoc.exe
   - renderdoc.dll F:\winDriver\te\renderdoc.dll
-  - æ¸¸æˆ E:\God of War Ragnarok\GoWR.exe
+  - ÓÎÏ· E:\God of War Ragnarok\GoWR.exe
   - BC.log C:\Windows\BC.log
-  - æ¨¡å—å¿«ç…§ C:\Windows\MOD_SNAPSHOT2.txtï¼ˆntoskrnl@FFFFF80581600000ï¼‰
-  - ç¬¦å· srv*C:\Symbols*https://msdl.microsoft.com/download/symbols;F:\winDriver\te\Ophion-master\Ophion-master\build\bin\Debug
+  - Ä£¿é¿ìÕÕ C:\Windows\MOD_SNAPSHOT2.txt
+  - ·ûºÅ srv*C:\Symbols*https://msdl.microsoft.com/download/symbols;F:\winDriver\te\Ophion-master\Ophion-master\build\bin\Debug
 
-## å¾…åŠž / ä¸‹ä¸€æ­¥
-1. He å†³å®šæ˜¯å¦é‡æ–°å¯åŠ¨æ¸¸æˆæµ‹è¯•æˆªå¸§
-2. å¦‚æµ‹æˆªå¸§ï¼šç”¨ flag file è§¦å‘ï¼ˆä¸è¦ç”¨ F12ï¼‰
-3. å¦‚æˆªå¸§æˆåŠŸ -> ç¡®è®¤æµç¨‹å®Œæ•´
-4. å¦‚æˆªå¸§æœ‰é—®é¢˜ -> åˆ†æž renderdoc RDCLOG è¾“å‡º
-5. ï¼ˆå¯é€‰ï¼‰æäº¤åŽæ¸…ç†å·¥ä½œæ ‘ .bak/.rej ä¸´æ—¶æ–‡ä»¶
+## ´ý°ì / ÏÂÒ»²½
+1. ²¿Êð²âÊÔ£¨Í£Çý¶¯ -> killÓÎÏ· -> ²¿ÊðÐÂÇý¶¯ -> Æô¶¯Ophion -> Æô¶¯TestEptHook -> Ä£¿é¿ìÕÕ -> Æô¶¯ÓÎÏ· -> ×¢Èë -> flag file ´¥·¢½ØÖ¡£©
+2. ÈçÈÔ¿¨ËÀ£º¼ì²é W.log ÐÂÔö markers 0x07/0x08 È·¶¨¿¨ËÀÎ»ÖÃ
+3. Èç×¢Èë³É¹¦£º¼ì²é½ØÖ¡ÊÇ·ñÉú³É .rdc ÎÄ¼þ
+4. £¨¿ÉÑ¡£©ÓÃ shadow CR3 PTE NX Î»ÓÅ»¯ stealth_pages Á´±í±éÀú£¨O(n) -> O(1)£©

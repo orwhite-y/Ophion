@@ -12,6 +12,31 @@
 - **下一步**：部署测试（停驱动 -> kill游戏 -> 部署新驱动 -> 启动Ophion -> 启动TestEptHook -> 模块快照 -> 启动游戏 -> 注入）
 
 ## 变更日志
+### 2026-08-12 16:05  [session 52]
+- 动作：接管 + 分析 stealth page match 失败根因 + 修复 target_pid 硬编码 bug + 编译 + 提交
+- 根因分析（He 的问题：注入后游戏崩，match_seen=0）：
+  - BC.log: 62 个 #PF 事件 (evt=0x0014)，大部分 flg=21 (0x15=P/U/S/F, 无 shadow)
+  - fault 地址 0x000001adb7784xxx 在 renderdoc 范围内，VA 匹配应该成功
+  - 但 match_seen=0 -> L1905 wedge_cmos_set_match_seen 从未执行 -> 匹配在 L1848-1874 失败
+  - 根因：TdStealthAllocPage (td_inject.cpp L1019) 硬编码 req->target_pid = 0
+  - target_pid=0 -> 跳过 PID 检查 (L1851) -> 走 CR3 fallback (L1859)
+  - CR3 fallback 比较 VMCS_GUEST_CR3 (user CR3, KPTI) vs sp->guest_cr3 (kernel CR3)
+  - KPTI: user CR3 ≠ kernel CR3 -> PFN 不匹配 -> continue -> 无匹配
+  - #PF 返回 FALSE -> guest 收到 NX access violation -> 游戏崩
+- 修复：
+  - TdStealthAllocPage 新增 UINT64 target_pid 参数（末尾，默认 0）
+  - req->target_pid = target_pid（替换硬编码 0）
+  - 7 个调用点全部传入 PID：
+    - td_pe_mapper.cpp: target_pid (GoWR PID)
+    - td_ept_hook.cpp: target_pid (R3 hook 上下文)
+    - td_ioctl.cpp x3: p->target_pid (ioctl 参数)
+    - td_inject.cpp: PsGetCurrentProcessId() (shellcode 路径)
+  - PID 在 KPTI 下不变（同进程，只有 CR3 变），PID 检查比 CR3 检查更可靠
+  - 同时提交 near-NULL latch (g_near_null_shadow_disabled) from session 50
+- 文件：td_common.h, td_inject.cpp, td_pe_mapper.cpp, td_ept_hook.cpp, td_ioctl.cpp, ept_stealth.cpp
+- 编译：Ophion.sys + TestEptHook.sys 成功签名
+- 提交：812cda9
+- 结论：等待 He 决定是否测试
 ### 2026-08-12 15:30  [session 49]
 - 动作：接管 + 分析 hard-reboot crash + 修复 near-NULL triple fault + 编译 + 提交
 - 根因分析（He 的问题：注入后直接硬重启）：
@@ -144,7 +169,7 @@
 - VMCALL streak 排除修复
 
 ## 关键发现
-- **【session 49】near-NULL data #PF (VA 0x12) 导致 triple fault**：stealth_sync_data_pte_in_window 对 near-NULL 地址同步 PML4[0] 返回 TRUE，保持 shadow CR3 活跃。Guest 重试真正未映射的地址 -> fetch<->data-#PF livelock -> shadow PML4 内核映射过时 -> 异常分发时 double fault -> triple fault -> 硬重启（无 dump）。修复：fault_addr < 0x10000 时 return FALSE。
+- **【session 52】TdStealthAllocPage 硬编码 target_pid=0 是 match 失败根因**：td_inject.cpp L1019 eq->target_pid = 0 导致所有 stealth page 走 CR3 fallback，KPTI 下 user CR3 ≠ kernel CR3 -> 匹配失败 -> NX #PF 未处理 -> 游戏崩。修复：传 target_pid 参数，PID 在 KPTI 下不变。- **【session 49】near-NULL data #PF (VA 0x12) 导致 triple fault**：stealth_sync_data_pte_in_window 对 near-NULL 地址同步 PML4[0] 返回 TRUE，保持 shadow CR3 活跃。Guest 重试真正未映射的地址 -> fetch<->data-#PF livelock -> shadow PML4 内核映射过时 -> 异常分发时 double fault -> triple fault -> 硬重启（无 dump）。修复：fault_addr < 0x10000 时 return FALSE。
 - **【session 49】PML4 sync 可能破坏 stealth**：PML4 sync 替换 shadow PML4 条目为 real PML4 条目。如果 stealth 页在同一 PML4 区域，sync 会用 real PDPT 替换 shadow PDPT，破坏 stealth。当前 near-NULL check 只防 VA < 0x10000。
 - **【session 38】CR3 窗口内禁止 HYPERPLATFORM_LOG_WARN_SAFE**：vmx_enter_cr3/vmx_leave_guest_cr3 窗口内只能有 stealth_walk_pte（安全范围）、shadow PTE 写（NonPaged pool）、INVVPID（VMX 指令）、CMOS markers（端口 I/O）、计数器自增（互锁内存写）。任何其他函数调用都可能触发不可恢复的 host #PF -> pf_panic -> jmp $ -> CPU 卡死。
 - **【session 38】W.log pf_err 字段存储 streak 值**：wedge_cmos_snap_reinj 存储 pf_va=addr, pf_err=streak。pfloop 检测器和 reinj 检测器都写同一 CMOS 字段。pf_err=0x180=384 是 pfloop_streak。

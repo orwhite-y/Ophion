@@ -1,0 +1,200 @@
+﻿
+************* Preparing the environment for Debugger Extensions Gallery repositories **************
+   ExtensionRepository : Implicit
+   UseExperimentalFeatureForNugetShare : true
+   AllowNugetExeUpdate : true
+   NonInteractiveNuget : true
+   AllowNugetMSCredentialProviderInstall : true
+   AllowParallelInitializationOfLocalRepositories : true
+
+   EnableRedirectToV8JsProvider : false
+
+   -- Configuring repositories
+      ----> Repository : LocalInstalled, Enabled: true
+      ----> Repository : UserExtensions, Enabled: true
+
+>>>>>>>>>>>>> Preparing the environment for Debugger Extensions Gallery repositories completed, duration 0.000 seconds
+
+************* Waiting for Debugger Extensions Gallery to Initialize **************
+
+>>>>>>>>>>>>> Waiting for Debugger Extensions Gallery to Initialize completed, duration 0.015 seconds
+   ----> Repository : UserExtensions, Enabled: true, Packages count: 0
+   ----> Repository : LocalInstalled, Enabled: true, Packages count: 29
+
+Microsoft (R) Windows Debugger Version 10.0.26100.6584 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+
+Loading Dump File [C:\Windows\Minidump\081326-10437-01.dmp]
+Mini Kernel Dump File: Only registers and stack trace are available
+
+DbsSplayTreeRangeMap::Add: ignoring zero-sized range at ?00000000`00000000?
+
+************* Path validation summary **************
+Response                         Time (ms)     Location
+Deferred                                       srv*C:\Symbols*https://msdl.microsoft.com/download/symbols
+OK                                             F:\winDriver\te\Ophion-master\Ophion-master\build\bin\Debug
+Deferred                                       srv*d:\symbols*http://msdl.microsoft.com/download/symbols
+Symbol search path is: srv*C:\Symbols*https://msdl.microsoft.com/download/symbols;F:\winDriver\te\Ophion-master\Ophion-master\build\bin\Debug;srv*d:\symbols*http://msdl.microsoft.com/download/symbols
+Executable search path is: 
+Windows 10 Kernel Version 19041 MP (20 procs) Free x64
+Product: WinNt, suite: TerminalServer SingleUserTS
+Kernel base = 0xfffff807`2e600000 PsLoadedModuleList = 0xfffff807`2f22a420
+Debug session time: Thu Aug 13 03:58:32.697 2026 (UTC + 8:00)
+System Uptime: 0 days 0:29:47.392
+Loading Kernel Symbols
+...............................................................
+................................................................
+................................................................
+............
+Loading User Symbols
+PEB is paged out (Peb.Ldr = 000000e9`ae37e018).  Type ".hh dbgerr001" for details
+Loading unloaded module list
+.......
+For analysis of this file, run !analyze -v
+0: kd> kd: Reading initial command '!analyze -v; kb; lmvm Ophion; .ecxr; kb; q'
+*******************************************************************************
+*                                                                             *
+*                        Bugcheck Analysis                                    *
+*                                                                             *
+*******************************************************************************
+
+Unknown bugcheck code (deadc0de)
+Unknown bugcheck description
+Arguments:
+Arg1: 0000000000000004
+Arg2: 0000000000000000
+Arg3: 00007ffa3bb11ad0
+Arg4: 0000000000000000
+
+Debugging Details:
+------------------
+
+
+KEY_VALUES_STRING: 1
+
+    Key  : Analysis.CPU.mSec
+    Value: 5046
+
+    Key  : Analysis.Elapsed.mSec
+    Value: 3408
+
+    Key  : Analysis.IO.Other.Mb
+    Value: 0
+
+    Key  : Analysis.IO.Read.Mb
+    Value: 0
+
+    Key  : Analysis.IO.Write.Mb
+    Value: 0
+
+    Key  : Analysis.Init.CPU.mSec
+    Value: 3921
+
+    Key  : Analysis.Init.Elapsed.mSec
+    Value: 3957
+
+    Key  : Analysis.Memory.CommitPeak.Mb
+    Value: 80
+
+    Key  : Bugcheck.Code.LegacyAPI
+    Value: 0xdeadc0de
+
+    Key  : Dump.Attributes.AsUlong
+    Value: 8
+
+    Key  : Dump.Attributes.KernelGeneratedTriageDump
+    Value: 1
+
+    Key  : Failure.Bucket
+    Value: ZEROED_STACK_0xDEADC0DE
+
+    Key  : Failure.Hash
+    Value: {2ac59feb-6e71-7167-5c3a-fedc04f8900d}
+
+
+BUGCHECK_CODE:  deadc0de
+
+BUGCHECK_P1: 4
+
+BUGCHECK_P2: 0
+
+BUGCHECK_P3: 7ffa3bb11ad0
+
+BUGCHECK_P4: 0
+
+FILE_IN_CAB:  081326-10437-01.dmp
+
+DUMP_FILE_ATTRIBUTES: 0x8
+  Kernel Generated Triage Dump
+
+BLACKBOXBSD: 1 (!blackboxbsd)
+
+
+BLACKBOXNTFS: 1 (!blackboxntfs)
+
+
+BLACKBOXPNP: 1 (!blackboxpnp)
+
+
+BLACKBOXWINLOGON: 1
+
+CUSTOMER_CRASH_COUNT:  1
+
+PROCESS_NAME:  powershell.exe
+
+STACK_TEXT:  
+ffffe28f`2169db88 00000000`00000000     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : nt!KeBugCheckEx
+
+
+SYMBOL_NAME:  ANALYSIS_INCONCLUSIVE
+
+MODULE_NAME: Unknown_Module
+
+IMAGE_NAME:  Unknown_Image
+
+STACK_COMMAND:  .cxr; .ecxr ; kb
+
+FAILURE_BUCKET_ID:  ZEROED_STACK_0xDEADC0DE
+
+OSPLATFORM_TYPE:  x64
+
+OSNAME:  Windows 10
+
+FAILURE_ID_HASH:  {2ac59feb-6e71-7167-5c3a-fedc04f8900d}
+
+Followup:     MachineOwner
+---------
+
+ # RetAddr               : Args to Child                                                           : Call Site
+00 00000000`00000000     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : nt!KeBugCheckEx
+Browse full module list
+start             end                 module name
+fffff809`fedf0000 fffff809`fee32000   Ophion     (deferred)             
+    Mapped memory image file: f:\windriver\te\ophion-master\ophion-master\build\bin\debug\Ophion.sys
+    Image path: Ophion.sys
+    Image name: Ophion.sys
+    Browse all global symbols  functions  data
+    Timestamp:        Thu Aug 13 03:54:40 2026 (6A7CCF80)
+    CheckSum:         00024FAC
+    ImageSize:        00042000
+    Translations:     0000.04b0 0000.04e4 0409.04b0 0409.04e4
+    Information from resource tables:
+Can't switch processors on a single processor kernel triage dump
+Unable to get exception context, HRESULT 0x8000FFFF
+ # RetAddr               : Args to Child                                                           : Call Site
+00 00000000`00000000     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : nt!KeBugCheckEx
+quit:
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\atlmfc.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\ObjectiveC.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\concurrency.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\cpp_rest.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Kernel.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\stl.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Data.Json.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'
+NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Usb4Kd.natvis'

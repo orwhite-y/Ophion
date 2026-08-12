@@ -1,0 +1,3 @@
+[+] Found GoWR.exe pid=7720
+[+] renderdoc NT path: \??\F:\winDriver\te\Ophion-master\renderdoc-1.36\x64\Development\renderdoc.dll
+[+] Driver device opened

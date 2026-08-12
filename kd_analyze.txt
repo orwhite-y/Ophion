@@ -1,0 +1,6 @@
+!analyze -v
+.printf "\n=== STUCK RIP RESOLUTION ===\n"
+.printf "%y\n", fffff8070afe4a60
+.printf "\n=== ALL MODULES (filtered 0a000000-0b000000) ===\n"
+lmf
+q

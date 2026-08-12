@@ -1,0 +1,9 @@
+.printf "=== BUGCHECK ARGS ===\n"
+.printf "Arg1=%p Arg2=%p Arg3=%p Arg4=%p\n", 4, 0, 0x7ffd4aff23a8, 0x11
+.printf "\n=== STUCK RIP RESOLUTION ===\n"
+.printf "%y\n", 0x7ffd4aff23a8
+.printf "\n=== REGISTERS ===\n"
+r
+.printf "\n=== USER MODULES ===\n"
+lmf
+q

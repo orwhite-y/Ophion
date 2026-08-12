@@ -1,0 +1,2 @@
+.printf "stuck RIP resolves to: %y\n", 0xfffff8070afe4a60
+q

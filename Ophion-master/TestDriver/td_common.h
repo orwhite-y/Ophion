@@ -130,6 +130,7 @@ typedef struct _TD_STEALTH_PARAM {
     UINT64  shadow_cr3_phys;    // physical address of shadow PML4 (0 = no shadow CR3)
     BOOLEAN no_ept_split;       // TRUE = shadow CR3 only, keep target EPT mapping unchanged
     PVOID   shadow_pte_va;      // VA of this page's shadow PTE (NonPaged pool, computed via TdResolveShadowPte at PASSIVE); HV writes it directly on #PF (NULL = none)
+    PVOID   shadow_pml4_va;     // VA of shadow PML4 (NonPaged pool, for stale PML4 entry sync in VMX-root)
     PVOID   real_page_map;      // ptr to STEALTH_REAL_PAGE_ENTRY[real_page_count] (MDL-mapped real PT pages, NULL = none)
     UINT32  real_page_count;    // number of entries in real_page_map
     volatile LONG installed;

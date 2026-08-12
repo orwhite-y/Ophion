@@ -117,16 +117,21 @@ TdShadowAllocPage(TD_SHADOW_BUILD_CONTEXT * ctx)
 VOID
 TdShadowUnmapRealPage(STEALTH_REAL_PAGE_ENTRY * e)
 {
-    if (!e || !e->va || !e->mdl)
+    if (!e || !e->va)
         return;
-    __try {
-        MmUnmapLockedPages(e->va, (PMDL)e->mdl);
-        // NO MmUnlockPages: MDL_IO_SPACE + manual-PFN touched no PFN refcount. The
-        // page-table page's refcount is untouched (pure read-only alias).
-        IoFreeMdl((PMDL)e->mdl);
+    if (e->mdl == (PVOID)(ULONG_PTR)-1)
+    {
+        // MmGetVirtualForPhysical self-map VA: no cleanup needed (not our mapping).
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Stale MDL/VA during process-exit cleanup. Leak rather than crash.
+    else if (e->mdl)
+    {
+        __try {
+            MmUnmapLockedPages(e->va, (PMDL)e->mdl);
+            IoFreeMdl((PMDL)e->mdl);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Stale MDL/VA during process-exit cleanup. Leak rather than crash.
+        }
     }
     e->va  = NULL;
     e->mdl = NULL;
@@ -151,52 +156,64 @@ TdShadowMapRealPage(TD_SHADOW_BUILD_CONTEXT * ctx, UINT64 pa)
         return FALSE;
     }
 
-    PMDL mdl = IoAllocateMdl(NULL, PAGE_SIZE, FALSE, FALSE, NULL);
-    if (!mdl)
+    // Primary: MmGetVirtualForPhysical (self-map VA). TdBuildShadowCR3 already
+    // uses TdMapPhys (= MmGetVirtualForPhysical) to READ these exact pages, so
+    // it is proven to return a valid VA. The VA is valid under sp->guest_cr3
+    // (guest kernel CR3) because TdBuildShadowCR3 runs after KeStackAttachProcess
+    // under that same CR3 -- the self-map PML4 entry is in the shared kernel half.
+    // The HV uses stealth_real_va() to look up this pre-computed VA, avoiding
+    // MmGetVirtualForPhysical in VMX-root (PFN DB lock -> WHEA 0x124 hard reset).
+    PHYSICAL_ADDRESS phys;
+    phys.QuadPart = (LONGLONG)page_pa;
+    PVOID va = MmGetVirtualForPhysical(phys);
+    if (va)
     {
-        HYPERPLATFORM_LOG_ERROR("[td-rw] real-page map FAIL pa=%llx: IoAllocateMdl NULL",
-                                page_pa);
-        return FALSE;
+        static volatile LONG s_first_log = 0;
+        if (!_InterlockedExchange(&s_first_log, 1))
+        {
+            HYPERPLATFORM_LOG_INFO(
+                "[td-rw] real-page GetVirtPhys ok: pa=%llx va=%llx",
+                page_pa, (UINT64)va);
+        }
+        ctx->real_pages[ctx->real_page_count].pa  = page_pa;
+        ctx->real_pages[ctx->real_page_count].va  = va;
+        ctx->real_pages[ctx->real_page_count].mdl = (PVOID)(ULONG_PTR)-1;  // sentinel: self-map VA, no cleanup
+        ctx->real_page_count++;
+        return TRUE;
     }
-    mdl->StartVa    = NULL;
-    mdl->ByteOffset = 0;
-    mdl->ByteCount  = PAGE_SIZE;
-    mdl->MdlFlags  |= MDL_PAGES_LOCKED | MDL_IO_SPACE;
-    PPFN_NUMBER pfns = MmGetMdlPfnArray(mdl);
-    pfns[0] = (PFN_NUMBER)(page_pa >> PAGE_SHIFT);
 
-    // UC first (winpmem default); fall back to WB. MDL_IO_SPACE skips PFN
-    // cache-attribute tracking, so neither conflicts/bugchecks.
-    PVOID va = MmMapLockedPagesSpecifyCache(
-        mdl, KernelMode, MmNonCached, NULL, FALSE, NormalPagePriority);
-    if (!va)
+    // Fallback: MDL_IO_SPACE mapping (for pages where GetVirtualForPhysical fails).
+    PMDL mdl = IoAllocateMdl(NULL, PAGE_SIZE, FALSE, FALSE, NULL);
+    if (mdl)
     {
+        mdl->StartVa    = NULL;
+        mdl->ByteOffset = 0;
+        mdl->ByteCount  = PAGE_SIZE;
+        mdl->MdlFlags  |= MDL_PAGES_LOCKED | MDL_IO_SPACE;
+        PPFN_NUMBER pfns = MmGetMdlPfnArray(mdl);
+        pfns[0] = (PFN_NUMBER)(page_pa >> PAGE_SHIFT);
+
         va = MmMapLockedPagesSpecifyCache(
             mdl, KernelMode, MmCached, NULL, FALSE, NormalPagePriority);
-    }
-    if (!va)
-    {
-        HYPERPLATFORM_LOG_ERROR(
-            "[td-rw] real-page map FAIL pa=%llx pfn=%llx: MDL_IO_SPACE map NULL (UC+WB)",
-            page_pa, (UINT64)pfns[0]);
+        if (!va)
+            va = MmMapLockedPagesSpecifyCache(
+                mdl, KernelMode, MmNonCached, NULL, FALSE, NormalPagePriority);
+
+        if (va)
+        {
+            ctx->real_pages[ctx->real_page_count].pa  = page_pa;
+            ctx->real_pages[ctx->real_page_count].va  = va;
+            ctx->real_pages[ctx->real_page_count].mdl = mdl;
+            ctx->real_page_count++;
+            return TRUE;
+        }
         IoFreeMdl(mdl);
-        return FALSE;
     }
 
-    // one-shot confirmation that the MDL_IO_SPACE path works at runtime.
-    static volatile LONG s_first_log = 0;
-    if (!_InterlockedExchange(&s_first_log, 1))
-    {
-        HYPERPLATFORM_LOG_INFO(
-            "[td-rw] real-page MDL_IO_SPACE map ok: pa=%llx va=%llx",
-            page_pa, (UINT64)va);
-    }
-
-    ctx->real_pages[ctx->real_page_count].pa  = page_pa;
-    ctx->real_pages[ctx->real_page_count].va  = va;
-    ctx->real_pages[ctx->real_page_count].mdl = mdl;
-    ctx->real_page_count++;
-    return TRUE;
+    HYPERPLATFORM_LOG_ERROR(
+        "[td-rw] real-page map FAIL pa=%llx: GetVirtPhys NULL + MDL NULL",
+        page_pa);
+    return FALSE;
 }
 
 BOOLEAN
@@ -495,9 +512,9 @@ TdBuildShadowCR3(UINT64 cr3, UINT64 base_va, SIZE_T size)
     // --- shadow PML4 ---
     PUINT64 real_pml4 = TdMapPhys(cr3);
     if (!real_pml4) goto Fail;
-    // No real-page MDL map: the HV heals under sp->guest_cr3 (this kernel CR3),
-    // where pa_to_va resolves the guest's real PT pages directly. See vmx_enter_cr3.
-
+    // Map real PML4 for VMX-root heal (stealth_real_va MDL lookup).
+    // pa_to_va/MmGetVirtualForPhysical deadlocks in VMX-root (PFN DB lock).
+    TdShadowMapRealPage(&ctx, cr3);
     PUINT64 shadow_pml4 = (PUINT64)TdShadowAllocPage(&ctx);
     if (!shadow_pml4) goto Fail;
     RtlCopyMemory(shadow_pml4, real_pml4, PAGE_SIZE);
@@ -508,6 +525,7 @@ TdBuildShadowCR3(UINT64 cr3, UINT64 base_va, SIZE_T size)
     PUINT64 real_pdpt = TdMapPhys(pml4e);
     if (!real_pdpt) goto Fail;
 
+    TdShadowMapRealPage(&ctx, pml4e);
     PUINT64 shadow_pdpt = (PUINT64)TdShadowAllocPage(&ctx);
     if (!shadow_pdpt) goto Fail;
     RtlCopyMemory(shadow_pdpt, real_pdpt, PAGE_SIZE);
@@ -536,6 +554,7 @@ TdBuildShadowCR3(UINT64 cr3, UINT64 base_va, SIZE_T size)
             if (!(pdpe & 1) || (pdpe & (1ULL << 7))) goto Fail;  // 1GB large page
             PUINT64 real_pd = TdMapPhys(pdpe);
             if (!real_pd) goto Fail;
+    TdShadowMapRealPage(&ctx, pdpe);
 
             shadow_pd = (PUINT64)TdShadowAllocPage(&ctx);
             if (!shadow_pd) goto Fail;
@@ -554,6 +573,7 @@ TdBuildShadowCR3(UINT64 cr3, UINT64 base_va, SIZE_T size)
             if (!(pde & 1) || (pde & (1ULL << 7))) goto Fail;  // 2MB large page
             PUINT64 real_pt = TdMapPhys(pde);
             if (!real_pt) goto Fail;
+    TdShadowMapRealPage(&ctx, pde);
 
             shadow_pt = (PUINT64)TdShadowAllocPage(&ctx);
             if (!shadow_pt) goto Fail;

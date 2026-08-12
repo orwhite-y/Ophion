@@ -62,6 +62,7 @@ volatile LONG g_dbg_a2_stale_p1_logged = 0;       // verbose-log cap counter for
 volatile LONG g_dbg_a2_stale_p1_total = 0;         // A2: total silent P=1/wrong-PFN staleness detected (UNBOUNDED; overlay-killer / crash class)
 volatile LONG g_dbg_a2_dump_tick = 0;              // A2: periodic counter-dump tick (diagnostic)
 volatile LONG g_dbg_a2_already_on_shadow = 0;      // A2: mid-window NX-fetch #PF hitting the already_on_shadow branch (stale-gap suspect)
+volatile LONG g_dbg_a2_pml4_synced = 0;            // A2: stale shadow PML4 entries synced from real (non-DLL range fix)
 
 //
 // DIAG: capture the first distinct renderdoc code RIPs that open an NX-fetch
@@ -742,7 +743,19 @@ stealth_walk_pte(PEPT_STEALTH_PAGE_INFO sp, UINT64 cr3, UINT64 va, UINT64 * out_
     {
         PUINT64 table = (PUINT64)stealth_real_va(sp, pa);
         if (!table)
-            return FALSE;
+        {
+            // KPTI: user CR3 PML4 not in real_page_map (built from kernel CR3).
+            // Fall back to sp->guest_cr3 (kernel CR3) PML4 -- user-space entries
+            // are identical between user/kernel CR3s under KPTI.
+            if (lvl == 0 && sp->guest_cr3 &&
+                (sp->guest_cr3 & PFN_MASK) != (cr3 & PFN_MASK))
+            {
+                pa = sp->guest_cr3 & PFN_MASK;
+                table = (PUINT64)stealth_real_va(sp, pa);
+            }
+            if (!table)
+                return FALSE;
+        }
         entry = table[(va >> shift[lvl]) & 0x1FF];
         if (!(entry & 1))            // not present at this level
             break;
@@ -780,9 +793,21 @@ stealth_walk_pt_page(PEPT_STEALTH_PAGE_INFO sp, UINT64 cr3, UINT64 va,
         PUINT64 table = (PUINT64)stealth_real_va(sp, pa);
         if (!table)
         {
-            *out_pt_page_va = 0;
-            *out_pte = 0;
-            return FALSE;
+            // KPTI: user CR3 PML4 not in real_page_map (built from kernel CR3).
+            // Fall back to sp->guest_cr3 (kernel CR3) PML4 -- user-space entries
+            // are identical between user/kernel CR3s under KPTI.
+            if (lvl == 0 && sp->guest_cr3 &&
+                (sp->guest_cr3 & PFN_MASK) != (cr3 & PFN_MASK))
+            {
+                pa = sp->guest_cr3 & PFN_MASK;
+                table = (PUINT64)stealth_real_va(sp, pa);
+            }
+            if (!table)
+            {
+                *out_pt_page_va = 0;
+                *out_pte = 0;
+                return FALSE;
+            }
         }
         if (lvl == 3)
             pt_page = table;
@@ -804,6 +829,10 @@ stealth_walk_pt_page(PEPT_STEALTH_PAGE_INFO sp, UINT64 cr3, UINT64 va,
     return TRUE;
 }
 
+// Forward declarations for #PF safe-range init (defined below).
+static BOOLEAN stealth_sync_data_pte_in_window(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error_code);
+static BOOLEAN stealth_refresh_shadow_code_pte(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_PAGE_INFO sp, UINT64 fault_addr, UINT64 real_cr3);
+
 // Set the host #PF safe-recovery range to bracket the self-map walk functions.
 // A host #PF with RIP in [g_pf_safe_start, g_pf_safe_end) recovers (RAX=0, skip 3)
 // instead of BSODing. This catches direct-memory-access #PFs inside the walk
@@ -815,8 +844,14 @@ void ept_stealth_init_pf_safe_range(void)
 {
     UINT64 a = (UINT64)&stealth_walk_pte;
     UINT64 b = (UINT64)&stealth_walk_pt_page;
-    g_pf_safe_start = (a < b) ? a : b;
-    g_pf_safe_end   = ((a > b) ? a : b) + 0x1000;  // generous: covers both fns
+    UINT64 c = (UINT64)&stealth_sync_data_pte_in_window;
+    UINT64 d = (UINT64)&stealth_refresh_shadow_code_pte;
+    UINT64 lo = a, hi = a + 0x1000;
+    if (b < lo) lo = b; if (b + 0x1000 > hi) hi = b + 0x1000;
+    if (c < lo) lo = c; if (c + 0x2000 > hi) hi = c + 0x2000;
+    if (d < lo) lo = d; if (d + 0x2000 > hi) hi = d + 0x2000;
+    g_pf_safe_start = lo;
+    g_pf_safe_end   = hi;
 }
 
 static BOOLEAN
@@ -871,11 +906,56 @@ stealth_sync_data_pte_in_window(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr,
         }
     }
 
-    // Not a DLL stealth page (heap/stack/TLS): these share the REAL PT through
-    // the copied PML4 entry (no shadow PT copy), so a reinject commits them
-    // correctly under the real CR3. Bail without touching anything.
+    // Not a DLL stealth page (heap/stack/TLS): the shadow PML4 is a build-time
+    // snapshot -- non-DLL PML4 entries go stale when the OS allocates new memory
+    // ranges after the snapshot. The stale entry (P=0 in shadow, P=1 in real)
+    // causes a #PF under the shadow CR3 that aborts the window and re-injects
+    // under real CR3. The guest demand-pages it, the instruction retries, hits
+    // the NX fetch #PF again -> shadow window re-opens -> data #PF on the SAME
+    // stale PML4 -> livelock (same RIP, alternating addresses, no breaker fires).
+    //
+    // Fix: sync the stale shadow PML4 entry from the real PML4 and let the
+    // instruction retry under the shadow CR3 with refreshed page tables.
+    // Both shadow_pml4_va (NonPaged pool) and stealth_real_va (MDL map) are
+    // system VAs valid under any CR3 -- no CR3 switch needed.
     if (!sp_data || !sp_data->shadow_pte_va)
+    {
+        if (sp->shadow_pml4_va)
+        {
+            UINT32 pml4_idx = (UINT32)((fault_addr >> 39) & 0x1FF);
+            PUINT64 shadow_pml4 = (PUINT64)sp->shadow_pml4_va;
+            PUINT64 real_pml4   = (PUINT64)stealth_real_va(sp, real_cr3);
+            // KPTI fallback: user CR3 PML4 not in real_page_map (built from kernel CR3).
+            // Fall back to sp->guest_cr3 (kernel CR3) -- user-space PML4 entries are
+            // identical between user/kernel CR3s under KPTI.
+            if (!real_pml4 && sp->guest_cr3 &&
+                (sp->guest_cr3 & PFN_MASK) != (real_cr3 & PFN_MASK))
+            {
+                real_pml4 = (PUINT64)stealth_real_va(sp, sp->guest_cr3);
+            }
+            if (real_pml4 && shadow_pml4)
+            {
+                UINT64 real_entry   = real_pml4[pml4_idx];
+                UINT64 shadow_entry = shadow_pml4[pml4_idx];
+                if (real_entry != shadow_entry)
+                {
+                    shadow_pml4[pml4_idx] = real_entry;
+                    INVVPID_DESCRIPTOR desc = {0};
+                    desc.Vpid = VPID_TAG;
+                    if (g_ept->invvpid_individual_addr)
+                    {
+                        desc.LinearAddress = fault_addr;
+                        asm_invvpid(InvvpidIndividualAddress, &desc);
+                    }
+                    else
+                        asm_invvpid(InvvpidSingleContext, &desc);
+                    _InterlockedIncrement(&g_dbg_a2_pml4_synced);
+                    return TRUE;
+                }
+            }
+        }
         return FALSE;
+    }
 
     // A write to a write-protected stealth page (intercept_write, shadow W=0)
     // must stay mediated - do NOT heal it (healing sets W=1 and lets the write
@@ -1403,6 +1483,7 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     sp->no_ept_split    = req->no_ept_split;
     sp->intercept_write = req->intercept_write;
     sp->shadow_pte_va   = req->shadow_pte_va;
+    sp->shadow_pml4_va  = req->shadow_pml4_va;
     // MDL-mapped real page-table pages (PML4+PDPT+PDs+PTs along the alloc
     // path), built by TdBuildShadowCR3 in the guest driver and passed up here.
     // VMX-root reads real page-table entries through stealth_real_va(sp, pa)

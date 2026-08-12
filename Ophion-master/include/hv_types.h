@@ -1,5 +1,5 @@
 /*
-*   hv_types.h - core hypervisor type definitions ï¿½?per-vcpu state, ept structures, configs
+*   hv_types.h - core hypervisor type definitions ï¿?per-vcpu state, ept structures, configs
 *   zero windows api dependency in vmx-root mode by design
 */
 #pragma once
@@ -28,7 +28,7 @@ typedef struct _GUEST_REGS {
     UINT64 rcx;
     UINT64 rdx;
     UINT64 rbx;
-    UINT64 rsp;    // placeholder ï¿½?real RSP read from VMCS
+    UINT64 rsp;    // placeholder ï¿?real RSP read from VMCS
     UINT64 rbp;
     UINT64 rsi;
     UINT64 rdi;
@@ -80,11 +80,11 @@ typedef struct _VMM_EPT_DYNAMIC_SPLIT {
 #define EPTO_HOOK_FUNCTION       2
 #define EPTO_VIRTUAL_BREAKPOINT  1
 
-// forward declaration ï¿½?needed by EPT_HOOKED_PAGE_INFO before full definition
+// forward declaration ï¿?needed by EPT_HOOKED_PAGE_INFO before full definition
 typedef struct _STEALTH_FAKE_PT *PSTEALTH_FAKE_PT;
 
 //
-// per-function hook tracking ï¿½?one for each function hooked within a page
+// per-function hook tracking ï¿?one for each function hooked within a page
 //
 typedef struct _EPT_HOOKED_FUNCTION_INFO {
     LIST_ENTRY  hooked_function_list;
@@ -103,7 +103,7 @@ typedef struct _EPT_HOOKED_FUNCTION_INFO {
 } EPT_HOOKED_FUNCTION_INFO, *PEPT_HOOKED_FUNCTION_INFO;
 
 //
-// per-page hook tracking ï¿½?one for each 4KB page with hooks
+// per-page hook tracking ï¿?one for each 4KB page with hooks
 //
 typedef struct _EPT_HOOKED_PAGE_INFO {
     LIST_ENTRY       hooked_page_list;
@@ -122,16 +122,17 @@ typedef struct _EPT_HOOKED_PAGE_INFO {
     //           other processes execute original code transparently via MTF)
     //
     UINT64           target_cr3;
+    UINT8            has_tid_filter;    // set when any hooked function has expected_tid (skip CR3 pre-filter for KPTI)
     //
     // fake PT page association (for inject hooks with NX hiding)
     //
     PSTEALTH_FAKE_PT fake_pt;           // shared fake PT page (NULL if not using fake PT)
     UINT32           pt_pte_index;      // our PTE index in the PT page
     //
-    // exec PT page ï¿½?separate page with NX=0 for #PF recovery.
+    // exec PT page ï¿?separate page with NX=0 for #PF recovery.
     // used by ept_hook_handle_pf to swap EPT PFN (no content modification).
-    //   fake PT page: NX=1 (anti-cheat reads)   ï¿½?default EPT view
-    //   exec PT page: NX=0 (CPU page walk)      ï¿½?swapped in during #PF recovery
+    //   fake PT page: NX=1 (anti-cheat reads)   ï¿?default EPT view
+    //   exec PT page: NX=0 (CPU page walk)      ï¿?swapped in during #PF recovery
     //
     PUINT8           exec_pt_page;      // contiguous region page with NX=0
     UINT64           exec_pt_pfn;       // PFN of exec_pt_page
@@ -140,7 +141,7 @@ typedef struct _EPT_HOOKED_PAGE_INFO {
 } EPT_HOOKED_PAGE_INFO, *PEPT_HOOKED_PAGE_INFO;
 
 //
-// contiguous shadow region ï¿½?must be defined before EPT_STATE (embedded, not pointer)
+// contiguous shadow region ï¿?must be defined before EPT_STATE (embedded, not pointer)
 //
 #define STEALTH_REGION_DEFAULT_MB   64
 #define STEALTH_REGION_DEFAULT_SIZE ((SIZE_T)STEALTH_REGION_DEFAULT_MB * 1024 * 1024)
@@ -227,7 +228,7 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     // stealth: per-VCPU TSC compensation state for "trap next RDTSC" approach.
     // after CPUID exit, RDTSC exiting is armed for one instruction.
     // the trapped RDTSC returns a compensated value hiding VM-exit overhead.
-    // TSC_OFFSET is never modified ï¿½?zero drift, zero monotonicity issues.
+    // TSC_OFFSET is never modified ï¿?zero drift, zero monotonicity issues.
     //
     UINT64  tsc_cpuid_entry;        // TSC recorded at start of CPUID VM-exit handler
     BOOLEAN tsc_rdtsc_armed;        // TRUE = next RDTSC/RDTSCP should be compensated
@@ -383,14 +384,14 @@ typedef struct _VMCALL_MEM_REQUEST {
 } VMCALL_MEM_REQUEST, *PVMCALL_MEM_REQUEST;
 
 //
-// VMCALL identifier in rax ï¿½?like UnrealVTDbg's VMCALL_IDENTIFIER
+// VMCALL identifier in rax ï¿?like UnrealVTDbg's VMCALL_IDENTIFIER
 // checked BEFORE the r10/r11/r12 signature. if rax matches this,
 // parameters are in rcx/rdx/r8/r9/r10-r15 (no signature registers).
 //
 #define OPHION_VMCALL_ID        0x4F5048494F4E4558ULL   // 'OPHIONEX'
 
 //
-// EPT hook VMCALL request ï¿½?caller fills at PASSIVE_LEVEL, VMX-root processes.
+// EPT hook VMCALL request ï¿?caller fills at PASSIVE_LEVEL, VMX-root processes.
 // VMX-root temporarily switches to guest CR3 to access guest memory safely.
 // param1 (rdx) = pointer to this struct
 //
@@ -400,12 +401,12 @@ typedef struct _EPT_HOOK_VMCALL_PARAM {
     PVOID   proxy_function;       // [in] VA of hook proxy
     PVOID * origin_function;      // [in/out] receives trampoline address (or NULL)
     UINT32  hook_type;            // [in] 0=abs jmp, 1=VMCALL, 2=INT3
-    volatile LONG installed;      // [internal] 0ï¿½? by first CPU, others just split+PTE
+    volatile LONG installed;      // [internal] 0ï¿? by first CPU, others just split+PTE
     BOOLEAN result;               // [out]
     UINT32  error_code;           // [out] debug: 0=ok, 1=no_pa, 2=split_fail, 3=pml1_null,
                                   //   4=pool_page, 5=pool_func, 6=pool_tramp, 7=pa_fake
     //
-    // R3 hook extensions ï¿½?set target_cr3 != 0 to enable per-process EPT hook.
+    // R3 hook extensions ï¿?set target_cr3 != 0 to enable per-process EPT hook.
     //   caller must:
     //     1. attach to target process (KeStackAttachProcess)
     //     2. lock target page (MmProbeAndLockPages) to pin physical page
@@ -419,7 +420,7 @@ typedef struct _EPT_HOOK_VMCALL_PARAM {
     //
     // force changed_entry ReadAccess=1 even when execute-only EPT is supported.
     // needed for shellcode inject: code reads its own embedded data from the
-    // fake page. without R=1, reads EPT-violate ï¿½?original page (zeros) ï¿½?crash.
+    // fake page. without R=1, reads EPT-violate ï¿?original page (zeros) ï¿?crash.
     //
     BOOLEAN force_read_access;    // [in] TRUE = changed_entry R=1 (shellcode self-read)
     BOOLEAN oneshot;              // [in] TRUE = redirect to proxy once, then pass-through to trampoline
@@ -428,7 +429,7 @@ typedef struct _EPT_HOOK_VMCALL_PARAM {
 } EPT_HOOK_VMCALL_PARAM, *PEPT_HOOK_VMCALL_PARAM;
 
 //
-// EPT hook inject ï¿½?pre-built at PASSIVE_LEVEL, no user VA access in VMX-root.
+// EPT hook inject ï¿?pre-built at PASSIVE_LEVEL, no user VA access in VMX-root.
 // all data passed via kernel NonPaged buffers. safe from SMAP / page faults.
 // param passed as pointer via rdx (like VMCALL_STEALTH_ALLOC).
 //
@@ -447,7 +448,7 @@ typedef struct _EPT_HOOK_INJECT_PARAM {
     UINT32  pt_pte_index;           // [in] index within PT page (0-511)
     PVOID   pt_page_copy;           // [in] kernel buffer with PT page content (for fake PT init)
     PVOID   pt_page_va;             // [in] system VA of real PT page (hostcr3-mapped, for resync)
-    volatile LONG installed;        // [internal] first CPU ï¿½?1
+    volatile LONG installed;        // [internal] first CPU ï¿?1
     BOOLEAN result;                 // [out]
     BOOLEAN fake_pt_ok;             // [out] TRUE if fake PT was created successfully
     volatile LONG * dbg_pf_counter; // [in] pointer to counter (kernel NonPaged), handler increments
@@ -456,26 +457,26 @@ typedef struct _EPT_HOOK_INJECT_PARAM {
 typedef struct _EPT_UNHOOK_VMCALL_PARAM {
     UINT64  caller_cr3;           // [in] caller's CR3
     PVOID   target_function;      // [in] VA to unhook
-    volatile LONG unhooked;       // [internal] 0ï¿½? by first CPU
+    volatile LONG unhooked;       // [internal] 0ï¿? by first CPU
     BOOLEAN result;               // [out]
 } EPT_UNHOOK_VMCALL_PARAM, *PEPT_UNHOOK_VMCALL_PARAM;
 
 //
-// stealth memory allocation ï¿½?EPT split page with hidden execute capability
+// stealth memory allocation ï¿?EPT split page with hidden execute capability
 //
 // allocates memory as PAGE_READWRITE (non-executable in VAD/NtQueryVirtualMemory)
 // hypervisor clears NX in guest PTE and sets up EPT split:
-//   read  ï¿½?original page (clean data, no suspicious code)
-//   exec  ï¿½?shadow page with VMCALL at entry ï¿½?dispatch to handler
+//   read  ï¿?original page (clean data, no suspicious code)
+//   exec  ï¿?shadow page with VMCALL at entry ï¿?dispatch to handler
 //
 // anti-cheat sees: PAGE_READWRITE, no executable attribute, no PE/MZ headers
-// CPU executes: VMCALL ï¿½?VM exit ï¿½?handler function
+// CPU executes: VMCALL ï¿?VM exit ï¿?handler function
 //
 
 #define EPTO_STEALTH_PAGE       4
 
 //
-// shared fake PT page ï¿½?one per physical PT page, ref-counted
+// shared fake PT page ï¿?one per physical PT page, ref-counted
 // multiple stealth pages in the same 2MB VA range share this
 //
 typedef struct _STEALTH_FAKE_PT {
@@ -483,7 +484,7 @@ typedef struct _STEALTH_FAKE_PT {
     UINT64          pt_page_pfn;        // PFN of the real guest PT page
     PUINT8          fake_page_va;       // VA of fake page in contiguous region
     UINT64          pfn_of_fake;        // PFN of fake page
-    EPT_PML1_ENTRY  pt_fake_entry;      // EPT PTE: read ï¿½?fake (NX=1)
+    EPT_PML1_ENTRY  pt_fake_entry;      // EPT PTE: read ï¿?fake (NX=1)
     EPT_PML1_ENTRY  pt_real_entry;      // EPT PTE: real PT (for temp swap)
     PVOID           real_page_va;       // system VA of real PT page (hostcr3-mapped, for resync)
     UINT32          ref_count;          // number of stealth pages using this
@@ -549,6 +550,7 @@ typedef struct _EPT_STEALTH_PAGE_INFO {
     UINT64          shadow_cr3_phys;    // physical address of shadow PML4 (0 = not used)
     UINT64          real_cr3_value;     // saved real guest CR3 during shadow switch
     PVOID           shadow_pte_va;      // VA of this page's shadow PTE (NonPaged pool, valid under any CR3); HV writes *shadow_pte_va=(real_pte&~NX) on #PF. NULL = legacy pa_to_va walk (broken in VMX-root).
+    PVOID           shadow_pml4_va;     // VA of shadow PML4 (NonPaged pool, valid under any CR3); for stale PML4 entry sync
 
     // --- real page-table page map (MDL-mapped, valid under g_system_cr3) ---
     // shared across all stealth pages of the same shadow CR3 (same protected
@@ -590,9 +592,10 @@ typedef struct _EPT_STEALTH_ALLOC_PARAM {
     UINT64  shadow_cr3_phys;      // [in] physical address of shadow PML4 (0 = no shadow CR3)
     BOOLEAN no_ept_split;         // [in] TRUE = shadow CR3 only, keep target EPT mapping unchanged
     PVOID   shadow_pte_va;        // [in] VA of this page's shadow PTE (NonPaged pool, computed by caller via TdResolveShadowPte); HV writes *shadow_pte_va=(real_pte&~NX) on #PF without pa_to_va (NULL = legacy walk)
+    PVOID   shadow_pml4_va;       // [in] VA of shadow PML4 (NonPaged pool, for stale PML4 entry sync in VMX-root)
     PVOID   real_page_map;        // [in] ptr to STEALTH_REAL_PAGE_ENTRY[real_page_count]: MDL-mapped real PT pages (NULL = none)
     UINT32  real_page_count;      // [in] number of entries in real_page_map
-    volatile LONG installed;      // [internal] 0ï¿½? by first CPU
+    volatile LONG installed;      // [internal] 0ï¿? by first CPU
     BOOLEAN result;               // [out]
 } EPT_STEALTH_ALLOC_PARAM, *PEPT_STEALTH_ALLOC_PARAM;
 

@@ -152,6 +152,13 @@ typedef struct _STEALTH_REGION {
     volatile LONG   next_page;
 } STEALTH_REGION;
 
+//
+// Hash table for O(1) stealth page lookup (4096 buckets)
+//
+#define STEALTH_HASH_BITS   12
+#define STEALTH_HASH_SIZE   (1 << STEALTH_HASH_BITS)  // 4096 buckets
+#define STEALTH_HASH_MASK   (STEALTH_HASH_SIZE - 1)
+
 // forward declarations for pointer types used in VIRTUAL_MACHINE_STATE
 typedef struct _EPT_STEALTH_PAGE_INFO *PEPT_STEALTH_PAGE_INFO;
 // PSTEALTH_FAKE_PT already forward-declared above (before EPT_HOOKED_PAGE_INFO)
@@ -163,7 +170,8 @@ typedef struct _EPT_STATE {
     BOOLEAN               ad_supported;
     BOOLEAN               execute_only_supported;
     LIST_ENTRY            hooked_pages;
-    LIST_ENTRY            stealth_pages;
+    LIST_ENTRY            stealth_pages;           // legacy: keep for cleanup walk
+    LIST_ENTRY            stealth_hash[STEALTH_HASH_SIZE];  // O(1) lookup hash table (4096 buckets)
     LIST_ENTRY            stealth_fake_pts;
     STEALTH_REGION        stealth_region;
 
@@ -467,6 +475,12 @@ typedef struct _STEALTH_FAKE_PT {
     UINT32          ref_count;          // number of stealth pages using this
 } STEALTH_FAKE_PT, *PSTEALTH_FAKE_PT;
 
+static __forceinline UINT32 stealth_hash_va(UINT64 va)
+{
+    // hash = (va >> 12) & mask (page-aligned VA, use page number as hash key)
+    return (UINT32)((va >> 12) & STEALTH_HASH_MASK);
+}
+
 //
 // per-page stealth allocation tracking (~200 bytes, no embedded PAGE_SIZE arrays)
 //
@@ -499,7 +513,8 @@ typedef struct _STEALTH_REAL_PAGE_ENTRY {
 #define MAX_REAL_PAGES_PER_SHADOW  64   // PML4 + PDPT + PDs + PTs along the range
 
 typedef struct _EPT_STEALTH_PAGE_INFO {
-    LIST_ENTRY      stealth_page_list;
+    LIST_ENTRY      stealth_page_list;      // for g_ept->stealth_pages (cleanup walk)
+    LIST_ENTRY      stealth_hash_list;      // for g_ept->stealth_hash[bucket] (O(1) lookup)
 
     // --- target page ---
     UINT64          guest_va;           // guest VA of stealth page (page-aligned)

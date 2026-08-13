@@ -306,6 +306,11 @@ ept_init(VOID)
 
     InitializeListHead(&g_ept->hooked_pages);
     InitializeListHead(&g_ept->stealth_pages);
+
+    // initialize hash table buckets (4096 buckets for O(1) lookup)
+    for (UINT32 i = 0; i < STEALTH_HASH_SIZE; i++)
+        InitializeListHead(&g_ept->stealth_hash[i]);
+
     InitializeListHead(&g_ept->stealth_fake_pts);
     RtlZeroMemory(&g_ept->stealth_region, sizeof(g_ept->stealth_region));
 
@@ -340,6 +345,8 @@ ept_init(VOID)
     }
 
     HYPERPLATFORM_LOG_INFO("[hv] EPT initialized for %u processors", g_cpu_count);
+
+
     return TRUE;
 }
 

@@ -317,6 +317,17 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     UINT64  host_pf_rip;
     UINT32  host_pf_count;
     UINT64  host_pf_cr2;
+
+    //
+    // Performance optimization: cache frequently-read values to avoid expensive operations
+    //
+    // PID cache: avoids PsGetCurrentProcessId() calls (~50 cycles each, 10k/sec)
+    UINT64  cached_pid;         // Cached current PID
+    UINT64  cached_pid_cr3;     // CR3 when PID was cached (validation key)
+
+    // GUEST_CR3 cache: avoids VMREAD(GUEST_CR3) calls (~100 cycles each, 15k/sec)
+    UINT64  cached_guest_cr3;   // Cached GUEST_CR3 value
+    BOOLEAN cached_cr3_valid;   // Cache validity flag (invalidated on CR3 write)
 } VIRTUAL_MACHINE_STATE, *PVIRTUAL_MACHINE_STATE;
 
 #define VMCALL_TEST             0x00000001

@@ -1922,6 +1922,14 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     vcpu->exit_reason = exit_reason;
 
     //
+    // OPTIMIZATION: Cache GUEST_CR3 at VM-exit entry
+    // This avoids expensive VMREAD calls in hot paths (ept_stealth_handle_pf, etc.)
+    // Cache is invalidated on CR3 writes (see handle_cr_access)
+    //
+    __vmx_vmread(VMCS_GUEST_CR3, &vcpu->cached_guest_cr3);
+    vcpu->cached_cr3_valid = TRUE;
+
+    //
     // lazy per-CPU stealth setup DISABLED for now.
     // stealth only active on the install CPU. shellcode thread must be
     // affinity-pinned to that CPU by the caller.

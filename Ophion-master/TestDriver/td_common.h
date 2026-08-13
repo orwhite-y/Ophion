@@ -72,6 +72,8 @@ typedef struct _TD_PEB_LDR_DATA {
 #define VMCALL_EPT_UNHOOK_BY_CR3 0x0000000A   // retire all R3 hooks for a CR3 (no CR3 switch - safe from process-exit callback)
 #define VMCALL_SHADOW_ABORT_ALL 0x00000013   // clear stale shadow-CR3 window on all vCPUs (safe from process-exit callback)
 #define VMCALL_STEALTH_FREE_ALL  0x00000014   // remove ALL stealth page entries (pre-injection cleanup)
+#define VMCALL_GET_HOOK_DIAG   0x00000015
+#define VMCALL_GET_HOOK_DIAG2  0x00000016   // return last ept_hook_install failure code
 
 //
 // EPT hook inject param ??pre-built at PASSIVE_LEVEL, passed to VMX-root.
@@ -367,6 +369,7 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
     UINT64                user_trampoline_pa;
     UINT64                flags;
     UINT64                expected_tid;
+    BOOLEAN               is_primary_cpu;     // TRUE = primary CPU (allocate resources), FALSE = secondary (EPT only)
 } TD_PERCPU_VMCALL_CTX;
 
 

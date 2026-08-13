@@ -9,7 +9,7 @@
 #include "hv.h"
 #include "log.h"
 
-#define POOL_MAX_ENTRIES     256
+#define POOL_MAX_ENTRIES     1024   // Increased from 256 to support ~340 hooks (RenderDoc needs many)
 #define TRAMPOLINE_BUF_SIZE  128    // enough for overwritten instructions + abs jmp
 
 typedef enum _POOL_TYPE_TAG {
@@ -117,8 +117,11 @@ pool_manager_init(VOID)
     // split buffers: need cpu_count per hooked page (each CPU has its own EPT)
     // hooked_page/func/trampoline: shared, only 1 per hook
     //
-    UINT32 split_count = g_cpu_count * 8;    // 8 hooks × cpu_count splits
-    if (split_count < 64) split_count = 64;
+    // splits needed for BOTH stealth pages (injection) AND EPT hooks.
+    // injection: ~5 2MB regions * cpu_count; hooks: ~15 2MB regions * cpu_count;
+    // fake pages: ~2 2MB regions * cpu_count. Use 48x for margin.
+    UINT32 split_count = g_cpu_count * 48;
+    if (split_count < 1024) split_count = 1024;
 
     for (UINT32 i = 0; i < split_count; i++)
     {
@@ -129,7 +132,7 @@ pool_manager_init(VOID)
         }
     }
 
-    for (UINT32 i = 0; i < 32; i++)
+    for (UINT32 i = 0; i < 64; i++)
     {
         if (!pool_add_entry(POOL_TAG_HOOKED_PAGE, sizeof(EPT_HOOKED_PAGE_INFO)))
         {
@@ -138,7 +141,7 @@ pool_manager_init(VOID)
         }
     }
 
-    for (UINT32 i = 0; i < 64; i++)
+    for (UINT32 i = 0; i < 128; i++)
     {
         if (!pool_add_entry(POOL_TAG_HOOKED_FUNC, sizeof(EPT_HOOKED_FUNCTION_INFO)))
         {

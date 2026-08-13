@@ -1063,7 +1063,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             UINT64 origin_va       = regs->r9;
             UINT64 caller_cr3      = regs->r10;
             UINT32 hook_type       = (UINT32)regs->r11;
-            UINT64 flags           = regs->r11 >> 32;   // high32: force_read_access(bit0), oneshot(bit1)
+            UINT64 flags           = regs->r11 >> 32;   // high32: force_read_access(bit0), oneshot(bit1), is_primary_cpu(bit2)
             UINT64 target_cr3      = regs->r12;
             UINT64 user_tramp_va   = regs->r13;
             UINT64 user_tramp_pa   = regs->r14;
@@ -1087,6 +1087,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             local_req.user_trampoline_pa = user_tramp_pa;
             local_req.force_read_access  = (flags & 1) ? TRUE : FALSE;
             local_req.oneshot            = (flags & 2) ? TRUE : FALSE;
+            local_req.is_primary_cpu     = (flags & 4) ? TRUE : FALSE;
             local_req.expected_tid       = expected_tid;
             if (origin_va)
                 local_req.origin_function = (PVOID *)origin_va;
@@ -1179,6 +1180,22 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             ept_update_pf_intercept(vcpu);
             ept_invept_single(vcpu->ept_pointer);
             regs->rax = (UINT64)STATUS_SUCCESS;
+            break;
+        }
+
+        case VMCALL_GET_HOOK_DIAG:
+        {
+            extern volatile UINT64 g_ept_hook_diag;
+            extern volatile UINT64 g_ept_hook_diag2;
+            regs->rax = g_ept_hook_diag;
+            regs->rdx = g_ept_hook_diag2;
+            break;
+        }
+
+        case VMCALL_GET_HOOK_DIAG2:
+        {
+            extern volatile UINT64 g_ept_hook_diag2;
+            regs->rax = g_ept_hook_diag2;
             break;
         }
 

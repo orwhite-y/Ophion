@@ -333,7 +333,7 @@ TdEptUnhookNtCreateFile(VOID)
 //
 // tracking for active R3 hooks (simple array, max 16 concurrent R3 hooks)
 //
-#define MAX_R3_HOOKS 16
+#define MAX_R3_HOOKS 64
 
 
 R3_HOOK_ENTRY g_r3_hooks[MAX_R3_HOOKS] = {};
@@ -411,13 +411,16 @@ TdPerCpuVmcallDpc(PKDPC Dpc, PVOID Ctx, PVOID, PVOID)
 
     if (ctx->op == TdPerCpuVmcallHookTrigger)
     {
+        // Pack is_primary_cpu into flags (bit 2)
+        UINT64 packed_flags = ctx->flags | ((ctx->is_primary_cpu ? 1ULL : 0ULL) << 2);
+
         st = hv_vmcall_ex(
             VMCALL_EPT_HOOK,
             (UINT64)ctx->target,
             (UINT64)ctx->proxy,
             (UINT64)ctx->origin,
             ctx->caller_cr3,
-            (UINT64)ctx->hook_type | (ctx->flags << 32),  // r11 = hook_type(low32) | flags(high32)
+            (UINT64)ctx->hook_type | (packed_flags << 32),  // r11 = hook_type(low32) | flags(high32, bit 2 = is_primary_cpu)
             ctx->target_cr3,                        // r12 = target_cr3
             (UINT64)ctx->user_trampoline,           // r13 = user_trampoline
             ctx->user_trampoline_pa,                // r14 = user_trampoline_pa
@@ -498,6 +501,11 @@ TdRunPerCpuVmcall(TD_PERCPU_VMCALL_CTX * ctx, ULONG timeout_ms)
     return (ctx->success_count != 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }
 
+//
+// Install EPT hook on all CPUs (optimized: primary then secondary)
+// Phase 1: CPU 0 allocates resources
+// Phase 2: Other CPUs modify EPT only (eliminates race conditions)
+//
 NTSTATUS
 TdInstallTriggerHookAllCpus(
     PVOID   trigger_fn,
@@ -523,12 +531,48 @@ TdInstallTriggerHookAllCpus(
     ctx->target_cr3 = caller_cr3; // per-process filter
     ctx->flags      = (flags ? flags : 2);
     ctx->expected_tid = expected_tid;
+    ctx->is_primary_cpu = TRUE;   // Phase 1: primary CPU
 
+    //
+    // Phase 1: Primary CPU (CPU 0) - allocate all resources
+    //
+    KAFFINITY old_affinity = KeSetSystemAffinityThreadEx(1);  // Pin to CPU 0
     NTSTATUS st = TdRunPerCpuVmcall(ctx, 2000);
-    if (st != STATUS_IO_TIMEOUT)
-        ExFreePoolWithTag(ctx, TD_PERCPU_VMCALL_TAG);
+    KeRevertToUserAffinityThreadEx(old_affinity);
 
-    if (NT_SUCCESS(st) && fired_signal)
+    if (!NT_SUCCESS(st))
+    {
+        ExFreePoolWithTag(ctx, TD_PERCPU_VMCALL_TAG);
+        HYPERPLATFORM_LOG_ERROR("[td-hook] Primary CPU hook failed: trigger=%p st=0x%08X",
+            trigger_fn, st);
+        return st;
+    }
+
+    HYPERPLATFORM_LOG_DEBUG("[td-hook] Primary CPU hook OK: trigger=%p", trigger_fn);
+
+    //
+    // Phase 2: Secondary CPUs - modify EPT only (parallel)
+    //
+    ctx->is_primary_cpu = FALSE;  // Phase 2: secondary CPUs
+
+    ULONG cpu_count = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    for (ULONG cpu = 1; cpu < cpu_count; cpu++)
+    {
+        old_affinity = KeSetSystemAffinityThreadEx((KAFFINITY)(1ULL << cpu));
+        NTSTATUS cpu_st = TdRunPerCpuVmcall(ctx, 2000);
+        KeRevertToUserAffinityThreadEx(old_affinity);
+
+        if (!NT_SUCCESS(cpu_st))
+        {
+            HYPERPLATFORM_LOG_WARN("[td-hook] Secondary CPU %u hook failed: trigger=%p st=0x%08X",
+                cpu, trigger_fn, cpu_st);
+            // Continue with other CPUs even if one fails
+        }
+    }
+
+    ExFreePoolWithTag(ctx, TD_PERCPU_VMCALL_TAG);
+
+    if (fired_signal)
     {
         NTSTATUS fired_st = hv_vmcall_ex(
             VMCALL_EPT_SET_EXTERNAL_FIRED,
@@ -543,7 +587,8 @@ TdInstallTriggerHookAllCpus(
                 trigger_fn, fired_st);
         }
     }
-    return st;
+
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS
@@ -628,9 +673,65 @@ TdEptHookR3(
     //
     PVOID tramp_va = NULL;
     SIZE_T tramp_size = PAGE_SIZE;
-    st = ZwAllocateVirtualMemory(
-        ZwCurrentProcess(), &tramp_va, 0, &tramp_size,
-        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+    // Allocate trampoline within +/-2GB of target_va so RIP-relative
+    // instruction relocation in hook_build_trampoline succeeds.
+    // Scan free regions via ZwQueryVirtualMemory for nearest allocation.
+    {
+        UINT64 target_page = (UINT64)target_va & ~0xFFFULL;
+        UINT64 best_addr = 0;
+        INT64  best_dist = 0x7FFF0000LL;
+
+        for (UINT64 off = 0x100000; off < 0x40000000ULL; off += 0x100000)
+        {
+            UINT64 addrs[2] = { target_page + off, target_page - off };
+            for (int d = 0; d < 2; d++)
+            {
+                if (addrs[d] < 0x10000ULL || addrs[d] > 0x7FFFFFFFFFFFULL)
+                    continue;
+                MEMORY_BASIC_INFORMATION mbi;
+                SIZE_T ret_len = 0;
+                NTSTATUS qst = ZwQueryVirtualMemory(
+                    ZwCurrentProcess(), (PVOID)addrs[d],
+                    MemoryBasicInformation, &mbi, sizeof(mbi), &ret_len);
+                if (!NT_SUCCESS(qst) || mbi.State != MEM_FREE)
+                    continue;
+                UINT64 free_base = ((UINT64)mbi.BaseAddress + 0xFFFF) & ~0xFFFFULL;
+                UINT64 free_end  = (UINT64)mbi.BaseAddress + mbi.RegionSize;
+                if (free_base + tramp_size > free_end)
+                    continue;
+                INT64 dist = (INT64)free_base - (INT64)target_va;
+                if (dist < 0) dist = -dist;
+                if (dist < best_dist) { best_dist = dist; best_addr = free_base; }
+            }
+            if (best_dist < 0x100000) break;
+        }
+
+        if (best_addr)
+        {
+            PVOID try_base = (PVOID)best_addr;
+            SIZE_T try_size = tramp_size;
+            st = ZwAllocateVirtualMemory(
+                ZwCurrentProcess(), &try_base, 0, &try_size,
+                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (NT_SUCCESS(st) && try_base)
+                tramp_va = try_base;
+        }
+
+        if (!tramp_va)
+        {
+            tramp_va = NULL;
+            st = ZwAllocateVirtualMemory(
+                ZwCurrentProcess(), &tramp_va, 0, &tramp_size,
+                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        }
+
+        INT64 tramp_dist = tramp_va ? ((INT64)tramp_va - (INT64)target_va) : 0;
+        if (tramp_dist < 0) tramp_dist = -tramp_dist;
+        HYPERPLATFORM_LOG_INFO("[td-r3] tramp alloc: target=%p tramp=%p dist=0x%llX %s",
+            target_va, tramp_va, (UINT64)tramp_dist,
+            (UINT64)tramp_dist < 0x7FFF0000ULL ? "IN-RANGE" : "OUT-OF-RANGE");
+    }
 
     if (!NT_SUCCESS(st) || !tramp_va)
     {
@@ -777,7 +878,9 @@ TdEptHookR3(
         MmUnlockPages(mdl);
         IoFreeMdl(mdl);
 
-        HYPERPLATFORM_LOG_ERROR("[td-r3] R3 EPT hook FAILED: 0x%08X", ctx.result);
+        NTSTATUS diag = hv_vmcall_simple(VMCALL_GET_HOOK_DIAG, 0, 0, 0);
+        UINT64 diag2 = (UINT64)hv_vmcall_simple(VMCALL_GET_HOOK_DIAG2, 0, 0, 0);
+        HYPERPLATFORM_LOG_ERROR("[td-r3] R3 EPT hook FAILED: 0x%08X diag=%llu diag2=0x%llX", ctx.result, (UINT64)diag, diag2);
     }
 
     ObDereferenceObject(proc);

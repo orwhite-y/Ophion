@@ -350,6 +350,8 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_WRITE_MEM_PTE    0x00000012   // R0: PTE-window write (same layout)
 #define VMCALL_SHADOW_ABORT_ALL 0x00000013   // R0: clear stale shadow-CR3 window on this vCPU (nx_timer_restore/real_cr3/MTF)
 #define VMCALL_STEALTH_FREE_ALL  0x00000014   // R0: remove ALL stealth page entries from g_ept->stealth_pages (pre-injection cleanup)
+#define VMCALL_GET_HOOK_DIAG   0x00000015   // R0: return last ept_hook_install failure code
+#define VMCALL_GET_HOOK_DIAG2  0x00000016   // R0: return trampoline LDE sub-diagnostic   // R0: return last ept_hook_install failure code   // R0: remove ALL stealth page entries from g_ept->stealth_pages (pre-injection cleanup)
 
 #define HV_R3_MEM_MAX           262144        // max bytes per R3 read/write call (16 pages, prefetch batch)
 
@@ -421,6 +423,7 @@ typedef struct _EPT_HOOK_VMCALL_PARAM {
     BOOLEAN force_read_access;    // [in] TRUE = changed_entry R=1 (shellcode self-read)
     BOOLEAN oneshot;              // [in] TRUE = redirect to proxy once, then pass-through to trampoline
     UINT64  expected_tid;         // [in] 0 = any thread, non-0 = only this TID may redirect
+    BOOLEAN is_primary_cpu;       // [in] TRUE = primary CPU (allocate resources), FALSE = secondary (EPT only)
     volatile LONG * external_fired; // [in] optional kernel NonPaged signal set to 1 on first oneshot hit
 } EPT_HOOK_VMCALL_PARAM, *PEPT_HOOK_VMCALL_PARAM;
 

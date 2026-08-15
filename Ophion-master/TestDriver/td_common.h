@@ -237,6 +237,8 @@ typedef NTSTATUS (NTAPI * fn_ZwResumeThread)(HANDLE, PULONG);
 #define IOCTL_HIDE_DEVICE     CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 14, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_GET_SELF_PE_INFO CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 15, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_INJECT_RENDERDOC  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 16, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_ENUM_D3D12_COMMANDLISTS CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 23, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_DUMP_D3D12_DEVICE CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 24, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #pragma pack(push, 8)
 typedef struct _TD_RESOLVE_EXPORT_PARAMS {
@@ -253,6 +255,23 @@ typedef struct _TD_GET_MODULE_BASE_PARAMS {
     UINT64 module_size;         // [out] size of image in bytes
     UINT64 status;              // [out] NTSTATUS
 } TD_GET_MODULE_BASE_PARAMS;
+
+typedef struct _TD_ENUM_D3D12_CL_PARAMS {
+    UINT64 target_pid;          // [in]  target process PID
+    UINT64 device_va;           // [in]  ID3D12Device pointer
+    UINT64 vtable_va;           // [in]  ID3D12GraphicsCommandList vtable for validation
+    UINT64 commandlist_vas[256]; // [out] array of CL pointers
+    UINT32 count;               // [out] number of CLs found
+    UINT64 status;              // [out] NTSTATUS
+} TD_ENUM_D3D12_CL_PARAMS;
+
+typedef struct _TD_DUMP_DEVICE_PARAMS {
+    UINT64 target_pid;          // [in]  target process PID
+    UINT64 device_va;           // [in]  ID3D12Device pointer
+    UINT64 dump_size;           // [in]  bytes to dump (max 4096)
+    UINT8  data[4096];          // [out] device memory dump
+    UINT64 status;              // [out] NTSTATUS
+} TD_DUMP_DEVICE_PARAMS;
 
 // Query cached PE info for a manually-mapped renderdoc module whose headers
 // were erased after mapping. The driver caches this at map time (before

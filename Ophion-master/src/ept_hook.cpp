@@ -14,6 +14,13 @@
 #include "hv.h"
 #include "log.h"
 
+// Forward declaration: secondary CPU hook installation (EPT-only, no allocation)
+BOOLEAN ept_hook_install_secondary_cpu(
+    VIRTUAL_MACHINE_STATE * vcpu,
+    PEPT_HOOK_VMCALL_PARAM req,
+    UINT64 target_pfn,
+    UINT64 phys_addr);
+
 #define POOL_TAG_SPLIT       0
 #define POOL_TAG_HOOKED_PAGE 1
 #define POOL_TAG_HOOKED_FUNC 2
@@ -347,102 +354,10 @@ ept_split_large_page_pool(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
 }
 
 // =========================================================================
-//  Secondary CPU hook installation (EPT-only, no resource allocation)
-//  Called when is_primary_cpu == FALSE
-// =========================================================================
-
-static BOOLEAN
-ept_hook_install_secondary_cpu(
-    VIRTUAL_MACHINE_STATE * vcpu,
-    PEPT_HOOK_VMCALL_PARAM req,
-    UINT64 target_pfn,
-    UINT64 phys_addr)
-{
-    //
-    // 1. Find existing HOOKED_PAGE_INFO (primary CPU already created it)
-    //
-    PEPT_HOOKED_PAGE_INFO hp = NULL;
-
-    for (struct _LIST_ENTRY * cur = g_ept->hooked_pages.Flink;
-         cur != &g_ept->hooked_pages;
-         cur = cur->Flink)
-    {
-        PEPT_HOOKED_PAGE_INFO existing = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
-        if (existing->pfn_of_hooked_page == target_pfn)
-        {
-            hp = existing;
-            break;
-        }
-    }
-
-    if (!hp)
-    {
-        // Primary CPU failed or hasn't completed yet
-        g_ept_hook_diag = HOOK_DIAG_SECONDARY_NO_PAGE;
-        g_ept_hook_diag2 = target_pfn;
-        return FALSE;
-    }
-
-    //
-    // 2. Split large page if needed (each CPU has independent EPT)
-    //
-    PEPT_PML2_ENTRY p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)phys_addr);
-    if (p2 && p2->LargePage)
-    {
-        if (!ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)phys_addr))
-        {
-            g_ept_hook_diag = HOOK_DIAG_SECONDARY_SPLIT;
-            g_ept_hook_diag2 = phys_addr;
-            return FALSE;
-        }
-    }
-
-    //
-    // 3. Modify target page EPT: X=0 (trigger EPT violation)
-    //
-    PEPT_PML1_ENTRY target_pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)phys_addr);
-    if (!target_pte)
-    {
-        g_ept_hook_diag = HOOK_DIAG_SECONDARY_NO_PML1;
-        g_ept_hook_diag2 = phys_addr;
-        return FALSE;
-    }
-
-    target_pte->ExecuteAccess = 0;  // Trigger EPT violation on execute
-
-    //
-    // 4. Modify fake page EPT: R=0, W=0, X=1 (execute-only)
-    //
-    UINT64 fake_phys = (UINT64)(hp->pfn_of_fake_page_contents << 12);
-
-    // Split fake page's 2MB if needed
-    PEPT_PML2_ENTRY fake_p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)fake_phys);
-    if (fake_p2 && fake_p2->LargePage)
-    {
-        ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)fake_phys);
-    }
-
-    PEPT_PML1_ENTRY fake_pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)fake_phys);
-    if (fake_pte)
-    {
-        fake_pte->ReadAccess = (req->force_read_access) ? 1 : 0;
-        fake_pte->WriteAccess = 0;
-        fake_pte->ExecuteAccess = 1;  // Execute-only (or R+X if force_read_access)
-    }
-
-    //
-    // 5. INVEPT (single-context is sufficient)
-    //
-    ept_invept_single_context(vcpu->ept_pointer);
-
-    return TRUE;
-}
-
-// =========================================================================
-//  VMX-root: ept_hook_install – called from VMCALL handler per-CPU
+//  VMX-root: ept_hook_install 鈥?called from VMCALL handler per-CPU
 //  caller must switch CR3 to caller_cr3 BEFORE calling this.
 //
-//  first CPU (InterlockedCmpExchg installed 0→1):
+//  first CPU (InterlockedCmpExchg installed 0鈫?):
 //    full install: alloc, copy page, LDE, trampoline, fake page, list add
 //  other CPUs:
 //    just split their own EPT page + modify PTE + invept
@@ -530,6 +445,28 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
         pre_rflags = __readeflags();
         __writeeflags(pre_rflags | (1ULL << 18));  // set AC flag
         _mm_mfence();
+
+        //
+        // Verify CR3 switch was safe by attempting to read target VA
+        // If CR3 is truly invalid, this will #PF and we catch it below
+        //
+        __try
+        {
+            // Probe read: touch first byte of target function
+            volatile UINT8 probe = *(volatile UINT8 *)req->target_function;
+            (void)probe;  // Suppress unused warning
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            // CR3 switch caused fault → restore and fail
+            _mm_mfence();
+            __writeeflags(pre_rflags);
+            __writecr3(pre_cr3);
+
+            g_ept_hook_diag = HOOK_DIAG_CR3_FAULT;
+            g_ept_hook_diag2 = req->caller_cr3;
+            return FALSE;
+        }
     }
 
     //

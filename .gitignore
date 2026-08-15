@@ -6,3 +6,9 @@
 /Output/
 /ophion_diff.txt
 /renderdoc_diff.txt
+
+# runtime / local files
+.crashdata/
+.crash*data/
+/query
+/settings.ini

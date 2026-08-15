@@ -388,7 +388,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
     case IOCTL_INJECT:
     {
         //
-        // EPT hook-based shellcode injection ï¿?ALL pre-built at PASSIVE_LEVEL.
+        // EPT hook-based shellcode injection ï¿½?ALL pre-built at PASSIVE_LEVEL.
         // VMX-root only does EPT manipulation, NEVER touches user VA (SMAP safe).
         //
         // flow:
@@ -398,7 +398,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         //   4. zero original page (COW may change PA), walk PT AFTER zero
         //   5. copy PT page to buffer, force NX=0 in buffer (NOT real PTE)
         //   6. VMCALL_EPT_HOOK_INJECT: EPT split + fake PT(NX=1) + exec PT(NX=0)
-        //   7. create thread ï¿?#PF(NX) ï¿?HV swaps to exec PT ï¿?TLB(NX=0) ï¿?executes
+        //   7. create thread ï¿½?#PF(NX) ï¿½?HV swaps to exec PT ï¿½?TLB(NX=0) ï¿½?executes
         //
         if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_INJECT_PARAMS) ||
             io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_INJECT_PARAMS))
@@ -416,7 +416,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         ULONG gap_offset = 0, gap_avail = 0;
 
         //
-        // try section tail padding first ï¿?shellcode goes into the zero-padded
+        // try section tail padding first ï¿½?shellcode goes into the zero-padded
         // tail of a section's last page. no new allocation, no new VAD.
         // original page content preserved (real DLL code stays in front).
         //
@@ -430,7 +430,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         if (!base)
         {
             //
-            // no gap found ï¿?refuse to inject. never allocate new memory
+            // no gap found ï¿½?refuse to inject. never allocate new memory
             // (VirtualAlloc creates a visible VAD that anti-cheat can scan).
             //
             HYPERPLATFORM_LOG_ERROR("[td] inject: no section gap found, aborting (no VirtualAlloc fallback)");
@@ -454,9 +454,9 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
         // --- step 3: build fake_buf (shadow page content) ---
         //
-        // gap mode:  copy original page (preserving DLL code) ï¿?write shellcode at gap_offset
-        // fallback:  page starts empty ï¿?write shellcode at offset 0
-        // original page is NOT zeroed in gap mode ï¿?DLL code stays intact.
+        // gap mode:  copy original page (preserving DLL code) ï¿½?write shellcode at gap_offset
+        // fallback:  page starts empty ï¿½?write shellcode at offset 0
+        // original page is NOT zeroed in gap mode ï¿½?DLL code stays intact.
         //
         PVOID fake_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'kjnI');
         if (!fake_buf)
@@ -469,10 +469,10 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
         //
         // trigger COW to get a private physical page for this process.
-        // the shared DLL page PA is used by ALL processes ï¿?EPT hooking
+        // the shared DLL page PA is used by ALL processes ï¿½?EPT hooking
         // the shared PA would affect every process.
         //
-        // direct PTE manipulation: set Write bit in PTE ï¿?write byte ï¿?COW.
+        // direct PTE manipulation: set Write bit in PTE ï¿½?write byte ï¿½?COW.
         // no ZwProtectVirtualMemory call (AC can monitor that API).
         // user-visible page protection stays unchanged.
         //
@@ -504,7 +504,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                     PUINT64 pde = (PUINT64)MmGetVirtualForPhysical(cow_pa);
                     if (pde && (*pde & 1) && !(*pde & (1ULL << 7)))
                     {
-                        // PT ï¿?PTE
+                        // PT ï¿½?PTE
                         cow_pa.QuadPart = (LONGLONG)((*pde & 0x000FFFFFFFFFF000ULL) + ((cow_va >> 12) & 0x1FF) * 8);
                         PUINT64 pte = (PUINT64)MmGetVirtualForPhysical(cow_pa);
                         if (pte && (*pte & 1))
@@ -514,7 +514,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                             *pte = orig_pte | (1ULL << 1);  // set W bit
                             __invlpg((PVOID)cow_va);         // flush TLB for this VA
 
-                            // write to padding ï¿?triggers COW
+                            // write to padding ï¿½?triggers COW
                             ((volatile UINT8 *)base)[gap_offset] = 0x01;
                             ((volatile UINT8 *)base)[gap_offset] = 0x00;
 
@@ -552,7 +552,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             HYPERPLATFORM_LOG_ERROR("[td] inject: PIC shellcode build failed");
             break;
         }
-        // gap mode: original page untouched ï¿?DLL code + zero padding stays
+        // gap mode: original page untouched ï¿½?DLL code + zero padding stays
 
         UINT64 base_phys = MmGetPhysicalAddress(base).QuadPart;
         HYPERPLATFORM_LOG_INFO("[td] inject: PA=%llx entry=%p", base_phys, entry_va);
@@ -571,7 +571,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         //
         // VMCALL at shellcode entry (gap_offset in shadow page).
         // trampoline at shadow offset 0xF00.
-        // HV intercepts VMCALL ï¿?set RIP = base+0xF00 ï¿?trampoline ï¿?jmp back.
+        // HV intercepts VMCALL ï¿½?set RIP = base+0xF00 ï¿½?trampoline ï¿½?jmp back.
         //
         UINT32 hook_size = 4;  // sub rsp, 28h = 48 83 EC 28
 
@@ -597,7 +597,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         // --- step 5b: pre-compute PT page info for fake PT / NX hiding ---
         //
         // walk guest page tables AFTER zeroing (COW may have changed PTE/PA).
-        // NEVER clear NX in real PTE ï¿?Windows' MiAgeWorkingSet restores it.
+        // NEVER clear NX in real PTE ï¿½?Windows' MiAgeWorkingSet restores it.
         // instead: copy PT page to kernel buffer, force NX=0 in the COPY.
         // VMX-root builds exec PT from this copy (NX=0), fake PT gets NX=1.
         //
@@ -608,17 +608,17 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         PVOID pt_real_va = NULL;  // system VA of real PT page (for VMX-root resync)
 
         //
-        // DISABLED fake PT for gap mode ï¿?the #PF + MTF single-step conflicts
+        // DISABLED fake PT for gap mode ï¿½?the #PF + MTF single-step conflicts
         // with the VMCALL at shellcode entry (MTF fires before VMCALL executes,
         // restoring fake PT NX=1, causing infinite #PF loop).
         //
-        // gap mode uses EPT X=0 path instead: EPT violation ï¿?shadow ï¿?VMCALL.
+        // gap mode uses EPT X=0 path instead: EPT violation ï¿½?shadow ï¿½?VMCALL.
         // PTE NX bit is already 0 (PAGE_EXECUTE_READ .text section), no fake PT needed.
         //
         // TODO: fix #PF handler to not arm MTF for inject hook pages, then re-enable.
         //
         //
-        // fake PT disabled for gap mode ï¿?the #PF + MTF single-step conflicts
+        // fake PT disabled for gap mode ï¿½?the #PF + MTF single-step conflicts
         // with the VMCALL at shellcode entry. gap mode uses EPT X=0 path instead.
         // PTE NX bit is already 0 (PAGE_EXECUTE_READ .text section), no fake PT needed.
         //
@@ -630,7 +630,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         inj_req.handler_va       = (UINT64)base + 0xF00;  // trampoline in shadow page
         inj_req.fake_page_buffer = fake_buf;
         inj_req.hook_size        = hook_size;
-        inj_req.force_read_access = FALSE;  // execute-only: reads ï¿?original page (zeros)
+        inj_req.force_read_access = FALSE;  // execute-only: reads ï¿½?original page (zeros)
         inj_req.pt_page_pfn      = pt_pfn;
         inj_req.pt_pte_index     = pt_idx;
         inj_req.pt_page_copy     = pt_page_buf;
@@ -649,12 +649,12 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         if (inj_req.result)
         {
             // original page already zeroed (step 3, before PA read + EPT install).
-            // EPT binds to the zeroed page's PA. reads ï¿?zeros. execute ï¿?fake page.
+            // EPT binds to the zeroed page's PA. reads ï¿½?zeros. execute ï¿½?fake page.
 
             HYPERPLATFORM_LOG_INFO("[td] inject: EPT hook OK, fake_pt=%s",
                        inj_req.fake_pt_ok ? "YES" : "NO");
 
-            // track for cleanup (no MDL ï¿?page is one-shot inject, not persistent)
+            // track for cleanup (no MDL ï¿½?page is one-shot inject, not persistent)
             R3_HOOK_ENTRY * he = R3HookFindFree();
             if (he)
             {
@@ -681,12 +681,12 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         //
         // --- step 7: resolve trigger function (valid CFG target) ---
         //
-        // gap address is NOT in CFG bitmap ï¿?can't create thread there directly.
-        // instead: EPT hook a legit function ï¿?redirect to entry_va (gap shellcode).
-        // thread entry = trigger function (in CFG bitmap) ï¿?EPT hook ï¿?shellcode.
+        // gap address is NOT in CFG bitmap ï¿½?can't create thread there directly.
+        // instead: EPT hook a legit function ï¿½?redirect to entry_va (gap shellcode).
+        // thread entry = trigger function (in CFG bitmap) ï¿½?EPT hook ï¿½?shellcode.
         //
         // NtYieldExecution: cold function, rarely monitored by anti-cheat.
-        // takes no params, returns immediately ï¿?perfect as thread entry stub.
+        // takes no params, returns immediately ï¿½?perfect as thread entry stub.
         // (NtTestAlert is a well-known injection vector and heavily monitored.)
         //
         PVOID trigger_fn = (PVOID)p->trigger_va;
@@ -757,7 +757,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
 
         //
-        // --- step 8: EPT hook trigger ï¿?entry_va (single VMCALL, CPU 0) ---
+        // --- step 8: EPT hook trigger ï¿½?entry_va (single VMCALL, CPU 0) ---
         //
         NTSTATUS hook_st = STATUS_UNSUCCESSFUL;
         if (NT_SUCCESS(st))
@@ -789,8 +789,8 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         //
         // --- step 9: create thread at trigger, pin to CPU 0 ---
         //
-        // trigger hook only on CPU 0's EPT ï¿?thread MUST run on CPU 0.
-        // SUSPENDED ï¿?set affinity ï¿?resume.
+        // trigger hook only on CPU 0's EPT ï¿½?thread MUST run on CPU 0.
+        // SUSPENDED ï¿½?set affinity ï¿½?resume.
         // keep thread handle for async cleanup.
         //
         HANDLE cleanup_thr_h = NULL;
@@ -864,12 +864,12 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
 
         //
-        // --- step 10: async cleanup ï¿?unhook trigger ASAP, inject stays resident ---
+        // --- step 10: async cleanup ï¿½?unhook trigger ASAP, inject stays resident ---
         //
-        // trigger hook only needed for first thread creation ï¿?shellcode entry.
+        // trigger hook only needed for first thread creation ï¿½?shellcode entry.
         // once thread is running, unhook trigger immediately to minimize
         // EPT violation exposure on NtYieldExecution.
-        // inject page EPT stealth stays permanently ï¿?shellcode runs forever.
+        // inject page EPT stealth stays permanently ï¿½?shellcode runs forever.
         //
         if (cleanup_thr_h && NT_SUCCESS(st))
         {
@@ -901,7 +901,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                     IoQueueWorkItem(wi, [](PDEVICE_OBJECT, PVOID context) {
                         auto * c = (struct _INJECT_CLEANUP_CTX *)context;
 
-                        // short delay ï¿?let thread start executing (trigger fires once)
+                        // short delay ï¿½?let thread start executing (trigger fires once)
                         LARGE_INTEGER delay;
                         delay.QuadPart = -5LL * 10000000LL;  // 5 sec
                         KeDelayExecutionThread(KernelMode, FALSE, &delay);
@@ -911,7 +911,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
                         HYPERPLATFORM_LOG_INFO("[td] cleanup: unhooking trigger, inject stays resident");
 
-                        // unhook trigger only ï¿?inject page stays
+                        // unhook trigger only ï¿½?inject page stays
                         PEPROCESS proc2 = NULL;
                         if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)c->target_pid, &proc2)))
                         {
@@ -920,12 +920,12 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
                             KAFFINITY old = KeSetSystemAffinityThreadEx((KAFFINITY)1);
 
-                            // unhook trigger (NtYieldExecution) ï¿?no longer needed
+                            // unhook trigger (NtYieldExecution) ï¿½?no longer needed
                             hv_vmcall_ex(VMCALL_EPT_UNHOOK,
                                 (UINT64)c->trigger_fn, 0, 0,
                                 c->target_cr3, 0, 0, 0, 0, 0);
 
-                            // inject page EPT stealth KEPT ï¿?shellcode runs permanently
+                            // inject page EPT stealth KEPT ï¿½?shellcode runs permanently
                             // read view  = original DLL code (anti-cheat sees clean page)
                             // exec view  = shadow page (shellcode loop)
 
@@ -1012,7 +1012,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
     case IOCTL_INJECT_DLL:
     {
         //
-        // manual-map DLL injection ï¿?zero R3 API calls.
+        // manual-map DLL injection ï¿½?zero R3 API calls.
         // buffer layout: [TD_INJECT_DLL_PARAMS header] [raw DLL bytes]
         //
         ULONG in_len  = io->Parameters.DeviceIoControl.InputBufferLength;
@@ -1115,7 +1115,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             }
 
             //
-            // EPT hook trigger ï¿?stub (oneshot, per-process CR3 filter)
+            // EPT hook trigger ï¿½?stub (oneshot, per-process CR3 filter)
             //
             UINT64 caller_cr3 = __readcr3();
             NTSTATUS hook_st = STATUS_UNSUCCESSFUL;
@@ -1147,7 +1147,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             KeUnstackDetachProcess(&apc_state);
 
             //
-            // create thread at trigger ï¿?EPT hook ï¿?DllMain stub
+            // create thread at trigger ï¿½?EPT hook ï¿½?DllMain stub
             //
             if (NT_SUCCESS(st))
             {
@@ -1237,13 +1237,13 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         //
         // flow:
         //   1. attach to target process
-        //   2. ZwAllocateVirtualMemory(PAGE_READWRITE) ï¿?own VAD, NX=1 in PTE
+        //   2. ZwAllocateVirtualMemory(PAGE_READWRITE) ï¿½?own VAD, NX=1 in PTE
         //   3. build PIC shellcode into the page
         //   4. EPT stealth: shadow page = shellcode (execute view),
         //      original page zeroed (read view = clean for anti-cheat)
         //      NX handled by HV #PF cycle (no PTE/fake PT manipulation)
-        //   5. EPT hook trigger function ï¿?redirect to shellcode VA
-        //   6. create thread at trigger ï¿?EPT hook fires ï¿?#PF ï¿?NX cycle ï¿?executes
+        //   5. EPT hook trigger function ï¿½?redirect to shellcode VA
+        //   6. create thread at trigger ï¿½?EPT hook fires ï¿½?#PF ï¿½?NX cycle ï¿½?executes
         //   7. async cleanup: unhook trigger after delay, inject stays resident
         //
         if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_INJECT_RW_PARAMS) ||
@@ -1324,24 +1324,24 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
                    shadow_only ? "-shadow" : "", alloc_base, r3_shellcode_size, (UINT64)alloc_size);
 
         //
-        // NO PTE NX clear needed here ï¿?HV handles NX via #PF cycle:
-        //   #PF (NX=1) ï¿?VMX-root clears NX ï¿?MTF restores NX ï¿?TLB keeps NX=0
-        //   PTE always shows NX=1 to scanners. TLB eviction ï¿?#PF ï¿?repeat.
+        // NO PTE NX clear needed here ï¿½?HV handles NX via #PF cycle:
+        //   #PF (NX=1) ï¿½?VMX-root clears NX ï¿½?MTF restores NX ï¿½?TLB keeps NX=0
+        //   PTE always shows NX=1 to scanners. TLB eviction ï¿½?#PF ï¿½?repeat.
         //
 
         //
-        // step 4: EPT stealth ï¿?shadow page gets shellcode, original page zeroed
+        // step 4: EPT stealth ï¿½?shadow page gets shellcode, original page zeroed
         //
-        // use resident mode: shellcode_buffer = NULL ï¿?HV copies from
+        // use resident mode: shellcode_buffer = NULL ï¿½?HV copies from
         // target_page_copy (kernel NonPaged buffer, safe on any CPU).
         // the shellcode is already written in the page, so target_page_copy
-        // contains the shellcode content ï¿?shadow page gets it.
-        // EPT: execute ï¿?shadow (shellcode), read/write ï¿?original (zeros).
+        // contains the shellcode content ï¿½?shadow page gets it.
+        // EPT: execute ï¿½?shadow (shellcode), read/write ï¿½?original (zeros).
         //
         UINT64 caller_cr3 = __readcr3();
 
         // build shadow CR3: copies page tables with NX=0 for shellcode page.
-        // never modifies real PTEs ï¿?no conflict with MiAgeWorkingSet.
+        // never modifies real PTEs ï¿½?no conflict with MiAgeWorkingSet.
         UINT64 existing = TdStealthFindShadowCr3ForPid(p->target_pid);
         UINT64 shadow_cr3 = existing ? TdExtendShadowCR3(existing, caller_cr3, (UINT64)alloc_base, alloc_size)
                                       : TdBuildShadowCR3(caller_cr3, (UINT64)alloc_base, alloc_size);
@@ -1415,7 +1415,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             shadow_only ? "-shadow" : "", (UINT64)pages_installed, shadow_cr3);
 
         //
-        // step 5: zero the original page ï¿?read view is now clean
+        // step 5: zero the original page ï¿½?read view is now clean
         // EPT stealth is already active, so execute view (shadow) is untouched.
         //
         if (!shadow_only)
@@ -1493,7 +1493,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
 
         //
-        // step 8: create thread at trigger (SUSPENDED) ï¿?before hook, no race
+        // step 8: create thread at trigger (SUSPENDED) ï¿½?before hook, no race
         //
         HANDLE cleanup_thr_h = NULL;
         UINT64 expected_tid = 0;
@@ -1644,7 +1644,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
 
         //
-        // step 10: EPT hook trigger ï¿?shellcode VA (TID-filtered, oneshot)
+        // step 10: EPT hook trigger ï¿½?shellcode VA (TID-filtered, oneshot)
         //
         if (NT_SUCCESS(st) && expected_tid)
         {
@@ -1692,7 +1692,7 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
 
         //
-        // step 12: async cleanup ï¿?unhook trigger immediately after first hit
+        // step 12: async cleanup ï¿½?unhook trigger immediately after first hit
         //
         if (cleanup_ctx && NT_SUCCESS(st) && thread_started)
         {
@@ -2635,6 +2635,119 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
 
         HYPERPLATFORM_LOG_INFO("[td] get module base: pid=%llu name=%s base=0x%llX size=0x%llX",
                    p->target_pid, p->module_name, p->module_base, p->module_size);
+
+        KeUnstackDetachProcess(&apc_state);
+        ObDereferenceObject(proc);
+        break;
+    }
+
+    case IOCTL_ENUM_D3D12_COMMANDLISTS:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_ENUM_D3D12_CL_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_ENUM_D3D12_CL_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_ENUM_D3D12_CL_PARAMS * p = (TD_ENUM_D3D12_CL_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+        p->count = 0;
+        p->status = (UINT64)(ULONG)STATUS_INVALID_PARAMETER;
+
+        PEPROCESS proc = NULL;
+        if (!NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)p->target_pid, &proc)))
+        { st = STATUS_INVALID_PARAMETER; break; }
+
+        KAPC_STATE apc_state;
+        KeStackAttachProcess(proc, &apc_state);
+
+        // Scan target process memory for command list objects with matching vtable
+        UINT64 target_vt = p->vtable_va;
+        UINT32 found_count = 0;
+
+        __try {
+            // Scan typical heap range (avoid huge address space)
+            // Most game objects are in 0x10000 - 0x200'0000'0000 range
+            for (UINT64 addr = 0x10000; addr < 0x20000000000ULL && found_count < 256; addr += 0x1000)
+            {
+                // Check if page is committed
+                if (!MmIsAddressValid((PVOID)addr)) {
+                    // Skip ahead if we hit a large unmapped region
+                    if ((addr & 0xFFFFFFFF) == 0) {
+                        // At 4GB boundary, check if next GB is mapped
+                        if (!MmIsAddressValid((PVOID)(addr + 0x40000000)))
+                            addr += 0x40000000; // skip 1GB
+                    }
+                    continue;
+                }
+
+                // Scan page for vtable pointers (8-byte aligned)
+                for (UINT64 offset = 0; offset < 0x1000; offset += 8)
+                {
+                    UINT64 va = addr + offset;
+                    UINT64 vt_ptr = *(UINT64 *)va;
+
+                    if (vt_ptr == target_vt)
+                    {
+                        // Found potential command list
+                        // Store the CL address
+                        p->commandlist_vas[found_count] = va;
+                        found_count++;
+
+                        if (found_count >= 256) break;
+                    }
+                }
+            }
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            // Memory access violation - stop scanning
+        }
+
+        p->count = found_count;
+        p->status = 0;
+        irp->IoStatus.Information = sizeof(TD_ENUM_D3D12_CL_PARAMS);
+
+        HYPERPLATFORM_LOG_INFO("[td] enum d3d12 cls: pid=%llu device=0x%llX vt=0x%llX found=%u",
+                   p->target_pid, p->device_va, p->vtable_va, found_count);
+
+        KeUnstackDetachProcess(&apc_state);
+        ObDereferenceObject(proc);
+        break;
+    }
+
+    case IOCTL_DUMP_D3D12_DEVICE:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_DUMP_DEVICE_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_DUMP_DEVICE_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_DUMP_DEVICE_PARAMS * p = (TD_DUMP_DEVICE_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+        RtlZeroMemory(p->data, sizeof(p->data));
+        p->status = (UINT64)(ULONG)STATUS_INVALID_PARAMETER;
+
+        if (p->dump_size > 4096) p->dump_size = 4096;
+
+        PEPROCESS proc = NULL;
+        if (!NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)p->target_pid, &proc)))
+        { st = STATUS_INVALID_PARAMETER; break; }
+
+        KAPC_STATE apc_state;
+        KeStackAttachProcess(proc, &apc_state);
+
+        __try {
+            PVOID device_ptr = (PVOID)p->device_va;
+            if (MmIsAddressValid(device_ptr)) {
+                RtlCopyMemory(p->data, device_ptr, (SIZE_T)p->dump_size);
+                p->status = 0;
+            } else {
+                p->status = (UINT64)(ULONG)STATUS_INVALID_ADDRESS;
+            }
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            p->status = (UINT64)(ULONG)STATUS_ACCESS_VIOLATION;
+        }
+
+        irp->IoStatus.Information = sizeof(TD_DUMP_DEVICE_PARAMS);
+
+        HYPERPLATFORM_LOG_INFO("[td] dump d3d12 device: pid=%llu device=0x%llX size=%llu status=0x%llX",
+                   p->target_pid, p->device_va, p->dump_size, p->status);
 
         KeUnstackDetachProcess(&apc_state);
         ObDereferenceObject(proc);

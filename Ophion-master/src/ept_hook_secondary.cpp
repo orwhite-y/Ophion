@@ -17,7 +17,6 @@
 */
 #include "hv.h"
 #include "log.h"
-#include "ept.h"
 
 extern volatile UINT64 g_ept_hook_diag;
 extern volatile UINT64 g_ept_hook_diag2;
@@ -113,7 +112,7 @@ ept_hook_install_secondary_cpu(
     //
     // 5. INVEPT (single-context is sufficient)
     //
-    ept_invept_single_context(vcpu->ept_pointer);
+    ept_invept_single(vcpu->ept_pointer);
 
     return TRUE;
 }

@@ -125,6 +125,7 @@
     <ClCompile Include="src\hostgdt.cpp" />
     <ClCompile Include="src\ept_diag.cpp" />
     <ClCompile Include="src\ept_hook.cpp" />
+    <ClCompile Include="src\ept_hook_secondary.cpp" />
     <ClCompile Include="src\pool_manager.cpp" />
     <ClCompile Include="src\ept_stealth.cpp" />
     <ClCompile Include="src\log.cpp" />

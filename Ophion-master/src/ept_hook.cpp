@@ -21,6 +21,7 @@ BOOLEAN ept_hook_install_secondary_cpu(
     UINT64 target_pfn,
     UINT64 phys_addr);
 
+#define PFN_MASK  0x000FFFFFFFFFF000ULL
 #define POOL_TAG_SPLIT       0
 #define POOL_TAG_HOOKED_PAGE 1
 #define POOL_TAG_HOOKED_FUNC 2

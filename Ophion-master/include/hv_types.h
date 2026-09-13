@@ -266,9 +266,13 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     UINT8   guest_cr8;
 
     //
-    // EPT hook: page to restore after MTF single-step
+    // EPT hook: page to restore after MTF single-step.
+    // mtf_restore_hook_view records whether the temporary view was opened for
+    // data access (restore changed_entry) or for execute passthrough (restore
+    // the hook base view, normally original_entry for non-fake-PT hooks).
     //
     PEPT_HOOKED_PAGE_INFO mtf_restore_page;
+    BOOLEAN               mtf_restore_hook_view;
 
     //
     // stealth page: page to restore after MTF single-step

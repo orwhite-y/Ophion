@@ -1130,6 +1130,10 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
                     ept_invept_single(vcpu->ept_pointer);
 
                     vcpu->mtf_restore_page = hp;
+                    // Direct physical scans of the fake page must preserve the
+                    // historical base-view restore; only target-page data faults
+                    // need to return to changed_entry.
+                    vcpu->mtf_restore_hook_view = FALSE;
                     SIZE_T pc = 0;
                     __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
                     pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
@@ -1154,6 +1158,7 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
             EPT_PML1_ENTRY orig = hp->original_entry;
             ept_swap_page(my_pte, orig, vcpu->ept_pointer);
             vcpu->mtf_restore_page = hp;
+            vcpu->mtf_restore_hook_view = TRUE;
             SIZE_T pc = 0;
             __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
             pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
@@ -1180,6 +1185,7 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
                     passthrough.ExecuteAccess = 1;
                     ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
                     vcpu->mtf_restore_page = hp;
+                    vcpu->mtf_restore_hook_view = FALSE;
                     SIZE_T pc = 0;
                     __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
                     pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
@@ -1214,6 +1220,7 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
                         passthrough.ExecuteAccess = 1;
                         ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
                         vcpu->mtf_restore_page = hp;
+                        vcpu->mtf_restore_hook_view = FALSE;
 
                         SIZE_T pc = 0;
                         __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
@@ -1277,6 +1284,7 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
         {
             ept_hook_restore_current_vcpu(vcpu, hp);
             vcpu->mtf_restore_page = NULL;
+            vcpu->mtf_restore_hook_view = FALSE;
             return;
         }
 
@@ -1285,10 +1293,10 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
             (SIZE_T)(hp->pfn_of_hooked_page << 12));
         if (my_pte)
         {
-            if (hp->fake_pt)
-                ept_swap_page(my_pte, hp->changed_entry, vcpu->ept_pointer);
-            else
-                ept_swap_page(my_pte, hp->original_entry, vcpu->ept_pointer);
+            EPT_PML1_ENTRY restore_entry =
+                (vcpu->mtf_restore_hook_view || hp->fake_pt) ? hp->changed_entry
+                                                             : hp->original_entry;
+            ept_swap_page(my_pte, restore_entry, vcpu->ept_pointer);
         }
 
         // restore fake page EPT to X-only (in case it was opened for phys scan read)
@@ -1306,6 +1314,7 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
         }
 
         vcpu->mtf_restore_page = NULL;
+        vcpu->mtf_restore_hook_view = FALSE;
     }
 
     //
@@ -1614,6 +1623,7 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                         passthrough.ExecuteAccess = 1;
                         ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
                         vcpu->mtf_restore_page = hp;
+                        vcpu->mtf_restore_hook_view = FALSE;
                         SIZE_T pc = 0;
                         __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
                         pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
@@ -1644,6 +1654,7 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                         passthrough.ExecuteAccess = 1;
                         ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
                         vcpu->mtf_restore_page = hp;
+                        vcpu->mtf_restore_hook_view = FALSE;
                         SIZE_T pc = 0;
                         __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
                         pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;

@@ -1,5 +1,9 @@
 #include "td_common.h"
 
+#ifndef MAXSIZE_T
+#define MAXSIZE_T ((SIZE_T)~(SIZE_T)0)
+#endif
+
 // ----------------------------------------------------------------
 //  MmCopyVirtualMemory: canonical cross-process memory copy (R0).
 //  Exported by ntoskrnl but absent from public WDK headers, so it is

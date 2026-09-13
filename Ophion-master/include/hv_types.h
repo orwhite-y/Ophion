@@ -93,6 +93,7 @@ typedef struct _EPT_HOOKED_FUNCTION_INFO {
     PUINT8      first_trampoline_address; // trampoline for calling original
     PUINT8      fake_page_contents;       // pointer to parent page's fake page
     UINT64      hook_size;                // bytes overwritten
+    UINT8       original_bytes[32];       // original bytes split across pages on unhook
     UINT32      hook_type;                // 0=abs jmp, 1=VMCALL, 2=INT3
     BOOLEAN     user_trampoline;          // TRUE = trampoline is user-mode (don't pool_release)
     BOOLEAN     oneshot;                  // TRUE = redirect once, then pass through to original
@@ -105,6 +106,7 @@ typedef struct _EPT_HOOKED_FUNCTION_INFO {
 //
 // per-page hook tracking 閿?one for each 4KB page with hooks
 //
+typedef struct _EPT_HOOKED_PAGE_INFO *PEPT_HOOKED_PAGE_INFO;
 typedef struct _EPT_HOOKED_PAGE_INFO {
     LIST_ENTRY       hooked_page_list;
     LIST_ENTRY       hooked_functions_list;
@@ -137,6 +139,15 @@ typedef struct _EPT_HOOKED_PAGE_INFO {
     UINT64           exec_pt_pfn;       // PFN of exec_pt_page
     EPT_PML1_ENTRY   pt_exec_entry;     // EPT entry pointing to exec_pt_page
     volatile LONG *  dbg_pf_counter;    // debug: #PF handler writes here (kernel NonPaged)
+
+    //
+    // Cross-page hook support (maximum two pages).
+    //   primary page: owns EPT_HOOKED_FUNCTION_INFO and dispatch state
+    //   secondary page: contains only the overflow bytes of a hook payload
+    //
+    BOOLEAN                is_secondary_hook_page;
+    PEPT_HOOKED_PAGE_INFO  primary_hook_page;
+    PEPT_HOOKED_PAGE_INFO  secondary_hook_page;
 } EPT_HOOKED_PAGE_INFO, *PEPT_HOOKED_PAGE_INFO;
 
 //

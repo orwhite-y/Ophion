@@ -37,82 +37,79 @@ ept_hook_install_secondary_cpu(
     UINT64 target_pfn,
     UINT64 phys_addr)
 {
-    //
-    // 1. Find existing HOOKED_PAGE_INFO (primary CPU already created it)
-    //
     PEPT_HOOKED_PAGE_INFO hp = NULL;
 
     for (struct _LIST_ENTRY * cur = g_ept->hooked_pages.Flink;
          cur != &g_ept->hooked_pages;
          cur = cur->Flink)
     {
-        PEPT_HOOKED_PAGE_INFO existing = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
+        PEPT_HOOKED_PAGE_INFO existing = CONTAINING_RECORD(
+            cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
         if (existing->pfn_of_hooked_page == target_pfn)
         {
-            hp = existing;
+            hp = existing->is_secondary_hook_page ? existing->primary_hook_page : existing;
             break;
         }
     }
 
     if (!hp)
     {
-        // Primary CPU failed or hasn't completed yet
         g_ept_hook_diag = HOOK_DIAG_SECONDARY_NO_PAGE;
         g_ept_hook_diag2 = target_pfn;
         return FALSE;
     }
 
-    //
-    // 2. Split large page if needed (each CPU has independent EPT)
-    //
-    PEPT_PML2_ENTRY p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)phys_addr);
-    if (p2 && p2->LargePage)
+    PEPT_HOOKED_PAGE_INFO pages[2];
+    pages[0] = hp;
+    pages[1] = hp->secondary_hook_page;
+    UINT64 target_phys[2];
+    target_phys[0] = (UINT64)(hp->pfn_of_hooked_page << 12);
+    target_phys[1] = pages[1] ? (UINT64)(pages[1]->pfn_of_hooked_page << 12) : 0;
+
+    for (UINT32 i = 0; i < 2; i++)
     {
-        if (!ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)phys_addr))
+        if (!pages[i] || !target_phys[i])
+            continue;
+
+        PEPT_PML2_ENTRY p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys[i]);
+        if (p2 && p2->LargePage &&
+            !ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys[i]))
         {
             g_ept_hook_diag = HOOK_DIAG_SECONDARY_SPLIT;
-            g_ept_hook_diag2 = phys_addr;
+            g_ept_hook_diag2 = target_phys[i];
             return FALSE;
         }
-    }
 
-    //
-    // 3. Modify target page EPT: X=0 (trigger EPT violation)
-    //
-    PEPT_PML1_ENTRY target_pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)phys_addr);
-    if (!target_pte)
-    {
-        g_ept_hook_diag = HOOK_DIAG_SECONDARY_NO_PML1;
-        g_ept_hook_diag2 = phys_addr;
-        return FALSE;
-    }
+        PEPT_PML1_ENTRY target_pte = ept_get_pml1(
+            vcpu->ept_page_table, (SIZE_T)target_phys[i]);
+        if (!target_pte)
+        {
+            g_ept_hook_diag = HOOK_DIAG_SECONDARY_NO_PML1;
+            g_ept_hook_diag2 = target_phys[i];
+            return FALSE;
+        }
+        target_pte->ExecuteAccess = 0;
+        target_pte->ReadAccess = 1;
+        target_pte->WriteAccess = 1;
 
-    target_pte->ExecuteAccess = 0;  // Trigger EPT violation on execute
+        UINT64 fake_phys = (UINT64)(pages[i]->pfn_of_fake_page_contents << 12);
+        PEPT_PML2_ENTRY fake_p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)fake_phys);
+        if (fake_p2 && fake_p2->LargePage)
+            ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)fake_phys);
 
-    //
-    // 4. Modify fake page EPT: R=0, W=0, X=1 (execute-only)
-    //
-    UINT64 fake_phys = (UINT64)(hp->pfn_of_fake_page_contents << 12);
-
-    // Split fake page's 2MB if needed
-    PEPT_PML2_ENTRY fake_p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)fake_phys);
-    if (fake_p2 && fake_p2->LargePage)
-    {
-        ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)fake_phys);
-    }
-
-    PEPT_PML1_ENTRY fake_pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)fake_phys);
-    if (fake_pte)
-    {
-        fake_pte->ReadAccess = (req->force_read_access) ? 1 : 0;
+        PEPT_PML1_ENTRY fake_pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)fake_phys);
+        if (!fake_pte)
+        {
+            g_ept_hook_diag = HOOK_DIAG_SECONDARY_NO_PML1;
+            g_ept_hook_diag2 = fake_phys;
+            return FALSE;
+        }
+        fake_pte->ReadAccess = (g_ept->execute_only_supported && !req->force_read_access) ? 0 : 1;
         fake_pte->WriteAccess = 0;
-        fake_pte->ExecuteAccess = 1;  // Execute-only (or R+X if force_read_access)
+        fake_pte->ExecuteAccess = 1;
+        fake_pte->PageFrameNumber = pages[i]->pfn_of_fake_page_contents;
     }
 
-    //
-    // 5. INVEPT (single-context is sufficient)
-    //
     ept_invept_single(vcpu->ept_pointer);
-
     return TRUE;
 }

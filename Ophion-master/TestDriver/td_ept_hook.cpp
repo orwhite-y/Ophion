@@ -673,8 +673,17 @@ TdEptHookR3(
     //
     // 1. lock target page in physical memory via MDL
     //
-    PVOID page_va = (PVOID)((UINT64)target_va & ~0xFFFULL);
-    PMDL mdl = IoAllocateMdl(page_va, PAGE_SIZE, FALSE, FALSE, NULL);
+    UINT64 page_start = (UINT64)target_va & ~0xFFFULL;
+    UINT64 page_offset = (UINT64)target_va & 0xFFFULL;
+    SIZE_T lock_length = PAGE_SIZE;
+
+    // A cross-page hook can read LDE bytes and write payload bytes into the
+    // next page. 32 bytes covers the maximum LDE accumulation window.
+    if (page_offset + 32 > PAGE_SIZE)
+        lock_length += PAGE_SIZE;
+
+    PVOID page_va = (PVOID)page_start;
+    PMDL mdl = IoAllocateMdl(page_va, (ULONG)lock_length, FALSE, FALSE, NULL);
     if (!mdl)
     {
         KeUnstackDetachProcess(&apc);

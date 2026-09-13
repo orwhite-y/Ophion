@@ -1,4 +1,4 @@
-﻿#include "td_common.h"
+#include "td_common.h"
 
 // =========================================================================
 //  driver entry / unload
@@ -137,9 +137,12 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     // init log system 闁?file output, truncate on load
     //
     static const wchar_t kLogFilePath[] = L"\\SystemRoot\\T.log";
-    auto log_status = LogInitialization(kLogPutLevelWarn, kLogFilePath);
+    auto log_status = LogInitialization(kLogPutLevelInfo, kLogFilePath);
     if (log_status == STATUS_REINITIALIZATION_NEEDED)
         LogRegisterReinitialization(drv);
+
+    // ---- DriverEntry checkpoint trace (WARN so it always shows) ----
+    HYPERPLATFORM_LOG_WARN("[td] >>> DriverEntry START");
 
     UNICODE_STRING fn;
     // try NtCreateThreadEx first (more likely exported), then ZwCreateThreadEx
@@ -149,6 +152,24 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     {
         RtlInitUnicodeString(&fn, L"ZwCreateThreadEx");
         g_pZwCreateThreadEx = (fn_ZwCreateThreadEx)MmGetSystemRoutineAddress(&fn);
+    }
+    // Special search: pattern scan from ZwCreateSymbolicLinkObject (for systems where ZwCreateThreadEx is not exported)
+    if (!g_pZwCreateThreadEx)
+    {
+        RtlInitUnicodeString(&fn, L"ZwCreateSymbolicLinkObject");
+        PUCHAR func = (PUCHAR)MmGetSystemRoutineAddress(&fn);
+        if (func)
+        {
+            func += 5;  // skip first instruction
+            for (int i = 0; i < 0x30; i++)
+            {
+                if (func[i] == 0x48 && func[i + 1] == 0x8b && func[i + 2] == 0xc4)  // mov rax, rsp
+                {
+                    g_pZwCreateThreadEx = (fn_ZwCreateThreadEx)(func + i);
+                    break;
+                }
+            }
+        }
     }
     // resolve ZwResumeThread via MmGetSystemRoutineAddress (exported)
     RtlInitUnicodeString(&fn, L"NtResumeThread");
@@ -171,22 +192,20 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     HYPERPLATFORM_LOG_INFO("[td] thread APIs: create=%p zw_resume=%p ps_resume=%p ke_resume=%p",
         g_pZwCreateThreadEx, g_pZwResumeThread, g_pPsResumeThread, g_pKeResumeThread);
 
+    HYPERPLATFORM_LOG_WARN("[td] cp: thread APIs resolved create=%p zw_resume=%p",
+        g_pZwCreateThreadEx, g_pZwResumeThread);
+
     // prefetch read cache (64 KB batch vmcall) - must be ready before IOCTLs
     TdMemCacheInit();
+    HYPERPLATFORM_LOG_WARN("[td] cp: TdMemCacheInit done");
 
-    // Open liveness event + check if Ophion VMX is active.
-    // If Ophion is not loaded / VMX not active, refuse to load TestDriver:
-    // all memory IOCTLs require VMCALL, so loading without Ophion is useless
-    // and risks #UD BSOD (HvlpVtlCallExceptionHandler bypasses SEH on VBS).
-    TdAliveInit();
-    if (!TdOphionAlive())
-    {
-        HYPERPLATFORM_LOG_ERROR("[td] Ophion not active -- refusing to load TestDriver");
-        TdAliveFini();
-        TdMemCacheFini();
-        return (NTSTATUS)0xC0000362;  // STATUS_FAILED_DRIVER_ENTRY
-    }
-    HYPERPLATFORM_LOG_INFO("[td] Ophion alive -- TestDriver loading with VMX support");
+    // ---- LIVENESS CHECK SKIPPED FOR DEBUGGING ----
+    // Original:
+    //   TdAliveInit();
+    //   if (!TdOphionAlive()) { ... return STATUS_FAILED_DRIVER_ENTRY; }
+    // Commented out to allow TestDriver to load even when Ophion doesn't signal alive event.
+    // In production, keep this check to avoid #UD BSOD when Ophion isn't active.
+    // ------------------------------------------------
 
     UNICODE_STRING dev_name, sym_name;
     RtlInitUnicodeString(&dev_name, TD_DEVICE_NAME);
@@ -195,10 +214,12 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     PDEVICE_OBJECT dev = NULL;
     NTSTATUS st = IoCreateDevice(drv, 0, &dev_name,
         FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &dev);
+    HYPERPLATFORM_LOG_WARN("[td] cp: IoCreateDevice -> 0x%08X", (unsigned)st);
     if (!NT_SUCCESS(st)) return st;
     g_dev_obj = dev;
 
     st = IoCreateSymbolicLink(&sym_name, &dev_name);
+    HYPERPLATFORM_LOG_WARN("[td] cp: IoCreateSymbolicLink -> 0x%08X", (unsigned)st);
     if (!NT_SUCCESS(st)) { IoDeleteDevice(dev); return st; }
 
     drv->DriverUnload = TdUnload;
@@ -261,11 +282,14 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     //}
 
 
+    HYPERPLATFORM_LOG_WARN("[td] cp: notify registered ex=%d", (int)g_process_notify_ex_registered);
+
 #if TD_HIDE_DRIVER
     // DKOM: hide this driver from PsLoadedModuleList (after all init).
-    TdHideFromPsLoadedModuleList(drv);
+    //TdHideFromPsLoadedModuleList(drv);
 #endif
 
+    HYPERPLATFORM_LOG_WARN("[td] cp: DriverEntry SUCCESS (about to return)");
     HYPERPLATFORM_LOG_INFO("[td] Loaded. Device: %wZ", &sym_name);
     return STATUS_SUCCESS;
 }

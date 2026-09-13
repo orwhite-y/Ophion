@@ -1,4 +1,5 @@
 #include "td_common.h"
+#include "td_memload_shellcode.h"
 
 // =========================================================================
 //  inject target tracking (for LoadImage callback)
@@ -328,7 +329,7 @@ TdResolveNtoskrnlExport(const char * func_name)
                 {
                     ULONG func_rva = funcs[ord];
                     if (func_rva >= exp_rva && func_rva < exp_rva + exp_sz)
-                        return NULL;  // forwarded export é—?skip
+                        return NULL;  // forwarded export ï¿½?skip
                     PVOID resolved = (PUINT8)g_ntoskrnl_base + func_rva;
                     HYPERPLATFORM_LOG_INFO("[td] nt export %s = %p", func_name, resolved);
                     return resolved;
@@ -617,7 +618,7 @@ extern BOOLEAN g_device_hidden;
 #pragma pack(pop)
 
 //
-// R3 EPT hook params é—?from user-mode app via DeviceIoControl
+// R3 EPT hook params ï¿½?from user-mode app via DeviceIoControl
 //
 
 #pragma pack(pop)
@@ -625,9 +626,9 @@ extern BOOLEAN g_device_hidden;
 // ---- MessageBoxA shellcode (x64 PIC) ----
 //
 // flow:
-//   PEB é—?kernel32 base é—?parse exports é—?find GetProcAddress (hash-based)
-//   GetProcAddress(kernel32, "LoadLibraryA") é—?LoadLibraryA("user32.dll")
-//   GetProcAddress(user32, "MessageBoxA") é—?MessageBoxA(0, text, title, 0)
+//   PEB ï¿½?kernel32 base ï¿½?parse exports ï¿½?find GetProcAddress (hash-based)
+//   GetProcAddress(kernel32, "LoadLibraryA") ï¿½?LoadLibraryA("user32.dll")
+//   GetProcAddress(user32, "MessageBoxA") ï¿½?MessageBoxA(0, text, title, 0)
 //   ret
 //
 // this shellcode is assembled from the following NASM source:
@@ -636,7 +637,7 @@ extern BOOLEAN g_device_hidden;
 //   ; --- prologue ---
 //   sub rsp, 0x28
 //
-//   ; --- PEB é—?kernel32 ---
+//   ; --- PEB ï¿½?kernel32 ---
 //   mov rax, [gs:0x60]        ; PEB
 //   mov rax, [rax+0x18]       ; Ldr
 //   mov rax, [rax+0x20]       ; InMemoryOrderModuleList head
@@ -644,13 +645,13 @@ extern BOOLEAN g_device_hidden;
 //   mov rax, [rax]            ; kernel32
 //   mov rbx, [rax+0x20]      ; kernel32 DllBase
 //
-//   ; --- find_export(rbx=base, r12d=hash) é—?rax=funcVA ---
+//   ; --- find_export(rbx=base, r12d=hash) ï¿½?rax=funcVA ---
 //   ; uses ROR13-add hash of function name
 //   ;   GetProcAddress hash = 0x7C0DFCAA
 //   ;   LoadLibraryA  hash = 0xEC0E4E8E  (resolved via GetProcAddress)
 //   ;   MessageBoxA   hash = 0x1E380A6A  (resolved via GetProcAddress)
 //
-//   (see byte array below é—?hand-assembled and verified)
+//   (see byte array below ï¿½?hand-assembled and verified)
 //
 
 // ---- DLL name matching helpers (used by PIC shellcode + gap finder) ----
@@ -735,7 +736,7 @@ extern const WCHAR g_kernel32_name[] = L"kernel32.dll";
 //
 // build PIC shellcode: resolve user32!MessageBoxA + kernel32!SleepEx
 // via PEB walk + export table.
-// zero runtime API calls é—?all resolution done here at PASSIVE_LEVEL.
+// zero runtime API calls ï¿½?all resolution done here at PASSIVE_LEVEL.
 // must be called while attached to the target process.
 //
 BOOLEAN
@@ -860,13 +861,13 @@ TdBuildShellcodePIC(PVOID buf, SIZE_T buf_size)
 }
 
 // =========================================================================
-//  DPC broadcast é—?VMCALL per CPU
+//  DPC broadcast ï¿½?VMCALL per CPU
 // =========================================================================
 
 //
-// set up EPT stealth for one page é—?single VMCALL from current CPU.
+// set up EPT stealth for one page ï¿½?single VMCALL from current CPU.
 // HV internally loops all g_vcpu[i].ept_page_table to split + set PTE.
-// NO KeGenericCallDpc é—?avoids 0x101 CLOCK_WATCHDOG when a CPU is
+// NO KeGenericCallDpc ï¿½?avoids 0x101 CLOCK_WATCHDOG when a CPU is
 // stuck in VMX-root (Ophion HV pre-existing bug).
 //
 #ifndef TD_MAX_DPC_CPUS
@@ -1041,7 +1042,7 @@ TdStealthAllocPage(
     // copy PT page and target page content into NonPaged kernel buffers.
     // VMX-root accesses these buffers (always valid under any CR3).
     // MmGetVirtualForPhysical returns process-relative VAs that are
-    // invalid under system CR3 in VMX-root é—?so we copy the content here.
+    // invalid under system CR3 in VMX-root ï¿½?so we copy the content here.
     //
     PVOID pt_buf  = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'htpS');
     PVOID tgt_buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, 'htpS');
@@ -1096,7 +1097,7 @@ TdStealthAllocPage(
     req->target_page_copy = tgt_buf;
     req->pt_precomputed   = TRUE;
 
-    // DPC broadcast é—?every CPU does VMCALL, each splits its own EPT.
+    // DPC broadcast ï¿½?every CPU does VMCALL, each splits its own EPT.
     // same pattern as EPT hook's KeGenericCallDpc.
     NTSTATUS run_st = TdRunStealthAllocOnCpus(req, pt_buf, tgt_buf);
     if (run_st == STATUS_IO_TIMEOUT)
@@ -1135,7 +1136,7 @@ TdStealthInjectPages(
         UINT32 chunk      = (shellcode_size - done < space) ? (shellcode_size - done) : space;
 
         //
-        // page already has content from TdBuildShellcodePage é—?no need to touch.
+        // page already has content from TdBuildShellcodePage ï¿½?no need to touch.
         // (touching would overwrite first byte of shellcode with 0)
         // MmGetPhysicalAddress works because the page was already committed+written.
         //
@@ -1164,7 +1165,7 @@ TdStealthInjectPages(
         }
 
         //
-        // NX bit in real PTE is NOT cleared é—?Windows' MiAgeWorkingSet
+        // NX bit in real PTE is NOT cleared ï¿½?Windows' MiAgeWorkingSet
         // can restore it at any time. the fake/exec PT pages handle NX hiding.
         //
 
@@ -1197,5 +1198,273 @@ TdStealthInjectPages(
 
     HYPERPLATFORM_LOG_INFO("[td] stealth inject: %u pages set up via VMCALL", page_count);
     return TRUE;
+}
+
+// =========================================================================
+//  TdInjectMemDllX64 -- port of "InjectX64" (Inject project, inject/Inject.c)
+//
+//  R3 gives only a PID + a DLL file path. This reads the DLL, then performs
+//  the same 3-allocation manual-map trick the source uses:
+//
+//    1. ufileDll  : raw DLL FILE image  (PAGE_READWRITE, stays NX)   -> rcx
+//    2. uShellcode: MemLoadShellcode_x64 blob (RX, NX cleared)        -> thread entry
+//    3. uImage    : buffer for the loader to map the real image into  (RX, NX cleared)
+//
+//  The loader blob (compiled in the source) walks the PEB, resolves imports
+//  by hash, maps/relocates the DLL, and calls DllMain. Its internal
+//  "VirtualAlloc image" call site at blob offset 0x50f is patched so the
+//  loader uses our pre-allocated uImage instead of calling VirtualAlloc:
+//      0x50f: 0x90                  NOP first byte of "mov edx,eax"
+//      0x510: 48 B8 <imm64=uImage>   mov rax, uImage   (overwrites the
+//                                     VirtualAlloc result in rax)
+//
+//  Thread entry = uShellcode, start context (rcx) = ufileDll. We wait for the
+//  loader thread to finish, then release every allocation.
+//
+//  Memory model differs from the source:
+//    - source "AllocateMemory"          -> target ZwAllocateVirtualMemory
+//      PAGE_READWRITE + SetExecutePage  -> here: NX cleared via PTE walk
+//      (TdResolveGuestPte + TdApplyProtectToPte + TdFlushAddressRangeForCr3).
+//    - source "AllocateMemoryNotExecute"-> same alloc, NX left set.
+//    - source "FreeMemory"              -> ZwFreeVirtualMemory(MEM_RELEASE).
+//
+//  Must be called at PASSIVE_LEVEL with a referenced PEPROCESS (we attach here).
+// =========================================================================
+
+// blob offsets baked into MemLoadShellcode_x64 (see td_memload_shellcode.h)
+#define MEMLOAD_PATCH_NOEXEC   0x50F   // "mov edx,eax" first byte -> NOP
+#define MEMLOAD_PATCH_IMM_OFF  0x512   // imm64 slot of "mov rax, imm64"
+
+static NTSTATUS
+TdTargetAlloc(
+    _In_  SIZE_T size,
+    _In_  BOOLEAN make_exec,
+    _Out_ PVOID * out_va,
+    _Out_ SIZE_T * out_alloc_size,
+    _Out_ UINT64 * out_cr3)
+{
+    PVOID va = NULL;
+    SIZE_T sz = size;
+    NTSTATUS st = ZwAllocateVirtualMemory(
+        ZwCurrentProcess(), &va, 0, &sz,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!NT_SUCCESS(st) || !va)
+        return NT_SUCCESS(st) ? STATUS_NO_MEMORY : st;
+
+    RtlZeroMemory(va, sz);   // source does memset(0) in both alloc helpers
+
+    *out_va = va;
+    *out_alloc_size = sz;
+    *out_cr3 = __readcr3();  // target CR3 while attached
+
+    if (make_exec)
+    {
+        // Port of SetExecutePage(): clear NX for every page in [va, va+sz).
+        // While attached, __readcr3() is the target DirBase so the guest walk
+        // lands on the target's real PTEs.
+        UINT64 cr3 = *out_cr3;
+        for (UINT64 p = (UINT64)va; p < (UINT64)va + sz; p += PAGE_SIZE)
+        {
+            PUINT64 pte = TdResolveGuestPte(cr3, p);
+            if (pte)
+                TdApplyProtectToPte(pte, PAGE_EXECUTE_READWRITE);
+        }
+        TdFlushAddressRangeForCr3((UINT64)va & ~(UINT64)(PAGE_SIZE - 1), sz, cr3);
+    }
+    return STATUS_SUCCESS;
+}
+
+static VOID
+TdTargetFree(PVOID va, SIZE_T size)
+{
+    if (!va) return;
+    SIZE_T sz = size;
+    ZwFreeVirtualMemory(ZwCurrentProcess(), &va, &sz, MEM_RELEASE);
+}
+
+// Port of CreateRemoteThreadByProcess, but NOT suspended and with a start
+// context (rcx) -- the source's helper always passed Arg, TdCreateThread
+// cannot, so we call g_pZwCreateThreadEx directly and hand back the thread
+// object for the caller to wait on and dereference.
+static NTSTATUS
+TdTargetCreateThreadWithArg(
+    _In_  PEPROCESS proc,
+    _In_  PVOID entry,
+    _In_  PVOID arg,
+    _Out_ PETHREAD * out_thread)
+{
+    *out_thread = NULL;
+    if (!g_pZwCreateThreadEx) return STATUS_NOT_SUPPORTED;
+
+    HANDLE proc_h = NULL;
+    NTSTATUS st = ObOpenObjectByPointer(proc, OBJ_KERNEL_HANDLE, NULL,
+        PROCESS_ALL_ACCESS, *PsProcessType, KernelMode, &proc_h);
+    if (!NT_SUCCESS(st)) return st;
+
+    HANDLE thread_h = NULL;
+    st = g_pZwCreateThreadEx(
+        &thread_h, THREAD_ALL_ACCESS, NULL, proc_h,
+        entry, arg,
+        0,                // flags = 0 (run immediately, matches source)
+        0,                // ZeroBits
+        0x100000,         // StackSize  (source: 0x100000)
+        0x200000,         // MaxStackSize (source: 0x200000)
+        NULL);            // AttributeList
+    ZwClose(proc_h);
+
+    if (!NT_SUCCESS(st) || !thread_h)
+    {
+        if (thread_h) ZwClose(thread_h);
+        return NT_SUCCESS(st) ? STATUS_UNSUCCESSFUL : st;
+    }
+
+    PETHREAD thr = NULL;
+    st = ObReferenceObjectByHandle(thread_h, THREAD_ALL_ACCESS,
+        *PsThreadType, KernelMode, (PVOID *)&thr, NULL);
+    ZwClose(thread_h);
+    if (!NT_SUCCESS(st) || !thr)
+        return NT_SUCCESS(st) ? STATUS_UNSUCCESSFUL : st;
+
+    *out_thread = thr;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+TdInjectMemDllX64(
+    _In_  PEPROCESS proc,
+    _In_  PCUNICODE_STRING dll_nt_path,
+    _Out_opt_ UINT64 * out_image_va,
+    _Out_opt_ SIZE_T * out_image_size)
+{
+    if (out_image_va) *out_image_va = 0;
+    if (out_image_size) *out_image_size = 0;
+
+    // --- 1. validate process still alive (source: PsGetProcessExitStatus) ---
+    if (PsGetProcessExitStatus(proc) != STATUS_PENDING)
+        return STATUS_PROCESS_IS_TERMINATING;
+
+    // --- 2. read the DLL file into a nonpaged kernel buffer ---
+    PUINT8 raw_dll = NULL;
+    SIZE_T dll_size = 0;
+    NTSTATUS st = TdReadFileKernel(dll_nt_path, &raw_dll, &dll_size);
+    if (!NT_SUCCESS(st))
+    {
+        HYPERPLATFORM_LOG_ERROR("[inject-x64] read DLL failed 0x%08X", st);
+        return st;
+    }
+
+    // --- 3. parse PE: validate + read SizeOfImage ---
+    SIZE_T image_size = 0;
+    ULONG  entry_rva  = 0;
+    __try
+    {
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)raw_dll;
+        if (dll_size < sizeof(IMAGE_DOS_HEADER) || dos->e_magic != IMAGE_DOS_SIGNATURE)
+        { st = STATUS_INVALID_IMAGE_FORMAT; __leave; }
+        if ((SIZE_T)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > dll_size)
+        { st = STATUS_INVALID_IMAGE_FORMAT; __leave; }
+        PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(raw_dll + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE)
+        { st = STATUS_INVALID_IMAGE_FORMAT; __leave; }
+        if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64)
+        { st = STATUS_INVALID_IMAGE_FORMAT; __leave; }
+        image_size = (SIZE_T)nt->OptionalHeader.SizeOfImage;
+        entry_rva  = nt->OptionalHeader.AddressOfEntryPoint;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        st = STATUS_INVALID_IMAGE_FORMAT;
+    }
+    if (!NT_SUCCESS(st) || image_size == 0 || image_size > 256 * 1024 * 1024)
+    {
+        HYPERPLATFORM_LOG_ERROR("[inject-x64] bad PE, SizeOfImage=0x%llX st=0x%08X",
+            (UINT64)image_size, st);
+        ExFreePoolWithTag(raw_dll, 'fRdO');
+        return NT_SUCCESS(st) ? STATUS_INVALID_IMAGE_FORMAT : st;
+    }
+
+    // --- 4. allocate the three target regions while attached ---
+    KAPC_STATE apc;
+    KeStackAttachProcess(proc, &apc);
+
+    PVOID ufileDll = NULL; SIZE_T sz_file = 0; UINT64 cr3 = 0;
+    PVOID uShell   = NULL; SIZE_T sz_shel = 0;
+    PVOID uImage   = NULL; SIZE_T sz_img  = 0;
+    BOOLEAN have_file = FALSE, have_shel = FALSE, have_img = FALSE;
+    BOOLEAN keep_image = FALSE;   // source keeps uImage alive on success
+    st = STATUS_UNSUCCESSFUL;
+
+    // ufileDll: raw file image, NX left set (source: AllocateMemoryNotExecute)
+    do
+    {
+        if (!NT_SUCCESS(TdTargetAlloc(dll_size, FALSE, &ufileDll, &sz_file, &cr3)))
+            break;
+        have_file = TRUE;
+        __try { RtlCopyMemory(ufileDll, raw_dll, dll_size); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+
+        // uShellcode: loader blob, executable (source: AllocateMemory)
+        if (!NT_SUCCESS(TdTargetAlloc(sizeof(MemLoadShellcode_x64), TRUE,
+                                         &uShell, &sz_shel, &cr3)))
+            break;
+        have_shel = TRUE;
+        __try { RtlCopyMemory(uShell, MemLoadShellcode_x64, sizeof(MemLoadShellcode_x64)); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+
+        // uImage: destination for the real mapped image, executable
+        if (!NT_SUCCESS(TdTargetAlloc(image_size, TRUE, &uImage, &sz_img, &cr3)))
+            break;
+        have_img = TRUE;
+
+        // --- 5. patch the loader: point its "VirtualAlloc" result at uImage ---
+        // Same bytes the source writes at offsets 0x50f-0x515:
+        //   uShellcode[0x50f] = 0x90;    NOP
+        //   uShellcode[0x510] = 0x48;    REX.W
+        //   uShellcode[0x511] = 0xb8;    mov rax, imm64
+        //   *(PULONG64)(uShellcode+0x512) = (ULONG64)uImage;
+        ((PUINT8)uShell)[MEMLOAD_PATCH_NOEXEC]      = 0x90;
+        ((PUINT8)uShell)[MEMLOAD_PATCH_NOEXEC + 1]  = 0x48;
+        ((PUINT8)uShell)[MEMLOAD_PATCH_NOEXEC + 2]  = 0xB8;
+        *(UINT64 *)((PUINT8)uShell + MEMLOAD_PATCH_IMM_OFF) = (UINT64)uImage;
+
+        // --- 6. run loader in the target (rcx = ufileDll) ---
+        PETHREAD thr = NULL;
+        NTSTATUS thr_st = TdTargetCreateThreadWithArg(
+            proc, uShell, ufileDll, &thr);
+        if (!NT_SUCCESS(thr_st))
+        {
+            HYPERPLATFORM_LOG_ERROR("[inject-x64] thread create failed 0x%08X", thr_st);
+            st = thr_st;
+            break;
+        }
+
+        // Wait for the loader to map the DLL and call DllMain, then return.
+        KeWaitForSingleObject(thr, Executive, KernelMode, FALSE, NULL);
+        ObDereferenceObject(thr);
+
+        // Source clears only one page of uImage after the thread completes.
+        __try { RtlZeroMemory(uImage, PAGE_SIZE); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        keep_image = TRUE;
+        if (out_image_va) *out_image_va = (UINT64)uImage;
+        if (out_image_size) *out_image_size = image_size;
+        st = STATUS_SUCCESS;
+        HYPERPLATFORM_LOG_INFO("[inject-x64] OK: file=%p shell=%p image=%p entry=%p size=0x%llX",
+            ufileDll, uShell, uImage,
+            (PVOID)((PUINT8)uImage + entry_rva), (UINT64)image_size);
+    } while (0);
+
+    // --- 7. release allocations (source model) ---
+    // Success: loader ran DllMain and uImage now holds the live mapped DLL,
+    // so free the staging buffers (ufileDll, uShellcode) but NOT uImage.
+    // Failure: free whatever was allocated (uImage is freed when thread
+    // creation fails, matching Inject.c's isuimageDll behavior).
+    if (have_file) TdTargetFree(ufileDll, sz_file);
+    if (have_shel) TdTargetFree(uShell,   sz_shel);
+    if (have_img && !keep_image) TdTargetFree(uImage, sz_img);
+
+    KeUnstackDetachProcess(&apc);
+    ExFreePoolWithTag(raw_dll, 'fRdO');
+    return st;
 }
 

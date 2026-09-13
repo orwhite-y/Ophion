@@ -1,4 +1,4 @@
-/*
+﻿/*
 *   td_common.h - shared declarations for TestDriver (split from test_driver.cpp)
 */
 #pragma once
@@ -239,6 +239,27 @@ typedef NTSTATUS (NTAPI * fn_ZwResumeThread)(HANDLE, PULONG);
 #define IOCTL_INJECT_RENDERDOC  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 16, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_ENUM_D3D12_COMMANDLISTS CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 23, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_DUMP_D3D12_DEVICE CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 24, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// =============================================================================
+//  INJECT_MEM_DLL - Port of "InjectX64" from Inject project
+//  Takes a process ID and NT path to a DLL file, reads the DLL into kernel
+//  memory, patches the MemLoadShellcode_x64 loader blob, allocates RWX memory
+//  in the target process, and creates a remote thread to execute the loader.
+//  R3 usage: injectmemdll <pid> <dll_nt_path>
+//    e.g. injectmemdll 1234 \??\C:\path\to\my.dll
+// =============================================================================
+#define IOCTL_INJECT_MEM_DLL CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 25, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#pragma pack(push, 8)
+typedef struct _TD_INJECT_MEM_DLL_PARAMS {
+    UINT64 target_pid;          // [in]  target process PID
+    WCHAR  dll_path[520];       // [in]  NT path to DLL (null-terminated)
+    UINT64 mapped_base;         // [out] base VA of mapped image in target
+    UINT64 entry_point;         // [out] DllMain VA in target
+    UINT64 image_size;          // [out] total image size mapped
+    UINT64 status;              // [out] NTSTATUS (0 = success)
+} TD_INJECT_MEM_DLL_PARAMS;
+#pragma pack(pop)
 
 #pragma pack(push, 8)
 typedef struct _TD_RESOLVE_EXPORT_PARAMS {
@@ -674,6 +695,7 @@ NTSTATUS TdEptHookR3( UINT64 target_pid, PVOID target_va, PVOID proxy_va, UINT32
 NTSTATUS TdEptUnhookNtCreateFile(VOID);
 NTSTATUS TdEptUnhookR3(UINT64 target_pid, PVOID target_va);
 NTSTATUS TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const char * log_prefix, BOOLEAN wait_for_completion);
+NTSTATUS TdInjectMemDllX64(PEPROCESS proc, PCUNICODE_STRING dll_nt_path, UINT64 * out_image_va, SIZE_T * out_image_size);
 NTSTATUS TdInstallTriggerHookAllCpus( PVOID trigger_fn, PVOID proxy_va, UINT64 caller_cr3, UINT64 flags, UINT64 expected_tid, PVOID * origin, volatile LONG * fired_signal);
 NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp);
 NTSTATUS TdMakeKernelThreadHandle(HANDLE thread_h, HANDLE * kernel_thread_h, UINT64 * thread_id);

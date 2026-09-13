@@ -370,6 +370,11 @@ typedef struct _R3_HOOK_DPC_CTX {
     UINT64   user_trampoline_pa;
     UINT64   flags;             // bit 0 = force_read_access (shellcode self-read)
     UINT64   expected_tid;      // 0 = any thread
+    ULONG    primary_processor;
+    volatile LONG primary_done;
+    volatile LONG success_count;
+    volatile LONG failure_count;
+    volatile LONG first_failure;
     NTSTATUS result;
 } R3_HOOK_DPC_CTX;
 
@@ -379,17 +384,40 @@ DpcEptHookR3(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
     UNREFERENCED_PARAMETER(Dpc);
     R3_HOOK_DPC_CTX * ctx = (R3_HOOK_DPC_CTX *)Ctx;
 
-    ctx->result = hv_vmcall_ex(
+    // One CPU must perform the full EPT-hook installation. The other CPUs use
+    // ept_hook_install_secondary_cpu(), which requires an already-installed
+    // page. Wait until the primary CPU has completed that first installation.
+    BOOLEAN is_primary = (KeGetCurrentProcessorNumber() == ctx->primary_processor);
+    UINT64 packed_flags = ctx->flags | ((is_primary ? 1ULL : 0ULL) << 2);
+
+    if (!is_primary) {
+        while (ctx->primary_done == 0) {
+            _mm_pause();
+        }
+    }
+
+    NTSTATUS st = hv_vmcall_ex(
         VMCALL_EPT_HOOK,
         (UINT64)ctx->target,
         (UINT64)ctx->proxy,
         (UINT64)ctx->origin,
         ctx->caller_cr3,
-        (UINT64)ctx->hook_type | (ctx->flags << 32),
+        (UINT64)ctx->hook_type | (packed_flags << 32),
         ctx->target_cr3,
         (UINT64)ctx->user_trampoline,
         ctx->user_trampoline_pa,
         ctx->expected_tid);
+
+    if (is_primary) {
+        ctx->primary_done = 1;
+    }
+
+    if (NT_SUCCESS(st)) {
+        _InterlockedIncrement(&ctx->success_count);
+    } else {
+        _InterlockedIncrement(&ctx->failure_count);
+        _InterlockedCompareExchange(&ctx->first_failure, (LONG)st, (LONG)STATUS_SUCCESS);
+    }
 
     KeSignalCallDpcSynchronize(A2);
     KeSignalCallDpcDone(A1);
@@ -846,8 +874,17 @@ TdEptHookR3(
     ctx.target_cr3          = target_cr3;
     ctx.user_trampoline     = tramp_va;
     ctx.user_trampoline_pa  = tramp_pa;
+    ctx.primary_processor   = KeGetCurrentProcessorNumber();
+    ctx.primary_done        = 0;
+    ctx.success_count       = 0;
+    ctx.failure_count       = 0;
+    ctx.first_failure       = (LONG)STATUS_SUCCESS;
 
     KeGenericCallDpc(DpcEptHookR3, &ctx);
+
+    ctx.result = (ctx.failure_count != 0)
+        ? (NTSTATUS)ctx.first_failure
+        : ((ctx.success_count != 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL);
 
     KeUnstackDetachProcess(&apc);
 

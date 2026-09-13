@@ -2870,6 +2870,63 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         break;
     }
     // ================================================================
+    //  INJECT_MEM_DLL -- ported InjectX64 (R3 gives only PID + DLL path)
+    //  Reads the DLL in R0, 3-alloc manual-map via MemLoadShellcode_x64,
+    //  creates a remote loader thread. Result delivered in p->status.
+    // ================================================================
+    case IOCTL_INJECT_MEM_DLL:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_INJECT_MEM_DLL_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_INJECT_MEM_DLL_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_INJECT_MEM_DLL_PARAMS * p = (TD_INJECT_MEM_DLL_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+        p->dll_path[519] = L'\0';   // hard null-terminate (defensive vs. R3)
+        p->mapped_base = 0;
+        p->entry_point = 0;
+        p->image_size  = 0;
+
+        // path must be non-empty (the only required inputs are PID + DLL path)
+        if (p->target_pid == 0 || p->dll_path[0] == L'\0')
+        {
+            p->status = (UINT64)STATUS_INVALID_PARAMETER;
+            irp->IoStatus.Information = sizeof(TD_INJECT_MEM_DLL_PARAMS);
+            st = STATUS_SUCCESS;
+            break;
+        }
+
+        PEPROCESS proc = NULL;
+        NTSTATUS lookup_st = PsLookupProcessByProcessId((HANDLE)p->target_pid, &proc);
+        if (!NT_SUCCESS(lookup_st) || !proc)
+        {
+            HYPERPLATFORM_LOG_ERROR("[inj-x64] PsLookupProcessByProcessId failed pid=%llu st=0x%08X",
+                p->target_pid, lookup_st);
+            p->status = (UINT64)lookup_st;
+            irp->IoStatus.Information = sizeof(TD_INJECT_MEM_DLL_PARAMS);
+            st = STATUS_SUCCESS;   // IOCTL ok; result delivered in p->status
+            break;
+        }
+
+        UNICODE_STRING dll_nt;
+        RtlInitUnicodeString(&dll_nt, p->dll_path);
+
+        HYPERPLATFORM_LOG_INFO("[inj-x64] inject pid=%llu path=%wZ", p->target_pid, &dll_nt);
+
+        // TdInjectMemDllX64 attaches to the target internally (same convention
+        // as TdInjectRenderdocShadow), so we do NOT KeStackAttachProcess here.
+        UINT64 image_va = 0;
+        SIZE_T image_sz = 0;
+        NTSTATUS inj_st = TdInjectMemDllX64(proc, &dll_nt, &image_va, &image_sz);
+        ObDereferenceObject(proc);
+
+        p->mapped_base = image_va;   // uImage VA in target (0 on failure)
+        p->image_size  = (UINT64)image_sz;
+        p->status = (UINT64)inj_st;
+        irp->IoStatus.Information = sizeof(TD_INJECT_MEM_DLL_PARAMS);
+        st = STATUS_SUCCESS;   // IOCTL ok; injection result in p->status (0 = success)
+        break;
+    }
+    // ================================================================
     // ================================================================
     //  HV memory read/write  --  VMX-root path (primary) + R0 fallback
     //

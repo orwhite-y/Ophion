@@ -104,7 +104,8 @@ ept_hook_install_secondary_cpu(
             g_ept_hook_diag2 = fake_phys;
             return FALSE;
         }
-        fake_pte->ReadAccess = (g_ept->execute_only_supported && !req->force_read_access) ? 0 : 1;
+        fake_pte->ReadAccess =
+            (g_ept->execute_only_supported && !pages[i]->force_read_access) ? 0 : 1;
         fake_pte->WriteAccess = 0;
         fake_pte->ExecuteAccess = 1;
         fake_pte->PageFrameNumber = pages[i]->pfn_of_fake_page_contents;

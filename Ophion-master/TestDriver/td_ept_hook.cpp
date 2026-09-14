@@ -370,8 +370,7 @@ typedef struct _R3_HOOK_DPC_CTX {
     UINT64   user_trampoline_pa;
     UINT64   flags;             // bit 0 = force_read_access (shellcode self-read)
     UINT64   expected_tid;      // 0 = any thread
-    ULONG    primary_processor;
-    volatile LONG primary_done;
+    volatile LONG secondary_phase;
     volatile LONG success_count;
     volatile LONG failure_count;
     volatile LONG first_failure;
@@ -384,17 +383,18 @@ DpcEptHookR3(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
     UNREFERENCED_PARAMETER(Dpc);
     R3_HOOK_DPC_CTX * ctx = (R3_HOOK_DPC_CTX *)Ctx;
 
-    // One CPU must perform the full EPT-hook installation. The other CPUs use
-    // ept_hook_install_secondary_cpu(), which requires an already-installed
-    // page. Wait until the primary CPU has completed that first installation.
-    BOOLEAN is_primary = (KeGetCurrentProcessorNumber() == ctx->primary_processor);
-    UINT64 packed_flags = ctx->flags | ((is_primary ? 1ULL : 0ULL) << 2);
-
-    if (!is_primary) {
-        while (ctx->primary_done == 0) {
-            _mm_pause();
-        }
+    // This DPC is used only after the caller completed the primary installation.
+    // Secondary CPUs therefore never spin at DISPATCH_LEVEL waiting for primary.
+    if (!ctx->secondary_phase) {
+        _InterlockedIncrement(&ctx->failure_count);
+        _InterlockedCompareExchange(&ctx->first_failure,
+            (LONG)STATUS_INVALID_DEVICE_STATE, (LONG)STATUS_SUCCESS);
+        KeSignalCallDpcSynchronize(A2);
+        KeSignalCallDpcDone(A1);
+        return;
     }
+
+    UINT64 packed_flags = ctx->flags;
 
     NTSTATUS st = hv_vmcall_ex(
         VMCALL_EPT_HOOK,
@@ -407,10 +407,6 @@ DpcEptHookR3(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
         (UINT64)ctx->user_trampoline,
         ctx->user_trampoline_pa,
         ctx->expected_tid);
-
-    if (is_primary) {
-        ctx->primary_done = 1;
-    }
 
     if (NT_SUCCESS(st)) {
         _InterlockedIncrement(&ctx->success_count);
@@ -883,13 +879,52 @@ TdEptHookR3(
     ctx.target_cr3          = target_cr3;
     ctx.user_trampoline     = tramp_va;
     ctx.user_trampoline_pa  = tramp_pa;
-    ctx.primary_processor   = KeGetCurrentProcessorNumber();
-    ctx.primary_done        = 0;
+    ctx.secondary_phase     = 0;
     ctx.success_count       = 0;
     ctx.failure_count       = 0;
     ctx.first_failure       = (LONG)STATUS_SUCCESS;
 
-    KeGenericCallDpc(DpcEptHookR3, &ctx);
+    //
+    // Phase 1: full installation on the current CPU only.  This is done while
+    // still attached to the target process, so caller_cr3 and all target VAs
+    // remain valid for the VMX-root installer.
+    //
+    BOOLEAN primary_installed = FALSE;
+    {
+        UINT64 packed_flags = ctx.flags | (1ULL << 2);
+        NTSTATUS primary_st = hv_vmcall_ex(
+            VMCALL_EPT_HOOK,
+            (UINT64)ctx.target,
+            (UINT64)ctx.proxy,
+            (UINT64)ctx.origin,
+            ctx.caller_cr3,
+            (UINT64)ctx.hook_type | (packed_flags << 32),
+            ctx.target_cr3,
+            (UINT64)ctx.user_trampoline,
+            ctx.user_trampoline_pa,
+            ctx.expected_tid);
+
+        if (NT_SUCCESS(primary_st)) {
+            primary_installed = TRUE;
+            _InterlockedIncrement(&ctx.success_count);
+        } else {
+            _InterlockedIncrement(&ctx.failure_count);
+            _InterlockedCompareExchange(&ctx.first_failure,
+                (LONG)primary_st, (LONG)STATUS_SUCCESS);
+        }
+    }
+
+    //
+    // Phase 2: only after primary success, propagate the already-installed hook
+    // to every CPU.  DpcEptHookR3 now performs secondary installs only and never
+    // waits for primary inside a DPC.
+    //
+    if (ctx.failure_count == 0)
+    {
+        KeMemoryBarrier();
+        _InterlockedExchange(&ctx.secondary_phase, 1);
+        KeGenericCallDpc(DpcEptHookR3, &ctx);
+    }
 
     ctx.result = (ctx.failure_count != 0)
         ? (NTSTATUS)ctx.first_failure
@@ -915,9 +950,26 @@ TdEptHookR3(
     else
     {
         //
-        // failed 閳?clean up: free trampoline, unlock MDL
+        // Failed. If phase 1 installed the global hook, remove it before freeing
+        // the user trampoline. Always unregister the trampoline stealth page,
+        // otherwise the hypervisor keeps a reference to freed user memory.
         //
         KeStackAttachProcess(proc, &apc);
+
+        if (primary_installed)
+        {
+            struct
+            {
+                PVOID    target;
+                UINT64   caller_cr3;
+                NTSTATUS result;
+            } unhook_ctx = {};
+            unhook_ctx.target     = target_va;
+            unhook_ctx.caller_cr3 = __readcr3();
+            KeGenericCallDpc(DpcEptUnhook, &unhook_ctx);
+        }
+
+        TdStealthFreePage((PVOID)((UINT64)tramp_va & ~0xFFFULL));
         ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
         KeUnstackDetachProcess(&apc);
 

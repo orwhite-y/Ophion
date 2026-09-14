@@ -117,6 +117,7 @@ typedef struct _EPT_HOOKED_PAGE_INFO {
     EPT_PML1_ENTRY   original_entry;      // saved original PTE (RW, no X)
     EPT_PML1_ENTRY   changed_entry;       // fake page PTE (X only, no RW)
     UINT32           Options;             // EPTO_HOOK_FUNCTION or EPTO_VIRTUAL_BREAKPOINT
+    BOOLEAN          force_read_access;   // page-wide read policy; all hooks on this page must match
     //
     // R3 hook: per-process filtering via CR3.
     //   0 = R0 hook (all processes see the hook)

@@ -1471,7 +1471,13 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     // pt_precomputed MUST be TRUE 闂?callers fill pt_page_pfn/pt_pte_index/pt_page_va
     // at PASSIVE/DISPATCH level. NEVER walk guest page tables via pa_to_va in VMX-root
     // (deadlocks when KeGenericCallDpc puts all CPUs into VMX-root simultaneously).
-    if (!req->pt_precomputed) { pool_manager_release(sp); return FALSE; }
+    if (!req->pt_precomputed)
+    {
+        pool_manager_release(sp);
+        if (interlock)
+            _InterlockedExchange(interlock, 0);
+        return FALSE;
+    }
 
     pt_page_pfn = req->pt_page_pfn;
     pt_idx      = req->pt_pte_index;
@@ -2448,6 +2454,20 @@ static VOID dpc_stealth_alloc(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
     KeSignalCallDpcDone(A1);
 }
 
+static BOOLEAN ept_stealth_alloc_publish(PEPT_STEALTH_ALLOC_PARAM req)
+{
+    req->result = FALSE;
+
+    // Owner-first: one VMCALL performs the full install.  The following DPC
+    // broadcast only takes the already-installed path for each vCPU EPT.
+    asm_vmx_vmcall(VMCALL_STEALTH_ALLOC, (UINT64)req, req->caller_cr3, 0);
+    if (!req->result)
+        return FALSE;
+
+    KeGenericCallDpc(dpc_stealth_alloc, req);
+    return req->result;
+}
+
 static VOID dpc_stealth_free(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
 {
     UNREFERENCED_PARAMETER(Dpc);
@@ -2493,8 +2513,7 @@ ept_stealth_alloc(PVOID target_va, PVOID handler_function)
         }
     }
 
-    KeGenericCallDpc(dpc_stealth_alloc, &req);
-    return req.result;
+    return ept_stealth_alloc_publish(&req);
 }
 
 BOOLEAN
@@ -2540,8 +2559,8 @@ ept_stealth_inject(PVOID target_va, PVOID shellcode, UINT32 shellcode_size)
             }
         }
 
-        KeGenericCallDpc(dpc_stealth_alloc, &req);
-        if (!req.result) goto rollback;
+        if (!ept_stealth_alloc_publish(&req))
+            goto rollback;
 
         bytes_done += chunk;
         page_count++;

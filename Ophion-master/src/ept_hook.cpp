@@ -70,6 +70,7 @@ volatile UINT64 g_ept_hook_diag2 = 0;  // sub-diagnostic (LDE length, instructio
 #define HOOK_DIAG_SECONDARY_NO_PAGE  16  // Secondary CPU: HOOKED_PAGE_INFO not found
 #define HOOK_DIAG_SECONDARY_SPLIT    17  // Secondary CPU: split large page failed
 #define HOOK_DIAG_SECONDARY_NO_PML1  18  // Secondary CPU: PML1 entry not found
+#define HOOK_DIAG_PAGE_POLICY_MISMATCH 19 // Same page has a different read-access policy
 
 static __forceinline VOID
 hook_lock_acquire(VOID)
@@ -464,7 +465,7 @@ ept_hook_prepare_target_pte(VIRTUAL_MACHINE_STATE *vcpu, UINT64 phys_addr,
         // An installed target PTE may currently point at its fake page. Never
         // re-baseline original_entry from a transient EPT state.
         hp->changed_entry.ReadAccess =
-            (g_ept->execute_only_supported && !force_read_access) ? 0 : 1;
+            (g_ept->execute_only_supported && !hp->force_read_access) ? 0 : 1;
         return pte;
     }
 
@@ -561,6 +562,7 @@ ept_hook_create_secondary_page(VIRTUAL_MACHINE_STATE *vcpu,
     }
 
     secondary->Options = EPTO_HOOK_FUNCTION;
+    secondary->force_read_access = force_read_access;
     secondary->is_secondary_hook_page = TRUE;
     secondary->primary_hook_page = primary;
     primary->secondary_hook_page = secondary;
@@ -921,10 +923,27 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
         }
 
         primary->Options = EPTO_HOOK_FUNCTION;
+        primary->force_read_access = req->force_read_access;
         InsertHeadList(&g_ept->hooked_pages, &primary->hooked_page_list);
     }
     else
     {
+        // Read access is an EPT page-wide property.  A later hook must not
+        // silently switch it while earlier hooks on the same page are active.
+        if (primary->force_read_access != req->force_read_access)
+        {
+            if (restore_trampoline)
+                RtlCopyMemory(trampoline, trampoline_backup, sizeof(trampoline_backup));
+            if (allocated_trampoline)
+                pool_manager_release(trampoline);
+            if (!existing_function)
+                pool_manager_release(fi);
+            _InterlockedExchange(&g_hook_list_lock, 0);
+            g_ept_hook_diag = HOOK_DIAG_PAGE_POLICY_MISMATCH;
+            g_ept_hook_diag2 = primary->pfn_of_hooked_page;
+            HOOK_RESTORE_CR3_AND_RETURN(FALSE);
+        }
+
         secondary = primary->secondary_hook_page;
         if (crosses_page)
         {
@@ -968,7 +987,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
         // its read-permission policy refreshed for this request.
         if (secondary)
             secondary->changed_entry.ReadAccess =
-                (g_ept->execute_only_supported && !req->force_read_access) ? 0 : 1;
+                (g_ept->execute_only_supported && !secondary->force_read_access) ? 0 : 1;
     }
 
     if (existing_function && old_trampoline && !old_user_trampoline &&
@@ -1041,8 +1060,11 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
             PEPT_PML1_ENTRY fp1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)fake_phys);
             if (fp1)
             {
+                BOOLEAN allow_read = (i == 0)
+                    ? primary->force_read_access
+                    : secondary->force_read_access;
                 fp1->ReadAccess =
-                    (g_ept->execute_only_supported && !req->force_read_access) ? 0 : 1;
+                    (g_ept->execute_only_supported && !allow_read) ? 0 : 1;
                 fp1->WriteAccess = 0;
                 fp1->ExecuteAccess = 1;
                 fp1->PageFrameNumber = pages[i];

@@ -935,6 +935,23 @@ TdRunStealthAllocOnCpus(TD_STEALTH_PARAM * req, PVOID pt_buf, PVOID tgt_buf)
     ctx->ref_count = (LONG)active_count + 1;
     KeInitializeEvent(&ctx->done_event, NotificationEvent, FALSE);
 
+    //
+    // Owner-first: the current CPU performs the full install alone.  Only after
+    // it publishes the shared stealth-page metadata do the secondary DPCs run.
+    // This prevents every CPU from simultaneously taking the VMX-root full-install
+    // interlock path (the CLOCK_WATCHDOG_TIMEOUT path seen in the dump).
+    //
+    NTSTATUS primary_st = hv_vmcall_simple(VMCALL_STEALTH_ALLOC, (UINT64)req, 0, 0);
+    if (!NT_SUCCESS(primary_st))
+    {
+        HYPERPLATFORM_LOG_ERROR("[td-rw] stealth alloc primary failed: st=0x%08X", primary_st);
+        ExFreePoolWithTag(ctx, TD_STEALTH_DPC_TAG);
+        return primary_st;
+    }
+
+    // Every DPC now takes the fast "already installed" branch and only updates
+    // its own vCPU EPT.  The owner CPU may be included; repeating its update is
+    // harmless and keeps the logic independent of processor numbering.
     for (ULONG cpu = 0; cpu < active_count; cpu++)
     {
         KeInitializeDpc(&ctx->dpcs[cpu], TdStealthAllocDpc, ctx);

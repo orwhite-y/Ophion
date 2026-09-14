@@ -374,6 +374,7 @@ typedef struct _R3_HOOK_DPC_CTX {
     volatile LONG success_count;
     volatile LONG failure_count;
     volatile LONG first_failure;
+    PROCESSOR_NUMBER primary_processor;
     NTSTATUS result;
 } R3_HOOK_DPC_CTX;
 
@@ -382,6 +383,16 @@ DpcEptHookR3(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
 {
     UNREFERENCED_PARAMETER(Dpc);
     R3_HOOK_DPC_CTX * ctx = (R3_HOOK_DPC_CTX *)Ctx;
+
+    PROCESSOR_NUMBER current_processor;
+    KeGetCurrentProcessorNumberEx(&current_processor);
+    if (current_processor.Group == ctx->primary_processor.Group &&
+        current_processor.Number == ctx->primary_processor.Number)
+    {
+        KeSignalCallDpcSynchronize(A2);
+        KeSignalCallDpcDone(A1);
+        return;
+    }
 
     // This DPC is used only after the caller completed the primary installation.
     // Secondary CPUs therefore never spin at DISPATCH_LEVEL waiting for primary.
@@ -883,6 +894,25 @@ TdEptHookR3(
     ctx.success_count       = 0;
     ctx.failure_count       = 0;
     ctx.first_failure       = (LONG)STATUS_SUCCESS;
+    KeGetCurrentProcessorNumberEx(&ctx.primary_processor);
+
+    //
+    // Pin the caller to the recorded primary CPU before issuing the primary
+    // VMCALL.  Without this, the thread can migrate between recording the CPU
+    // and executing the VMCALL, leaving one CPU without the EPT hook.
+    //
+    GROUP_AFFINITY primary_affinity;
+    GROUP_AFFINITY previous_affinity;
+    RtlZeroMemory(&primary_affinity, sizeof(primary_affinity));
+    RtlZeroMemory(&previous_affinity, sizeof(previous_affinity));
+
+    primary_affinity.Group = ctx.primary_processor.Group;
+    primary_affinity.Mask  = (KAFFINITY)1ULL << ctx.primary_processor.Number;
+
+    KeSetSystemGroupAffinityThread(&primary_affinity, &previous_affinity);
+
+    ULONG expected_processors = KeQueryActiveProcessorCountEx(
+        ctx.primary_processor.Group);
 
     //
     // Phase 1: full installation on the current CPU only.  This is done while
@@ -926,9 +956,17 @@ TdEptHookR3(
         KeGenericCallDpc(DpcEptHookR3, &ctx);
     }
 
+    //
+    // Restore the original group affinity now that the primary VMCALL and the
+    // secondary-CPU DPC broadcast have completed.
+    //
+    KeRevertToUserGroupAffinityThread(&previous_affinity);
+
     ctx.result = (ctx.failure_count != 0)
         ? (NTSTATUS)ctx.first_failure
-        : ((ctx.success_count != 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL);
+        : (((ULONG)ctx.success_count == expected_processors)
+            ? STATUS_SUCCESS
+            : STATUS_UNSUCCESSFUL);
 
     KeUnstackDetachProcess(&apc);
 

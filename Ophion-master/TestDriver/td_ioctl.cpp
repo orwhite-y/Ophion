@@ -1013,6 +1013,28 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         break;
     }
 
+    case IOCTL_EPT_R3_DIAG:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_R3_DIAG_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_R3_DIAG_PARAMS))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_R3_DIAG_PARAMS * p = (TD_R3_DIAG_PARAMS *)irp->AssociatedIrp.SystemBuffer;
+        TD_R3_EPT_DIAG diag = {};
+
+        NTSTATUS vmst = hv_vmcall_simple(
+            VMCALL_GET_R3_DIAG,
+            (UINT64)&diag,
+            0,
+            0);
+
+        p->status = (UINT64)vmst;
+        RtlCopyMemory(&p->diag, &diag, sizeof(diag));
+        irp->IoStatus.Information = sizeof(TD_R3_DIAG_PARAMS);
+        st = STATUS_SUCCESS;   // IOCTL ok; VMCALL result delivered in p->status
+        break;
+    }
+
     case IOCTL_INJECT_DLL:
     {
         //

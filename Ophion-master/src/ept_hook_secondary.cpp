@@ -62,17 +62,37 @@ ept_hook_install_secondary_cpu(
     PEPT_HOOKED_PAGE_INFO pages[2];
     pages[0] = hp;
     pages[1] = hp->secondary_hook_page;
-    UINT64 target_phys[2];
-    target_phys[0] = (UINT64)(hp->pfn_of_hooked_page << 12);
-    target_phys[1] = pages[1] ? (UINT64)(pages[1]->pfn_of_hooked_page << 12) : 0;
 
+    UINT64 target_phys[2] = {0};
+    UINT64 fake_phys[2] = {0};
     for (UINT32 i = 0; i < 2; i++)
     {
-        if (!pages[i] || !target_phys[i])
+        if (!pages[i])
+            continue;
+        target_phys[i] = (UINT64)(pages[i]->pfn_of_hooked_page << 12);
+        fake_phys[i] = (UINT64)(pages[i]->pfn_of_fake_page_contents << 12);
+        if (!target_phys[i] || !fake_phys[i])
+        {
+            g_ept_hook_diag = HOOK_DIAG_SECONDARY_NO_PAGE;
+            g_ept_hook_diag2 = target_phys[i] ? fake_phys[i] : target_phys[i];
+            return FALSE;
+        }
+    }
+
+    //
+    // Phase 1: split and resolve every page before changing any permission.
+    // A successful large-page split is semantically neutral, so it is safe to
+    // leave behind if a later page fails.  Permission changes are deferred to
+    // phase 2, preventing a primary/secondary half-installed hook.
+    //
+    for (UINT32 i = 0; i < 2; i++)
+    {
+        if (!pages[i])
             continue;
 
-        PEPT_PML2_ENTRY p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys[i]);
-        if (p2 && p2->LargePage &&
+        PEPT_PML2_ENTRY target_p2 = ept_get_pml2(
+            vcpu->ept_page_table, (SIZE_T)target_phys[i]);
+        if (target_p2 && target_p2->LargePage &&
             !ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys[i]))
         {
             g_ept_hook_diag = HOOK_DIAG_SECONDARY_SPLIT;
@@ -80,37 +100,64 @@ ept_hook_install_secondary_cpu(
             return FALSE;
         }
 
-        PEPT_PML1_ENTRY target_pte = ept_get_pml1(
+        PEPT_PML2_ENTRY fake_p2 = ept_get_pml2(
+            vcpu->ept_page_table, (SIZE_T)fake_phys[i]);
+        if (fake_p2 && fake_p2->LargePage &&
+            !ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)fake_phys[i]))
+        {
+            g_ept_hook_diag = HOOK_DIAG_SECONDARY_SPLIT;
+            g_ept_hook_diag2 = fake_phys[i];
+            return FALSE;
+        }
+    }
+
+    PEPT_PML1_ENTRY target_pte[2] = {NULL, NULL};
+    PEPT_PML1_ENTRY fake_pte[2] = {NULL, NULL};
+    for (UINT32 i = 0; i < 2; i++)
+    {
+        if (!pages[i])
+            continue;
+
+        target_pte[i] = ept_get_pml1(
             vcpu->ept_page_table, (SIZE_T)target_phys[i]);
-        if (!target_pte)
+        if (!target_pte[i])
         {
             g_ept_hook_diag = HOOK_DIAG_SECONDARY_NO_PML1;
             g_ept_hook_diag2 = target_phys[i];
             return FALSE;
         }
-        target_pte->ExecuteAccess = 0;
-        target_pte->ReadAccess = 1;
-        target_pte->WriteAccess = 1;
 
-        UINT64 fake_phys = (UINT64)(pages[i]->pfn_of_fake_page_contents << 12);
-        PEPT_PML2_ENTRY fake_p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)fake_phys);
-        if (fake_p2 && fake_p2->LargePage)
-            ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)fake_phys);
-
-        PEPT_PML1_ENTRY fake_pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)fake_phys);
-        if (!fake_pte)
+        fake_pte[i] = ept_get_pml1(
+            vcpu->ept_page_table, (SIZE_T)fake_phys[i]);
+        if (!fake_pte[i])
         {
             g_ept_hook_diag = HOOK_DIAG_SECONDARY_NO_PML1;
-            g_ept_hook_diag2 = fake_phys;
+            g_ept_hook_diag2 = fake_phys[i];
             return FALSE;
         }
-        fake_pte->ReadAccess =
+    }
+
+    //
+    // Phase 2: all pages were resolved successfully.  Apply the hook view now;
+    // this loop performs no fallible operation.
+    //
+    for (UINT32 i = 0; i < 2; i++)
+    {
+        if (!pages[i])
+            continue;
+
+        target_pte[i]->ExecuteAccess = 0;
+        target_pte[i]->ReadAccess = 1;
+        target_pte[i]->WriteAccess = 1;
+
+        fake_pte[i]->ReadAccess =
             (g_ept->execute_only_supported && !pages[i]->force_read_access) ? 0 : 1;
-        fake_pte->WriteAccess = 0;
-        fake_pte->ExecuteAccess = 1;
-        fake_pte->PageFrameNumber = pages[i]->pfn_of_fake_page_contents;
+        fake_pte[i]->WriteAccess = 0;
+        fake_pte[i]->ExecuteAccess = 1;
+        fake_pte[i]->PageFrameNumber = pages[i]->pfn_of_fake_page_contents;
     }
 
     ept_invept_single(vcpu->ept_pointer);
+    vcpu->ept_state_quiesced = FALSE;
     return TRUE;
 }

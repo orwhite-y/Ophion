@@ -1141,9 +1141,26 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         }
 
         case VMCALL_EPT_UNHOOK_ALL:
+        {
+            // Drain this vCPU first, then require every launched vCPU to
+            // acknowledge the same epoch before global hook metadata is freed.
+            stealth_clear_stale_window(vcpu);
+            ept_handle_mtf(vcpu);
+
+            vcpu->ept_state_quiesced = TRUE;
+            ept_state_mark_drained(vcpu);
+
+            if (!ept_state_all_vcpus_drained())
+            {
+                regs->rax = (UINT64)STATUS_RETRY;
+                break;
+            }
+
             ept_unhook_all();
+            ept_invept_single(vcpu->ept_pointer);
             regs->rax = (UINT64)STATUS_SUCCESS;
             break;
+        }
 
         case VMCALL_EPT_UNHOOK_BY_CR3:
         {
@@ -1161,9 +1178,16 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         {
             // R0 DPC broadcast from TestDriver cleanup: clear any stale shadow-CR3
             // window on THIS vCPU before stealth page entries are freed.
-            // Does NOT dereference nx_timer_restore (which may point to freed pool).
-            // Uses nx_timer_real_cr3 (a value copy) for CR3 restore.
+            // Also drain any pending EPT-hook MTF state so ept_unhook_all() can
+            // never free a PEPT_HOOKED_PAGE_INFO still referenced by this vCPU.
             stealth_clear_stale_window(vcpu);
+            ept_handle_mtf(vcpu);
+
+            // Pending state is drained.  Quiesce this vCPU and acknowledge the
+            // current lifecycle epoch so bulk release can wait for every vCPU.
+            vcpu->ept_state_quiesced = TRUE;
+            ept_state_mark_drained(vcpu);
+
             ept_invept_single(vcpu->ept_pointer);
             regs->rax = (UINT64)STATUS_SUCCESS;
             break;
@@ -1174,7 +1198,22 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             // R0 single-caller (NOT DPC): remove ALL stealth state before a new
             // injection. MUST be single-caller because RemoveHeadList on the
             // global lists is not SMP-safe.
+            //
+            // Drain this vCPU, then wait until every launched vCPU has reached
+            // quiesce at the same epoch.  No bulk free may run while another
+            // vCPU still owns a pending MTF or shadow-CR3 restore pointer.
             stealth_clear_stale_window(vcpu);
+            ept_handle_mtf(vcpu);
+
+            vcpu->ept_state_quiesced = TRUE;
+            ept_state_mark_drained(vcpu);
+
+            if (!ept_state_all_vcpus_drained())
+            {
+                regs->rax = (UINT64)STATUS_RETRY;
+                break;
+            }
+
             ept_stealth_free_all();
             ept_unhook_all();
             ept_update_pf_intercept(vcpu);
@@ -1196,6 +1235,20 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         {
             extern volatile UINT64 g_ept_hook_diag2;
             regs->rax = g_ept_hook_diag2;
+            break;
+        }
+
+        case VMCALL_GET_R3_DIAG:
+        {
+            extern R3_EPT_DIAG g_r3_ept_diag;
+            PR3_EPT_DIAG diag = (PR3_EPT_DIAG)regs->rdx;
+            if (!diag)
+            {
+                regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
+                break;
+            }
+            RtlCopyMemory(diag, &g_r3_ept_diag, sizeof(*diag));
+            regs->rax = (UINT64)STATUS_SUCCESS;
             break;
         }
 
@@ -1229,10 +1282,45 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             }
 
             UINT64 _saved_cr3 = vmx_enter_guest_cr3();
+
+            // A single-page release has the same lifetime requirement as bulk
+            // free: every vCPU must be drained and quiesced at this epoch before
+            // any global stealth metadata can be removed.
+            stealth_clear_stale_window(vcpu);
+            ept_handle_mtf(vcpu);
+
+            vcpu->ept_state_quiesced = TRUE;
+            ept_state_mark_drained(vcpu);
+
+            if (!ept_state_all_vcpus_drained())
+            {
+                vmx_leave_guest_cr3(_saved_cr3);
+                regs->rax = (UINT64)STATUS_RETRY;
+                break;
+            }
+
             BOOLEAN ok = ept_stealth_uninstall(vcpu, free_req);
             free_req->result = ok;
             vmx_leave_guest_cr3(_saved_cr3);
             regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
+            break;
+        }
+
+        case VMCALL_EPT_LIFECYCLE_RESUME:
+        {
+            // R0-only lifecycle tail.  The caller must have synchronized every
+            // vCPU after VMCALL_STEALTH_FREE.  Resume is deliberately local:
+            // no global lists, no metadata mutation, and no epoch change.
+            if (!vcpu->ept_page_table)
+            {
+                regs->rax = (UINT64)STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            _mm_mfence();
+            vcpu->ept_state_quiesced = FALSE;
+            ept_invept_single(vcpu->ept_pointer);
+            regs->rax = (UINT64)STATUS_SUCCESS;
             break;
         }
 
@@ -1312,7 +1400,13 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                     break;
                 }
             }
-            if (already) { vmx_leave_guest_cr3(_saved_cr3_inj); regs->rax = (UINT64)STATUS_SUCCESS; break; }
+            if (already)
+            {
+                vcpu->ept_state_quiesced = FALSE;
+                vmx_leave_guest_cr3(_saved_cr3_inj);
+                regs->rax = (UINT64)STATUS_SUCCESS;
+                break;
+            }
 
             // --- first CPU: full install ---
             if (_InterlockedCompareExchange(&inj->installed, 1, 0) != 0)
@@ -1343,6 +1437,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
 
                 _mm_mfence();
                 ept_invept_single(vcpu->ept_pointer);
+                vcpu->ept_state_quiesced = FALSE;
                 inj->result = TRUE;
                 vmx_leave_guest_cr3(_saved_cr3_inj);
                 regs->rax = (UINT64)STATUS_SUCCESS;
@@ -1501,6 +1596,8 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             _mm_mfence();
             ept_invept_single(vcpu->ept_pointer);
 
+            vcpu->ept_state_quiesced = FALSE;
+            ept_state_epoch_advance();
             inj->result = TRUE;
             vmx_leave_guest_cr3(_saved_cr3_inj);
             regs->rax = (UINT64)STATUS_SUCCESS;

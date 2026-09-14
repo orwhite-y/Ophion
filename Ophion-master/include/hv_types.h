@@ -188,6 +188,14 @@ typedef struct _EPT_STATE {
     STEALTH_REGION        stealth_region;
 
     //
+    // EPT/stealth lifecycle epoch.  A successful installation advances this
+    // value, invalidating every per-vCPU drain acknowledgement.  Bulk free
+    // paths may only release objects after all launched vCPUs have drained
+    // their pending MTF state at the current epoch.
+    //
+    volatile LONG64       ept_state_epoch;
+
+    //
     // INVVPID capability bits (cached from IA32_VMX_EPT_VPID_CAP)
     //
     BOOLEAN               invvpid_supported;
@@ -344,6 +352,15 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     // GUEST_CR3 cache: avoids VMREAD(GUEST_CR3) calls (~100 cycles each, 15k/sec)
     UINT64  cached_guest_cr3;   // Cached GUEST_CR3 value
     BOOLEAN cached_cr3_valid;   // Cache validity flag (invalidated on CR3 write)
+
+    //
+    // EPT/stealth lifecycle drain acknowledgement.  A drain VMCALL first
+    // empties this vCPU's pending MTF/shadow state, then sets quiesced and
+    // records the global epoch.  While quiesced, this vCPU must not arm new
+    // EPT-hook/stealth MTF state or open a new shadow-CR3 window.
+    //
+    volatile BOOLEAN ept_state_quiesced;
+    volatile UINT64 ept_state_drain_epoch;
 } VIRTUAL_MACHINE_STATE, *PVIRTUAL_MACHINE_STATE;
 
 #define VMCALL_TEST             0x00000001
@@ -368,6 +385,8 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_STEALTH_FREE_ALL  0x00000014   // R0: remove ALL stealth page entries from g_ept->stealth_pages (pre-injection cleanup)
 #define VMCALL_GET_HOOK_DIAG   0x00000015   // R0: return last ept_hook_install failure code
 #define VMCALL_GET_HOOK_DIAG2  0x00000016   // R0: return trampoline LDE sub-diagnostic   // R0: return last ept_hook_install failure code   // R0: remove ALL stealth page entries from g_ept->stealth_pages (pre-injection cleanup)
+#define VMCALL_EPT_LIFECYCLE_RESUME 0x00000017 // R0: resume this vCPU after a global EPT lifecycle barrier
+#define VMCALL_GET_R3_DIAG     0x00000018 // R0: copy R3 EPT hook diagnostics
 
 #define HV_R3_MEM_MAX           262144        // max bytes per R3 read/write call (16 pages, prefetch batch)
 
@@ -409,6 +428,29 @@ typedef struct _VMCALL_MEM_REQUEST {
 // VMX-root temporarily switches to guest CR3 to access guest memory safely.
 // param1 (rdx) = pointer to this struct
 //
+typedef struct _R3_EPT_DIAG {
+    volatile LONG64 execute_violation_count;
+    volatile LONG64 execute_cr3_mismatch_count;
+    volatile LONG64 execute_rip_mismatch_count;
+    volatile LONG64 execute_tid_mismatch_count;
+    volatile LONG64 execute_changed_view_count;
+
+    volatile LONG64 vmcall_dispatch_count;
+    volatile LONG64 vmcall_cr3_mismatch_count;
+    volatile LONG64 vmcall_rip_mismatch_count;
+    volatile LONG64 vmcall_tid_mismatch_count;
+    volatile LONG64 vmcall_redirect_count;
+    volatile LONG64 vmcall_restore_count;
+
+    volatile LONG64 last_guest_cr3;
+    volatile LONG64 last_target_cr3;
+    volatile LONG64 last_rip;
+
+    volatile LONG64 last_vmcall_guest_cr3;
+    volatile LONG64 last_vmcall_target_cr3;
+    volatile LONG64 last_vmcall_rip;
+} R3_EPT_DIAG, *PR3_EPT_DIAG;
+
 typedef struct _EPT_HOOK_VMCALL_PARAM {
     UINT64  caller_cr3;           // [in] for guest memory access inside ept_hook_install
     PVOID   target_function;      // [in] VA of function to hook

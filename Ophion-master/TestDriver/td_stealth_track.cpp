@@ -202,6 +202,7 @@ TdStealthFreePage(PVOID target_va)
     KeGenericCallDpc([](PKDPC, PVOID Ctx, PVOID A1, PVOID A2) {
         hv_vmcall_simple(VMCALL_STEALTH_FREE, (UINT64)Ctx, 0, 0);
         KeSignalCallDpcSynchronize(A2);
+        hv_vmcall_simple(VMCALL_EPT_LIFECYCLE_RESUME, 0, 0, 0);
         KeSignalCallDpcDone(A1);
     }, &req);
     return req.result;
@@ -228,6 +229,7 @@ TdStealthFreePageSafe(PVOID target_va, UINT64 target_phys)
     KeGenericCallDpc([](PKDPC, PVOID Ctx, PVOID A1, PVOID A2) {
         hv_vmcall_simple(VMCALL_STEALTH_FREE, (UINT64)Ctx, 0, 0);
         KeSignalCallDpcSynchronize(A2);
+        hv_vmcall_simple(VMCALL_EPT_LIFECYCLE_RESUME, 0, 0, 0);
         KeSignalCallDpcDone(A1);
     }, &req);
     return req.result;

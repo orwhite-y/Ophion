@@ -49,9 +49,57 @@ BOOLEAN ept_hook_install_secondary_cpu(
 //
 static volatile LONG g_hook_list_lock = 0;
 
+//
+// EPT/stealth lifecycle epoch.
+//
+// Installations advance the epoch, invalidating all per-vCPU drain acks.
+// Bulk frees are allowed only after every launched vCPU has executed the drain
+// VMCALL at the current epoch.  This keeps the release path from freeing an
+// EPT_HOOKED_PAGE_INFO or EPT_STEALTH_PAGE_INFO still referenced by another
+// vCPU's pending MTF restore slot.
+//
+UINT64
+ept_state_epoch_get(VOID)
+{
+    return g_ept ? (UINT64)g_ept->ept_state_epoch : 0;
+}
+
+VOID
+ept_state_epoch_advance(VOID)
+{
+    if (g_ept)
+        _InterlockedIncrement64(&g_ept->ept_state_epoch);
+}
+
+VOID
+ept_state_mark_drained(VIRTUAL_MACHINE_STATE *vcpu)
+{
+    if (vcpu && g_ept)
+        vcpu->ept_state_drain_epoch = (UINT64)g_ept->ept_state_epoch;
+}
+
+BOOLEAN
+ept_state_all_vcpus_drained(VOID)
+{
+    if (!g_ept || !g_vcpu || !g_cpu_count)
+        return TRUE;
+
+    UINT64 epoch = (UINT64)g_ept->ept_state_epoch;
+    for (UINT32 i = 0; i < g_cpu_count; i++)
+    {
+        if (!g_vcpu[i].launched)
+            continue;
+        if (!g_vcpu[i].ept_state_quiesced ||
+            g_vcpu[i].ept_state_drain_epoch != epoch)
+            return FALSE;
+    }
+    return TRUE;
+}
+
 // Diagnostic: last failure point in ept_hook_install (0=success, 1+=failure code)
 volatile UINT64 g_ept_hook_diag = 0;
 volatile UINT64 g_ept_hook_diag2 = 0;  // sub-diagnostic (LDE length, instruction bytes)
+R3_EPT_DIAG g_r3_ept_diag = {};
 #define HOOK_DIAG_NO_EPT       1
 #define HOOK_DIAG_NO_PHYS      2
 #define HOOK_DIAG_TRAMP_SAME   3
@@ -564,10 +612,19 @@ ept_hook_create_secondary_page(VIRTUAL_MACHINE_STATE *vcpu,
     secondary->Options = EPTO_HOOK_FUNCTION;
     secondary->force_read_access = force_read_access;
     secondary->is_secondary_hook_page = TRUE;
+    return secondary;
+}
+
+static VOID
+ept_hook_link_secondary_page(PEPT_HOOKED_PAGE_INFO primary,
+                             PEPT_HOOKED_PAGE_INFO secondary)
+{
+    if (!primary || !secondary || primary->secondary_hook_page)
+        return;
+
     secondary->primary_hook_page = primary;
     primary->secondary_hook_page = secondary;
     InsertHeadList(&g_ept->hooked_pages, &secondary->hooked_page_list);
-    return secondary;
 }
 
 static PEPT_HOOKED_PAGE_INFO
@@ -622,6 +679,7 @@ ept_hook_ensure_secondary_page(VIRTUAL_MACHINE_STATE *vcpu,
 //   - 浣跨敤 caller 鎻愪緵鐨?user_trampoline (R3 鍙墽琛屽唴瀛? 浠ｆ浛 kernel pool
 //   - violation handler 鎸?CR3 杩囨护: 鍙湁鐩爣杩涚▼鐪嬪埌 hook锛屽叾浠栬繘绋嬮€忎紶
 BOOLEAN
+BOOLEAN
 ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
 {
     if (!vcpu->ept_page_table || !req->target_function)
@@ -631,6 +689,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     }
 
     BOOLEAN is_r3 = (req->target_cr3 != 0 || req->user_trampoline != NULL);
+    BOOLEAN metadata_changed = FALSE;
     UINT64 pre_cr3 = 0;
     UINT64 pre_rflags = 0;
 
@@ -777,6 +836,8 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     {
         fi = (PEPT_HOOKED_FUNCTION_INFO)
             pool_manager_request(POOL_TAG_HOOKED_FUNC, sizeof(EPT_HOOKED_FUNCTION_INFO));
+        if (fi)
+            metadata_changed = TRUE;
         if (!fi)
         {
             _InterlockedExchange(&g_hook_list_lock, 0);
@@ -851,6 +912,8 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     {
         primary = (PEPT_HOOKED_PAGE_INFO)
             pool_manager_request(POOL_TAG_HOOKED_PAGE, sizeof(EPT_HOOKED_PAGE_INFO));
+        if (primary)
+            metadata_changed = TRUE;
         if (!primary)
         {
             if (restore_trampoline)
@@ -906,6 +969,8 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
             secondary = ept_hook_create_secondary_page(
                 vcpu, primary, req->target_function, next_phys,
                 req->force_read_access);
+            if (secondary)
+                metadata_changed = TRUE;
             if (!secondary)
             {
                 pool_manager_release(primary);
@@ -925,6 +990,8 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
         primary->Options = EPTO_HOOK_FUNCTION;
         primary->force_read_access = req->force_read_access;
         InsertHeadList(&g_ept->hooked_pages, &primary->hooked_page_list);
+        if (secondary)
+            ept_hook_link_secondary_page(primary, secondary);
     }
     else
     {
@@ -949,9 +1016,12 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
         {
             // Reuse the page pair when another function on this primary page
             // already owns it.  Otherwise create it before any metadata commit.
+            PEPT_HOOKED_PAGE_INFO prior_secondary = primary->secondary_hook_page;
             secondary = ept_hook_ensure_secondary_page(
                 vcpu, primary, req->target_function, next_phys,
                 hook_size, req->force_read_access);
+            if (secondary && !prior_secondary)
+                metadata_changed = TRUE;
             if (!secondary)
             {
                 if (restore_trampoline)
@@ -981,6 +1051,9 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
             g_ept_hook_diag = HOOK_DIAG_NO_PML1;
             HOOK_RESTORE_CR3_AND_RETURN(FALSE);
         }
+
+        if (secondary)
+            ept_hook_link_secondary_page(primary, secondary);
 
         // ensure_secondary_page() initializes a newly created secondary page.
         // An already-linked secondary page has valid EPT state and only needs
@@ -1075,6 +1148,11 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     g_ept_hook_diag = 0;
     _mm_mfence();
     ept_invept_single(vcpu->ept_pointer);
+
+    vcpu->ept_state_quiesced = FALSE;
+    if (metadata_changed)
+        ept_state_epoch_advance();
+
     return TRUE;
 
 #undef HOOK_RESTORE_CR3_AND_RETURN
@@ -1176,7 +1254,7 @@ ept_unhook_install(VIRTUAL_MACHINE_STATE *vcpu, PEPT_UNHOOK_VMCALL_PARAM req)
 VOID
 ept_unhook_all(VOID)
 {
-    if (!g_ept)
+    if (!g_ept || !ept_state_all_vcpus_drained())
         return;
 
     while (!IsListEmpty(&g_ept->hooked_pages))
@@ -1267,6 +1345,7 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE *vcpu, UINT64 guest_phys, UINT64 exit
     VMX_EXIT_QUALIFICATION_EPT_VIOLATION viol;
     viol.AsUInt = exit_qual;
     UINT64 pfn = guest_phys >> 12;
+    const BOOLEAN quiesced = (vcpu->ept_state_quiesced != FALSE);
 
     PLIST_ENTRY cur = g_ept->hooked_pages.Flink;
     while (cur != &g_ept->hooked_pages)
@@ -1304,12 +1383,15 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE *vcpu, UINT64 guest_phys, UINT64 exit
                 {
                     EPT_PML1_ENTRY temporary = *fake_pte;
                     temporary.ReadAccess = 1;
-                    temporary.WriteAccess = 0;
+                    temporary.WriteAccess = quiesced ? 1 : 0;
                     temporary.ExecuteAccess = 0;
                     temporary.PageFrameNumber = fake_owner->pfn_of_hooked_page;
                     fake_pte->AsUInt = temporary.AsUInt;
                     _mm_mfence();
                     ept_invept_single(vcpu->ept_pointer);
+
+                    if (quiesced)
+                        return TRUE;
 
                     vcpu->mtf_restore_page = hp;
                     vcpu->mtf_restore_hook_view = FALSE;
@@ -1333,6 +1415,8 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE *vcpu, UINT64 guest_phys, UINT64 exit
         {
             ept_hook_pair_swap(vcpu, hp, hp->original_entry,
                                secondary ? secondary->original_entry : hp->original_entry);
+            if (quiesced)
+                return TRUE;
             vcpu->mtf_restore_page = hp;
             vcpu->mtf_restore_hook_view = TRUE;
             SIZE_T pc = 0;
@@ -1347,14 +1431,23 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE *vcpu, UINT64 guest_phys, UINT64 exit
             EPT_PML1_ENTRY passthrough = hp->original_entry;
             passthrough.ExecuteAccess = 1;
 
+            _InterlockedIncrement64(&g_r3_ept_diag.execute_violation_count);
+            UINT64 diag_guest_cr3 = 0;
+            UINT64 diag_rip = vcpu->vmexit_rip;
+            __vmx_vmread(VMCS_GUEST_CR3, &diag_guest_cr3);
+            _InterlockedExchange64(&g_r3_ept_diag.last_guest_cr3, diag_guest_cr3);
+            _InterlockedExchange64(&g_r3_ept_diag.last_target_cr3, hp->target_cr3);
+            _InterlockedExchange64(&g_r3_ept_diag.last_rip, diag_rip);
+
             if (hp->target_cr3 != 0)
             {
-                UINT64 guest_cr3 = 0;
-                __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
-                if ((guest_cr3 & CR3_ADDR_MASK) != hp->target_cr3)
+                if ((diag_guest_cr3 & CR3_ADDR_MASK) != hp->target_cr3)
                 {
+                    _InterlockedIncrement64(&g_r3_ept_diag.execute_cr3_mismatch_count);
                     ept_hook_pair_swap(vcpu, hp, passthrough,
                                        secondary ? ept_hook_passthrough_entry(secondary) : passthrough);
+                    if (quiesced)
+                        return TRUE;
                     vcpu->mtf_restore_page = hp;
                     vcpu->mtf_restore_hook_view = FALSE;
                     SIZE_T pc = 0;
@@ -1366,6 +1459,7 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE *vcpu, UINT64 guest_phys, UINT64 exit
             }
 
             UINT64 rip = vcpu->vmexit_rip;
+            BOOLEAN function_matched = FALSE;
             for (PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
                  fc != &hp->hooked_functions_list; fc = fc->Flink)
             {
@@ -1374,13 +1468,17 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE *vcpu, UINT64 guest_phys, UINT64 exit
                 if ((UINT64)fi->virtual_address != rip)
                     continue;
 
+                function_matched = TRUE;
                 if (fi->expected_tid)
                 {
                     UINT64 current_tid = (UINT64)(ULONG_PTR)PsGetCurrentThreadId();
                     if (current_tid != fi->expected_tid)
                     {
+                        _InterlockedIncrement64(&g_r3_ept_diag.execute_tid_mismatch_count);
                         ept_hook_pair_swap(vcpu, hp, passthrough,
                                            secondary ? ept_hook_passthrough_entry(secondary) : passthrough);
+                        if (quiesced)
+                            return TRUE;
                         vcpu->mtf_restore_page = hp;
                         vcpu->mtf_restore_hook_view = FALSE;
                         SIZE_T pc = 0;
@@ -1393,6 +1491,10 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE *vcpu, UINT64 guest_phys, UINT64 exit
                 break;
             }
 
+            if (!function_matched)
+                _InterlockedIncrement64(&g_r3_ept_diag.execute_rip_mismatch_count);
+
+            _InterlockedIncrement64(&g_r3_ept_diag.execute_changed_view_count);
             ept_hook_pair_swap(vcpu, hp, hp->changed_entry,
                                secondary ? secondary->changed_entry : hp->changed_entry);
             return TRUE;
@@ -1492,9 +1594,11 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     }
 
     //
-    // stealth target page MTF: swap back to read-only view (no execute)
+    // stealth target page MTF: swap back to read-only view (no execute).
+    // This is intentionally an independent check: a single MTF exit may
+    // carry more than one pending restore class.
     //
-    else if (vcpu->mtf_restore_stealth)
+    if (vcpu->mtf_restore_stealth)
     {
         PEPT_STEALTH_PAGE_INFO sp = vcpu->mtf_restore_stealth;
         PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,
@@ -1509,10 +1613,10 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     }
 
     //
-    // stealth shared fake PT page MTF: resync from real PT page, swap back
-    // fires after OS writes a PTE in the same PT page (page in/out, A/D bits)
+    // stealth shared fake PT page MTF: resync from real PT page, swap back.
+    // This is also independent so stale pending state is not skipped.
     //
-    else if (vcpu->mtf_restore_fake_pt)
+    if (vcpu->mtf_restore_fake_pt)
     {
         PSTEALTH_FAKE_PT fpt = vcpu->mtf_restore_fake_pt;
 
@@ -1707,11 +1811,12 @@ ept_hook_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error
                     (SIZE_T)(hp->fake_pt->pt_page_pfn << 12));
                 if (pt_pte) pt_pte->AsUInt = hp->pt_exec_entry.AsUInt;
 
-                // 2. record for MTF restore (swap back to fake PT after one instruction)
-                vcpu->stealth_pf_swapped_hook = hp;
-
-                // 3. arm MTF 鈥?after one instruction, MTF handler restores fake PT (NX=1)
+                if (!vcpu->ept_state_quiesced)
                 {
+                    // 2. record for MTF restore (swap back to fake PT after one instruction)
+                    vcpu->stealth_pf_swapped_hook = hp;
+
+                    // 3. arm MTF: after one instruction, MTF handler restores fake PT (NX=1)
                     SIZE_T pc = 0;
                     __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
                     pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
@@ -1752,6 +1857,48 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
             continue;
 
         PEPT_HOOKED_PAGE_INFO hp = listed;
+
+        //
+        // Diagnostics/dispatch narrowing: count only VMCALLs whose RIP is a
+        // recorded hooked-function entry. Ordinary driver VMCALLs are ignored.
+        //
+        BOOLEAN function_entry_matched = FALSE;
+        BOOLEAN same_hook_page = FALSE;
+        for (PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
+             fc != &hp->hooked_functions_list; fc = fc->Flink)
+        {
+            PEPT_HOOKED_FUNCTION_INFO fi = CONTAINING_RECORD(
+                fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
+            UINT64 target_va = (UINT64)fi->virtual_address;
+            if (target_va == rip)
+            {
+                function_entry_matched = TRUE;
+                same_hook_page = TRUE;
+                break;
+            }
+            if ((target_va & ~0xFFFULL) == (rip & ~0xFFFULL))
+                same_hook_page = TRUE;
+        }
+
+        if (!function_entry_matched)
+        {
+            if (same_hook_page && hp->target_cr3 != 0)
+            {
+                UINT64 diag_guest_cr3 = 0;
+                __vmx_vmread(VMCS_GUEST_CR3, &diag_guest_cr3);
+                if ((diag_guest_cr3 & CR3_ADDR_MASK) == hp->target_cr3)
+                    _InterlockedIncrement64(&g_r3_ept_diag.vmcall_rip_mismatch_count);
+            }
+            continue;
+        }
+
+        UINT64 diag_guest_cr3 = 0;
+        __vmx_vmread(VMCS_GUEST_CR3, &diag_guest_cr3);
+        _InterlockedIncrement64(&g_r3_ept_diag.vmcall_dispatch_count);
+        _InterlockedExchange64(&g_r3_ept_diag.last_vmcall_guest_cr3, diag_guest_cr3);
+        _InterlockedExchange64(&g_r3_ept_diag.last_vmcall_target_cr3, hp->target_cr3);
+        _InterlockedExchange64(&g_r3_ept_diag.last_vmcall_rip, rip);
+
         //
         // R3 hook: only dispatch VMCALL for the target process.
         // non-target processes should never reach here (violation handler
@@ -1759,10 +1906,11 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
         //
         if (hp->target_cr3 != 0)
         {
-            UINT64 guest_cr3 = 0;
-            __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
-            if ((guest_cr3 & CR3_ADDR_MASK) != hp->target_cr3)
+            if ((diag_guest_cr3 & CR3_ADDR_MASK) != hp->target_cr3)
+            {
+                _InterlockedIncrement64(&g_r3_ept_diag.vmcall_cr3_mismatch_count);
                 continue;
+            }
         }
 
         PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
@@ -1772,26 +1920,29 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
             fc = fc->Flink;
             if ((UINT64)fi->virtual_address == rip)
             {
+                if (vcpu->ept_state_quiesced)
+                {
+                    _InterlockedIncrement64(&g_r3_ept_diag.vmcall_restore_count);
+                    ept_hook_restore_current_vcpu(vcpu, hp);
+                    return TRUE;
+                }
+
                 if (fi->retiring)
                 {
+                    _InterlockedIncrement64(&g_r3_ept_diag.vmcall_restore_count);
                     ept_hook_restore_current_vcpu(vcpu, hp);
                     return TRUE;
                 }
 
                 //
-                // oneshot: first trigger 鈫?redirect to handler (shellcode).
-                // subsequent triggers 鈫?pass through to original function.
-                //
-                // can't use fi->first_trampoline_address for R3 hooks because
-                // it's in kernel pool (R3 can't execute kernel addresses 鈫?crash).
-                //
-                // instead: temporarily swap EPT to original view (real code),
-                // let CPU re-execute from the real function, arm MTF to swap back.
-                // same technique as ept_handle_violation for non-target CR3.
+                // oneshot: first trigger redirects to handler (shellcode).
+                // subsequent triggers pass through to the original function.
                 //
                 UINT64 current_tid = (UINT64)(ULONG_PTR)PsGetCurrentThreadId();
                 if (fi->expected_tid && current_tid != fi->expected_tid)
                 {
+                    _InterlockedIncrement64(&g_r3_ept_diag.vmcall_tid_mismatch_count);
+                    _InterlockedIncrement64(&g_r3_ept_diag.vmcall_restore_count);
                     EPT_PML1_ENTRY passthrough = hp->original_entry;
                     passthrough.ExecuteAccess = 1;
                     ept_hook_pair_swap(vcpu, hp, passthrough,
@@ -1814,11 +1965,13 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                             _InterlockedExchange(fi->external_fired, 1);
                         ept_hook_fire_record((UINT64)fi->virtual_address, (UINT64)fi->handler_function);
                         __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
-                        wedge_cmos_mark(0x01);  // WEDGE-A (trigger fired -> redirected RIP to handler)
-                        wedge_cmos_set_trig_seen();  // sticky: the injection trigger fired this run
+                        _InterlockedIncrement64(&g_r3_ept_diag.vmcall_redirect_count);
+                        wedge_cmos_mark(0x01);
+                        wedge_cmos_set_trig_seen();
                         return TRUE;
                     }
 
+                    _InterlockedIncrement64(&g_r3_ept_diag.vmcall_restore_count);
                     EPT_PML1_ENTRY passthrough = hp->original_entry;
                     passthrough.ExecuteAccess = 1;
                     ept_hook_pair_swap(vcpu, hp, passthrough,
@@ -1829,11 +1982,12 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
                     __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
                     pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
                     __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
-                    // don't change RIP 鈥?CPU re-executes same VA from original code
                     return TRUE;
                 }
+
                 ept_hook_fire_record((UINT64)fi->virtual_address, (UINT64)fi->handler_function);
                 __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
+                _InterlockedIncrement64(&g_r3_ept_diag.vmcall_redirect_count);
                 return TRUE;
             }
         }

@@ -7,6 +7,7 @@
 #define TD_IOCTL_BASE 0x900
 #define IOCTL_EPT_HOOK_R3   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900+3, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_EPT_UNHOOK_R3 CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900+4, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_EPT_R3_DIAG   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900+26, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #pragma pack(push, 8)
 typedef struct _TD_R3_HOOK_PARAMS {
@@ -22,6 +23,34 @@ typedef struct _TD_R3_UNHOOK_PARAMS {
     UINT64 target_function_va;
     UINT64 status;
 } TD_R3_UNHOOK_PARAMS;
+
+typedef struct _TD_R3_EPT_DIAG {
+    volatile LONG64 execute_violation_count;
+    volatile LONG64 execute_cr3_mismatch_count;
+    volatile LONG64 execute_rip_mismatch_count;
+    volatile LONG64 execute_tid_mismatch_count;
+    volatile LONG64 execute_changed_view_count;
+
+    volatile LONG64 vmcall_dispatch_count;
+    volatile LONG64 vmcall_cr3_mismatch_count;
+    volatile LONG64 vmcall_rip_mismatch_count;
+    volatile LONG64 vmcall_tid_mismatch_count;
+    volatile LONG64 vmcall_redirect_count;
+    volatile LONG64 vmcall_restore_count;
+
+    volatile LONG64 last_guest_cr3;
+    volatile LONG64 last_target_cr3;
+    volatile LONG64 last_rip;
+
+    volatile LONG64 last_vmcall_guest_cr3;
+    volatile LONG64 last_vmcall_target_cr3;
+    volatile LONG64 last_vmcall_rip;
+} TD_R3_EPT_DIAG;
+
+typedef struct _TD_R3_DIAG_PARAMS {
+    UINT64 status;
+    TD_R3_EPT_DIAG diag;
+} TD_R3_DIAG_PARAMS;
 #pragma pack(pop)
 
 static UINT64 g_trampoline = 0;
@@ -93,8 +122,8 @@ int main(void)
         CloseHandle(dev);
         return 1;
     }
-    system("pause");
     g_trampoline = p.trampoline_va;
+    system("pause");
     printf("[PASS] Hook installed! trampoline=0x%llX\n", (unsigned long long)g_trampoline);
 
     // Trigger test - title will show "[HOOK #1]"
@@ -104,6 +133,37 @@ int main(void)
     // Trigger test again - title will show "[HOOK #2]"
     printf("[TEST] Calling MessageBoxA again (expect title [HOOK #2])...\n");
     MessageBoxA(NULL, "Second test message", "Another Title", MB_OK);
+
+    // Query driver diagnostics before unhooking the R3 EPT hook.
+    TD_R3_DIAG_PARAMS d = {0};
+    ok = DeviceIoControl(dev, IOCTL_EPT_R3_DIAG, &d, sizeof(d), &d, sizeof(d), &bytes, NULL);
+    printf("[R3DIAG] ioctl_ok=%d err=%lu bytes=%lu status=0x%llX\n",
+           (int)ok, GetLastError(), bytes, (unsigned long long)d.status);
+    if (ok && bytes >= sizeof(d)) {
+        printf("[R3DIAG] execute=%lld cr3_mismatch=%lld rip_mismatch=%lld tid_mismatch=%lld changed_view=%lld\n",
+               (long long)d.diag.execute_violation_count,
+               (long long)d.diag.execute_cr3_mismatch_count,
+               (long long)d.diag.execute_rip_mismatch_count,
+               (long long)d.diag.execute_tid_mismatch_count,
+               (long long)d.diag.execute_changed_view_count);
+        printf("[R3DIAG] vmcall=%lld cr3_mismatch=%lld rip_mismatch=%lld tid_mismatch=%lld redirect=%lld restore=%lld\n",
+               (long long)d.diag.vmcall_dispatch_count,
+               (long long)d.diag.vmcall_cr3_mismatch_count,
+               (long long)d.diag.vmcall_rip_mismatch_count,
+               (long long)d.diag.vmcall_tid_mismatch_count,
+               (long long)d.diag.vmcall_redirect_count,
+               (long long)d.diag.vmcall_restore_count);
+        printf("[R3DIAG] last_guest_cr3=0x%llX last_target_cr3=0x%llX last_rip=0x%llX\n",
+               (unsigned long long)d.diag.last_guest_cr3,
+               (unsigned long long)d.diag.last_target_cr3,
+               (unsigned long long)d.diag.last_rip);
+        printf("[R3DIAG] last_vmcall_guest_cr3=0x%llX last_vmcall_target_cr3=0x%llX last_vmcall_rip=0x%llX\n",
+               (unsigned long long)d.diag.last_vmcall_guest_cr3,
+               (unsigned long long)d.diag.last_vmcall_target_cr3,
+               (unsigned long long)d.diag.last_vmcall_rip);
+    } else {
+        printf("[R3DIAG] Query failed or returned an incomplete buffer\n");
+    }
 
     // Unhook
     TD_R3_UNHOOK_PARAMS u = {0};

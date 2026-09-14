@@ -96,11 +96,13 @@ DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
     g_vmx_active = FALSE;
     hv_alive_clear();          // tell clients to stop vmcalling BEFORE VMX goes off
 
+    // Stop every vCPU before releasing global EPT/stealth metadata.  After
+    // VMXOFF, no vCPU can own a pending MTF or shadow-CR3 restore pointer.
+    broadcast_terminate_all();
     ept_stealth_free_all_broadcast();
     ept_stealth_region_destroy();
     hv_pid_cr3_fini();
     hv_scratch_fini();
-    broadcast_terminate_all();
     vmx_terminate();
 
     HYPERPLATFORM_LOG_INFO("[hv] Driver unloaded.");

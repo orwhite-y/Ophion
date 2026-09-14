@@ -311,6 +311,11 @@ VOID vpid_invvpid_single(UINT16 vpid);
 //
 
 // VMX-root internal �?called from VMCALL handler (guest CR3 must be active)
+UINT64  ept_state_epoch_get(VOID);
+VOID    ept_state_epoch_advance(VOID);
+VOID    ept_state_mark_drained(VIRTUAL_MACHINE_STATE *vcpu);
+BOOLEAN ept_state_all_vcpus_drained(VOID);
+
 BOOLEAN ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req);
 BOOLEAN ept_unhook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_UNHOOK_VMCALL_PARAM req);
 VOID    ept_unhook_all(VOID);

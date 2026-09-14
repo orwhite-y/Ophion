@@ -74,6 +74,8 @@ typedef struct _TD_PEB_LDR_DATA {
 #define VMCALL_STEALTH_FREE_ALL  0x00000014   // remove ALL stealth page entries (pre-injection cleanup)
 #define VMCALL_GET_HOOK_DIAG   0x00000015
 #define VMCALL_GET_HOOK_DIAG2  0x00000016   // return last ept_hook_install failure code
+#define VMCALL_EPT_LIFECYCLE_RESUME 0x00000017 // R0: resume this vCPU after a global EPT lifecycle barrier
+#define VMCALL_GET_R3_DIAG 0x00000018 // R0: copy R3 EPT hook diagnostics
 
 //
 // EPT hook inject param ??pre-built at PASSIVE_LEVEL, passed to VMX-root.
@@ -249,6 +251,7 @@ typedef NTSTATUS (NTAPI * fn_ZwResumeThread)(HANDLE, PULONG);
 //    e.g. injectmemdll 1234 \??\C:\path\to\my.dll
 // =============================================================================
 #define IOCTL_INJECT_MEM_DLL CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 25, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_EPT_R3_DIAG CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 26, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #pragma pack(push, 8)
 typedef struct _TD_INJECT_MEM_DLL_PARAMS {
@@ -345,6 +348,34 @@ typedef struct _TD_R3_UNHOOK_PARAMS {
     UINT64 target_function_va;  // [in]  same VA passed to hook
     UINT64 status;              // [out]
 } TD_R3_UNHOOK_PARAMS;
+
+typedef struct _TD_R3_EPT_DIAG {
+    volatile LONG64 execute_violation_count;
+    volatile LONG64 execute_cr3_mismatch_count;
+    volatile LONG64 execute_rip_mismatch_count;
+    volatile LONG64 execute_tid_mismatch_count;
+    volatile LONG64 execute_changed_view_count;
+
+    volatile LONG64 vmcall_dispatch_count;
+    volatile LONG64 vmcall_cr3_mismatch_count;
+    volatile LONG64 vmcall_rip_mismatch_count;
+    volatile LONG64 vmcall_tid_mismatch_count;
+    volatile LONG64 vmcall_redirect_count;
+    volatile LONG64 vmcall_restore_count;
+
+    volatile LONG64 last_guest_cr3;
+    volatile LONG64 last_target_cr3;
+    volatile LONG64 last_rip;
+
+    volatile LONG64 last_vmcall_guest_cr3;
+    volatile LONG64 last_vmcall_target_cr3;
+    volatile LONG64 last_vmcall_rip;
+} TD_R3_EPT_DIAG;
+
+typedef struct _TD_R3_DIAG_PARAMS {
+    UINT64 status;              // [out] NTSTATUS from VMCALL_GET_R3_DIAG
+    TD_R3_EPT_DIAG diag;        // [out] diagnostic snapshot
+} TD_R3_DIAG_PARAMS;
 #pragma pack(pop)
 
 

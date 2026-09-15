@@ -99,7 +99,7 @@ typedef struct _EPT_HOOKED_FUNCTION_INFO {
     volatile LONG oneshot_fired;          // atomically set by handler after first trigger
     volatile LONG * external_fired;       // optional NonPaged signal set on first oneshot hit
     UINT64      expected_tid;             // 0 = any thread, non-0 = only this TID may redirect
-    BOOLEAN     retiring;                 // TRUE = unhook requested; per-vCPU paths restore lazily
+    volatile LONG retiring;              // 0 = active, non-0 = retiring; updated atomically
 } EPT_HOOKED_FUNCTION_INFO, *PEPT_HOOKED_FUNCTION_INFO;
 
 //

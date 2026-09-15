@@ -40,19 +40,7 @@ ept_hook_install_secondary_cpu(
     //
     // 1. Find existing HOOKED_PAGE_INFO (primary CPU already created it)
     //
-    PEPT_HOOKED_PAGE_INFO hp = NULL;
-
-    for (struct _LIST_ENTRY * cur = g_ept->hooked_pages.Flink;
-         cur != &g_ept->hooked_pages;
-         cur = cur->Flink)
-    {
-        PEPT_HOOKED_PAGE_INFO existing = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
-        if (existing->pfn_of_hooked_page == target_pfn)
-        {
-            hp = existing;
-            break;
-        }
-    }
+    PEPT_HOOKED_PAGE_INFO hp = ept_hook_find_page(target_pfn);
 
     if (!hp)
     {
@@ -104,7 +92,10 @@ ept_hook_install_secondary_cpu(
     PEPT_PML1_ENTRY fake_pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)fake_phys);
     if (fake_pte)
     {
-        fake_pte->ReadAccess = (req->force_read_access) ? 1 : 0;
+        // The target/fake page permissions are owned by the single PFN
+        // descriptor.  A secondary request must not turn a shared execute-only
+        // fake page into readable (or vice versa) for this CPU only.
+        fake_pte->ReadAccess = hp->changed_entry.ReadAccess ? 1 : 0;
         fake_pte->WriteAccess = 0;
         fake_pte->ExecuteAccess = 1;  // Execute-only (or R+X if force_read_access)
     }

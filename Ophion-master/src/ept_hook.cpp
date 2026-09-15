@@ -29,9 +29,6 @@ BOOLEAN ept_hook_install_secondary_cpu(
 
 #define EPT_PML1_PAGE_OFFSET(_a) (((UINT64)(_a)) & 0xFFF)
 
-// mask PCID and no-flush bit from CR3, keep only PML4 physical address
-#define CR3_ADDR_MASK  0x000FFFFFFFFFF000ULL
-
 #ifndef INT32_MIN
 #define INT32_MIN (-2147483647 - 1)
 #define INT32_MAX 2147483647
@@ -428,6 +425,67 @@ ept_split_large_page_pool(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
     return new_split;
 }
 
+static BOOLEAN ept_hook_page_has_active_function(PEPT_HOOKED_PAGE_INFO hp);
+
+static BOOLEAN
+ept_hook_function_matches_cr3(
+    PEPT_HOOKED_FUNCTION_INFO fi,
+    UINT64 guest_cr3)
+{
+    if (!fi)
+        return FALSE;
+
+    UINT64 key_cr3 = guest_cr3 & CR3_ADDR_MASK;
+    UINT64 function_cr3 = fi->target_cr3 & CR3_ADDR_MASK;
+
+    return function_cr3 == 0 || function_cr3 == key_cr3;
+}
+
+PEPT_HOOKED_PAGE_INFO
+ept_hook_find_page(UINT64 pfn)
+{
+    if (!g_ept)
+        return NULL;
+
+    PLIST_ENTRY cur = g_ept->hooked_pages.Flink;
+    while (cur != &g_ept->hooked_pages)
+    {
+        PEPT_HOOKED_PAGE_INFO hp =
+            CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
+        cur = cur->Flink;
+
+        if (hp->pfn_of_hooked_page == pfn)
+            return hp;
+    }
+
+    return NULL;
+}
+
+BOOLEAN
+ept_hook_page_has_cr3_function(
+    PEPT_HOOKED_PAGE_INFO hp,
+    UINT64 guest_cr3)
+{
+    if (!hp)
+        return FALSE;
+
+    PLIST_ENTRY cur = hp->hooked_functions_list.Flink;
+    while (cur != &hp->hooked_functions_list)
+    {
+        PEPT_HOOKED_FUNCTION_INFO fi =
+            CONTAINING_RECORD(
+                cur,
+                EPT_HOOKED_FUNCTION_INFO,
+                hooked_function_list);
+        cur = cur->Flink;
+
+        if (!fi->retiring && ept_hook_function_matches_cr3(fi, guest_cr3))
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
 // =========================================================================
 //  VMX-root: ept_hook_install 鈥?called from VMCALL handler per-CPU
 //  caller must switch CR3 to caller_cr3 BEFORE calling this.
@@ -592,16 +650,20 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
 
     hook_lock_acquire();
 
-    struct _LIST_ENTRY * hcur;
-    for (hcur = g_ept->hooked_pages.Flink; hcur != &g_ept->hooked_pages; hcur = hcur->Flink)
+    PEPT_HOOKED_PAGE_INFO existing = ept_hook_find_page(target_pfn);
+    if (existing)
     {
-        PEPT_HOOKED_PAGE_INFO existing = CONTAINING_RECORD(hcur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
-        if (existing->pfn_of_hooked_page == target_pfn)
-        {
-            if ((existing->target_cr3 & CR3_ADDR_MASK) != requested_cr3)
+            //
+            // The fake-page EPT permissions belong to the single PFN
+            // descriptor.  Reject a second hook that requests different
+            // read visibility instead of silently diverging per CPU.
+            //
+            UINT32 requested_read_access =
+                (g_ept->execute_only_supported && !req->force_read_access) ? 0 : 1;
+            if (existing->changed_entry.ReadAccess != requested_read_access)
             {
-                g_ept_hook_diag = HOOK_DIAG_CR3_CONFLICT;
-                g_ept_hook_diag2 = existing->target_cr3;
+                g_ept_hook_diag = HOOK_DIAG_PAGE_RACE;
+                g_ept_hook_diag2 = target_pfn;
                 _InterlockedExchange(&g_hook_list_lock, 0);
                 HOOK_RESTORE_CR3_AND_RETURN(FALSE);
             }
@@ -613,7 +675,11 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
                 PEPT_HOOKED_FUNCTION_INFO efi = CONTAINING_RECORD(
                     fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
 
-                if (efi->virtual_address == req->target_function)
+                BOOLEAN same_va = (efi->virtual_address == req->target_function);
+                BOOLEAN same_cr3 =
+                    ((efi->target_cr3 & CR3_ADDR_MASK) == requested_cr3);
+
+                if (same_va && same_cr3)
                 {
                     exact_function = efi;
                 }
@@ -622,10 +688,20 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
                                              req->target_function,
                                              requested_size))
                 {
-                    g_ept_hook_diag = HOOK_DIAG_HOOK_OVERLAP;
-                    g_ept_hook_diag2 = (UINT64)efi->virtual_address;
-                    _InterlockedExchange(&g_hook_list_lock, 0);
-                    HOOK_RESTORE_CR3_AND_RETURN(FALSE);
+                    //
+                    // The fake page is shared by all CR3s for this PFN.  Only
+                    // the process-independent VMCALL payload may be shared by
+                    // multiple CR3 records at the same VA.
+                    //
+                    if (!(same_va &&
+                          req->hook_type == 1 &&
+                          efi->hook_type == 1))
+                    {
+                        g_ept_hook_diag = HOOK_DIAG_HOOK_OVERLAP;
+                        g_ept_hook_diag2 = (UINT64)efi->virtual_address;
+                        _InterlockedExchange(&g_hook_list_lock, 0);
+                        HOOK_RESTORE_CR3_AND_RETURN(FALSE);
+                    }
                 }
             }
 
@@ -679,6 +755,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
                 exact_function->oneshot = req->oneshot;
                 exact_function->expected_tid = req->expected_tid;
                 exact_function->hook_type = req->hook_type;
+                exact_function->target_cr3 = requested_cr3;
                 exact_function->external_fired = req->external_fired;
                 exact_function->first_trampoline_address = trampoline;
                 exact_function->hook_size = requested_size;
@@ -723,6 +800,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
                 fi->oneshot            = req->oneshot;
                 fi->expected_tid       = req->expected_tid;
                 fi->hook_type          = req->hook_type;
+                fi->target_cr3         = requested_cr3;
                 fi->external_fired     = req->external_fired;
                 fi->hook_size          = requested_size;
 
@@ -788,7 +866,6 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
             _InterlockedExchange(&g_hook_list_lock, 0);
             HOOK_RESTORE_CR3_AND_RETURN(TRUE);
         }
-    }
 
     //
     // page not found: the hook-list lock is already held.
@@ -856,7 +933,6 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
         hp->pfn_of_fake_page_contents = fake_pfn;
     }
     hp->entry_address = pte;
-    hp->target_cr3 = req->target_cr3 & CR3_ADDR_MASK;
 
     // 鎷疯礉鍘熷椤甸潰鍒?fake page (stealth region)
     RtlCopyMemory(hp->fake_page_va, PAGE_ALIGN(req->target_function), PAGE_SIZE);
@@ -868,6 +944,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     fi->oneshot            = req->oneshot;
     fi->expected_tid       = req->expected_tid;
     fi->hook_type          = req->hook_type;
+    fi->target_cr3         = requested_cr3;
     fi->external_fired     = req->external_fired;
 
     UINT64 off   = EPT_PML1_PAGE_OFFSET(req->target_function);
@@ -993,54 +1070,43 @@ ept_unhook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_UNHOOK_VMCALL_PARAM req)
 
     UINT64 phys_addr  = MmGetPhysicalAddress(req->target_function).QuadPart;
     UINT64 target_pfn = phys_addr >> 12;
+    UINT64 requested_cr3 = req->caller_cr3 & CR3_ADDR_MASK;
 
-    PLIST_ENTRY cur = g_ept->hooked_pages.Flink;
-    while (cur != &g_ept->hooked_pages)
+    PEPT_HOOKED_PAGE_INFO hp = ept_hook_find_page(target_pfn);
+    if (!hp)
+        return FALSE;
+
+    PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
+    while (fc != &hp->hooked_functions_list)
     {
-        PEPT_HOOKED_PAGE_INFO hp = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
-        cur = cur->Flink;
-        if (hp->pfn_of_hooked_page != target_pfn) continue;
+        PEPT_HOOKED_FUNCTION_INFO fn =
+            CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
+        fc = fc->Flink;
 
-        PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
-        while (fc != &hp->hooked_functions_list)
-        {
-            PEPT_HOOKED_FUNCTION_INFO fn = CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
-            fc = fc->Flink;
-            if (fn->virtual_address == req->target_function)
-            {
-                if (fn->fake_page_contents && fn->first_trampoline_address && fn->hook_size)
-                {
-                    UINT64 off = EPT_PML1_PAGE_OFFSET(fn->virtual_address);
-                    RtlCopyMemory(&fn->fake_page_contents[off],
-                                  fn->first_trampoline_address,
-                                  fn->hook_size);
-                }
-                _InterlockedExchange(&fn->retiring, 1);
-                req->result = TRUE;
-                break;
-            }
-        }
+        if (fn->virtual_address != req->target_function)
+            continue;
+        if ((fn->target_cr3 & CR3_ADDR_MASK) != requested_cr3)
+            continue;
 
-        if (req->result)
-        {
-            if (!ept_hook_page_has_active_function(hp))
-                ept_hook_restore_current_vcpu(vcpu, hp);
-            return TRUE;
-        }
+        //
+        // The fake page is shared by every CR3 on this PFN.  Retire only the
+        // matching function record; restore the EPT page only when no active
+        // function remains on the whole page.
+        //
+        _InterlockedExchange(&fn->retiring, 1);
+        req->result = TRUE;
+        break;
     }
 
-    //
-    // 鎭㈠鎵€鏈?CPU 鐨?PTE 鍒?RWX
-    // (涓嶈兘鍙仮澶嶅綋鍓?CPU锛屽叾浠?CPU 鐨?EPT PTE 涔熼渶瑕佹仮澶?
-    //
-    return FALSE;
+    if (!req->result)
+        return FALSE;
+
+    if (!ept_hook_page_has_active_function(hp))
+        ept_hook_restore_current_vcpu(vcpu, hp);
+
+    return TRUE;
 }
 
-//
-// unhook all 鈥?only restore PTEs and free memory.
-// does NOT call INVEPT 鈥?caller is responsible for TLB invalidation.
-// this is safe to call after VMXOFF (vmx_terminate path).
-//
 VOID
 ept_unhook_all(VOID)
 {
@@ -1091,25 +1157,28 @@ ept_unhook_by_cr3(VIRTUAL_MACHINE_STATE * vcpu, UINT64 target_cr3)
         PEPT_HOOKED_PAGE_INFO hp = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
         cur = cur->Flink;
 
-        if ((hp->target_cr3 & CR3_ADDR_MASK) != (target_cr3 & CR3_ADDR_MASK))
-            continue;
-
-        // retire every function on this page so both the violation handler
-        // (ept_hook_page_has_active_function -> restore) and the VMCALL
-        // dispatch (fi->retiring -> restore) pass through to the original
-        // code instead of redirecting to this process's proxy.
         PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
         while (fc != &hp->hooked_functions_list)
         {
-            PEPT_HOOKED_FUNCTION_INFO fi = CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
+            PEPT_HOOKED_FUNCTION_INFO fi =
+                CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
             fc = fc->Flink;
+
+            //
+            // Never retire global hooks on process exit.  Only the exact CR3
+            // record owned by the dying process is neutralized.
+            //
+            if ((fi->target_cr3 & CR3_ADDR_MASK) != (target_cr3 & CR3_ADDR_MASK))
+                continue;
+
             _InterlockedExchange(&fi->retiring, 1);
         }
 
-        // restore THIS vCPU's EPT to the original page (RWX). the DPC broadcast
-        // runs this on every vCPU, so all vCPUs drop the hook. target_cr3 is
-        // left as-is so non-target processes still take the cheap non-target
-        // pass-through in ept_handle_violation without a VMCALL.
+        //
+        // Restore THIS vCPU's EPT only when no other active function still
+        // needs the shared fake page.  The DPC broadcast repeats this on every
+        // vCPU, so all CPUs drop the page hook when the last owner retires.
+        //
         if (!ept_hook_page_has_active_function(hp))
             ept_hook_restore_current_vcpu(vcpu, hp);
     }
@@ -1126,12 +1195,18 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
     viol.AsUInt = exit_qual;
     UINT64 pfn = guest_phys >> 12;
 
+    UINT64 guest_cr3 = 0;
+    __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
+    PEPT_HOOKED_PAGE_INFO selected =
+        ept_hook_find_page(pfn);
+
     PLIST_ENTRY cur = g_ept->hooked_pages.Flink;
     while (cur != &g_ept->hooked_pages)
     {
         PEPT_HOOKED_PAGE_INFO hp = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
         cur = cur->Flink;
         if (hp->pfn_of_hooked_page != pfn && hp->pfn_of_fake_page_contents != pfn) continue;
+        if (hp->pfn_of_hooked_page == pfn && hp != selected) continue;
 
         //
         // fake page physical page scan protection:
@@ -1189,29 +1264,23 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
         if (viol.ExecuteAccess)
         {
             //
-            // R3 hook: per-process filtering.
-            // only the target process (matching CR3) sees the fake page (hook).
-            // other processes get a temporary RWX pass-through via MTF single-step,
-            // executing original code transparently.
+            // R3 hook: function-level CR3 filtering.  Only a process owning an
+            // active function (or a global function) sees the shared fake page.
+            // Every other CR3 gets a temporary RWX pass-through via MTF and
+            // executes the original code transparently.
             //
-            if (hp->target_cr3 != 0)
+            if (!ept_hook_page_has_cr3_function(hp, guest_cr3))
             {
-                UINT64 guest_cr3 = 0;
-                __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
+                EPT_PML1_ENTRY passthrough = hp->original_entry;
+                passthrough.ExecuteAccess = 1;
+                ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
+                vcpu->mtf_restore_page = hp;
 
-                if ((guest_cr3 & CR3_ADDR_MASK) != hp->target_cr3)
-                {
-                    // non-target process: pass through with temporary RWX
-                    EPT_PML1_ENTRY passthrough = hp->original_entry;
-                    passthrough.ExecuteAccess = 1;
-                    ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
-                    vcpu->mtf_restore_page = hp;
-                    SIZE_T pc = 0;
-                    __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
-                    pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
-                        __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
-                    return TRUE;
-                }
+                SIZE_T pc = 0;
+                __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+                pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+                __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+                return TRUE;
             }
 
             //
@@ -1299,6 +1368,8 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     {
         PEPT_HOOKED_PAGE_INFO hp = vcpu->mtf_restore_page;
 
+        // The EPT PTE is shared by every function record on this PFN.  Fully
+        // restore it only when no active function remains on this page.
         if (!ept_hook_page_has_active_function(hp))
         {
             ept_hook_restore_current_vcpu(vcpu, hp);
@@ -1494,24 +1565,27 @@ volatile LONG g_dbg_pf_skipped = 0;   // skipped (no fake_pt/exec_pt)
 BOOLEAN
 ept_hook_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error_code)
 {
-    if (!g_ept || IsListEmpty(&g_ept->hooked_pages)) return FALSE;
+    if (!g_ept || IsListEmpty(&g_ept->hooked_pages))
+        return FALSE;
 
     //
     // ONLY handle NX violations: P=1 (page present) + I/D=1 (instruction fetch).
-    // P=0 means demand paging 鈥?must re-inject to guest so Windows pages it in.
-    // error_code bit 0 = P (present), bit 4 = I/D (instruction fetch).
+    // P=0 means demand paging and must be re-injected to the guest.
     //
     _InterlockedIncrement(&g_dbg_pf_called);
 
     if (!(error_code & 0x01))
-        return FALSE;  // page not present 鈫?demand paging, let guest handle
+        return FALSE;
 
     UINT64 fault_page = fault_addr & ~0xFFFULL;
+    UINT64 guest_cr3 = 0;
+    __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
 
     PLIST_ENTRY cur = g_ept->hooked_pages.Flink;
     while (cur != &g_ept->hooked_pages)
     {
-        PEPT_HOOKED_PAGE_INFO hp = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
+        PEPT_HOOKED_PAGE_INFO hp =
+            CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
         cur = cur->Flink;
 
         if (!hp->fake_pt || !hp->exec_pt_page)
@@ -1523,62 +1597,73 @@ ept_hook_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error
         PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
         while (fc != &hp->hooked_functions_list)
         {
-            PEPT_HOOKED_FUNCTION_INFO fi = CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
+            PEPT_HOOKED_FUNCTION_INFO fi =
+                CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
             fc = fc->Flink;
 
-            if (((UINT64)fi->virtual_address & ~0xFFFULL) == fault_page)
+            if ((((UINT64)fi->virtual_address & ~0xFFFULL) != fault_page) ||
+                fi->retiring ||
+                !ept_hook_function_matches_cr3(fi, guest_cr3))
             {
-                _InterlockedIncrement(&g_dbg_pf_matched);
-
-                // 1. resync exec PT from fake PT (fake page is "live" 鈥?gets all writes)
-                //    then force NX=0 for our entry so CPU page walk succeeds
-                if (hp->exec_pt_page)
-                {
-                    RtlCopyMemory(hp->exec_pt_page, hp->fake_pt->fake_page_va, PAGE_SIZE);
-                    PUINT64 exec_pte = (PUINT64)hp->exec_pt_page;
-                    exec_pte[hp->pt_pte_index] &= ~(1ULL << 63);  // NX=0
-                }
-
-                // 2. lazy split PT page EPT (2MB 鈫?4KB) if needed, then swap to exec view
-                {
-                    UINT64 pt_phys = hp->fake_pt->pt_page_pfn << 12;
-                    PEPT_PML2_ENTRY pt_p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys);
-                    if (pt_p2 && pt_p2->LargePage)
-                        ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)pt_phys);
-                }
-                PEPT_PML1_ENTRY pt_pte = ept_get_pml1(vcpu->ept_page_table,
-                    (SIZE_T)(hp->fake_pt->pt_page_pfn << 12));
-                if (pt_pte) pt_pte->AsUInt = hp->pt_exec_entry.AsUInt;
-
-                // 2. record for MTF restore (swap back to fake PT after one instruction)
-                vcpu->stealth_pf_swapped_hook = hp;
-
-                // 3. arm MTF 鈥?after one instruction, MTF handler restores fake PT (NX=1)
-                {
-                    SIZE_T pc = 0;
-                    __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
-                    pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
-                    __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
-                }
-
-                _mm_mfence();
-                ept_invept_single(vcpu->ept_pointer);
-
-                // flush guest TLB for fault VA so CPU re-walks with NX=0
-                INVVPID_DESCRIPTOR desc = {0};
-                desc.Vpid = VPID_TAG;
-                if (g_ept->invvpid_individual_addr)
-                {
-                    desc.LinearAddress = fault_addr;
-                    asm_invvpid(InvvpidIndividualAddress, &desc);
-                }
-                else
-                    asm_invvpid(InvvpidSingleContext, &desc);
-
-                return TRUE;
+                continue;
             }
+
+            _InterlockedIncrement(&g_dbg_pf_matched);
+
+            //
+            // 1. Resync the executable PT view from the live fake PT page and
+            //    clear NX for the hooked entry so the guest page walk succeeds.
+            //
+            RtlCopyMemory(hp->exec_pt_page, hp->fake_pt->fake_page_va, PAGE_SIZE);
+            PUINT64 exec_pte = (PUINT64)hp->exec_pt_page;
+            exec_pte[hp->pt_pte_index] &= ~(1ULL << 63);
+
+            //
+            // 2. Lazily split the PT page EPT (2MB -> 4KB), then switch this
+            //    vCPU to the executable PT view.
+            //
+            UINT64 pt_phys = hp->fake_pt->pt_page_pfn << 12;
+            PEPT_PML2_ENTRY pt_p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys);
+            if (pt_p2 && pt_p2->LargePage)
+                ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)pt_phys);
+
+            PEPT_PML1_ENTRY pt_pte = ept_get_pml1(
+                vcpu->ept_page_table,
+                (SIZE_T)(hp->fake_pt->pt_page_pfn << 12));
+            if (pt_pte)
+                pt_pte->AsUInt = hp->pt_exec_entry.AsUInt;
+
+            //
+            // 3. Restore the PT view after one instruction.  The descriptor is
+            //    shared by all functions on this PFN, so MTF restores the page,
+            //    not an individual function.
+            //
+            vcpu->stealth_pf_swapped_hook = hp;
+
+            SIZE_T pc = 0;
+            __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+            pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+            __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+
+            _mm_mfence();
+            ept_invept_single(vcpu->ept_pointer);
+
+            INVVPID_DESCRIPTOR desc = {0};
+            desc.Vpid = VPID_TAG;
+            if (g_ept->invvpid_individual_addr)
+            {
+                desc.LinearAddress = fault_addr;
+                asm_invvpid(InvvpidIndividualAddress, &desc);
+            }
+            else
+            {
+                asm_invvpid(InvvpidSingleContext, &desc);
+            }
+
+            return TRUE;
         }
     }
+
     return FALSE;
 }
 
@@ -1586,103 +1671,187 @@ BOOLEAN
 ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
 {
     UINT64 rip = vcpu->vmexit_rip;
+    UINT64 guest_cr3 = 0;
+    __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
+
+    //
+    // One PFN has one page descriptor, but may contain exact per-process
+    // functions and global functions.  Select an exact CR3 record first; a
+    // retiring exact record still wins over a global record so its process is
+    // passed through during teardown instead of leaking to another handler.
+    //
+    PEPT_HOOKED_PAGE_INFO selected_page = NULL;
+    PEPT_HOOKED_FUNCTION_INFO selected_function = NULL;
+    BOOLEAN selected_exact = FALSE;
+    BOOLEAN selected_retiring = FALSE;
+
     PLIST_ENTRY cur = g_ept->hooked_pages.Flink;
     while (cur != &g_ept->hooked_pages)
     {
-        PEPT_HOOKED_PAGE_INFO hp = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
+        PEPT_HOOKED_PAGE_INFO hp =
+            CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
         cur = cur->Flink;
-
-        //
-        // R3 hook: only dispatch VMCALL for the target process.
-        // non-target processes should never reach here (violation handler
-        // gives them original code), but check CR3 as safety net.
-        //
-        if (hp->target_cr3 != 0)
-        {
-            UINT64 guest_cr3 = 0;
-            __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
-            if ((guest_cr3 & CR3_ADDR_MASK) != hp->target_cr3)
-                continue;
-        }
 
         PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
         while (fc != &hp->hooked_functions_list)
         {
-            PEPT_HOOKED_FUNCTION_INFO fi = CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
+            PEPT_HOOKED_FUNCTION_INFO fi =
+                CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
             fc = fc->Flink;
-            if ((UINT64)fi->virtual_address == rip)
+
+            if ((UINT64)fi->virtual_address != rip ||
+                !ept_hook_function_matches_cr3(fi, guest_cr3))
             {
-                if (fi->retiring)
-                {
-                    ept_hook_restore_current_vcpu(vcpu, hp);
-                    return TRUE;
-                }
+                continue;
+            }
 
-                //
-                // oneshot: first trigger 鈫?redirect to handler (shellcode).
-                // subsequent triggers 鈫?pass through to original function.
-                //
-                // can't use fi->first_trampoline_address for R3 hooks because
-                // it's in kernel pool (R3 can't execute kernel addresses 鈫?crash).
-                //
-                // instead: temporarily swap EPT to original view (real code),
-                // let CPU re-execute from the real function, arm MTF to swap back.
-                // same technique as ept_handle_violation for non-target CR3.
-                //
-                UINT64 current_tid = (UINT64)(ULONG_PTR)PsGetCurrentThreadId();
-                if (fi->expected_tid && current_tid != fi->expected_tid)
-                {
-                    PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,
-                        (SIZE_T)(hp->pfn_of_hooked_page << 12));
-                    if (my_pte)
-                    {
-                        EPT_PML1_ENTRY passthrough = hp->original_entry;
-                        passthrough.ExecuteAccess = 1;
-                        ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
-                        vcpu->mtf_restore_page = hp;
-                        SIZE_T pc = 0;
-                        __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
-                        pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
-                        __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
-                    }
-                    return TRUE;
-                }
+            BOOLEAN exact = ((fi->target_cr3 & CR3_ADDR_MASK) != 0);
+            BOOLEAN retiring = (fi->retiring != 0);
 
-                if (fi->oneshot)
-                {
-                    if (_InterlockedCompareExchange(&fi->oneshot_fired, 1, 0) == 0)
-                    {
-                        _InterlockedExchange(&fi->retiring, 1);
-                        if (fi->external_fired)
-                            _InterlockedExchange(fi->external_fired, 1);
-                        ept_hook_fire_record((UINT64)fi->virtual_address, (UINT64)fi->handler_function);
-                        __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
-                        wedge_cmos_mark(0x01);  // WEDGE-A (trigger fired -> redirected RIP to handler)
-                        wedge_cmos_set_trig_seen();  // sticky: the injection trigger fired this run
-                        return TRUE;
-                    }
-
-                    PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,
-                        (SIZE_T)(hp->pfn_of_hooked_page << 12));
-                    if (my_pte)
-                    {
-                        EPT_PML1_ENTRY passthrough = hp->original_entry;
-                        passthrough.ExecuteAccess = 1;
-                        ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
-                        vcpu->mtf_restore_page = hp;
-                        SIZE_T pc = 0;
-                        __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
-                        pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
-                        __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
-                    }
-                    // don't change RIP 鈥?CPU re-executes same VA from original code
-                    return TRUE;
-                }
-                ept_hook_fire_record((UINT64)fi->virtual_address, (UINT64)fi->handler_function);
-                __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
-                return TRUE;
+            if (exact &&
+                (!selected_exact || (!retiring && selected_retiring)))
+            {
+                selected_page = hp;
+                selected_function = fi;
+                selected_exact = TRUE;
+                selected_retiring = retiring;
+            }
+            else if (!selected_exact &&
+                     (!selected_function || (!retiring && selected_retiring)))
+            {
+                selected_page = hp;
+                selected_function = fi;
+                selected_retiring = retiring;
             }
         }
     }
-    return FALSE;
+
+    if (!selected_page || !selected_function)
+        return FALSE;
+
+    PEPT_HOOKED_PAGE_INFO hp = selected_page;
+    PEPT_HOOKED_FUNCTION_INFO fi = selected_function;
+
+    //
+    // Retiring hook: execute the original page for one instruction.  If no
+    // active function remains on this shared PFN, fully restore this vCPU.
+    //
+    if (fi->retiring)
+    {
+        if (!ept_hook_page_has_active_function(hp))
+        {
+            ept_hook_restore_current_vcpu(vcpu, hp);
+            return TRUE;
+        }
+
+        PEPT_PML1_ENTRY my_pte = ept_get_pml1(
+            vcpu->ept_page_table,
+            (SIZE_T)(hp->pfn_of_hooked_page << 12));
+        if (my_pte)
+        {
+            EPT_PML1_ENTRY passthrough = hp->original_entry;
+            passthrough.ExecuteAccess = 1;
+            ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
+            vcpu->mtf_restore_page = hp;
+
+            SIZE_T pc = 0;
+            __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+            pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+            __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+        }
+        return TRUE;
+    }
+
+    //
+    // Thread filter mismatch: pass through the original page for one
+    // instruction, then restore the shared no-execute view through MTF.
+    //
+    UINT64 current_tid = (UINT64)(ULONG_PTR)PsGetCurrentThreadId();
+    if (fi->expected_tid && current_tid != fi->expected_tid)
+    {
+        PEPT_PML1_ENTRY my_pte = ept_get_pml1(
+            vcpu->ept_page_table,
+            (SIZE_T)(hp->pfn_of_hooked_page << 12));
+        if (my_pte)
+        {
+            EPT_PML1_ENTRY passthrough = hp->original_entry;
+            passthrough.ExecuteAccess = 1;
+            ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
+            vcpu->mtf_restore_page = hp;
+
+            SIZE_T pc = 0;
+            __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+            pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+            __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+        }
+        return TRUE;
+    }
+
+    //
+    // Oneshot: redirect once, then retire this exact function.  Subsequent
+    // calls pass through the original page.
+    //
+    if (fi->oneshot)
+    {
+        if (_InterlockedCompareExchange(&fi->oneshot_fired, 1, 0) == 0)
+        {
+            _InterlockedExchange(&fi->retiring, 1);
+            if (fi->external_fired)
+                _InterlockedExchange(fi->external_fired, 1);
+
+            ept_hook_fire_record(
+                (UINT64)fi->virtual_address,
+                (UINT64)fi->handler_function);
+
+            //
+            // The EPT PTE is shared by every CR3 on this PFN.  Restore the
+            // read/write/no-execute view before redirecting so another process
+            // cannot execute the fake page without a fresh EPT violation.
+            //
+            PEPT_PML1_ENTRY my_pte = ept_get_pml1(
+                vcpu->ept_page_table,
+                (SIZE_T)(hp->pfn_of_hooked_page << 12));
+            if (my_pte)
+                ept_swap_page(my_pte, hp->original_entry, vcpu->ept_pointer);
+
+            __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
+            wedge_cmos_mark(0x01);
+            wedge_cmos_set_trig_seen();
+            return TRUE;
+        }
+
+        PEPT_PML1_ENTRY my_pte = ept_get_pml1(
+            vcpu->ept_page_table,
+            (SIZE_T)(hp->pfn_of_hooked_page << 12));
+        if (my_pte)
+        {
+            EPT_PML1_ENTRY passthrough = hp->original_entry;
+            passthrough.ExecuteAccess = 1;
+            ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
+            vcpu->mtf_restore_page = hp;
+
+            SIZE_T pc = 0;
+            __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+            pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+            __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+        }
+        return TRUE;
+    }
+
+    ept_hook_fire_record(
+        (UINT64)fi->virtual_address,
+        (UINT64)fi->handler_function);
+
+    //
+    // Redirect, but first restore the shared target-page PTE to its no-execute
+    // view.  This is essential when multiple CR3 records share one PFN.
+    //
+    PEPT_PML1_ENTRY redirect_pte = ept_get_pml1(
+        vcpu->ept_page_table,
+        (SIZE_T)(hp->pfn_of_hooked_page << 12));
+    if (redirect_pte)
+        ept_swap_page(redirect_pte, hp->original_entry, vcpu->ept_pointer);
+
+    __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)fi->handler_function);
+    return TRUE;
 }

@@ -1262,57 +1262,51 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             UINT64 target_pfn  = target_phys >> 12;
 
             // --- already installed (other CPU in DPC broadcast) ---
-            BOOLEAN already = FALSE;
-            PLIST_ENTRY hcur = g_ept->hooked_pages.Flink;
-            while (hcur != &g_ept->hooked_pages)
+            PEPT_HOOKED_PAGE_INFO ex = ept_hook_find_page(target_pfn);
+            if (ex)
             {
-                PEPT_HOOKED_PAGE_INFO ex = CONTAINING_RECORD(hcur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
-                hcur = hcur->Flink;
-                if (ex->pfn_of_hooked_page == target_pfn)
+                // split this CPU's EPT + set PTE for target page
+                PEPT_PML2_ENTRY p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
+                if (p2 && p2->LargePage)
+                    ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
+                PEPT_PML1_ENTRY p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
+
+                // EPT X-only on fake page physical page (this CPU)
                 {
-                    // split this CPU's EPT + set PTE for target page
-                    PEPT_PML2_ENTRY p2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)target_phys);
-                    if (p2 && p2->LargePage)
-                        ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)target_phys);
-                    PEPT_PML1_ENTRY p1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)target_phys);
-
-                    // EPT X-only on fake page physical page (this CPU)
-                    {
-                        SIZE_T fake_phys = (SIZE_T)(ex->pfn_of_fake_page_contents << 12);
-                        PEPT_PML2_ENTRY fp2 = ept_get_pml2(vcpu->ept_page_table, fake_phys);
-                        if (fp2 && fp2->LargePage)
-                            ept_split_large_page_pool(vcpu->ept_page_table, fake_phys);
-                        PEPT_PML1_ENTRY fp1 = ept_get_pml1(vcpu->ept_page_table, fake_phys);
-                        if (fp1) { fp1->ReadAccess = 0; fp1->WriteAccess = 0; fp1->ExecuteAccess = 1; }
-                    }
-
-                    // split + set PT page EPT to fake view on this CPU
-                    if (ex->fake_pt)
-                    {
-                        if (p1) p1->AsUInt = ex->changed_entry.AsUInt;
-
-                        UINT64 pt_phys = ex->fake_pt->pt_page_pfn << 12;
-                        PEPT_PML2_ENTRY pp2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys);
-                        if (pp2 && pp2->LargePage)
-                            ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)pt_phys);
-                        PEPT_PML1_ENTRY pp1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys);
-                        if (pp1) pp1->AsUInt = ex->fake_pt->pt_fake_entry.AsUInt;
-
-                        ept_update_pf_intercept(vcpu);
-                    }
-                    else
-                    {
-                        if (p1) { p1->ReadAccess = 1; p1->WriteAccess = 1; p1->ExecuteAccess = 0; }
-                    }
-
-                    _mm_mfence();
-                    ept_invept_single(vcpu->ept_pointer);
-                    inj->result = TRUE;
-                    already = TRUE;
-                    break;
+                    SIZE_T fake_phys = (SIZE_T)(ex->pfn_of_fake_page_contents << 12);
+                    PEPT_PML2_ENTRY fp2 = ept_get_pml2(vcpu->ept_page_table, fake_phys);
+                    if (fp2 && fp2->LargePage)
+                        ept_split_large_page_pool(vcpu->ept_page_table, fake_phys);
+                    PEPT_PML1_ENTRY fp1 = ept_get_pml1(vcpu->ept_page_table, fake_phys);
+                    if (fp1) { fp1->ReadAccess = 0; fp1->WriteAccess = 0; fp1->ExecuteAccess = 1; }
                 }
+
+                // split + set PT page EPT to fake view on this CPU
+                if (ex->fake_pt)
+                {
+                    if (p1) p1->AsUInt = ex->changed_entry.AsUInt;
+
+                    UINT64 pt_phys = ex->fake_pt->pt_page_pfn << 12;
+                    PEPT_PML2_ENTRY pp2 = ept_get_pml2(vcpu->ept_page_table, (SIZE_T)pt_phys);
+                    if (pp2 && pp2->LargePage)
+                        ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)pt_phys);
+                    PEPT_PML1_ENTRY pp1 = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)pt_phys);
+                    if (pp1) pp1->AsUInt = ex->fake_pt->pt_fake_entry.AsUInt;
+
+                    ept_update_pf_intercept(vcpu);
+                }
+                else
+                {
+                    if (p1) { p1->ReadAccess = 1; p1->WriteAccess = 1; p1->ExecuteAccess = 0; }
+                }
+
+                _mm_mfence();
+                ept_invept_single(vcpu->ept_pointer);
+                inj->result = TRUE;
+                vmx_leave_guest_cr3(_saved_cr3_inj);
+                regs->rax = (UINT64)STATUS_SUCCESS;
+                break;
             }
-            if (already) { vmx_leave_guest_cr3(_saved_cr3_inj); regs->rax = (UINT64)STATUS_SUCCESS; break; }
 
             // --- first CPU: full install ---
             if (_InterlockedCompareExchange(&inj->installed, 1, 0) != 0)
@@ -1395,7 +1389,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 hp->pfn_of_fake_page_contents = fake_pfn;
             }
             hp->entry_address = pte;
-            hp->target_cr3 = 0;  // global (no CR3 filtering �?private page, safe)
+            fi->target_cr3 = 0;  // inject hooks are global page owners
 
             RtlCopyMemory(hp->fake_page_va, inj->fake_page_buffer, PAGE_SIZE);
 
@@ -1525,13 +1519,18 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
                 {
                     PEPT_HOOKED_PAGE_INFO hp = CONTAINING_RECORD(cur, EPT_HOOKED_PAGE_INFO, hooked_page_list);
                     cur = cur->Flink;
-                    if (caller_cr3 && hp->target_cr3 != (caller_cr3 & 0x000FFFFFFFFFF000ULL)) continue;
 
                     PLIST_ENTRY fc = hp->hooked_functions_list.Flink;
                     while (fc != &hp->hooked_functions_list)
                     {
                         PEPT_HOOKED_FUNCTION_INFO fi = CONTAINING_RECORD(fc, EPT_HOOKED_FUNCTION_INFO, hooked_function_list);
                         fc = fc->Flink;
+
+                        UINT64 caller_key = caller_cr3 & CR3_ADDR_MASK;
+                        UINT64 function_key = fi->target_cr3 & CR3_ADDR_MASK;
+                        if (caller_key && function_key && function_key != caller_key)
+                            continue;
+
                         if (fi->virtual_address == target_va)
                         {
                             fi->external_fired = ext_fired;

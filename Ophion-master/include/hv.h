@@ -16,6 +16,9 @@
 #include "asm_prototypes.h"
 #include "stealth.h"
 
+// mask PCID and no-flush bit from CR3, keep only PML4 physical address
+#define CR3_ADDR_MASK  0x000FFFFFFFFFF000ULL
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -315,6 +318,8 @@ BOOLEAN ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM re
 BOOLEAN ept_unhook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_UNHOOK_VMCALL_PARAM req);
 VOID    ept_unhook_all(VOID);
 VOID    ept_unhook_by_cr3(VIRTUAL_MACHINE_STATE * vcpu, UINT64 target_cr3);
+PEPT_HOOKED_PAGE_INFO ept_hook_find_page(UINT64 pfn);
+BOOLEAN ept_hook_page_has_cr3_function(PEPT_HOOKED_PAGE_INFO hp, UINT64 guest_cr3);
 
 // VMX-root safe EPT 2MB�?KB split (uses pre-allocated pool, NOT ExAllocatePool2)
 PVMM_EPT_DYNAMIC_SPLIT ept_split_large_page_pool(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);

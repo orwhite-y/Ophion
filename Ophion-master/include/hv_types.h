@@ -99,6 +99,7 @@ typedef struct _EPT_HOOKED_FUNCTION_INFO {
     volatile LONG oneshot_fired;          // atomically set by handler after first trigger
     volatile LONG * external_fired;       // optional NonPaged signal set on first oneshot hit
     UINT64      expected_tid;             // 0 = any thread, non-0 = only this TID may redirect
+    UINT64      target_cr3;               // 0 = global, non-0 = exact process CR3
     volatile LONG retiring;              // 0 = active, non-0 = retiring; updated atomically
 } EPT_HOOKED_FUNCTION_INFO, *PEPT_HOOKED_FUNCTION_INFO;
 
@@ -116,12 +117,8 @@ typedef struct _EPT_HOOKED_PAGE_INFO {
     EPT_PML1_ENTRY   changed_entry;       // fake page PTE (X only, no RW)
     UINT32           Options;             // EPTO_HOOK_FUNCTION or EPTO_VIRTUAL_BREAKPOINT
     //
-    // R3 hook: per-process filtering via CR3.
-    //   0 = R0 hook (all processes see the hook)
-    //   non-0 = R3 hook (only the process with this CR3 PFN sees the hook,
-    //           other processes execute original code transparently via MTF)
-    //
-    UINT64           target_cr3;
+    // Shared target page: one PFN has one descriptor and one fake page.
+    // CR3 ownership is tracked per EPT_HOOKED_FUNCTION_INFO below.
     //
     // fake PT page association (for inject hooks with NX hiding)
     //

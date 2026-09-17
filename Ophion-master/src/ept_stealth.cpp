@@ -1368,6 +1368,7 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
             _mm_mfence();
             ept_invept_single(vcpu->ept_pointer);
             vcpu->ept_state_quiesced = FALSE;
+            ept_lists_lock_release();
             return TRUE;
         }
     }
@@ -1443,9 +1444,11 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
                 _mm_mfence();
                 ept_invept_single(vcpu->ept_pointer);
                 vcpu->ept_state_quiesced = FALSE;
+                ept_lists_lock_release();
                 return TRUE;
             }
         }
+        ept_lists_lock_release();
 
         return FALSE;
     }

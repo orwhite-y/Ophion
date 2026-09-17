@@ -369,6 +369,12 @@ BOOLEAN ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, U
 VOID    ept_update_pf_intercept(VIRTUAL_MACHINE_STATE * vcpu);
 VOID    stealth_clear_stale_window(VIRTUAL_MACHINE_STATE * vcpu);  // clear stale shadow-CR3 window (VMCALL_SHADOW_ABORT_ALL)
 
+// EPT/stealth lifecycle drain (cross-vCPU MTF/shadow-window race fix)
+UINT64  ept_state_epoch_get(VOID);
+VOID    ept_state_epoch_advance(VOID);
+VOID    ept_state_mark_drained(VIRTUAL_MACHINE_STATE * vcpu);
+BOOLEAN ept_state_all_vcpus_drained(VOID);
+
 // shared fake PT page management (VMX-root safe)
 PSTEALTH_FAKE_PT stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, PVOID pt_page_va_hint, PVOID real_page_va);
 VOID stealth_fake_pt_set_nx(PSTEALTH_FAKE_PT fpt, UINT32 pte_index);

@@ -105,5 +105,9 @@ ept_hook_install_secondary_cpu(
     //
     ept_invept_single(vcpu->ept_pointer);
 
+    // EPT-only secondary install: clear quiesce without advancing the epoch
+    // (no global metadata was modified).
+    vcpu->ept_state_quiesced = FALSE;
+
     return TRUE;
 }

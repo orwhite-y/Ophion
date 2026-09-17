@@ -1358,6 +1358,7 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
 
             _mm_mfence();
             ept_invept_single(vcpu->ept_pointer);
+            vcpu->ept_state_quiesced = FALSE;
             return TRUE;
         }
     }
@@ -1429,6 +1430,7 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
 
                 _mm_mfence();
                 ept_invept_single(vcpu->ept_pointer);
+                vcpu->ept_state_quiesced = FALSE;
                 return TRUE;
             }
         }
@@ -1520,6 +1522,8 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
 
         _mm_mfence();
         ept_invept_single(vcpu->ept_pointer);
+        vcpu->ept_state_quiesced = FALSE;
+        ept_state_epoch_advance();
         if (interlock)
             _InterlockedExchange(interlock, 2);
         return TRUE;
@@ -1701,6 +1705,8 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
 
     _mm_mfence();
     ept_invept_single(vcpu->ept_pointer);
+    vcpu->ept_state_quiesced = FALSE;
+    ept_state_epoch_advance();
     if (interlock)
         _InterlockedExchange(interlock, 2);
 
@@ -1744,6 +1750,10 @@ BOOLEAN
 ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error_code)
 {
     if (!g_ept || IsListEmpty(&g_ept->stealth_pages)) return FALSE;
+
+    const BOOLEAN quiesced = (vcpu->ept_state_quiesced != FALSE);
+    if (quiesced && vcpu->nx_timer_restore)
+        stealth_clear_stale_window(vcpu);
 
     // WEDGE-B (0x02) removed: per-CPU exit-reason snap in vmexit_handler records
     // #PF as 0x8E per-CPU now. This global mark was a per-#PF port-I/O confound
@@ -1893,6 +1903,12 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             UINT64 shadow_pfn  = sp->shadow_cr3_phys & PFN_MASK;
             BOOLEAN already_on_shadow = (current_pfn == shadow_pfn);
 
+            if (quiesced)
+            {
+                stealth_clear_stale_window(vcpu);
+                return FALSE;
+            }
+
             // WEDGE-B2 (CMOS 0x0C): match, CR3 read + already_on_shadow done, about to call heal.
             wedge_cmos_mark(0x0C);
 
@@ -2012,6 +2028,13 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             PEPT_PML1_ENTRY target_pte = ept_get_pml1(vcpu->ept_page_table,
                 (SIZE_T)(sp->pfn_of_target << 12));
             if (target_pte) target_pte->AsUInt = sp->execute_entry.AsUInt;
+
+            if (quiesced)
+            {
+                _mm_mfence();
+                ept_invept_single(vcpu->ept_pointer);
+                return TRUE;
+            }
 
             vcpu->stealth_pf_swapped = sp;
             SIZE_T pc = 0;
@@ -2203,6 +2226,7 @@ BOOLEAN
 ept_stealth_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exit_qual)
 {
     VMX_EXIT_QUALIFICATION_EPT_VIOLATION viol;
+    const BOOLEAN quiesced = (vcpu->ept_state_quiesced != FALSE);
     viol.AsUInt = exit_qual;
     UINT64 pfn = guest_phys >> 12;
 
@@ -2226,6 +2250,9 @@ ept_stealth_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UI
                 pte->AsUInt = sp->original_entry.AsUInt;
                 _mm_mfence();
                 ept_invept_single(vcpu->ept_pointer);
+
+                if (quiesced)
+                    return TRUE;
 
                 vcpu->mtf_restore_stealth = sp;
                 SIZE_T pc = 0;
@@ -2264,6 +2291,9 @@ ept_stealth_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UI
                 _mm_mfence();
                 ept_invept_single(vcpu->ept_pointer);
 
+                if (quiesced)
+                    return TRUE;
+
                 vcpu->mtf_restore_fake_pt = fpt;
                 SIZE_T pc = 0;
                 __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
@@ -2284,7 +2314,7 @@ ept_stealth_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UI
 BOOLEAN
 ept_stealth_uninstall(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_FREE_PARAM req)
 {
-    if (!g_ept || !req->target_va) return FALSE;
+    if (!g_ept || !req->target_va || !ept_state_all_vcpus_drained()) return FALSE;
     UINT64 target_pfn = (req->target_phys & ~0xFFFULL) >> 12;
     UINT64 target_gva = (UINT64)req->target_va & ~0xFFFULL;
 
@@ -2374,7 +2404,7 @@ ept_stealth_uninstall(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_FREE_PARAM req)
 VOID
 ept_stealth_free_all(VOID)
 {
-    if (!g_ept) return;
+    if (!g_ept || !ept_state_all_vcpus_drained()) return;
 
     // restore target page EPT on ALL CPUs
     while (!IsListEmpty(&g_ept->stealth_pages))
@@ -2454,6 +2484,7 @@ static VOID dpc_stealth_free(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
     PEPT_STEALTH_FREE_PARAM req = (PEPT_STEALTH_FREE_PARAM)Ctx;
     asm_vmx_vmcall(VMCALL_STEALTH_FREE, (UINT64)req, req->caller_cr3, 0);
     KeSignalCallDpcSynchronize(A2);
+    asm_vmx_vmcall(VMCALL_EPT_LIFECYCLE_RESUME, 0, 0, 0);
     KeSignalCallDpcDone(A1);
 }
 

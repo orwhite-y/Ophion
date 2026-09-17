@@ -46,6 +46,51 @@ BOOLEAN ept_hook_install_secondary_cpu(
 //
 static volatile LONG g_hook_list_lock = 0;
 
+//
+// EPT/stealth lifecycle drain (cross-vCPU MTF / shadow-window race fix).
+// A successful installation advances the global epoch, invalidating every
+// per-vCPU drain acknowledgement.  Bulk free paths may only release objects
+// after all launched vCPUs have drained their pending MTF state at the
+// current epoch.
+//
+UINT64
+ept_state_epoch_get(VOID)
+{
+    return g_ept ? (UINT64)g_ept->ept_state_epoch : 0;
+}
+
+VOID
+ept_state_epoch_advance(VOID)
+{
+    if (g_ept)
+        _InterlockedIncrement64(&g_ept->ept_state_epoch);
+}
+
+VOID
+ept_state_mark_drained(VIRTUAL_MACHINE_STATE *vcpu)
+{
+    if (vcpu && g_ept)
+        vcpu->ept_state_drain_epoch = (UINT64)g_ept->ept_state_epoch;
+}
+
+BOOLEAN
+ept_state_all_vcpus_drained(VOID)
+{
+    if (!g_ept || !g_vcpu || !g_cpu_count)
+        return TRUE;
+
+    UINT64 epoch = (UINT64)g_ept->ept_state_epoch;
+    for (UINT32 i = 0; i < g_cpu_count; i++)
+    {
+        if (!g_vcpu[i].launched)
+            continue;
+        if (!g_vcpu[i].ept_state_quiesced ||
+            g_vcpu[i].ept_state_drain_epoch != epoch)
+            return FALSE;
+    }
+    return TRUE;
+}
+
 // Diagnostic: last failure point in ept_hook_install (0=success, 1+=failure code)
 volatile UINT64 g_ept_hook_diag = 0;
 volatile UINT64 g_ept_hook_diag2 = 0;  // sub-diagnostic (LDE length, instruction bytes)
@@ -522,6 +567,7 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     // target_cr3 controls EPT violation per-process CR3 filtering (separate).
     //
     BOOLEAN is_r3 = (req->target_cr3 != 0 || req->user_trampoline != NULL);
+    BOOLEAN metadata_changed = FALSE;
 
     //
     // R3 hook / inject: switch to caller_cr3 (target process) for user-mode VA access.
@@ -768,6 +814,8 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
             {
                 PEPT_HOOKED_FUNCTION_INFO fi = (PEPT_HOOKED_FUNCTION_INFO)
                     pool_manager_request(POOL_TAG_HOOKED_FUNC, sizeof(EPT_HOOKED_FUNCTION_INFO));
+                if (fi)
+                    metadata_changed = TRUE;
                 if (!fi)
                 {
                     g_ept_hook_diag = HOOK_DIAG_POOL_FUNC_S;
@@ -864,6 +912,12 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
             _mm_mfence();
             ept_invept_single(vcpu->ept_pointer);
             _InterlockedExchange(&g_hook_list_lock, 0);
+
+            g_ept_hook_diag = 0;
+            vcpu->ept_state_quiesced = FALSE;
+            if (metadata_changed)
+                ept_state_epoch_advance();
+
             HOOK_RESTORE_CR3_AND_RETURN(TRUE);
         }
 
@@ -891,12 +945,16 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     // 鍒嗛厤璺熻釜缁撴瀯
     PEPT_HOOKED_PAGE_INFO hp = (PEPT_HOOKED_PAGE_INFO)
         pool_manager_request(POOL_TAG_HOOKED_PAGE, sizeof(EPT_HOOKED_PAGE_INFO));
+    if (hp)
+        metadata_changed = TRUE;
     if (!hp) { g_ept_hook_diag = HOOK_DIAG_POOL_PAGE; _InterlockedExchange(&g_hook_list_lock, 0); HOOK_RESTORE_CR3_AND_RETURN(FALSE); }
     RtlZeroMemory(hp, sizeof(*hp));
     InitializeListHead(&hp->hooked_functions_list);
 
     PEPT_HOOKED_FUNCTION_INFO fi = (PEPT_HOOKED_FUNCTION_INFO)
         pool_manager_request(POOL_TAG_HOOKED_FUNC, sizeof(EPT_HOOKED_FUNCTION_INFO));
+    if (fi)
+        metadata_changed = TRUE;
     if (!fi) { g_ept_hook_diag = HOOK_DIAG_POOL_FUNC_N; pool_manager_release(hp); _InterlockedExchange(&g_hook_list_lock, 0); HOOK_RESTORE_CR3_AND_RETURN(FALSE); }
     RtlZeroMemory(fi, sizeof(*fi));
 
@@ -1024,6 +1082,11 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     g_ept_hook_diag = 0;
     _mm_mfence();
     ept_invept_single(vcpu->ept_pointer);
+
+    vcpu->ept_state_quiesced = FALSE;
+    if (metadata_changed)
+        ept_state_epoch_advance();
+
     return TRUE;
 
     #undef HOOK_RESTORE_CR3_AND_RETURN
@@ -1110,7 +1173,8 @@ ept_unhook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_UNHOOK_VMCALL_PARAM req)
 VOID
 ept_unhook_all(VOID)
 {
-    if (!g_ept) return;
+    if (!g_ept || !ept_state_all_vcpus_drained())
+        return;
     while (!IsListEmpty(&g_ept->hooked_pages))
     {
         PLIST_ENTRY item = RemoveHeadList(&g_ept->hooked_pages);
@@ -1194,6 +1258,7 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
     VMX_EXIT_QUALIFICATION_EPT_VIOLATION viol;
     viol.AsUInt = exit_qual;
     UINT64 pfn = guest_phys >> 12;
+    const BOOLEAN quiesced = (vcpu->ept_state_quiesced != FALSE);
 
     UINT64 guest_cr3 = 0;
     __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
@@ -1224,11 +1289,16 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
                 {
                     // temporarily point to the hooked page (zeroed) for reads
                     EPT_PML1_ENTRY tmp = *fake_pte;
-                    tmp.ReadAccess = 1; tmp.WriteAccess = 0; tmp.ExecuteAccess = 0;
+                    tmp.ReadAccess = 1;
+                    tmp.WriteAccess = quiesced ? 1 : 0;
+                    tmp.ExecuteAccess = 0;
                     tmp.PageFrameNumber = hp->pfn_of_hooked_page;  // zeroed page
                     fake_pte->AsUInt = tmp.AsUInt;
                     _mm_mfence();
                     ept_invept_single(vcpu->ept_pointer);
+
+                    if (quiesced)
+                        return TRUE;
 
                     vcpu->mtf_restore_page = hp;
                     SIZE_T pc = 0;
@@ -1254,6 +1324,8 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
         {
             EPT_PML1_ENTRY orig = hp->original_entry;
             ept_swap_page(my_pte, orig, vcpu->ept_pointer);
+            if (quiesced)
+                return TRUE;
             vcpu->mtf_restore_page = hp;
             SIZE_T pc = 0;
             __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
@@ -1274,6 +1346,8 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
                 EPT_PML1_ENTRY passthrough = hp->original_entry;
                 passthrough.ExecuteAccess = 1;
                 ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
+                if (quiesced)
+                    return TRUE;
                 vcpu->mtf_restore_page = hp;
 
                 SIZE_T pc = 0;
@@ -1308,6 +1382,8 @@ ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exi
                         EPT_PML1_ENTRY passthrough = hp->original_entry;
                         passthrough.ExecuteAccess = 1;
                         ept_swap_page(my_pte, passthrough, vcpu->ept_pointer);
+                        if (quiesced)
+                            return TRUE;
                         vcpu->mtf_restore_page = hp;
 
                         SIZE_T pc = 0;
@@ -1406,9 +1482,11 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     }
 
     //
-    // stealth target page MTF: swap back to read-only view (no execute)
+    // stealth target page MTF: swap back to read-only view (no execute).
+    // This is intentionally an independent check: a single MTF exit may
+    // carry more than one pending restore class.
     //
-    else if (vcpu->mtf_restore_stealth)
+    if (vcpu->mtf_restore_stealth)
     {
         PEPT_STEALTH_PAGE_INFO sp = vcpu->mtf_restore_stealth;
         PEPT_PML1_ENTRY my_pte = ept_get_pml1(vcpu->ept_page_table,
@@ -1423,10 +1501,10 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     }
 
     //
-    // stealth shared fake PT page MTF: resync from real PT page, swap back
-    // fires after OS writes a PTE in the same PT page (page in/out, A/D bits)
+    // stealth shared fake PT page MTF: resync from real PT page, swap back.
+    // This is also independent so stale pending state is not skipped.
     //
-    else if (vcpu->mtf_restore_fake_pt)
+    if (vcpu->mtf_restore_fake_pt)
     {
         PSTEALTH_FAKE_PT fpt = vcpu->mtf_restore_fake_pt;
 
@@ -1633,17 +1711,20 @@ ept_hook_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 error
             if (pt_pte)
                 pt_pte->AsUInt = hp->pt_exec_entry.AsUInt;
 
-            //
-            // 3. Restore the PT view after one instruction.  The descriptor is
-            //    shared by all functions on this PFN, so MTF restores the page,
-            //    not an individual function.
-            //
-            vcpu->stealth_pf_swapped_hook = hp;
+            if (!vcpu->ept_state_quiesced)
+            {
+                //
+                // 3. Restore the PT view after one instruction.  The descriptor is
+                //    shared by all functions on this PFN, so MTF restores the page,
+                //    not an individual function.
+                //
+                vcpu->stealth_pf_swapped_hook = hp;
 
-            SIZE_T pc = 0;
-            __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
-            pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
-            __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+                SIZE_T pc = 0;
+                __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
+                pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+                __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+            }
 
             _mm_mfence();
             ept_invept_single(vcpu->ept_pointer);
@@ -1731,6 +1812,16 @@ ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu)
 
     PEPT_HOOKED_PAGE_INFO hp = selected_page;
     PEPT_HOOKED_FUNCTION_INFO fi = selected_function;
+
+    //
+    // Quiesced (global lifecycle barrier in progress): restore this vCPU's
+    // EPT view and return before any proxy dispatch or MTF arm.
+    //
+    if (vcpu->ept_state_quiesced)
+    {
+        ept_hook_restore_current_vcpu(vcpu, hp);
+        return TRUE;
+    }
 
     //
     // Retiring hook: execute the original page for one instruction.  If no

@@ -374,7 +374,7 @@ typedef NTSTATUS (NTAPI * fn_NtCreateFile)(
     PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
     PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
 
-#define MAX_R3_HOOKS 16
+#define MAX_R3_HOOKS 32  // must cover full diag hook sets (17) with margin
 typedef struct _R3_HOOK_ENTRY {
     BOOLEAN     active;
     UINT64      target_pid;

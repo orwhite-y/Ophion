@@ -397,6 +397,7 @@ PSTEALTH_FAKE_PT
 stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, PVOID pt_page_va_hint, PVOID real_page_va)
 {
     // check if already exists
+    ept_lists_lock_acquire();
     PLIST_ENTRY cur = g_ept->stealth_fake_pts.Flink;
     while (cur != &g_ept->stealth_fake_pts)
     {
@@ -405,9 +406,11 @@ stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, 
         if (fpt->pt_page_pfn == pt_page_pfn)
         {
             fpt->ref_count++;
+            ept_lists_lock_release();
             return fpt;
         }
     }
+    ept_lists_lock_release();
 
     // create new
     PSTEALTH_FAKE_PT fpt = (PSTEALTH_FAKE_PT)
@@ -452,7 +455,9 @@ stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, 
     // activate fake view 闂?EPT now maps PT page to fake page
     pt_pte->AsUInt = fpt->pt_fake_entry.AsUInt;
 
+    ept_lists_lock_acquire();
     InsertHeadList(&g_ept->stealth_fake_pts, &fpt->fake_pt_list);
+    ept_lists_lock_release();
     return fpt;
 }
 
@@ -474,6 +479,7 @@ stealth_fake_pt_set_nx(PSTEALTH_FAKE_PT fpt, UINT32 pte_index)
 VOID
 stealth_fake_pt_resync(PSTEALTH_FAKE_PT fpt)
 {
+    // NOTE: caller must hold g_ept_lists_lock (this walks the global lists).
     if (!fpt->real_page_va) return;
 
     RtlCopyMemory(fpt->fake_page_va, fpt->real_page_va, PAGE_SIZE);
@@ -831,6 +837,7 @@ stealth_sync_data_pte_in_window(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr,
     {
         // OPTIMIZATION: Use hash table for O(1) lookup instead of linear scan
         UINT32 hash = stealth_hash_va(fault_page);
+        ept_lists_lock_acquire();
         PLIST_ENTRY cur2 = g_ept->stealth_hash[hash].Flink;
         while (cur2 != &g_ept->stealth_hash[hash])
         {
@@ -850,6 +857,7 @@ stealth_sync_data_pte_in_window(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr,
             sp_data = s;
             break;
         }
+        ept_lists_lock_release();
     }
 
     // Not a DLL stealth page (heap/stack/TLS): these share the REAL PT through
@@ -1307,6 +1315,7 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     UINT64 target_pfn = target_phys >> 12;
 
     // --- check if already installed (by another CPU in DPC broadcast) ---
+    ept_lists_lock_acquire();
     PLIST_ENTRY cur = g_ept->stealth_pages.Flink;
     while (cur != &g_ept->stealth_pages)
     {
@@ -1363,6 +1372,8 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
         }
     }
 
+    ept_lists_lock_release();
+
     // === first CPU: full install (use interlock to prevent duplicate) ===
     //
     // multiple CPUs enter VMX-root via KeGenericCallDpc simultaneously.
@@ -1388,6 +1399,7 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
             _mm_pause();
         }
 
+        ept_lists_lock_acquire();
         cur = g_ept->stealth_pages.Flink;
         while (cur != &g_ept->stealth_pages)
         {
@@ -1512,11 +1524,13 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
 #endif
 
         // Insert into both legacy list (for cleanup walk) and hash table (for O(1) lookup)
+        ept_lists_lock_acquire();
         InsertHeadList(&g_ept->stealth_pages, &sp->stealth_page_list);
 
         // hash table insert (use independent stealth_hash_list)
         UINT32 hash = stealth_hash_va(sp->guest_va);
         InsertHeadList(&g_ept->stealth_hash[hash], &sp->stealth_hash_list);
+        ept_lists_lock_release();
 
         ept_update_pf_intercept(vcpu);
 
@@ -1664,7 +1678,9 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
 
     // hash table insert (use independent stealth_hash_list)
     UINT32 hash = stealth_hash_va(sp->guest_va);
+    ept_lists_lock_acquire();
     InsertHeadList(&g_ept->stealth_hash[hash], &sp->stealth_hash_list);
+    ept_lists_lock_release();
 
     if (sp->fake_pt || sp->shadow_cr3_phys)
         ept_update_pf_intercept(vcpu);
@@ -1731,7 +1747,9 @@ fail_cleanup_fakept:
                 sp->fake_pt->fake_pt_list.Blink != NULL &&
                 sp->fake_pt->fake_pt_list.Flink != &sp->fake_pt->fake_pt_list)
             {
+                ept_lists_lock_acquire();
                 RemoveEntryList(&sp->fake_pt->fake_pt_list);
+                ept_lists_lock_release();
             }
             pool_manager_release(sp->fake_pt);
         }
@@ -1739,7 +1757,7 @@ fail_cleanup_fakept:
     pool_manager_release(sp);
     if (interlock)
         _InterlockedExchange(interlock, 0);
-    return FALSE;
+    { ept_lists_lock_release(); return FALSE; }
 }
 
 // =========================================================================
@@ -1809,6 +1827,7 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
     // Linear scan = avg 8K comparisons with 16K pages. Hash lookup = avg 4 comparisons.
     // 2000x performance improvement on hot path.
     UINT32 hash = stealth_hash_va(fault_page);
+    ept_lists_lock_acquire();
     PLIST_ENTRY cur = g_ept->stealth_hash[hash].Flink;
     UINT32 chain_len = 0;
 
@@ -1868,13 +1887,13 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             {
                 _InterlockedIncrement(&g_dbg_shadow_pf_reject);
                 stealth_diag_midwin_pf(vcpu, fault_addr, error_code, "reject", sp);
-                return FALSE;
+                { ept_lists_lock_release(); return FALSE; }
             }
             _InterlockedIncrement(&g_dbg_shadow_pf_allowed);
         }
         else if (!(error_code & PFEC_INSTR_FETCH))
         {
-            return FALSE;
+            { ept_lists_lock_release(); return FALSE; }
         }
 
         // WEDGE-B1 (CMOS 0x0B): stealth page MATCHED (guest_va + pid/cr3), entering mode handling.
@@ -1906,7 +1925,7 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             if (quiesced)
             {
                 stealth_clear_stale_window(vcpu);
-                return FALSE;
+                { ept_lists_lock_release(); return FALSE; }
             }
 
             // WEDGE-B2 (CMOS 0x0C): match, CR3 read + already_on_shadow done, about to call heal.
@@ -1949,7 +1968,7 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
                         // real PTE not present (page paged out): abort shadow
                         // window, re-inject #PF under real CR3 for demand fault.
                         stealth_pf_abort_shadow_window(vcpu);
-                        return FALSE;
+                        { ept_lists_lock_release(); return FALSE; }
                     }
                 }
             }
@@ -1958,7 +1977,7 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
                 if (!stealth_refresh_shadow_code_pte(vcpu, sp, fault_addr, current_cr3))
                 {
                     // real PTE not present: genuine demand fault, let guest handle.
-                    return FALSE;
+                    { ept_lists_lock_release(); return FALSE; }
                 }
             }
 
@@ -2033,7 +2052,7 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
             {
                 _mm_mfence();
                 ept_invept_single(vcpu->ept_pointer);
-                return TRUE;
+                { ept_lists_lock_release(); return TRUE; }
             }
 
             vcpu->stealth_pf_swapped = sp;
@@ -2073,7 +2092,7 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
         if (chain_len > 1)
             _InterlockedIncrement(&g_dbg_hash_collisions);
 
-        return TRUE;
+        { ept_lists_lock_release(); return TRUE; }
     }
 
     // WEDGE-BN (0x0D) removed: per-CPU snap captures the nomatch reinject; this
@@ -2118,7 +2137,7 @@ ept_stealth_handle_pf(VIRTUAL_MACHINE_STATE * vcpu, UINT64 fault_addr, UINT32 er
     {
         stealth_pf_abort_shadow_window(vcpu);
     }
-    return FALSE;
+    { ept_lists_lock_release(); return FALSE; }
 }
 
 // =========================================================================
@@ -2131,6 +2150,7 @@ ept_handle_stealth_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
     UINT64 rip = vcpu->vmexit_rip;
     UINT64 rip_page = rip & ~0xFFFULL;
 
+    ept_lists_lock_acquire();
     PLIST_ENTRY cur = g_ept->stealth_pages.Flink;
     while (cur != &g_ept->stealth_pages)
     {
@@ -2207,7 +2227,7 @@ ept_handle_stealth_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             asm_invvpid(InvvpidSingleContext, &desc);
 
         __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)sp->handler_function);
-        return TRUE;
+        { ept_lists_lock_release(); return TRUE; }
     }
 
     //
@@ -2215,7 +2235,7 @@ ept_handle_stealth_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
     // clear stealth_pf_swapped to prevent use-after-free in MTF handler.
     //
     vcpu->stealth_pf_swapped = NULL;
-    return FALSE;
+    { ept_lists_lock_release(); return FALSE; }
 }
 
 // =========================================================================
@@ -2231,6 +2251,7 @@ ept_stealth_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UI
     UINT64 pfn = guest_phys >> 12;
 
     // --- check stealth target pages ---
+    ept_lists_lock_acquire();
     PLIST_ENTRY cur = g_ept->stealth_pages.Flink;
     while (cur != &g_ept->stealth_pages)
     {
@@ -2252,21 +2273,21 @@ ept_stealth_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UI
                 ept_invept_single(vcpu->ept_pointer);
 
                 if (quiesced)
-                    return TRUE;
+                    { ept_lists_lock_release(); return TRUE; }
 
-                vcpu->mtf_restore_stealth = sp;
+                { LONG d = vcpu->mtf_restore_stealth_depth; if (d < 2) { vcpu->mtf_restore_stealth_stack[d] = sp; vcpu->mtf_restore_stealth_depth = d + 1; } }
                 SIZE_T pc = 0;
                 __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
                 pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
                 __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
-                return TRUE;
+                { ept_lists_lock_release(); return TRUE; }
             }
             if (viol.ExecuteAccess)
             {
                 pte->AsUInt = sp->execute_entry.AsUInt;
                 _mm_mfence();
                 ept_invept_single(vcpu->ept_pointer);
-                return TRUE;
+                { ept_lists_lock_release(); return TRUE; }
             }
         }
     }
@@ -2292,19 +2313,19 @@ ept_stealth_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UI
                 ept_invept_single(vcpu->ept_pointer);
 
                 if (quiesced)
-                    return TRUE;
+                    { ept_lists_lock_release(); return TRUE; }
 
-                vcpu->mtf_restore_fake_pt = fpt;
+                { LONG d = vcpu->mtf_restore_fake_pt_depth; if (d < 2) { vcpu->mtf_restore_fake_pt_stack[d] = fpt; vcpu->mtf_restore_fake_pt_depth = d + 1; } }
                 SIZE_T pc = 0;
                 __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
                 pc |= (SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
                 __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
-                return TRUE;
+                { ept_lists_lock_release(); return TRUE; }
             }
         }
     }
 
-    return FALSE;
+    { ept_lists_lock_release(); return FALSE; }
 }
 
 // =========================================================================
@@ -2320,6 +2341,7 @@ ept_stealth_uninstall(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_FREE_PARAM req)
 
     if (_InterlockedCompareExchange(&req->freed, 1, 0) == 0)
     {
+        ept_lists_lock_acquire();
         PLIST_ENTRY cur = g_ept->stealth_pages.Flink;
         while (cur != &g_ept->stealth_pages)
         {
@@ -2381,11 +2403,20 @@ ept_stealth_uninstall(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_FREE_PARAM req)
             {
                 RemoveEntryList(&sp->stealth_page_list);
             }
+            // CRITICAL: also unlink the hash-bucket entry, otherwise the O(1)
+            // lookup in ept_stealth_handle_pf walks into this released node.
+            if (sp->stealth_hash_list.Flink != NULL &&
+                sp->stealth_hash_list.Blink != NULL &&
+                sp->stealth_hash_list.Flink != &sp->stealth_hash_list)
+            {
+                RemoveEntryList(&sp->stealth_hash_list);
+            }
             pool_manager_release(sp);
             req->result = TRUE;
             break;
         }
     }
+    ept_lists_lock_release();
 
     // restore target page EPT on all CPUs
     for (UINT32 i = 0; i < g_cpu_count; i++)
@@ -2405,6 +2436,8 @@ VOID
 ept_stealth_free_all(VOID)
 {
     if (!g_ept || !ept_state_all_vcpus_drained()) return;
+
+    ept_lists_lock_acquire();
 
     // restore target page EPT on ALL CPUs
     while (!IsListEmpty(&g_ept->stealth_pages))
@@ -2455,6 +2488,7 @@ ept_stealth_free_all(VOID)
         }
         pool_manager_release(fpt);
     }
+    ept_lists_lock_release();
 }
 
 VOID ept_stealth_free_all_broadcast(VOID) { ept_stealth_free_all(); }

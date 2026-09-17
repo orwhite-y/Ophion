@@ -74,6 +74,7 @@ typedef struct _TD_PEB_LDR_DATA {
 #define VMCALL_STEALTH_FREE_ALL  0x00000014   // remove ALL stealth page entries (pre-injection cleanup)
 #define VMCALL_GET_HOOK_DIAG   0x00000015
 #define VMCALL_GET_HOOK_DIAG2  0x00000016   // return last ept_hook_install failure code
+#define VMCALL_EPT_LIFECYCLE_RESUME 0x00000017 // resume this vCPU after a synchronized EPT lifecycle barrier
 
 //
 // EPT hook inject param ??pre-built at PASSIVE_LEVEL, passed to VMX-root.
@@ -680,6 +681,7 @@ BOOLEAN TdShadowMapRealPage(TD_SHADOW_BUILD_CONTEXT * ctx, UINT64 pa);
 BOOLEAN TdShadowRegisterCr3(UINT64 shadow_cr3_phys, TD_SHADOW_BUILD_CONTEXT * ctx);
 BOOLEAN TdStealthFreePage(PVOID target_va);
 BOOLEAN TdStealthFreePageSafe(PVOID target_va, UINT64 target_phys);
+VOID    TdEptLifecycleResumeAll(VOID);
 BOOLEAN TdStealthInjectPages( PVOID base_va, PVOID shellcode, UINT32 shellcode_size, BOOLEAN resident);
 BOOLEAN TdStealthTrackAdd(UINT64 pid, PVOID va, SIZE_T size, UINT64 shadow_cr3, PMDL image_mdl = NULL, UINT64 guest_cr3 = 0, UINT64 *page_pfns = NULL, UINT32 page_count = 0);
 BOOLEAN TdStealthTrackFindOverlap(UINT64 pid, PVOID base_va, SIZE_T size, PVOID * out_base, SIZE_T * out_size, UINT64 * out_shadow_cr3);

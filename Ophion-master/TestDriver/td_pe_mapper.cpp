@@ -1227,6 +1227,9 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
         KeSignalCallDpcSynchronize(A2);
         KeSignalCallDpcDone(A1);
     }, NULL);
+    // The second abort is a lifecycle barrier, not a permanent mode.  Resume
+    // all vCPUs here so every early-return path below leaves dispatch enabled.
+    TdEptLifecycleResumeAll();
     HYPERPLATFORM_LOG_WARN("[%s] pre-injection HV cleanup done (abort + free + unhook + invept)", log_prefix);
 
     // 1. attach to target

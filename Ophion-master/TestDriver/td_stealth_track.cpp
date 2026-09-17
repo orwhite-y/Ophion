@@ -188,6 +188,18 @@ TdStealthTrackHasPartialOverlap(UINT64 pid, PVOID base_va, SIZE_T size)
 // free one stealth page via DPC broadcast �?VMCALL_STEALTH_FREE
 // must be called while attached to the target process.
 //
+VOID
+TdEptLifecycleResumeAll(VOID)
+{
+    // All CPUs meet at the DPC barrier before clearing quiesce locally.  This
+    // is the TestDriver-side tail for SHADOW_ABORT/FREE lifecycle operations.
+    KeGenericCallDpc([](PKDPC, PVOID, PVOID A1, PVOID A2) {
+        KeSignalCallDpcSynchronize(A2);
+        hv_vmcall_simple(VMCALL_EPT_LIFECYCLE_RESUME, 0, 0, 0);
+        KeSignalCallDpcDone(A1);
+    }, NULL);
+}
+
 BOOLEAN
 TdStealthFreePage(PVOID target_va)
 {
@@ -202,6 +214,7 @@ TdStealthFreePage(PVOID target_va)
     KeGenericCallDpc([](PKDPC, PVOID Ctx, PVOID A1, PVOID A2) {
         hv_vmcall_simple(VMCALL_STEALTH_FREE, (UINT64)Ctx, 0, 0);
         KeSignalCallDpcSynchronize(A2);
+        hv_vmcall_simple(VMCALL_EPT_LIFECYCLE_RESUME, 0, 0, 0);
         KeSignalCallDpcDone(A1);
     }, &req);
     return req.result;
@@ -228,6 +241,7 @@ TdStealthFreePageSafe(PVOID target_va, UINT64 target_phys)
     KeGenericCallDpc([](PKDPC, PVOID Ctx, PVOID A1, PVOID A2) {
         hv_vmcall_simple(VMCALL_STEALTH_FREE, (UINT64)Ctx, 0, 0);
         KeSignalCallDpcSynchronize(A2);
+        hv_vmcall_simple(VMCALL_EPT_LIFECYCLE_RESUME, 0, 0, 0);
         KeSignalCallDpcDone(A1);
     }, &req);
     return req.result;
@@ -240,6 +254,39 @@ TdStealthFreePageSafe(PVOID target_va, UINT64 target_phys)
 VOID
 TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
 {
+    // Process-notify runs for every process on the system.  Lifecycle DPCs are
+    // global, so broadcasting them for an unrelated cmd/git/conhost exit can
+    // quiesce an in-flight hook installation owned by another process.  Enter
+    // the teardown barrier only when this PID actually owns tracked EPT state.
+    BOOLEAN owns_ept_state = FALSE;
+    for (int i = 0; i < MAX_R3_HOOKS; i++)
+    {
+        if (g_r3_hooks[i].active && g_r3_hooks[i].target_pid == pid)
+        {
+            owns_ept_state = TRUE;
+            break;
+        }
+    }
+
+    if (!owns_ept_state)
+    {
+        KIRQL old_irql;
+        KeAcquireSpinLock(&g_stealth_track_lock, &old_irql);
+        for (int i = 0; i < MAX_STEALTH_TRACKS; i++)
+        {
+            if (g_stealth_tracks[i].active &&
+                g_stealth_tracks[i].target_pid == pid)
+            {
+                owns_ept_state = TRUE;
+                break;
+            }
+        }
+        KeReleaseSpinLock(&g_stealth_track_lock, old_irql);
+    }
+
+    if (!owns_ept_state)
+        return;
+
     //
     // 0. retire (passthrough) this process's EPT hooks on the shared d3d12/dxgi
     //    pages. Without this, the hooks (and their proxy pointers) survive exit
@@ -431,4 +478,9 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
         HYPERPLATFORM_LOG_WARN("[td-rw] process exit cleanup done: pid=%llu to_free=0x%llX",
                    pid, to_free);
     }
+
+    // SHADOW_ABORT_ALL quiesces every vCPU while cleanup may release metadata
+    // referenced by pending MTF/shadow windows.  Cleanup is complete here, so
+    // release the barrier even when the exiting process owned no stealth pages.
+    TdEptLifecycleResumeAll();
 }

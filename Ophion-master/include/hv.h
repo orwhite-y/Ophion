@@ -375,6 +375,11 @@ VOID    ept_state_epoch_advance(VOID);
 VOID    ept_state_mark_drained(VIRTUAL_MACHINE_STATE * vcpu);
 BOOLEAN ept_state_all_vcpus_drained(VOID);
 
+// global EPT metadata list lock (hooked_pages / stealth_pages mutation vs walk)
+extern volatile LONG g_ept_lists_lock;
+VOID    ept_lists_lock_acquire(VOID);
+VOID    ept_lists_lock_release(VOID);
+
 // shared fake PT page management (VMX-root safe)
 PSTEALTH_FAKE_PT stealth_get_or_create_fake_pt(VIRTUAL_MACHINE_STATE * vcpu, UINT64 pt_page_pfn, PVOID pt_page_va_hint, PVOID real_page_va);
 VOID stealth_fake_pt_set_nx(PSTEALTH_FAKE_PT fpt, UINT32 pte_index);

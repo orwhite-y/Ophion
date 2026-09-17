@@ -273,17 +273,25 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     //
     // EPT hook: page to restore after MTF single-step
     //
-    PEPT_HOOKED_PAGE_INFO mtf_restore_page;
+    // EPT-hook view restore stack.  A single slot was clobbered by nested hook
+    // frames (full hook set: proxy -> trampoline -> original -> next hooked
+    // function), leaving the outer page view stuck in a swapped state.
+    PEPT_HOOKED_PAGE_INFO mtf_restore_page_stack[4];
+    volatile LONG        mtf_restore_page_depth;
 
     //
-    // stealth page: page to restore after MTF single-step
+    // stealth page: restore stack after MTF single-step (nested trampolines)
     //
-    PEPT_STEALTH_PAGE_INFO mtf_restore_stealth;
+    PEPT_STEALTH_PAGE_INFO mtf_restore_stealth_stack[2];
+    volatile LONG          mtf_restore_stealth_depth;
 
     //
-    // stealth PT page: restore fake PT after MTF (PTE write passthrough)
+    // stealth PT page: restore fake PT after MTF (PTE write passthrough).
+    // Depth 2: a PTE write inside a trampoline while an outer fake-PT
+    // restore is still pending.
     //
-    PSTEALTH_FAKE_PT mtf_restore_fake_pt;
+    PSTEALTH_FAKE_PT mtf_restore_fake_pt_stack[2];
+    volatile LONG    mtf_restore_fake_pt_depth;
 
     //
     // stealth #PF swap state: target + PT EPTs swapped for execution

@@ -331,9 +331,10 @@ TdEptUnhookNtCreateFile(VOID)
 // =========================================================================
 
 //
-// tracking for active R3 hooks (simple array, max 16 concurrent R3 hooks)
+// tracking for active R3 hooks (simple array; MAX_R3_HOOKS comes from
+// td_common.h -- the local redefinition here shadowed it with a different
+// value, so other TUs scanning only 16 slots could orphan entries 16+)
 //
-#define MAX_R3_HOOKS 64
 
 
 R3_HOOK_ENTRY g_r3_hooks[MAX_R3_HOOKS] = {};

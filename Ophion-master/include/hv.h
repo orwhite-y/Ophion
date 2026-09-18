@@ -245,10 +245,8 @@ VOID    hostcr3_destroy(VOID);
 BOOLEAN hostcr3_map_va(PVOID va, SIZE_T size);
 
 //
-// PID -> kernel CR3 cache + per-CPU scratch buffer (driver.c)
-// lock-free lookup, callable from VMX-root.
+// Per-CPU scratch buffer (driver.c).
 //
-UINT64  hv_pid_to_cr3(HANDLE pid);
 PUCHAR  hv_get_scratch(VOID);
 
 //

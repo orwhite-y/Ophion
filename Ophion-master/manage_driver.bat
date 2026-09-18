@@ -69,6 +69,7 @@ if %errorlevel% neq 0 exit /b 1
 call :DoDeploy
 if %errorlevel% neq 0 exit /b 1
 call :DoStart
+if errorlevel 1 exit /b 1
 goto :Done
 
 :DoClean
@@ -77,7 +78,9 @@ echo ========================================
 echo   清理：停止+卸载服务
 echo ========================================
 call :DoStop
+if errorlevel 1 exit /b 1
 call :DoUninstall
+if errorlevel 1 exit /b 1
 goto :Done
 
 :DoBuild
@@ -167,8 +170,9 @@ exit /b 0
 echo.
 echo [DEPLOY] 部署驱动 + 创建服务
 
-:: 先卸载旧服务
+:: 先卸载旧服务；失败时禁止覆盖仍被加载的驱动文件
 call :DoUninstall
+if errorlevel 1 exit /b 1
 
 :: 复制文件
 echo.
@@ -213,85 +217,106 @@ echo [START] 启动服务
 
 echo   启动 %SVC1%...
 sc start %SVC1% >nul 2>&1
-timeout /t 2 /nobreak >nul
-sc query %SVC1% | findstr /i "RUNNING" >nul
-if %errorlevel% equ 0 (
-    echo [OK] %SVC1% 运行中
-) else (
-    echo [!] %SVC1% 未能启动（检查日志）
+call :WaitServiceState "%SVC1%" RUNNING 30
+if errorlevel 1 (
+    echo [X] %SVC1% 在 30 秒内未进入 RUNNING，停止后续启动
+    exit /b 1
 )
+echo [OK] %SVC1% 运行中
 
 echo   启动 %SVC2%...
 sc start %SVC2% >nul 2>&1
-timeout /t 2 /nobreak >nul
-sc query %SVC2% | findstr /i "RUNNING" >nul
-if %errorlevel% equ 0 (
-    echo [OK] %SVC2% 运行中
-) else (
-    echo [!] %SVC2% 未能启动（检查日志）
+call :WaitServiceState "%SVC2%" RUNNING 30
+if errorlevel 1 (
+    echo [X] %SVC2% 在 30 秒内未进入 RUNNING
+    exit /b 1
 )
-
+echo [OK] %SVC2% 运行中
 exit /b 0
 
 :DoStop
 echo.
 echo [STOP] 停止服务
 
-:: 按反序停止（TestDriver先，Ophion后）
+:: 必须等 TestDriver 完全 STOPPED，才允许关闭 Ophion/VMX。
 echo   停止 %SVC2%...
-sc query %SVC2% 2>nul | findstr /i "RUNNING" >nul
-if %errorlevel% equ 0 (
-    sc stop %SVC2% >nul 2>&1
-    timeout /t 2 /nobreak >nul
-    echo [OK] %SVC2% 已停止
-) else (
-    echo   %SVC2% 未运行，跳过
+call :StopServiceAndWait "%SVC2%" 45
+if errorlevel 1 (
+    echo [X] %SVC2% 未完全停止；保留 %SVC1% 运行，终止本次操作
+    exit /b 1
 )
+echo [OK] %SVC2% 已完全停止
 
 echo   停止 %SVC1%...
-sc query %SVC1% 2>nul | findstr /i "RUNNING" >nul
-if %errorlevel% equ 0 (
-    sc stop %SVC1% >nul 2>&1
-    timeout /t 3 /nobreak >nul
-    echo [OK] %SVC1% 已停止
-) else (
-    echo   %SVC1% 未运行，跳过
+call :StopServiceAndWait "%SVC1%" 45
+if errorlevel 1 (
+    echo [X] %SVC1% 在 45 秒内未完全停止
+    exit /b 1
 )
-
+echo [OK] %SVC1% 已完全停止
 exit /b 0
 
 :DoUninstall
 echo.
 echo [UNINSTALL] 卸载服务
 
-:: 先停止
 call :DoStop
-timeout /t 1 /nobreak >nul
+if errorlevel 1 exit /b 1
 
-:: 按反序删除
 echo.
 echo   删除 %SVC2%...
-sc query %SVC2% >nul 2>&1
-if %errorlevel% equ 0 (
-    sc delete %SVC2% >nul 2>&1
-    timeout /t 1 /nobreak >nul
-    echo [OK] %SVC2% 已卸载
-) else (
-    echo   %SVC2% 不存在，跳过
+call :DeleteServiceAndWait "%SVC2%" 30
+if errorlevel 1 (
+    echo [X] %SVC2% 删除失败或仍被 SCM 占用
+    exit /b 1
 )
+echo [OK] %SVC2% 已卸载
 
 echo   删除 %SVC1%...
-sc query %SVC1% >nul 2>&1
-if %errorlevel% equ 0 (
-    sc delete %SVC1% >nul 2>&1
-    timeout /t 1 /nobreak >nul
-    echo [OK] %SVC1% 已卸载
-) else (
-    echo   %SVC1% 不存在，跳过
+call :DeleteServiceAndWait "%SVC1%" 30
+if errorlevel 1 (
+    echo [X] %SVC1% 删除失败或仍被 SCM 占用
+    exit /b 1
 )
-
-timeout /t 2 /nobreak >nul
+echo [OK] %SVC1% 已卸载
 exit /b 0
+
+:WaitServiceState
+set "_WAIT_SVC=%~1"
+set "_WAIT_STATE=%~2"
+set "_WAIT_LIMIT=%~3"
+for /l %%I in (1,1,!_WAIT_LIMIT!) do (
+    set "_CUR_STATE="
+    for /f "tokens=4" %%S in ('sc query "!_WAIT_SVC!" 2^>nul ^| findstr /R /C:"STATE"') do set "_CUR_STATE=%%S"
+    if /i "!_CUR_STATE!"=="!_WAIT_STATE!" exit /b 0
+    ping 127.0.0.1 -n 2 >nul
+)
+exit /b 1
+
+:StopServiceAndWait
+set "_STOP_SVC=%~1"
+set "_STOP_LIMIT=%~2"
+sc query "!_STOP_SVC!" >nul 2>&1
+if errorlevel 1 exit /b 0
+call :WaitServiceState "!_STOP_SVC!" STOPPED 1
+if not errorlevel 1 exit /b 0
+sc stop "!_STOP_SVC!" >nul 2>&1
+call :WaitServiceState "!_STOP_SVC!" STOPPED "!_STOP_LIMIT!"
+exit /b !errorlevel!
+
+:DeleteServiceAndWait
+set "_DELETE_SVC=%~1"
+set "_DELETE_LIMIT=%~2"
+sc query "!_DELETE_SVC!" >nul 2>&1
+if errorlevel 1 exit /b 0
+sc delete "!_DELETE_SVC!" >nul 2>&1
+if errorlevel 1 exit /b 1
+for /l %%I in (1,1,!_DELETE_LIMIT!) do (
+    sc query "!_DELETE_SVC!" >nul 2>&1
+    if errorlevel 1 exit /b 0
+    ping 127.0.0.1 -n 2 >nul
+)
+exit /b 1
 
 :Done
 echo.

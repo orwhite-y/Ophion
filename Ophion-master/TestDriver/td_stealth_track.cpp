@@ -191,6 +191,9 @@ TdStealthTrackHasPartialOverlap(UINT64 pid, PVOID base_va, SIZE_T size)
 VOID
 TdEptLifecycleResumeAll(VOID)
 {
+    if (!TdOphionAlive())
+        return;
+
     // All CPUs meet at the DPC barrier before clearing quiesce locally.  This
     // is the TestDriver-side tail for SHADOW_ABORT/FREE lifecycle operations.
     KeGenericCallDpc([](PKDPC, PVOID, PVOID A1, PVOID A2) {
@@ -203,7 +206,7 @@ TdEptLifecycleResumeAll(VOID)
 BOOLEAN
 TdStealthFreePage(PVOID target_va)
 {
-    if (!target_va) return FALSE;
+    if (!target_va || !TdOphionAlive()) return FALSE;
     UINT64 phys = MmGetPhysicalAddress(target_va).QuadPart;
     // phys may be 0 if page already freed/paged �?still try VMCALL with VA match
     TD_STEALTH_FREE_PARAM req = {};
@@ -232,7 +235,7 @@ TdStealthFreePage(PVOID target_va)
 BOOLEAN
 TdStealthFreePageSafe(PVOID target_va, UINT64 target_phys)
 {
-    if (!target_va) return FALSE;
+    if (!target_va || !TdOphionAlive()) return FALSE;
     TD_STEALTH_FREE_PARAM req = {};
     req.caller_cr3  = __readcr3();   // System CR3 (not attached to dying process)
     req.target_va   = target_va;
@@ -254,21 +257,27 @@ TdStealthFreePageSafe(PVOID target_va, UINT64 target_phys)
 VOID
 TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
 {
+    // Serialize against hook install/explicit unhook. The process callback is
+    // PASSIVE_LEVEL, so waiting on the synchronization-event gate is valid.
+    TdR3HooksLock();
+
     // Process-notify runs for every process on the system.  Lifecycle DPCs are
     // global, so broadcasting them for an unrelated cmd/git/conhost exit can
     // quiesce an in-flight hook installation owned by another process.  Enter
     // the teardown barrier only when this PID actually owns tracked EPT state.
     BOOLEAN owns_ept_state = FALSE;
+    UINT64 dying_cr3 = 0;
     for (int i = 0; i < MAX_R3_HOOKS; i++)
     {
         if (g_r3_hooks[i].active && g_r3_hooks[i].target_pid == pid)
         {
             owns_ept_state = TRUE;
+            dying_cr3 = g_r3_hooks[i].target_cr3;
             break;
         }
     }
 
-    if (!owns_ept_state)
+    if (!owns_ept_state || !dying_cr3)
     {
         KIRQL old_irql;
         KeAcquireSpinLock(&g_stealth_track_lock, &old_irql);
@@ -278,6 +287,7 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
                 g_stealth_tracks[i].target_pid == pid)
             {
                 owns_ept_state = TRUE;
+                dying_cr3 = g_stealth_tracks[i].guest_cr3;
                 break;
             }
         }
@@ -285,7 +295,18 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
     }
 
     if (!owns_ept_state)
+    {
+        TdR3HooksUnlock();
         return;
+    }
+
+    const BOOLEAN hv_alive = TdOphionAlive();
+    if (!hv_alive)
+    {
+        HYPERPLATFORM_LOG_ERROR(
+            "[td-rw] process exit pid=%llu while Ophion is not alive; skipping VMCALL cleanup",
+            pid);
+    }
 
     //
     // 0. retire (passthrough) this process's EPT hooks on the shared d3d12/dxgi
@@ -297,15 +318,17 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
     //    in the exit callback), so use the CR3-free VMCALL_EPT_UNHOOK_BY_CR3.
     //    The VMCALL does not switch CR3, so it is safe to issue from here.
     //
+    if (hv_alive && dying_cr3)
     {
-        KAPC_STATE apc;
-        KeStackAttachProcess(Process, &apc);
-        UINT64 dying_cr3 = __readcr3();
-        KeUnstackDetachProcess(&apc);
-
         struct { UINT64 target_cr3; } rctx;
         rctx.target_cr3 = dying_cr3;
         KeGenericCallDpc(DpcEptUnhookByCr3, &rctx);
+    }
+    else if (hv_alive)
+    {
+        HYPERPLATFORM_LOG_WARN(
+            "[td-rw] process exit pid=%llu has tracked state but no saved CR3",
+            pid);
     }
 
     //
@@ -324,15 +347,9 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
         SIZE_T  trampoline_sz = g_r3_hooks[i].trampoline_size;
         PMDL    target_mdl    = g_r3_hooks[i].target_mdl;
 
-        // The hypervisor-side EPT hook on the shared d3d12/dxgi page is NOT
-        // unhooked here. VMCALL_EPT_UNHOOK switches CR3 to the (dying) process
-        // on every CPU via KeGenericCallDpc, which deadlocks when issued from
-        // the process-exit notify callback (one CPU never reaches
-        // KeSignalCallDpcDone -> caller blocks forever). The hook is CR3-filtered
-        // (ept_hook.cpp target_cr3 check), so it is inert for every other
-        // process, and the next Box process repoints it (existing-entry update
-        // path) on re-install. Full unhook happens on driver unload
-        // (TdEptUnhookAllR3 -> ept_unhook_all).
+        // The hypervisor record was retired above by saved CR3 without loading
+        // the dying address space on every CPU. Do not use VMCALL_EPT_UNHOOK
+        // here: that path switches CR3 and can deadlock in an exit callback.
 
         // attach: trampoline stealth-page free + trampoline free need the
         // process address space, still valid at exit-notify time.
@@ -373,11 +390,14 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
     //      This VMCALL clears nx_timer_restore/nx_timer_real_cr3/MTF on every CPU
     //      without dereferencing the pointer (uses the value-copied real_cr3).
     //
-    KeGenericCallDpc([](PKDPC, PVOID, PVOID A1, PVOID A2) {
-        hv_vmcall_simple(VMCALL_SHADOW_ABORT_ALL, 0, 0, 0);
-        KeSignalCallDpcSynchronize(A2);
-        KeSignalCallDpcDone(A1);
-    }, NULL);
+    if (hv_alive)
+    {
+        KeGenericCallDpc([](PKDPC, PVOID, PVOID A1, PVOID A2) {
+            hv_vmcall_simple(VMCALL_SHADOW_ABORT_ALL, 0, 0, 0);
+            KeSignalCallDpcSynchronize(A2);
+            KeSignalCallDpcDone(A1);
+        }, NULL);
+    }
 
     //
     // 2. clean up stealth tracks (shadow memory)
@@ -483,4 +503,5 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
     // referenced by pending MTF/shadow windows.  Cleanup is complete here, so
     // release the barrier even when the exiting process owned no stealth pages.
     TdEptLifecycleResumeAll();
+    TdR3HooksUnlock();
 }

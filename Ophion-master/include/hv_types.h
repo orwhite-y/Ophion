@@ -365,7 +365,7 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_READ_MEM         0x0000000B   // R3/R0: read target mem (rdx=&req, r8=caller_pid, r9=target_pid)
 #define VMCALL_WRITE_MEM        0x0000000C   // R3/R0: write target mem (rdx=&req, r8=caller_pid, r9=target_pid)
 #define VMCALL_QUERY_VA         0x0000000D   // R3/R0: query VA->PA (rdx=&req, r8=caller_pid, r9=target_pid)
-#define VMCALL_QUERY_CR3        0x0000000E
+// 0x0000000E retired: legacy PID->CR3 cache query
 #define VMCALL_SET_SELFMAP     0x0000000F
 #define VMCALL_DIAG_WALK        0x00000010   // R3: rdx=target_pid -> rax=kernel CR3
 #define VMCALL_READ_MEM_PTE     0x00000011   // R0: PTE-window read (rdx=pa_arr, r8=data, r9=size, r10=tva, r11=pa_cnt)

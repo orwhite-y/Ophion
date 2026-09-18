@@ -1291,6 +1291,11 @@ ept_unhook_by_cr3(VIRTUAL_MACHINE_STATE * vcpu, UINT64 target_cr3)
     if (!g_ept || !target_cr3)
         return;
 
+    // Hook installation/removal can update these lists from another vCPU.
+    // Serialize the walk so process-exit retirement never follows a removed
+    // function/page entry while the DPC broadcast is running.
+    ept_lists_lock_acquire();
+
     PLIST_ENTRY cur = g_ept->hooked_pages.Flink;
     while (cur != &g_ept->hooked_pages)
     {
@@ -1322,6 +1327,8 @@ ept_unhook_by_cr3(VIRTUAL_MACHINE_STATE * vcpu, UINT64 target_cr3)
         if (!ept_hook_page_has_active_function(hp))
             ept_hook_restore_current_vcpu(vcpu, hp);
     }
+
+    ept_lists_lock_release();
 }
 
 // =========================================================================

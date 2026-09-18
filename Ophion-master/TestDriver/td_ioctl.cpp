@@ -28,22 +28,6 @@ static VOID TdResolveMemApis(VOID)
     HYPERPLATFORM_LOG_INFO("[td] MmCopyVirtualMemory = %p", g_MmCopyVirtualMemory);
 }
 
-// R0 CR3 resolution: EPROCESS DirectoryTableBase (offset 0x28 on Win10/11 x64).
-// This avoids hv_pid_to_cr3() in VMX-root (which was unreliable: stale cache,
-// missing entries for processes created after Ophion init).
-static UINT64 TdResolveCr3(HANDLE pid)
-{
-    if (!pid) return 0;
-    PEPROCESS p = NULL;
-    if (NT_SUCCESS(PsLookupProcessByProcessId(pid, &p)) && p)
-    {
-        UINT64 cr3 = *(UINT64 *)((PUCHAR)p + 0x28);
-        ObDereferenceObject(p);
-        return cr3;
-    }
-    return 0;
-}
-
 //
 // PTE-window page-table walk: uses the Windows PML4 self-map to find
 // the PTE of a window page, then remaps that PTE to walk target page
@@ -3535,31 +3519,6 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         KeUnstackDetachProcess(&apc);
         ObDereferenceObject(target);
         irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
-        st = STATUS_SUCCESS;
-        break;
-    }
-
-    case IOCTL_HV_DETECT:
-    {
-        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_HV_DETECT) ||
-            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_HV_DETECT))
-        { st = STATUS_BUFFER_TOO_SMALL; break; }
-
-        TD_HV_DETECT * d = (TD_HV_DETECT *)irp->AssociatedIrp.SystemBuffer;
-        UINT64 qpid = d->target_pid ? d->target_pid : (UINT64)PsGetCurrentProcessId();
-        UINT64 cr3  = 0;
-        BOOLEAN ok  = FALSE;
-
-        __try {
-            cr3 = (UINT64)hv_vmcall_simple(HV_VMCALL_QUERY_CR3, qpid, 0, 0);
-            ok  = TRUE;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            ok = FALSE;
-        }
-
-        d->vmx_active = ok ? 1 : 0;
-        d->cr3 = ok ? cr3 : 0;
-        irp->IoStatus.Information = sizeof(TD_HV_DETECT);
         st = STATUS_SUCCESS;
         break;
     }

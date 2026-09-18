@@ -240,11 +240,17 @@ DpcEptUnhookByCr3(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
         UINT64 target_cr3;
     } * ctx = (struct _EPT_UNHOOK_BY_CR3_CTX *)Ctx;
 
-    hv_vmcall_ex(
-        VMCALL_EPT_UNHOOK_BY_CR3,
-        ctx->target_cr3,
-        0, 0, 0,
-        0, 0, 0, 0, 0);
+    // Ophion clears the named alive event before VMX teardown. Never execute
+    // a naked VMCALL after that point: it raises #UD and bugchecks with
+    // 0x1E/C000001D (observed 2026-09-18).
+    if (TdOphionAlive())
+    {
+        hv_vmcall_ex(
+            VMCALL_EPT_UNHOOK_BY_CR3,
+            ctx->target_cr3,
+            0, 0, 0,
+            0, 0, 0, 0, 0);
+    }
 
     KeSignalCallDpcSynchronize(A2);
     KeSignalCallDpcDone(A1);
@@ -338,6 +344,40 @@ TdEptUnhookNtCreateFile(VOID)
 
 
 R3_HOOK_ENTRY g_r3_hooks[MAX_R3_HOOKS] = {};
+static KEVENT g_r3_hooks_gate;
+static volatile LONG g_r3_hooks_gate_ready = 0;
+
+VOID
+TdR3HooksSyncInit(VOID)
+{
+    KeInitializeEvent(&g_r3_hooks_gate, SynchronizationEvent, TRUE);
+    InterlockedExchange(&g_r3_hooks_gate_ready, 1);
+}
+
+VOID
+TdR3HooksLock(VOID)
+{
+    NT_ASSERT(InterlockedCompareExchange(&g_r3_hooks_gate_ready, 1, 1) == 1);
+    (VOID)KeWaitForSingleObject(
+        &g_r3_hooks_gate, Executive, KernelMode, FALSE, NULL);
+}
+
+VOID
+TdR3HooksUnlock(VOID)
+{
+    KeSetEvent(&g_r3_hooks_gate, IO_NO_INCREMENT, FALSE);
+}
+
+class R3HookGateGuard
+{
+public:
+    R3HookGateGuard() { TdR3HooksLock(); }
+    ~R3HookGateGuard() { TdR3HooksUnlock(); }
+
+private:
+    R3HookGateGuard(const R3HookGateGuard &);
+    R3HookGateGuard & operator=(const R3HookGateGuard &);
+};
 
 R3_HOOK_ENTRY *
 R3HookFindFree(VOID)
@@ -653,6 +693,11 @@ TdEptHookR3(
 {
     if (!target_va) return STATUS_INVALID_PARAMETER;
 
+    // Serialize installation against explicit unhook and process-exit cleanup.
+    // The gate is a synchronization event (not a spin lock), so the PASSIVE-
+    // level allocation/attach path below may block safely while holding it.
+    R3HookGateGuard hook_guard;
+
     R3_HOOK_ENTRY * entry = R3HookFindFree();
     if (!entry)
     {
@@ -931,6 +976,8 @@ TdEptHookR3(
 NTSTATUS
 TdEptUnhookR3(UINT64 target_pid, PVOID target_va)
 {
+    R3HookGateGuard hook_guard;
+
     R3_HOOK_ENTRY * entry = R3HookFind(target_pid, target_va);
     if (!entry)
     {

@@ -426,7 +426,6 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
 #define IOCTL_HV_READ_MEM   CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 17, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
 #define IOCTL_HV_WRITE_MEM  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 18, METHOD_IN_DIRECT, FILE_ANY_ACCESS)
 #define IOCTL_HV_QUERY_VA   CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 19, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_HV_DETECT     CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 20, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_HV_DIAG_WALK  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 22, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // VMCALL subcodes (must match Ophion include/hv_types.h)
@@ -438,12 +437,11 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
 #define HV_VMCALL_READ_MEM_PTE  0x00000011
 #define HV_VMCALL_WRITE_MEM_PTE 0x00000012
 
-#define HV_VMCALL_QUERY_CR3  0x0000000E
 #define HV_MEM_MAX           16777216       // CE<->TestDriver IOCTL contract (16 MB per IOCTL)
 #define HV_VMCALL_MEM_MAX    262144         // vmcall batch size (16 pages, must match Ophion HV_R3_MEM_MAX)
 
 // Header-only subset of HV_MEM_REQUEST (same field offsets, no data[]).
-// Safe to place on the kernel stack for QUERY_VA / QUERY_CR3 which never touch data[].
+// Safe to place on the kernel stack for QUERY_VA, which never touches data[].
 typedef struct _HV_MEM_REQUEST_HDR {
     UINT64  target_cr3;
     UINT64  target_va;
@@ -487,13 +485,6 @@ typedef struct _TD_HV_MEM_HDR {
     UINT32  _pad;             // bit0: 1=fixup paged-out pages (mode=3)
     UINT64  result;           // [out] bytes transferred
 } TD_HV_MEM_HDR, *PTD_HV_MEM_HDR;
-
-// IOCTL detect param
-typedef struct _TD_HV_DETECT {
-    UINT64  target_pid;   // [in]  pid to query CR3 for (0 = self)
-    UINT64  cr3;          // [out] resolved CR3 (0 = not found / no VMX)
-    UINT32  vmx_active;   // [out] 1 = VMCALL succeeded (VMX-root present)
-} TD_HV_DETECT, *PTD_HV_DETECT;
 
 #define TD_MAX_INJECT_RW_SIZE (16ULL * 1024ULL * 1024ULL)
 
@@ -728,6 +719,9 @@ PVOID TdShadowAllocPage(TD_SHADOW_BUILD_CONTEXT * ctx);
 PVOID TdShadowVaFromPhys(UINT64 phys);
 R3_HOOK_ENTRY * R3HookFind(UINT64 pid, PVOID target_va);
 R3_HOOK_ENTRY * R3HookFindFree(VOID);
+VOID TdR3HooksSyncInit(VOID);
+VOID TdR3HooksLock(VOID);
+VOID TdR3HooksUnlock(VOID);
 UINT32 TdBuildDllMainStub(PVOID stub_addr, UINT64 image_base, UINT64 entry_point, UINT64 rtl_add_function_table_va, UINT64 pdata_va, UINT32 pdata_count);
 UINT64 TdBuildShadowCR3(UINT64 cr3, UINT64 base_va, SIZE_T size);
 UINT64 TdExtendShadowCR3(UINT64 shadow_cr3_phys, UINT64 cr3, UINT64 base_va, SIZE_T size);

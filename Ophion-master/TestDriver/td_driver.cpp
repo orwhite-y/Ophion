@@ -57,17 +57,27 @@ BOOLEAN TdOphionAlive(VOID)
 
 VOID TdUnload(PDRIVER_OBJECT drv)
 {
-    TdAliveFini();
-    TdMemCacheFini();
-
+    // Stop new exit callbacks first. Successful removal waits for callbacks
+    // already in flight, so hook teardown below cannot race TdProcessNotify.
     if (g_process_notify_registered)
     {
+        NTSTATUS notify_st;
         if (g_process_notify_ex_registered)
-            PsSetCreateProcessNotifyRoutineEx(TdProcessNotify, TRUE);
+            notify_st = PsSetCreateProcessNotifyRoutineEx(TdProcessNotify, TRUE);
         else
-            PsSetCreateProcessNotifyRoutine(TdProcessNotifyLegacy, TRUE);
-        g_process_notify_registered = FALSE;
-        g_process_notify_ex_registered = FALSE;
+            notify_st = PsSetCreateProcessNotifyRoutine(TdProcessNotifyLegacy, TRUE);
+
+        if (NT_SUCCESS(notify_st))
+        {
+            g_process_notify_registered = FALSE;
+            g_process_notify_ex_registered = FALSE;
+            HYPERPLATFORM_LOG_INFO("[td] Process notify callback removed.");
+        }
+        else
+        {
+            HYPERPLATFORM_LOG_ERROR(
+                "[td] Process notify callback removal FAILED: 0x%08X", notify_st);
+        }
     }
 
     // [瀹歌尙顩﹂悽鈺?娑撳秴鍟€闁俺绻?LoadImage 閸ョ偠鐨熷▔銊ュ弳 renderdoc閿涘本鏁兼稉?NtCreateFile hook 鐟欙箑褰?
@@ -77,13 +87,26 @@ VOID TdUnload(PDRIVER_OBJECT drv)
     //    g_loadimage_registered = FALSE;
     //}
 
-    if (g_hooked_target)
+    // Keep the alive-event reference until every VMCALL-backed hook has been
+    // removed. manage_driver.bat stops TestDriver before Ophion.
+    if (TdOphionAlive())
     {
-        HYPERPLATFORM_LOG_INFO("[td] Unhooking R0 hook before unload...");
-        TdEptUnhookNtCreateFile();
+        if (g_hooked_target)
+        {
+            HYPERPLATFORM_LOG_INFO("[td] Unhooking R0 hook before unload...");
+            TdEptUnhookNtCreateFile();
+        }
+
+        TdEptUnhookAllR3();
+    }
+    else
+    {
+        HYPERPLATFORM_LOG_ERROR(
+            "[td] Ophion not alive during unload; skipped all VMCALL teardown.");
     }
 
-    TdEptUnhookAllR3();
+    TdMemCacheFini();
+    TdAliveFini();
 
     if (!g_device_hidden)
     {
@@ -128,6 +151,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     UNREFERENCED_PARAMETER(reg);
     KeInitializeSpinLock(&g_shadow_alloc_lock);
     KeInitializeSpinLock(&g_stealth_track_lock);
+    TdR3HooksSyncInit();
     KeInitializeSpinLock(&g_inject_target_lock);
     g_inject_target_lock_init = TRUE;
     KeInitializeSpinLock(&g_SelfPeInfoLock);
@@ -199,13 +223,18 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     TdMemCacheInit();
     HYPERPLATFORM_LOG_WARN("[td] cp: TdMemCacheInit done");
 
-    // ---- LIVENESS CHECK SKIPPED FOR DEBUGGING ----
-    // Original:
-    //   TdAliveInit();
-    //   if (!TdOphionAlive()) { ... return STATUS_FAILED_DRIVER_ENTRY; }
-    // Commented out to allow TestDriver to load even when Ophion doesn't signal alive event.
-    // In production, keep this check to avoid #UD BSOD when Ophion isn't active.
-    // ------------------------------------------------
+    // Open Ophion's named event and require VMX to be active before exposing
+    // any IOCTL path that can issue VMCALL. This also makes process-exit cleanup
+    // able to distinguish a live hypervisor from teardown/no-driver state.
+    TdAliveInit();
+    if (!TdOphionAlive())
+    {
+        HYPERPLATFORM_LOG_ERROR("[td] Ophion alive event is not signaled; refusing to load.");
+        TdAliveFini();
+        TdMemCacheFini();
+        LogTermination();
+        return STATUS_DEVICE_NOT_READY;
+    }
 
     UNICODE_STRING dev_name, sym_name;
     RtlInitUnicodeString(&dev_name, TD_DEVICE_NAME);
@@ -215,12 +244,26 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     NTSTATUS st = IoCreateDevice(drv, 0, &dev_name,
         FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &dev);
     HYPERPLATFORM_LOG_WARN("[td] cp: IoCreateDevice -> 0x%08X", (unsigned)st);
-    if (!NT_SUCCESS(st)) return st;
+    if (!NT_SUCCESS(st))
+    {
+        TdAliveFini();
+        TdMemCacheFini();
+        LogTermination();
+        return st;
+    }
     g_dev_obj = dev;
 
     st = IoCreateSymbolicLink(&sym_name, &dev_name);
     HYPERPLATFORM_LOG_WARN("[td] cp: IoCreateSymbolicLink -> 0x%08X", (unsigned)st);
-    if (!NT_SUCCESS(st)) { IoDeleteDevice(dev); return st; }
+    if (!NT_SUCCESS(st))
+    {
+        IoDeleteDevice(dev);
+        g_dev_obj = NULL;
+        TdAliveFini();
+        TdMemCacheFini();
+        LogTermination();
+        return st;
+    }
 
     drv->DriverUnload = TdUnload;
     drv->MajorFunction[IRP_MJ_CREATE] = TdCreateClose;
@@ -251,6 +294,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
         else
         {
             HYPERPLATFORM_LOG_ERROR("[td] PsSetCreateProcessNotifyRoutine legacy failed: 0x%08X", legacy_st);
+            IoDeleteSymbolicLink(&sym_name);
+            IoDeleteDevice(dev);
+            g_dev_obj = NULL;
+            TdAliveFini();
+            TdMemCacheFini();
+            LogTermination();
+            return legacy_st;
         }
     }
 

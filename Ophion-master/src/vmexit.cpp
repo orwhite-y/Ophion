@@ -1007,7 +1007,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
 
     //
     // Selective CPL check: R3 VMCALL is allowed ONLY for memory access codes
-    // (READ_MEM/WRITE_MEM/QUERY_VA/QUERY_CR3). All other OPHION VMCALL codes
+    // (READ_MEM/WRITE_MEM/QUERY_VA). All other OPHION VMCALL codes
     // (EPT_HOOK, VMXOFF, etc.) remain R0-only. EPT hook/stealth vmcall was
     // already handled above.
     //
@@ -1028,7 +1028,6 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             case VMCALL_READ_MEM:
             case VMCALL_WRITE_MEM:
             case VMCALL_QUERY_VA:
-            case VMCALL_QUERY_CR3:
                 r3_allowed = TRUE;
                 break;
             }
@@ -1675,22 +1674,6 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         //                r8=caller_pid, r9=target_pid.
         // Protocol (R0): rcx=code, rdx=&req (kernel VA), r8=0, r9=target_pid.
         //
-        // The handler resolves caller_pid and target_pid to kernel CR3s via
-        // the PID->CR3 cache (kernel space, readable under the private host
-        // CR3 without a switch). For R3 callers it switches to the caller's
-        // kernel CR3 to access the struct (user VA), uses a per-CPU kernel
-        // scratch buffer as intermediary, and switches to the target CR3 for
-        // the actual memory access. #PF in VMX-root is fatal, so page tables
-        // are walked for present-safety before each copy.
-        //
-        case VMCALL_QUERY_CR3:
-        {
-            HANDLE target_pid = (HANDLE)regs->rdx;
-            UINT64 cr3 = hv_pid_to_cr3(target_pid);
-            regs->rax = cr3;  // 0 = not found
-            break;
-        }
-
         case VMCALL_READ_MEM:
             // DISABLED: VMX-root CR3 switch causes #PF/freeze under private host CR3.
             // All memory reads now done by TestDriver R0 via KeStackAttachProcess.

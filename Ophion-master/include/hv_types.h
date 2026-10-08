@@ -140,6 +140,9 @@ typedef struct _EPT_HOOKED_PAGE_INFO {
 //
 // contiguous shadow region 閿?must be defined before EPT_STATE (embedded, not pointer)
 //
+// 2026-09-20: pool exhausted by inject churn (bump-only allocator never frees).
+// Kept 64MB (128MB contiguous alloc fails on fragmented RAM); init has a
+// 64->32->16MB ladder fallback now. Free-list recycle is the real fix (TODO).
 #define STEALTH_REGION_DEFAULT_MB   64
 #define STEALTH_REGION_DEFAULT_SIZE ((SIZE_T)STEALTH_REGION_DEFAULT_MB * 1024 * 1024)
 

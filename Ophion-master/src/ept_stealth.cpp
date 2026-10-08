@@ -240,14 +240,29 @@ ept_stealth_region_init(VOID)
     region->base_va = MmAllocateContiguousMemory(size, max_phys);
     if (!region->base_va)
     {
-        // fallback: try 16MB
-        size = 16 * 1024 * 1024;
-        region->base_va = MmAllocateContiguousMemory(size, max_phys);
+        // 2026-09-20: contiguous alloc fails on fragmented RAM. Old code fell
+        // straight back to 16MB (SMALLER than the previous 64MB default) making
+        // pool exhaustion worse. Try a descending ladder instead.
+        static const SIZE_T ladder[] = {
+            32 * 1024 * 1024,
+            16 * 1024 * 1024,
+        };
+        for (UINT32 i = 0;
+             i < RTL_NUMBER_OF(ladder) && !region->base_va;
+             ++i)
+        {
+            size = ladder[i];
+            region->base_va = MmAllocateContiguousMemory(size, max_phys);
+        }
         if (!region->base_va)
         {
-            HYPERPLATFORM_LOG_ERROR("[hv] stealth region: alloc failed");
+            HYPERPLATFORM_LOG_ERROR("[hv] stealth region: alloc failed (tried %lluMB+fallbacks)",
+                       (UINT64)(STEALTH_REGION_DEFAULT_SIZE / (1024 * 1024)));
             return FALSE;
         }
+        HYPERPLATFORM_LOG_WARN("[hv] stealth region: full %lluMB contiguous alloc failed, fell back to %lluMB",
+                   (UINT64)(STEALTH_REGION_DEFAULT_SIZE / (1024 * 1024)),
+                   (UINT64)(size / (1024 * 1024)));
     }
 
     RtlZeroMemory(region->base_va, size);

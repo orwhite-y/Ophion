@@ -266,29 +266,60 @@ DpcEptUnhook(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
 // does NOT __writecr3 -> safe to issue from the process-exit notify callback
 // (where loading the dying CR3 on every CPU deadlocks). rdx = target_cr3,
 // used only as a match value to retire this process's hooks.
+typedef struct _EPT_UNHOOK_BY_CR3_DPC_CTX {
+    UINT64        target_cr3;
+    volatile LONG success_count;
+    volatile LONG failure_count;
+    volatile LONG first_failure;
+} EPT_UNHOOK_BY_CR3_DPC_CTX;
+
 VOID
 DpcEptUnhookByCr3(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
 {
     UNREFERENCED_PARAMETER(Dpc);
-
-    struct _EPT_UNHOOK_BY_CR3_CTX {
-        UINT64 target_cr3;
-    } * ctx = (struct _EPT_UNHOOK_BY_CR3_CTX *)Ctx;
+    EPT_UNHOOK_BY_CR3_DPC_CTX * ctx = (EPT_UNHOOK_BY_CR3_DPC_CTX *)Ctx;
 
     // Ophion clears the named alive event before VMX teardown. Never execute
     // a naked VMCALL after that point: it raises #UD and bugchecks with
     // 0x1E/C000001D (observed 2026-09-18).
+    NTSTATUS status = STATUS_DEVICE_NOT_READY;
     if (TdOphionAlive())
     {
-        hv_vmcall_ex(
+        status = hv_vmcall_ex(
             VMCALL_EPT_UNHOOK_BY_CR3,
             ctx->target_cr3,
             0, 0, 0,
             0, 0, 0, 0, 0);
     }
 
+    if (NT_SUCCESS(status))
+        InterlockedIncrement(&ctx->success_count);
+    else
+    {
+        InterlockedIncrement(&ctx->failure_count);
+        InterlockedCompareExchange(
+            &ctx->first_failure, (LONG)status, (LONG)STATUS_SUCCESS);
+    }
+
     KeSignalCallDpcSynchronize(A2);
     KeSignalCallDpcDone(A1);
+}
+
+NTSTATUS
+TdEptUnhookByCr3AllCpus(UINT64 target_cr3)
+{
+    if (!target_cr3)
+        return STATUS_INVALID_PARAMETER;
+    if (!TdOphionAlive())
+        return STATUS_DEVICE_NOT_READY;
+
+    EPT_UNHOOK_BY_CR3_DPC_CTX context = {};
+    context.target_cr3 = target_cr3;
+    KeGenericCallDpc(DpcEptUnhookByCr3, &context);
+    return TdDpcAggregateStatus(
+        context.success_count,
+        context.failure_count,
+        context.first_failure);
 }
 
 NTSTATUS
@@ -1228,10 +1259,22 @@ TdEptUnhookAllR3(VOID)
                     continue;
                 }
             }
-            // else: process dead 閳?EPT pages are orphaned but harmless.
-            // the PFN won't be reused for anything meaningful until
-            // ept_unhook_all() on HV unload restores all PTEs to RWX.
-
+            else
+            {
+                // The saved CR3 is only a match key; this path never loads the
+                // dead address space and is safe after process destruction.
+                NTSTATUS unhook_status = TdEptUnhookByCr3AllCpus(
+                    g_r3_hooks[i].target_cr3);
+                if (!NT_SUCCESS(unhook_status))
+                {
+                    if (NT_SUCCESS(first_status))
+                        first_status = unhook_status;
+                    HYPERPLATFORM_LOG_ERROR(
+                        "[td-r3] dead-process unhook failed; entry retained: 0x%08X",
+                        unhook_status);
+                    continue;
+                }
+            }
             RtlZeroMemory(&g_r3_hooks[i], sizeof(g_r3_hooks[i]));
         }
         else

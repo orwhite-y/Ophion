@@ -320,15 +320,33 @@ TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
     //
     if (hv_alive && dying_cr3)
     {
-        struct { UINT64 target_cr3; } rctx;
-        rctx.target_cr3 = dying_cr3;
-        KeGenericCallDpc(DpcEptUnhookByCr3, &rctx);
+        NTSTATUS retire_status = STATUS_UNSUCCESSFUL;
+        for (UINT32 attempt = 0; attempt < 3; ++attempt)
+        {
+            retire_status = TdEptUnhookByCr3AllCpus(dying_cr3);
+            if (NT_SUCCESS(retire_status))
+                break;
+        }
+
+        if (!NT_SUCCESS(retire_status))
+        {
+            // Releasing the tracked MDLs after a failed retirement can let an
+            // armed PFN hook target unrelated reused memory. Keep ownership so
+            // unload can retry with the saved CR3 match key.
+            HYPERPLATFORM_LOG_ERROR(
+                "[td-rw] process exit hook retirement failed; resources retained: pid=%llu st=0x%08X",
+                pid, retire_status);
+            TdR3HooksUnlock();
+            return;
+        }
     }
     else if (hv_alive)
     {
         HYPERPLATFORM_LOG_WARN(
-            "[td-rw] process exit pid=%llu has tracked state but no saved CR3",
+            "[td-rw] process exit pid=%llu has tracked state but no saved CR3; resources retained",
             pid);
+        TdR3HooksUnlock();
+        return;
     }
 
     //

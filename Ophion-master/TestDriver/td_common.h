@@ -784,6 +784,7 @@ VOID DpcEptHook(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2);
 VOID DpcEptHookR3(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2);
 VOID DpcEptUnhook(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2);
 VOID DpcEptUnhookByCr3(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2);
+NTSTATUS TdEptUnhookByCr3AllCpus(UINT64 target_cr3);
 VOID TdApplyProtectToPte(PUINT64 pte, ULONG protect);
 void TdCacheSelfPeInfo(UINT64 pid, UINT64 module_base, PIMAGE_NT_HEADERS64 nt);
 void TdCleanupSelfPeInfo(UINT64 pid);

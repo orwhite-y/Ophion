@@ -2,6 +2,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <wchar.h>
+#include <errno.h>
+#include <limits.h>
 #include <vector>
 
 #include "../include/trace_protocol.h"
@@ -13,6 +15,7 @@
 #define IOCTL_HV_TRACE_CLOSE CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 34, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 static volatile LONG g_stop_requested = 0;
+static const uint32_t kTraceRingCapacity = 1024;
 
 static BOOL WINAPI ConsoleHandler(DWORD type)
 {
@@ -27,6 +30,46 @@ static BOOL WINAPI ConsoleHandler(DWORD type)
 static bool NtSuccess(uint32_t status)
 {
     return (int32_t)status >= 0;
+}
+
+static const wchar_t * StopReasonName(uint32_t reason)
+{
+    switch (reason)
+    {
+    case OPHION_TRACE_STOP_NONE:          return L"none";
+    case OPHION_TRACE_STOP_REQUESTED:     return L"requested";
+    case OPHION_TRACE_STOP_LIMIT:         return L"limit";
+    case OPHION_TRACE_STOP_RANGE_EXIT:    return L"range-exit";
+    case OPHION_TRACE_STOP_PROCESS_EXIT:  return L"process-exit";
+    case OPHION_TRACE_STOP_OVERFLOW:      return L"overflow";
+    case OPHION_TRACE_STOP_CONTEXT_EXIT:  return L"context-exit";
+    case OPHION_TRACE_STOP_HWBP_CONFLICT: return L"hwbp-conflict";
+    default:                              return L"unknown";
+    }
+}
+
+static bool ParseU64(const wchar_t * text, uint64_t * value)
+{
+    if (!text || !*text || !value || *text == L'-')
+        return false;
+
+    errno = 0;
+    wchar_t * end = nullptr;
+    const unsigned __int64 parsed = _wcstoui64(text, &end, 0);
+    if (errno == ERANGE || end == text || *end != L'\0')
+        return false;
+
+    *value = (uint64_t)parsed;
+    return true;
+}
+
+static bool ParseU32(const wchar_t * text, uint32_t * value)
+{
+    uint64_t parsed = 0;
+    if (!ParseU64(text, &parsed) || parsed > UINT32_MAX)
+        return false;
+    *value = (uint32_t)parsed;
+    return true;
 }
 
 static void PrintUsage()
@@ -102,10 +145,11 @@ static bool StartTrace(
         return false;
 
     request->version = OPHION_TRACE_ABI_VERSION;
-    request->target_pid = _wcstoui64(argv[first_arg + 1], nullptr, 0);
-    request->start_address = _wcstoui64(argv[first_arg + 2], nullptr, 0);
-    request->end_address = _wcstoui64(argv[first_arg + 3], nullptr, 0);
-    request->max_steps = _wcstoui64(argv[first_arg + 4], nullptr, 0);
+    if (!ParseU64(argv[first_arg + 1], &request->target_pid) ||
+        !ParseU64(argv[first_arg + 2], &request->start_address) ||
+        !ParseU64(argv[first_arg + 3], &request->end_address) ||
+        !ParseU64(argv[first_arg + 4], &request->max_steps))
+        return false;
     if (request->backend == OPHION_TRACE_BACKEND_HWBP ||
         request->backend == OPHION_TRACE_BACKEND_AUTO)
         request->flags |= OPHION_TRACE_FLAG_STOP_OUTSIDE_RANGE;
@@ -130,6 +174,14 @@ static bool StartTrace(
     if (!NtSuccess(request->status))
     {
         wprintf(L"TRACE_START failed: NTSTATUS=0x%08X\n", request->status);
+        if (request->session_id)
+            wprintf(L"cleanup retained session with: trace_cli close %llu\n",
+                request->session_id);
+        return false;
+    }
+    if (returned < sizeof(*request))
+    {
+        wprintf(L"TRACE_START returned a short response: %lu bytes\n", returned);
         return false;
     }
 
@@ -176,6 +228,8 @@ static bool ReadTrace(
 {
     if (!count)
         count = 64;
+    if (count > kTraceRingCapacity)
+        count = kTraceRingCapacity;
     const DWORD output_size = OPHION_TRACE_READ_OUTPUT_HEADER_SIZE +
         count * (DWORD)sizeof(OPHION_TRACE_RECORD);
     std::vector<uint8_t> buffer(output_size);
@@ -198,9 +252,22 @@ static bool ReadTrace(
 
     OPHION_TRACE_READ_OUTPUT * output =
         reinterpret_cast<OPHION_TRACE_READ_OUTPUT *>(buffer.data());
+    if (returned < OPHION_TRACE_READ_OUTPUT_HEADER_SIZE)
+    {
+        wprintf(L"TRACE_READ returned a short response: %lu bytes\n", returned);
+        return false;
+    }
     if (!NtSuccess(output->status))
     {
         wprintf(L"TRACE_READ failed: NTSTATUS=0x%08X\n", output->status);
+        return false;
+    }
+    if (output->version != OPHION_TRACE_ABI_VERSION ||
+        output->record_count > count ||
+        returned < OPHION_TRACE_READ_OUTPUT_HEADER_SIZE +
+            output->record_count * sizeof(OPHION_TRACE_RECORD))
+    {
+        wprintf(L"TRACE_READ returned a malformed response\n");
         return false;
     }
 
@@ -208,6 +275,12 @@ static bool ReadTrace(
         PrintRecord(output->records[i]);
     *cursor = output->next_sequence;
     *state = output->state;
+
+    if (output->state != OPHION_TRACE_STATE_RUNNING &&
+        output->stop_reason != OPHION_TRACE_STOP_NONE)
+        wprintf(L"trace stopped: state=%u reason=%ls(%u)\n",
+            output->state, StopReasonName(output->stop_reason),
+            output->stop_reason);
 
     if (output->overwritten)
         wprintf(L"trace ring overwritten=%llu produced=%llu next=%llu\n",
@@ -231,6 +304,11 @@ static bool ControlTrace(HANDLE device, DWORD code, uint64_t session_id)
     if (!NtSuccess(request.status))
     {
         wprintf(L"trace control failed: NTSTATUS=0x%08X\n", request.status);
+        return false;
+    }
+    if (returned < sizeof(request))
+    {
+        wprintf(L"trace control returned a short response: %lu bytes\n", returned);
         return false;
     }
     return true;
@@ -284,11 +362,14 @@ int wmain(int argc, wchar_t ** argv)
     }
     else if (_wcsicmp(argv[1], L"read") == 0 && argc >= 3 && argc <= 5)
     {
-        uint64_t cursor = argc >= 4 ? _wcstoui64(argv[3], nullptr, 0) : 0;
-        uint32_t count = argc >= 5 ? wcstoul(argv[4], nullptr, 0) : 64;
+        uint64_t session_id = 0;
+        uint64_t cursor = 0;
+        uint32_t count = 64;
         uint32_t state = 0;
-        if (!ReadTrace(device, _wcstoui64(argv[2], nullptr, 0),
-                &cursor, count, &state))
+        if (!ParseU64(argv[2], &session_id) ||
+            (argc >= 4 && !ParseU64(argv[3], &cursor)) ||
+            (argc >= 5 && !ParseU32(argv[4], &count)) ||
+            !ReadTrace(device, session_id, &cursor, count, &state))
             result = 1;
         else
             wprintf(L"next-sequence=%llu state=%u\n", cursor, state);
@@ -298,7 +379,9 @@ int wmain(int argc, wchar_t ** argv)
     {
         DWORD code = _wcsicmp(argv[1], L"stop") == 0
             ? IOCTL_HV_TRACE_STOP : IOCTL_HV_TRACE_CLOSE;
-        if (!ControlTrace(device, code, _wcstoui64(argv[2], nullptr, 0)))
+        uint64_t session_id = 0;
+        if (!ParseU64(argv[2], &session_id) ||
+            !ControlTrace(device, code, session_id))
             result = 1;
     }
     else

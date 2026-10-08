@@ -655,9 +655,20 @@ TdTraceRead(
     OPHION_TRACE_READ_OUTPUT * output,
     UINT32 output_size)
 {
-    if (!request || request->version != OPHION_TRACE_ABI_VERSION || !output ||
-        output_size < OPHION_TRACE_READ_OUTPUT_HEADER_SIZE)
+    if (!output || output_size < OPHION_TRACE_READ_OUTPUT_HEADER_SIZE)
         return STATUS_INVALID_PARAMETER;
+
+    // The METHOD_OUT_DIRECT buffer belongs to the caller and may contain
+    // arbitrary bytes.  Initialize the header before every early return so the
+    // dispatch routine never derives IoStatus.Information from stale data.
+    RtlZeroMemory(output, OPHION_TRACE_READ_OUTPUT_HEADER_SIZE);
+    output->version = OPHION_TRACE_ABI_VERSION;
+
+    if (!request || request->version != OPHION_TRACE_ABI_VERSION)
+    {
+        output->status = (UINT32)STATUS_INVALID_PARAMETER;
+        return STATUS_INVALID_PARAMETER;
+    }
 
     const UINT32 capacity =
         (output_size - OPHION_TRACE_READ_OUTPUT_HEADER_SIZE) /
@@ -666,7 +677,6 @@ TdTraceRead(
     if (!max_records || max_records > capacity)
         max_records = capacity;
 
-    RtlZeroMemory(output, output_size);
     ExAcquireFastMutex(&g_trace_mutex);
     PTD_TRACE_ENTRY entry = TdTraceFindLocked(request->session_id);
     if (!entry)

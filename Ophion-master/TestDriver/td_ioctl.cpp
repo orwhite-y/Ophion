@@ -432,6 +432,13 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
             request, output,
             io->Parameters.DeviceIoControl.OutputBufferLength);
         output->status = trace_status;
+
+        const ULONG output_capacity =
+            (io->Parameters.DeviceIoControl.OutputBufferLength -
+             OPHION_TRACE_READ_OUTPUT_HEADER_SIZE) /
+            sizeof(OPHION_TRACE_RECORD);
+        if (output->record_count > output_capacity)
+            output->record_count = output_capacity;
         irp->IoStatus.Information = OPHION_TRACE_READ_OUTPUT_HEADER_SIZE +
             ((ULONG_PTR)output->record_count * sizeof(OPHION_TRACE_RECORD));
         st = STATUS_SUCCESS;

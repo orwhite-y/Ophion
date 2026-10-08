@@ -156,6 +156,32 @@ typedef struct _STEALTH_REGION {
 #define STEALTH_HASH_SIZE   (1 << STEALTH_HASH_BITS)  // 4096 buckets
 #define STEALTH_HASH_MASK   (STEALTH_HASH_SIZE - 1)
 
+//
+// EPT memory breakpoints. EPT permissions are page-granular, while the
+// address/size fields below provide byte-range filtering after the exit.
+//
+#define HV_MAX_MEMORY_BREAKPOINTS 64
+#define HV_BP_ACCESS_READ         0x01
+#define HV_BP_ACCESS_WRITE        0x02
+#define HV_BP_ACCESS_EXECUTE      0x04
+#define HV_BP_FLAG_ONESHOT        0x01
+
+typedef struct _EPT_MEMORY_BREAKPOINT {
+    volatile LONG allocated;       // slot contains metadata (also kept as a stale-PTE tombstone)
+    volatile LONG active;          // armed and included in page permission calculation
+    UINT64        id;
+    UINT64        target_cr3;      // masked CR3; 0 means every address space
+    UINT64        target_pid;      // fallback for KPTI user/kernel CR3 pairs
+    UINT64        target_va;
+    UINT64        target_pfn;
+    UINT32        page_offset;
+    UINT32        size;
+    UINT8         access;          // HV_BP_ACCESS_*
+    UINT8         flags;           // HV_BP_FLAG_*
+    UINT16        reserved;
+    volatile LONG64 hit_count;
+} EPT_MEMORY_BREAKPOINT, *PEPT_MEMORY_BREAKPOINT;
+
 // forward declarations for pointer types used in VIRTUAL_MACHINE_STATE
 typedef struct _EPT_STEALTH_PAGE_INFO *PEPT_STEALTH_PAGE_INFO;
 // PSTEALTH_FAKE_PT already forward-declared above (before EPT_HOOKED_PAGE_INFO)
@@ -171,6 +197,7 @@ typedef struct _EPT_STATE {
     LIST_ENTRY            stealth_hash[STEALTH_HASH_SIZE];  // O(1) lookup hash table (4096 buckets)
     LIST_ENTRY            stealth_fake_pts;
     STEALTH_REGION        stealth_region;
+    EPT_MEMORY_BREAKPOINT memory_breakpoints[HV_MAX_MEMORY_BREAKPOINTS];
 
     //
     // EPT/stealth lifecycle epoch.  A successful installation advances this
@@ -279,6 +306,10 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     PEPT_HOOKED_PAGE_INFO mtf_restore_page_stack[4];
     volatile LONG        mtf_restore_page_depth;
 
+    // EPT memory-breakpoint pages temporarily opened for one instruction.
+    UINT64               mtf_breakpoint_pfn_stack[4];
+    volatile LONG        mtf_breakpoint_pfn_depth;
+
     //
     // stealth page: restore stack after MTF single-step (nested trampolines)
     //
@@ -375,6 +406,8 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_GET_HOOK_DIAG   0x00000015   // R0: return last ept_hook_install failure code
 #define VMCALL_GET_HOOK_DIAG2  0x00000016   // R0: return trampoline LDE sub-diagnostic   // R0: return last ept_hook_install failure code   // R0: remove ALL stealth page entries from g_ept->stealth_pages (pre-injection cleanup)
 #define VMCALL_EPT_LIFECYCLE_RESUME 0x00000017 // R0: resume this vCPU after a global EPT lifecycle barrier
+#define VMCALL_MEMORY_BREAKPOINT_SET    0x00000018
+#define VMCALL_MEMORY_BREAKPOINT_CLEAR  0x00000019
 
 #define HV_R3_MEM_MAX           262144        // max bytes per R3 read/write call (16 pages, prefetch batch)
 

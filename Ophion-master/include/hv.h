@@ -34,6 +34,8 @@ UINT64 get_system_cr3(VOID);
 // Per-CPU PTE window pages for VMX-root memory access.
 // Allocates one 4KB stealth-region page per CPU for PTE-window remapping.
 VOID hv_pte_window_init(ULONG cpu_count);
+BOOLEAN hv_read_guest_virtual(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_cr3,
+                              UINT64 guest_va, PVOID buffer, SIZE_T size);
 
 //
 // CR3 switch helpers for private host CR3 compatibility.
@@ -326,6 +328,17 @@ PVMM_EPT_DYNAMIC_SPLIT ept_split_large_page_pool(PVMM_EPT_PAGE_TABLE page_table,
 BOOLEAN ept_handle_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys, UINT64 exit_qual);
 VOID    ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu);
 BOOLEAN ept_handle_vmcall_hook(VIRTUAL_MACHINE_STATE * vcpu);
+
+// EPT memory breakpoint engine (ept_breakpoint.cpp)
+BOOLEAN ept_breakpoint_configure(VIRTUAL_MACHINE_STATE * vcpu, UINT64 id,
+    UINT64 target_cr3, UINT64 target_pid, UINT64 target_va, UINT64 target_phys,
+    UINT32 size, UINT8 access, UINT8 flags, BOOLEAN create_record);
+BOOLEAN ept_breakpoint_clear(VIRTUAL_MACHINE_STATE * vcpu, UINT64 id,
+    UINT8 record_operation); // 0=apply, 1=deactivate+apply, 2=finalize metadata
+BOOLEAN ept_breakpoint_handle_violation(VIRTUAL_MACHINE_STATE * vcpu,
+    UINT64 guest_phys, UINT64 exit_qual);
+VOID ept_breakpoint_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu);
+BOOLEAN ept_breakpoint_page_reserved(UINT64 target_pfn);
 
 //
 // stealth memory allocation (ept_stealth.cpp)

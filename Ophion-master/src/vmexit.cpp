@@ -736,6 +736,14 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
     UINT64 guest_phys = 0;
     __vmx_vmread(VMCS_GUEST_PHYSICAL_ADDRESS, &guest_phys);
 
+    // Generic EPT memory breakpoints are disjoint from hook/stealth pages.
+    // Handle them first so a stale one-shot PTE can self-heal on every vCPU.
+    if (ept_breakpoint_handle_violation(vcpu, guest_phys, vcpu->exit_qual))
+    {
+        vcpu->advance_rip = FALSE;
+        return;
+    }
+
     //
     // try to handle as an EPT hook violation (split-TLB page swap)
     //
@@ -968,6 +976,129 @@ hv_pte_calc_pte_va(PUCHAR page_va)
     return (volatile UINT64 *)(selfmap_base | (p4 << 30) | (p3 << 21) | (p2 << 12) | (p1 << 3));
 }
 
+static BOOLEAN
+hv_pte_window_read_physical(
+    volatile UINT64 * pte_ptr,
+    PUCHAR window_va,
+    UINT64 saved_pte,
+    UINT64 physical_address,
+    PVOID output,
+    SIZE_T size)
+{
+    if (!pte_ptr || !window_va || !output || size == 0 ||
+        ((physical_address & 0xFFF) + size) > PAGE_SIZE)
+        return FALSE;
+
+    *pte_ptr = (saved_pte & ~HV_MEM_PFN_MASK) |
+               (physical_address & HV_MEM_PFN_MASK);
+    __invlpg(window_va);
+    RtlCopyMemory(output, window_va + (physical_address & 0xFFF), size);
+    return TRUE;
+}
+
+static BOOLEAN
+hv_translate_guest_va_with_window(
+    volatile UINT64 * pte_ptr,
+    PUCHAR window_va,
+    UINT64 saved_pte,
+    UINT64 guest_cr3,
+    UINT64 guest_va,
+    UINT64 * physical_address)
+{
+    UINT64 entry = 0;
+    UINT64 table = guest_cr3 & HV_MEM_PFN_MASK;
+    const UINT16 indexes[4] = {
+        (UINT16)((guest_va >> 39) & 0x1FF),
+        (UINT16)((guest_va >> 30) & 0x1FF),
+        (UINT16)((guest_va >> 21) & 0x1FF),
+        (UINT16)((guest_va >> 12) & 0x1FF),
+    };
+
+    if (!table || !physical_address)
+        return FALSE;
+
+    for (UINT32 level = 0; level < 4; ++level)
+    {
+        UINT64 entry_pa = table + ((UINT64)indexes[level] * sizeof(UINT64));
+        if (!hv_pte_window_read_physical(
+                pte_ptr, window_va, saved_pte, entry_pa, &entry, sizeof(entry)) ||
+            !(entry & 1))
+            return FALSE;
+
+        if (level == 1 && (entry & (1ULL << 7)))
+        {
+            *physical_address =
+                (entry & 0x000FFFFFC0000000ULL) | (guest_va & 0x3FFFFFFFULL);
+            return TRUE;
+        }
+        if (level == 2 && (entry & (1ULL << 7)))
+        {
+            *physical_address =
+                (entry & 0x000FFFFFFFE00000ULL) | (guest_va & 0x1FFFFFULL);
+            return TRUE;
+        }
+
+        table = entry & HV_MEM_PFN_MASK;
+    }
+
+    *physical_address = table | (guest_va & 0xFFF);
+    return TRUE;
+}
+
+BOOLEAN
+hv_read_guest_virtual(
+    VIRTUAL_MACHINE_STATE * vcpu,
+    UINT64 guest_cr3,
+    UINT64 guest_va,
+    PVOID buffer,
+    SIZE_T size)
+{
+    UNREFERENCED_PARAMETER(vcpu);
+
+    if (!buffer || size == 0 || size > PAGE_SIZE || !guest_cr3)
+        return FALSE;
+
+    ULONG cpu = KeGetCurrentProcessorNumberEx(NULL);
+    if (cpu >= HV_PTE_WIN_MAX_CPUS || !g_pte_windows[cpu].initialized)
+        return FALSE;
+
+    PUCHAR window_va = g_pte_windows[cpu].page_va;
+    volatile UINT64 * pte_ptr = hv_pte_calc_pte_va(window_va);
+    if (!pte_ptr)
+        return FALSE;
+
+    UINT64 saved_cr3 = vmx_enter_guest_cr3();
+    UINT64 saved_pte = *pte_ptr;
+    SIZE_T done = 0;
+    BOOLEAN ok = TRUE;
+
+    while (done < size)
+    {
+        UINT64 current_va = guest_va + done;
+        UINT64 physical_address = 0;
+        SIZE_T chunk = PAGE_SIZE - (SIZE_T)(current_va & 0xFFF);
+        if (chunk > size - done)
+            chunk = size - done;
+
+        if (!hv_translate_guest_va_with_window(
+                pte_ptr, window_va, saved_pte, guest_cr3,
+                current_va, &physical_address) ||
+            !hv_pte_window_read_physical(
+                pte_ptr, window_va, saved_pte, physical_address,
+                (PUCHAR)buffer + done, chunk))
+        {
+            ok = FALSE;
+            break;
+        }
+        done += chunk;
+    }
+
+    *pte_ptr = saved_pte;
+    __invlpg(window_va);
+    vmx_leave_guest_cr3(saved_cr3);
+    return ok;
+}
+
 
 VOID
 
@@ -1042,6 +1173,27 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
 
         switch (vmcall_num)
         {
+        case VMCALL_MEMORY_BREAKPOINT_SET:
+        {
+            // rdx=id, r8=target_cr3, r9=target_va, r10=target_phys,
+            // r11=size, r12=access, r13=flags, r14=create-record, r15=pid.
+            BOOLEAN ok = ept_breakpoint_configure(
+                vcpu, regs->rdx, regs->r8, regs->r15, regs->r9, regs->r10,
+                (UINT32)regs->r11, (UINT8)regs->r12, (UINT8)regs->r13,
+                regs->r14 ? TRUE : FALSE);
+            regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
+            break;
+        }
+
+        case VMCALL_MEMORY_BREAKPOINT_CLEAR:
+        {
+            // rdx=id, r8=0 apply / 1 deactivate+apply / 2 finalize metadata.
+            BOOLEAN ok = ept_breakpoint_clear(
+                vcpu, regs->rdx, (UINT8)regs->r8);
+            regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_NOT_FOUND;
+            break;
+        }
+
         case VMCALL_EPT_HOOK:
         {
             //

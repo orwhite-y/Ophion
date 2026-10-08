@@ -170,6 +170,7 @@ volatile UINT64 g_ept_hook_diag2 = 0;  // sub-diagnostic (LDE length, instructio
 #define HOOK_DIAG_TRAMP_SIZE       23
 #define HOOK_DIAG_CR3_CONFLICT     24
 #define HOOK_DIAG_PAGE_RACE        25
+#define HOOK_DIAG_BREAKPOINT_CONFLICT 26
 
 static __forceinline VOID
 hook_lock_acquire(VOID)
@@ -724,6 +725,11 @@ ept_hook_install(VIRTUAL_MACHINE_STATE * vcpu, PEPT_HOOK_VMCALL_PARAM req)
     }
 
     UINT64 target_pfn = phys_addr >> 12;
+    if (ept_breakpoint_page_reserved(target_pfn))
+    {
+        g_ept_hook_diag = HOOK_DIAG_BREAKPOINT_CONFLICT;
+        HOOK_RESTORE_CR3_AND_RETURN(FALSE);
+    }
 
     //
     // OPTIMIZATION: Secondary CPU fast path
@@ -1498,6 +1504,10 @@ ept_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
     __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &pc);
     pc &= ~(SIZE_T)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
     __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pc);
+
+    // Restore every page temporarily opened by the generic EPT breakpoint
+    // engine before any hook-specific branch can return early.
+    ept_breakpoint_handle_mtf(vcpu);
 
     //
     // Shadow-CR3 restore must run first. The same MTF exit can also carry

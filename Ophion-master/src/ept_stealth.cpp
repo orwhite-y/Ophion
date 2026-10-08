@@ -1313,6 +1313,8 @@ ept_stealth_install_ex(VIRTUAL_MACHINE_STATE * vcpu, PEPT_STEALTH_ALLOC_PARAM re
     if (!target_phys)
         return FALSE;
     UINT64 target_pfn = target_phys >> 12;
+    if (ept_breakpoint_page_reserved(target_pfn))
+        return FALSE;
 
     // --- check if already installed (by another CPU in DPC broadcast) ---
     ept_lists_lock_acquire();

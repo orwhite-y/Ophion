@@ -1177,9 +1177,10 @@ TdEptUnhookR3(UINT64 target_pid, PVOID target_va)
 //
 // unhook all active R3 hooks (called from unload)
 //
-VOID
+NTSTATUS
 TdEptUnhookAllR3(VOID)
 {
+    NTSTATUS first_status = STATUS_SUCCESS;
     for (int i = 0; i < MAX_R3_HOOKS; i++)
     {
         if (!g_r3_hooks[i].active) continue;
@@ -1219,6 +1220,8 @@ TdEptUnhookAllR3(VOID)
 
                 if (!NT_SUCCESS(unhook_status))
                 {
+                    if (NT_SUCCESS(first_status))
+                        first_status = unhook_status;
                     HYPERPLATFORM_LOG_ERROR(
                         "[td-r3] unload unhook failed; entry retained: 0x%08X",
                         unhook_status);
@@ -1234,9 +1237,13 @@ TdEptUnhookAllR3(VOID)
         else
         {
             // real R3 hook 閳?full cleanup
-            TdEptUnhookR3(g_r3_hooks[i].target_pid, g_r3_hooks[i].target_va);
+            NTSTATUS status = TdEptUnhookR3(
+                g_r3_hooks[i].target_pid, g_r3_hooks[i].target_va);
+            if (NT_SUCCESS(first_status) && !NT_SUCCESS(status))
+                first_status = status;
         }
     }
+    return first_status;
 }
 
 // =========================================================================

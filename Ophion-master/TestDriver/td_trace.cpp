@@ -722,14 +722,21 @@ TdTraceCleanupProcess(UINT64 pid)
     ExReleaseFastMutex(&g_trace_mutex);
 }
 
-VOID
+NTSTATUS
 TdTraceCleanupAll(BOOLEAN issue_vmcalls)
 {
+    NTSTATUS first_status = STATUS_SUCCESS;
     ExAcquireFastMutex(&g_trace_mutex);
     for (UINT32 i = 0; i < TD_TRACE_MAX_SESSIONS; ++i)
     {
         if (g_trace_entries[i].allocated)
-            TdTraceCloseLocked(&g_trace_entries[i], issue_vmcalls);
+        {
+            NTSTATUS status = TdTraceCloseLocked(
+                &g_trace_entries[i], issue_vmcalls);
+            if (NT_SUCCESS(first_status) && !NT_SUCCESS(status))
+                first_status = status;
+        }
     }
     ExReleaseFastMutex(&g_trace_mutex);
+    return first_status;
 }

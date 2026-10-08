@@ -91,21 +91,59 @@ VOID TdUnload(PDRIVER_OBJECT drv)
     // removed. manage_driver.bat stops TestDriver before Ophion.
     if (TdOphionAlive())
     {
-        TdTraceCleanupAll(TRUE);
-        TdMemoryBreakpointCleanupAll(TRUE);
+        NTSTATUS trace_status = STATUS_SUCCESS;
+        NTSTATUS breakpoint_status = STATUS_SUCCESS;
+        NTSTATUS r0_hook_status = STATUS_SUCCESS;
+        NTSTATUS r3_hook_status = STATUS_SUCCESS;
 
-        if (g_hooked_target)
+        // A broadcast can race a transient CPU/offline transition. Retry the
+        // idempotent teardown passes, but retain resources inside each
+        // subsystem until its VMCALL cleanup has actually succeeded.
+        for (UINT32 attempt = 1; attempt <= 3; ++attempt)
         {
-            HYPERPLATFORM_LOG_INFO("[td] Unhooking R0 hook before unload...");
-            TdEptUnhookNtCreateFile();
+            trace_status = TdTraceCleanupAll(TRUE);
+            breakpoint_status = TdMemoryBreakpointCleanupAll(TRUE);
+
+            if (g_hooked_target)
+            {
+                HYPERPLATFORM_LOG_INFO(
+                    "[td] Unhooking R0 hook before unload (attempt %u)...",
+                    attempt);
+                r0_hook_status = TdEptUnhookNtCreateFile();
+            }
+            else
+            {
+                r0_hook_status = STATUS_SUCCESS;
+            }
+
+            r3_hook_status = TdEptUnhookAllR3();
+            if (NT_SUCCESS(trace_status) &&
+                NT_SUCCESS(breakpoint_status) &&
+                NT_SUCCESS(r0_hook_status) &&
+                NT_SUCCESS(r3_hook_status))
+                break;
+
+            HYPERPLATFORM_LOG_WARN(
+                "[td] teardown attempt %u: trace=%08X bp=%08X r0=%08X r3=%08X",
+                attempt, trace_status, breakpoint_status,
+                r0_hook_status, r3_hook_status);
         }
 
-        TdEptUnhookAllR3();
+        if (!NT_SUCCESS(trace_status) ||
+            !NT_SUCCESS(breakpoint_status) ||
+            !NT_SUCCESS(r0_hook_status) ||
+            !NT_SUCCESS(r3_hook_status))
+        {
+            HYPERPLATFORM_LOG_ERROR(
+                "[td] teardown incomplete after retries: trace=%08X bp=%08X r0=%08X r3=%08X",
+                trace_status, breakpoint_status,
+                r0_hook_status, r3_hook_status);
+        }
     }
     else
     {
-        TdTraceCleanupAll(FALSE);
-        TdMemoryBreakpointCleanupAll(FALSE);
+        (VOID)TdTraceCleanupAll(FALSE);
+        (VOID)TdMemoryBreakpointCleanupAll(FALSE);
         HYPERPLATFORM_LOG_ERROR(
             "[td] Ophion not alive during unload; skipped all VMCALL teardown.");
     }

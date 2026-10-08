@@ -327,14 +327,21 @@ TdMemoryBreakpointCleanupProcess(UINT64 pid)
     ExReleaseFastMutex(&g_memory_breakpoint_mutex);
 }
 
-VOID
+NTSTATUS
 TdMemoryBreakpointCleanupAll(BOOLEAN issue_vmcalls)
 {
+    NTSTATUS first_status = STATUS_SUCCESS;
     ExAcquireFastMutex(&g_memory_breakpoint_mutex);
     for (UINT32 i = 0; i < TD_MAX_MEMORY_BREAKPOINTS; ++i)
     {
         if (g_memory_breakpoints[i].active)
-            TdMemoryBreakpointClearLocked(&g_memory_breakpoints[i], issue_vmcalls);
+        {
+            NTSTATUS status = TdMemoryBreakpointClearLocked(
+                &g_memory_breakpoints[i], issue_vmcalls);
+            if (NT_SUCCESS(first_status) && !NT_SUCCESS(status))
+                first_status = status;
+        }
     }
     ExReleaseFastMutex(&g_memory_breakpoint_mutex);
+    return first_status;
 }

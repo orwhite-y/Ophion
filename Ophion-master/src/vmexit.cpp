@@ -1843,9 +1843,11 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
 
             vcpu->vmxoff.executed = TRUE;
 
+            hv_trace_prepare_vmxoff(vcpu);
             __vmx_off();
 
             __writecr3(guest_cr3);
+            __writecr8(vcpu->guest_cr8);
 
 #if USE_PRIVATE_HOST_IDT
             if (g_host_idt.initialized)

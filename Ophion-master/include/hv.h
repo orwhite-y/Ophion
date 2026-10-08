@@ -357,6 +357,7 @@ BOOLEAN hv_trace_handle_debug_exception(VIRTUAL_MACHINE_STATE * vcpu,
 VOID hv_trace_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu);
 VOID hv_trace_rearm_pending_mtf(VIRTUAL_MACHINE_STATE * vcpu);
 VOID hv_trace_prepare_guest_debug_state(VIRTUAL_MACHINE_STATE * vcpu);
+VOID hv_trace_prepare_vmxoff(VIRTUAL_MACHINE_STATE * vcpu);
 
 //
 // stealth memory allocation (ept_stealth.cpp)

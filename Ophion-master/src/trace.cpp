@@ -150,6 +150,37 @@ hv_trace_prepare_guest_debug_state(VIRTUAL_MACHINE_STATE * vcpu)
     __vmx_vmwrite(VMCS_GUEST_DR7, effective_dr7);
 }
 
+VOID
+hv_trace_prepare_vmxoff(VIRTUAL_MACHINE_STATE * vcpu)
+{
+    if (!vcpu)
+        return;
+
+    UINT64 guest_dr7 = 0;
+    if (vcpu->trace_private_dr_active)
+        guest_dr7 = vcpu->guest_dr7_shadow;
+    else
+        __vmx_vmread(VMCS_GUEST_DR7, &guest_dr7);
+
+    // VMXOFF has no following VM-entry to reload guest debug state. Remove the
+    // private overlay and materialize the guest-visible DR state in hardware.
+    // Disable breakpoints while addresses are being restored, then publish DR7
+    // last so no partially restored slot can fire.
+    __writedr(7, 0x400ULL);
+    __writedr(0, vcpu->guest_dr0);
+    __writedr(1, vcpu->guest_dr1);
+    __writedr(2, vcpu->guest_dr2);
+    __writedr(3, vcpu->guest_dr3);
+    __writedr(6, vcpu->guest_dr6);
+    __writedr(7, guest_dr7);
+
+    vcpu->trace_private_dr_active = FALSE;
+    vcpu->trace_private_dr_armed = FALSE;
+    vcpu->trace_mtf_active = FALSE;
+    vcpu->trace_session_id = 0;
+    vcpu->trace_private_dr_address = 0;
+}
+
 static VOID
 hv_trace_disable_private_dr(VIRTUAL_MACHINE_STATE * vcpu)
 {

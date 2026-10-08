@@ -351,6 +351,34 @@ static __forceinline VOID TdMemCacheInvalidate(VOID)
 //  IOCTL handler
 // =========================================================================
 
+// 2026-09-20 hardening: front-gate validator for caller-supplied memory ranges.
+// A garbage VA (sign-extended data, kernel-range, wrapped, null page) must be
+// rejected BEFORE any read/write path touches it — page-table walkers and
+// copy loops derive pointers from it downstream. (BSOD 0x50 postmortem:
+// rep movsb dereferenced 0xffffffff01e09da8 from a blind pointer scan.)
+static BOOLEAN TdIsValidUserVaRange(UINT64 va, UINT64 size)
+{
+    if (size == 0) return FALSE;
+    if (va < 0x10000ULL) return FALSE;                 // null / near-null page
+    if (va >= 0x00007FFF00000000ULL) return FALSE;     // canonical user ceiling
+    UINT64 end = va + size;
+    if (end < va) return FALSE;                        // addition wrap
+    if (end > 0x00007FFF00000000ULL) return FALSE;
+    return TRUE;
+}
+
+static BOOLEAN TdIsValidKernelVaRange(UINT64 va, UINT64 size)
+{
+    if (size == 0 || va < 0xFFFF800000000000ULL)
+        return FALSE;
+
+    const UINT64 end = va + size;
+    if (end <= va)
+        return FALSE;
+
+    return (end - 1) >= 0xFFFF800000000000ULL;
+}
+
 NTSTATUS TdCreateClose(PDEVICE_OBJECT, PIRP irp)
 {
     irp->IoStatus.Status = STATUS_SUCCESS;
@@ -3079,6 +3107,16 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         UINT64 va  = hdr->target_va;
         HANDLE pid = (HANDLE)hdr->target_pid;
 
+        // front gate: reject garbage VA / unknown mode before any path runs
+        if (hdr->mode > 4 || !TdIsValidUserVaRange(hdr->target_va, hdr->size))
+        {
+            hdr->status = (UINT32)STATUS_INVALID_PARAMETER;
+            hdr->result = 0;
+            irp->IoStatus.Information = 0;
+            st = STATUS_SUCCESS;
+            break;
+        }
+
         TdMemCacheInvalidate();
 
         PEPROCESS target = NULL;
@@ -3340,6 +3378,123 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         }
     }
 
+    case IOCTL_HV_READ_KERNEL_MEM:
+    {
+        // ================================================================
+        //  METHOD_OUT_DIRECT: SystemBuffer = TD_HV_MEM_HDR (input),
+        //  MdlAddress = output buffer.
+        //  Target VA is a KERNEL address - globally mapped in every process
+        //  context, so no attach / no pid / no user-VA gate. Per-page SEH
+        //  copy: unreadable pages come back zero-filled, good pages intact,
+        //  so a dump always shows where the holes are.
+        // ================================================================
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_HV_MEM_HDR))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_HV_MEM_HDR * khdr = (TD_HV_MEM_HDR *)irp->AssociatedIrp.SystemBuffer;
+        if (khdr->size == 0 || khdr->size > HV_MEM_MAX)
+        { st = STATUS_INVALID_PARAMETER; break; }
+
+        if (io->Parameters.DeviceIoControl.OutputBufferLength < khdr->size || !irp->MdlAddress)
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        PUCHAR kout = (PUCHAR)MmGetSystemAddressForMdlSafe(irp->MdlAddress, NormalPagePriority);
+        if (!kout)
+        { st = STATUS_INSUFFICIENT_RESOURCES; break; }
+
+        UINT64 kva = khdr->target_va;
+        UINT32 ksz = khdr->size;
+
+        // kernel VAs only - deliberately separate from the user-range gate
+        if (!TdIsValidKernelVaRange(kva, ksz))
+        {
+            khdr->status = (UINT32)STATUS_INVALID_PARAMETER;
+            khdr->result = 0;
+            irp->IoStatus.Information = 0;
+            st = STATUS_SUCCESS;
+            break;
+        }
+
+        UINT64 kdone = 0;
+        BOOLEAN had_fault = FALSE;
+        while (kdone < ksz)
+        {
+            UINT64 koff   = (kva + kdone) & 0xFFF;
+            UINT64 kchunk = 0x1000 - koff;
+            if (kchunk > (UINT64)ksz - kdone) kchunk = (UINT64)ksz - kdone;
+            __try {
+                RtlCopyMemory((PUCHAR)kout + kdone,
+                              (PVOID)(ULONG_PTR)(kva + kdone),
+                              (SIZE_T)kchunk);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                RtlZeroMemory((PUCHAR)kout + kdone, (SIZE_T)kchunk);
+                had_fault = TRUE;
+            }
+            kdone += kchunk;
+        }
+
+        khdr->status = (UINT32)(had_fault
+            ? STATUS_SOME_NOT_MAPPED : STATUS_SUCCESS);
+        khdr->result = kdone;
+        irp->IoStatus.Information = (ULONG_PTR)kdone;
+        st = STATUS_SUCCESS;
+        break;
+    }
+
+    case IOCTL_HV_WRITE_KERNEL_MEM:
+    {
+        // ================================================================
+        //  METHOD_BUFFERED: SystemBuffer = [TD_HV_MEM_HDR][data...],
+        //  InputBufferLength = sizeof(TD_HV_MEM_HDR) + size.
+        //  Kernel VA must be >= 0xFFFF800000000000. Per-page SEH; aborts on
+        //  first fault (a partial write leaves the target inconsistent, so
+        //  callers must validate the address before writing).
+        // ================================================================
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_HV_MEM_HDR))
+        { st = STATUS_BUFFER_TOO_SMALL; break; }
+
+        TD_HV_MEM_HDR * whdr = (TD_HV_MEM_HDR *)irp->AssociatedIrp.SystemBuffer;
+        UINT64 wsize = whdr->size;
+        if (wsize == 0 || wsize > HV_MEM_MAX ||
+            io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_HV_MEM_HDR) + wsize)
+        { st = STATUS_INVALID_PARAMETER; break; }
+
+        PUCHAR wdata = (PUCHAR)irp->AssociatedIrp.SystemBuffer + sizeof(TD_HV_MEM_HDR);
+        UINT64 wva   = whdr->target_va;
+        if (!TdIsValidKernelVaRange(wva, wsize))
+        {
+            whdr->status = (UINT32)STATUS_INVALID_PARAMETER;
+            whdr->result = 0;
+            irp->IoStatus.Information = 0;
+            st = STATUS_SUCCESS;
+            break;
+        }
+
+        UINT64 wdone = 0;
+        NTSTATUS write_status = STATUS_SUCCESS;
+        while (wdone < wsize)
+        {
+            UINT64 woff   = (wva + wdone) & 0xFFF;
+            UINT64 wchunk = 0x1000 - woff;
+            if (wchunk > (UINT64)wsize - wdone) wchunk = (UINT64)wsize - wdone;
+            __try {
+                RtlCopyMemory((PVOID)(ULONG_PTR)(wva + wdone),
+                              wdata + wdone,
+                              (SIZE_T)wchunk);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                write_status = GetExceptionCode();
+                break;
+            }
+            wdone += wchunk;
+        }
+
+        whdr->status = (UINT32)write_status;
+        whdr->result = wdone;
+        irp->IoStatus.Information = sizeof(TD_HV_MEM_HDR);
+        st = STATUS_SUCCESS;
+        break;
+    }
+
     case IOCTL_HV_WRITE_MEM:
     {
         // ================================================================
@@ -3366,6 +3521,16 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         UINT32 sz = hdr->size;
         UINT64 va = hdr->target_va;
         HANDLE pid = (HANDLE)hdr->target_pid;
+
+        // front gate: reject garbage VA / unknown mode before any path runs
+        if (hdr->mode > 4 || !TdIsValidUserVaRange(hdr->target_va, hdr->size))
+        {
+            hdr->status = (UINT32)STATUS_INVALID_PARAMETER;
+            hdr->result = 0;
+            irp->IoStatus.Information = 0;
+            st = STATUS_SUCCESS;
+            break;
+        }
 
         KIRQL old_irql;
         KeAcquireSpinLock(&g_pfc_lock, &old_irql);

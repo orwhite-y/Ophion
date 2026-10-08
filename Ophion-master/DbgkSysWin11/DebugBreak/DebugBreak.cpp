@@ -20,20 +20,15 @@
 #include "../Encrypt/Blowfish/Blowfish.h"
 #include "../Hvm/AsmCallset.h"
 #include "../Hvm/vmcall_reason.h"
+#include "../../Common/Ring0/Hvm/OphionMemoryBreakpoint.h"
 #include "DebugBreak.h"
 
 bool vmcall_internal(PVOID vmcallinfo)
 {
-    unsigned long ecode = 0;
-    bool boSuccess = false;
-    __try {
-        //若非vmx模式则该指令会触发#UD异常
-        boSuccess = __vm_call(((PVMCALLINFO)vmcallinfo)->command, (unsigned __int64)vmcallinfo, 0, 0);
-    }
-    __except (ecode = GetExceptionCode(), 1) {
-        outLog("执行vmcall时遇到了错误 (error: 0x%X)", ecode);
-    }
-    return boSuccess;
+    UNREFERENCED_PARAMETER(vmcallinfo);
+    // VT_Driver's legacy software-breakpoint commands overlap unrelated
+    // Ophion services, so they must never be forwarded verbatim.
+    return false;
 }
 
 //只会向当前逻辑处理器发送请求
@@ -44,57 +39,43 @@ bool current_vmcall(PVOID vmcallinfo)
 
 bool AddHardwareBreakpoint(PBREAKPOINT_RECORD Breakpoint)
 {
-    bool boSuccess = false;
-    VT_BREAK_POINT vmcallinfo = { 0 };
-    vmcallinfo.cr3 = Breakpoint->cr3;
-    vmcallinfo.VirtualAddress = Breakpoint->Address;
-    vmcallinfo.Size = Breakpoint->length;
-    vmcallinfo.command = Breakpoint->command;
-    vmcallinfo.CPUCount = Breakpoint->CPUCount;
-    vmcallinfo.LoopUserMode = Breakpoint->LoopUserMode;
-    vmcallinfo.watchid = -1;
+    if (!Breakpoint)
+        return false;
 
-    KAPC_STATE ApcState;
-    PEPROCESS Process = NULL;
-    NTSTATUS status = PsLookupProcessByProcessId((HANDLE)Breakpoint->pid, &Process);
-    if (NT_SUCCESS(status))
+    UINT8 access = 0;
+    switch (Breakpoint->command)
     {
-        __try
-        {
-            KeStackAttachProcess(Process, &ApcState);
-            //outToFile("数值: %X", *(BYTE*)Breakpoint->Address);
-            //outToFile("地址: %p", Breakpoint->Address);
-            //outToFile("cr3: %p", __readcr3());
-
-            //apex使用了假cr3，通过此解决方案可以获得真实的cr3
-            //我们对目标地址读取一个字节的内容，从而使得系统触发#GP异常
-            //eac会在异常里接管#GP异常，从而恢复真实的cr3给cr3寄存器
-            //然后回到触发#GP异常的指令处，继续执行，故而我们便在此时有机会获得真实的cr3
-            *(volatile BYTE*)Breakpoint->Address;  //volatile关键字可以不被Release优化
-            _disable(); //关中断
-            vmcallinfo.cr3 = __readcr3();
-            _enable();  //开中断
-            boSuccess = current_vmcall(&vmcallinfo);
-            KeUnstackDetachProcess(&ApcState);
-        }
-        __except (1)
-        {
-            outLog("设置硬件断点时崩溃了");
-        }
-
-        Breakpoint->watchid = vmcallinfo.watchid;
-
-        if (!boSuccess)
-        {
-            outLog("current_vmcall 失败!");
-        }
-        else
-        {
-            outLog("current_vmcall 成功!  errorCode:%d", vmcallinfo.errorCode);
-        }
-        ObDereferenceObject(Process);
+    case VMCALL_WATCH_READS: access = OPHION_BP_ACCESS_READ; break;
+    case VMCALL_WATCH_WRITES: access = OPHION_BP_ACCESS_WRITE; break;
+    case VMCALL_WATCH_EXECUTES: access = OPHION_BP_ACCESS_EXECUTE; break;
+    default: return false;
     }
-    return boSuccess;
+
+    // Ophion compatibility contract: LoopUserMode == 1 selects one-shot;
+    // every other value keeps the original permanent-watch behaviour.
+    const UINT8 flags = Breakpoint->LoopUserMode == 1
+        ? OPHION_BP_FLAG_ONESHOT : 0;
+    UINT64 id = 0;
+    UINT64 target_cr3 = 0;
+    const NTSTATUS status = OphionMemoryBreakpointSet(
+        Breakpoint->pid,
+        static_cast<UINT64>(Breakpoint->Address),
+        static_cast<UINT32>(Breakpoint->length),
+        access,
+        flags,
+        &id,
+        &target_cr3);
+    if (!NT_SUCCESS(status))
+    {
+        outLog("Ophion memory breakpoint set failed: 0x%08X", status);
+        return false;
+    }
+
+    Breakpoint->watchid = static_cast<int>(id);
+    Breakpoint->cr3 = target_cr3;
+    outLog("Ophion memory breakpoint set: id=%llu access=%u mode=%s",
+        id, access, flags ? "once" : "permanent");
+    return true;
 }
 
 void SetHardwareBreakpoint(IN PUSER_DATA userData, IN PIRP pIrp)
@@ -127,43 +108,15 @@ void SetHardwareBreakpoint(IN PUSER_DATA userData, IN PIRP pIrp)
 
 bool DeleteHardwareBreakpoint(PBREAKPOINT_RECORD Breakpoint)
 {
-    bool boSuccess = false;
-    VT_BREAK_POINT vmcallinfo = { 0 };
-    vmcallinfo.cr3 = Breakpoint->cr3;
-    vmcallinfo.VirtualAddress = Breakpoint->Address;
-    vmcallinfo.Size = Breakpoint->length;
-    vmcallinfo.command = VMCALL_WATCH_DELETE;
-    vmcallinfo.LoopUserMode = Breakpoint->LoopUserMode;
-    vmcallinfo.watchid = Breakpoint->watchid;
-    vmcallinfo.CPUCount = Breakpoint->CPUCount;
-
-    KAPC_STATE ApcState;
-    PEPROCESS Process = NULL;
-    NTSTATUS status = PsLookupProcessByProcessId((HANDLE)Breakpoint->pid, &Process);
-    if (NT_SUCCESS(status))
+    if (!Breakpoint || Breakpoint->watchid <= 0)
+        return false;
+    const NTSTATUS status = OphionMemoryBreakpointClear(
+        static_cast<UINT64>(Breakpoint->watchid));
+    if (!NT_SUCCESS(status))
     {
-        __try
-        {
-            KeStackAttachProcess(Process, &ApcState);
-
-            //apex使用了假cr3，通过此解决方案可以获得真实的cr3
-            //我们对目标地址读取一个字节的内容，从而使得系统触发#GP异常
-            //eac会在异常里接管#GP异常，从而恢复真实的cr3给cr3寄存器
-            //然后回到触发#GP异常的指令处，继续执行，故而我们便在此时有机会获得真实的cr3
-            *(volatile BYTE*)Breakpoint->Address;  //volatile关键字可以不被Release优化
-            _disable(); //关中断
-            vmcallinfo.cr3 = __readcr3();
-            _enable();  //开中断
-            boSuccess = current_vmcall(&vmcallinfo);
-            KeUnstackDetachProcess(&ApcState);
-        }
-        __except (1)
-        {
-            outLog("删除硬件断点时崩溃了");
-        }
-        ObDereferenceObject(Process);
+        outLog("Ophion memory breakpoint clear failed: 0x%08X", status);
     }
-    return boSuccess;
+    return NT_SUCCESS(status);
 }
 
 //移除硬件断点

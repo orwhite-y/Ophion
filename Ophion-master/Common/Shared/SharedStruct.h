@@ -17,6 +17,13 @@
 #define PROTECT_FILE           1
 #define PROTECT_WINDOW         2
 
+// Ophion-backed memory-breakpoint compatibility values.
+#define BREAKPOINT_WATCH_WRITE       15ULL
+#define BREAKPOINT_WATCH_READ        16ULL
+#define BREAKPOINT_WATCH_EXECUTE     17ULL
+#define BREAKPOINT_MODE_PERMANENT     0ULL
+#define BREAKPOINT_MODE_ONESHOT       1ULL
+
 typedef struct _MY_CLIENT_ID
 {
     PTR64(HANDLE) UniqueProcess;
@@ -96,7 +103,7 @@ typedef struct _BREAKPOINT_RECORD {
     int length;
     int watchid;  //监视id
     int CPUCount;  //逻辑处理器数量
-    unsigned __int64 LoopUserMode;  //用户模式的int3
+    unsigned __int64 LoopUserMode;  // memory breakpoint: 0=permanent, 1=one-shot
     unsigned long pid; //进程pid
 }BREAKPOINT_RECORD, * PBREAKPOINT_RECORD;
 
@@ -149,4 +156,3 @@ typedef struct _RING3_VERIFY
 
 
 #endif // !_SHARED_STRUCT_H
-

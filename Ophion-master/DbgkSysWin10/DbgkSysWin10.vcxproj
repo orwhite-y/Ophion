@@ -395,6 +395,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\Common\Ring0\Inject\ApcInject\ApcInject.cpp" />
+    <ClCompile Include="..\Common\Ring0\Hvm\OphionMemoryBreakpoint.cpp" />
     <ClCompile Include="..\Common\Ring0\String\StringHandler.cpp" />
     <ClCompile Include="DbgkApi\DbgkApi.cpp" />
     <ClCompile Include="DebugBreak\DebugBreak.cpp" />
@@ -418,6 +419,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\Common\Ring0\Inject\ApcInject\ApcInject.h" />
+    <ClInclude Include="..\Common\Ring0\Hvm\OphionMemoryBreakpoint.h" />
     <ClInclude Include="..\Common\Ring0\PE\PE_struct.h" />
     <ClInclude Include="..\Common\Ring0\String\StringHandler.h" />
     <ClInclude Include="Asm\AsmVar.h" />

@@ -205,6 +205,9 @@
     <ClCompile Include="..\Common\Ring0\Inject\ApcInject\ApcInject.cpp">
       <Filter>Source Files\Common\Inject\ApcInject</Filter>
     </ClCompile>
+    <ClCompile Include="..\Common\Ring0\Hvm\OphionMemoryBreakpoint.cpp">
+      <Filter>Source Files\Hvm</Filter>
+    </ClCompile>
     <ClCompile Include="DebugBreak\DebugBreak.cpp">
       <Filter>Source Files\DebugBreak</Filter>
     </ClCompile>
@@ -318,14 +321,17 @@
     <ClInclude Include="Hvm\vmcall_reason.h">
       <Filter>Header Files\Hvm</Filter>
     </ClInclude>
-    <ClInclude Include="E:\Projects\VS\repos\UnrealDbg\Common\Shared\IOCTLs.h">
+    <ClInclude Include="..\Common\Shared\IOCTLs.h">
       <Filter>Header Files\Common\Shared</Filter>
     </ClInclude>
-    <ClInclude Include="E:\Projects\VS\repos\UnrealDbg\Common\Shared\SharedStruct.h">
+    <ClInclude Include="..\Common\Shared\SharedStruct.h">
       <Filter>Header Files\Common\Shared</Filter>
     </ClInclude>
     <ClInclude Include="..\Common\Ring0\Inject\ApcInject\ApcInject.h">
       <Filter>Header Files\Common\Inject\ApcInject</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Common\Ring0\Hvm\OphionMemoryBreakpoint.h">
+      <Filter>Header Files\Hvm</Filter>
     </ClInclude>
     <ClInclude Include="..\Common\Ring0\PE\PE_struct.h">
       <Filter>Header Files\Common\PE</Filter>

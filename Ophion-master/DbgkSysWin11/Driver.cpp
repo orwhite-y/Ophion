@@ -27,6 +27,7 @@
 #include "Asm/AsmVar.h"
 #include "Hvm/hypervisor_gateway.h"
 #include "DebugBreak/DebugBreak.h"
+#include "../Common/Ring0/Hvm/OphionMemoryBreakpoint.h"
 
 PWCHAR PassProcessList[12] = {
     _T("system"),
@@ -48,6 +49,7 @@ VOID Unload(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
     //UnloadProtect();
+    OphionMemoryBreakpointCleanupAll(OphionMemoryBreakpointAvailable());
     RemoveHooks();
     //DbgkUnInitialize();
     //ReleaseMemoryResources();
@@ -60,7 +62,8 @@ NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject, IN PUNICODE_STRING Registry
 {
     UNREFERENCED_PARAMETER(DriverObject);
     UNREFERENCED_PARAMETER(RegistryPath);
-    LogFile::InitDriverLog();    
+    LogFile::InitDriverLog();
+    OphionMemoryBreakpointInitialize();
 
     //DbgBreakPoint();
     //ApcCreateRemoteThread((HANDLE)7572, NULL);

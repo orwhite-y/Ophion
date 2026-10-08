@@ -163,19 +163,41 @@ call_original:
 //
 // DPC callback: each CPU issues VMCALL to install EPT hook
 //
+typedef struct _EPT_HOOK_DPC_CTX {
+    PVOID         target;
+    PVOID         proxy;
+    PVOID *       origin;
+    UINT64        caller_cr3;
+    UINT32        hook_type;
+    volatile LONG success_count;
+    volatile LONG failure_count;
+    volatile LONG first_failure;
+} EPT_HOOK_DPC_CTX;
+
+typedef struct _EPT_UNHOOK_DPC_CTX {
+    PVOID         target;
+    UINT64        caller_cr3;
+    volatile LONG success_count;
+    volatile LONG failure_count;
+    volatile LONG first_failure;
+} EPT_UNHOOK_DPC_CTX;
+
+static NTSTATUS
+TdDpcAggregateStatus(
+    volatile LONG success_count,
+    volatile LONG failure_count,
+    volatile LONG first_failure)
+{
+    if (failure_count != 0)
+        return (NTSTATUS)first_failure;
+    return success_count != 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
 VOID
 DpcEptHook(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
 {
     UNREFERENCED_PARAMETER(Dpc);
-
-    struct _EPT_HOOK_CTX {
-        PVOID   target;
-        PVOID   proxy;
-        PVOID * origin;
-        UINT64  caller_cr3;
-        UINT32  hook_type;
-        NTSTATUS result;
-    } * ctx = (struct _EPT_HOOK_CTX *)Ctx;
+    EPT_HOOK_DPC_CTX * ctx = (EPT_HOOK_DPC_CTX *)Ctx;
 
     //
     // hv_vmcall_ex: rax = OPHION_VMCALL_ID
@@ -189,7 +211,7 @@ DpcEptHook(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
     //   r13 = user_trampoline (NULL = kernel pool)
     //   r14 = user_trampoline_pa (0)
     //
-    ctx->result = hv_vmcall_ex(
+    NTSTATUS status = hv_vmcall_ex(
         VMCALL_EPT_HOOK,
         (UINT64)ctx->target,
         (UINT64)ctx->proxy,
@@ -201,6 +223,15 @@ DpcEptHook(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
         0,   // user_trampoline_pa = 0
         0);
 
+    if (NT_SUCCESS(status))
+        InterlockedIncrement(&ctx->success_count);
+    else
+    {
+        InterlockedIncrement(&ctx->failure_count);
+        InterlockedCompareExchange(
+            &ctx->first_failure, (LONG)status, (LONG)STATUS_SUCCESS);
+    }
+
     KeSignalCallDpcSynchronize(A2);
     KeSignalCallDpcDone(A1);
 }
@@ -209,19 +240,23 @@ VOID
 DpcEptUnhook(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
 {
     UNREFERENCED_PARAMETER(Dpc);
+    EPT_UNHOOK_DPC_CTX * ctx = (EPT_UNHOOK_DPC_CTX *)Ctx;
 
-    struct _EPT_UNHOOK_CTX {
-        PVOID    target;
-        UINT64   caller_cr3;
-        NTSTATUS result;
-    } * ctx = (struct _EPT_UNHOOK_CTX *)Ctx;
-
-    ctx->result = hv_vmcall_ex(
+    NTSTATUS status = hv_vmcall_ex(
         VMCALL_EPT_UNHOOK,
         (UINT64)ctx->target,
         0, 0,
         ctx->caller_cr3,
         0, 0, 0, 0, 0);
+
+    if (NT_SUCCESS(status))
+        InterlockedIncrement(&ctx->success_count);
+    else
+    {
+        InterlockedIncrement(&ctx->failure_count);
+        InterlockedCompareExchange(
+            &ctx->first_failure, (LONG)status, (LONG)STATUS_SUCCESS);
+    }
 
     KeSignalCallDpcSynchronize(A2);
     KeSignalCallDpcDone(A1);
@@ -270,14 +305,7 @@ TdEptHookNtCreateFile(VOID)
 
     HYPERPLATFORM_LOG_INFO("[td] NtCreateFile = %p, proxy = %p", target, (PVOID)HookedNtCreateFile);
 
-    struct {
-        PVOID   target;
-        PVOID   proxy;
-        PVOID * origin;
-        UINT64  caller_cr3;
-        UINT32  hook_type;
-        NTSTATUS result;
-    } ctx = {};
+    EPT_HOOK_DPC_CTX ctx = {};
 
     ctx.target     = target;
     ctx.proxy      = (PVOID)HookedNtCreateFile;
@@ -285,19 +313,64 @@ TdEptHookNtCreateFile(VOID)
     ctx.caller_cr3 = __readcr3();
     ctx.hook_type  = 0;   // absolute jump (14 bytes)
 
-    KeGenericCallDpc(DpcEptHook, &ctx);
+    // Publish the shared hook metadata before any secondary CPU tries to
+    // install its local EPT view. Bit 2 selects the full primary path.
+    NTSTATUS primary_status = hv_vmcall_ex(
+        VMCALL_EPT_HOOK,
+        (UINT64)ctx.target,
+        (UINT64)ctx.proxy,
+        (UINT64)ctx.origin,
+        ctx.caller_cr3,
+        (UINT64)ctx.hook_type | (4ULL << 32),
+        0, 0, 0, 0);
 
-    if (NT_SUCCESS(ctx.result))
+    if (NT_SUCCESS(primary_status))
+    {
+        KeGenericCallDpc(DpcEptHook, &ctx);
+    }
+    else
+    {
+        ctx.failure_count = 1;
+        ctx.first_failure = (LONG)primary_status;
+    }
+
+    NTSTATUS result = TdDpcAggregateStatus(
+        ctx.success_count, ctx.failure_count, ctx.first_failure);
+
+    if (!NT_SUCCESS(result) && NT_SUCCESS(primary_status))
+    {
+        EPT_UNHOOK_DPC_CTX rollback = {};
+        rollback.target = target;
+        rollback.caller_cr3 = ctx.caller_cr3;
+        KeGenericCallDpc(DpcEptUnhook, &rollback);
+        NTSTATUS rollback_status = TdDpcAggregateStatus(
+            rollback.success_count,
+            rollback.failure_count,
+            rollback.first_failure);
+        if (!NT_SUCCESS(rollback_status))
+        {
+            // The trampoline may still be reachable. Retain the target so a
+            // later explicit unhook can retry instead of losing ownership.
+            g_hooked_target = target;
+            HYPERPLATFORM_LOG_ERROR(
+                "[td] EPT hook rollback FAILED: 0x%08X", rollback_status);
+            result = rollback_status;
+        }
+        else
+            g_orig_NtCreateFile = NULL;
+    }
+
+    if (NT_SUCCESS(result))
     {
         g_hooked_target = target;
         HYPERPLATFORM_LOG_INFO("[td] EPT hook installed! trampoline = %p", (PVOID)g_orig_NtCreateFile);
     }
     else
     {
-        HYPERPLATFORM_LOG_ERROR("[td] EPT hook FAILED: 0x%08X", ctx.result);
+        HYPERPLATFORM_LOG_ERROR("[td] EPT hook FAILED: 0x%08X", result);
     }
 
-    return ctx.result;
+    return result;
 }
 
 NTSTATUS
@@ -306,18 +379,16 @@ TdEptUnhookNtCreateFile(VOID)
     if (!g_hooked_target)
         return STATUS_NOT_FOUND;
 
-    struct {
-        PVOID    target;
-        UINT64   caller_cr3;
-        NTSTATUS result;
-    } ctx = {};
+    EPT_UNHOOK_DPC_CTX ctx = {};
 
     ctx.target     = g_hooked_target;
     ctx.caller_cr3 = __readcr3();
 
     KeGenericCallDpc(DpcEptUnhook, &ctx);
+    NTSTATUS result = TdDpcAggregateStatus(
+        ctx.success_count, ctx.failure_count, ctx.first_failure);
 
-    if (NT_SUCCESS(ctx.result))
+    if (NT_SUCCESS(result))
     {
         HYPERPLATFORM_LOG_INFO("[td] EPT hook removed. total calls logged: %d", g_hook_log_count);
         g_hooked_target = NULL;
@@ -326,10 +397,10 @@ TdEptUnhookNtCreateFile(VOID)
     }
     else
     {
-        HYPERPLATFORM_LOG_ERROR("[td] EPT unhook FAILED: 0x%08X", ctx.result);
+        HYPERPLATFORM_LOG_ERROR("[td] EPT unhook FAILED: 0x%08X", result);
     }
 
-    return ctx.result;
+    return result;
 }
 
 // =========================================================================
@@ -411,8 +482,6 @@ typedef struct _R3_HOOK_DPC_CTX {
     UINT64   user_trampoline_pa;
     UINT64   flags;             // bit 0 = force_read_access (shellcode self-read)
     UINT64   expected_tid;      // 0 = any thread
-    ULONG    primary_processor;
-    volatile LONG primary_done;
     volatile LONG success_count;
     volatile LONG failure_count;
     volatile LONG first_failure;
@@ -425,33 +494,20 @@ DpcEptHookR3(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
     UNREFERENCED_PARAMETER(Dpc);
     R3_HOOK_DPC_CTX * ctx = (R3_HOOK_DPC_CTX *)Ctx;
 
-    // One CPU must perform the full EPT-hook installation. The other CPUs use
-    // ept_hook_install_secondary_cpu(), which requires an already-installed
-    // page. Wait until the primary CPU has completed that first installation.
-    BOOLEAN is_primary = (KeGetCurrentProcessorNumber() == ctx->primary_processor);
-    UINT64 packed_flags = ctx->flags | ((is_primary ? 1ULL : 0ULL) << 2);
-
-    if (!is_primary) {
-        while (ctx->primary_done == 0) {
-            _mm_pause();
-        }
-    }
-
+    // Primary installation is completed synchronously by the caller before
+    // this broadcast starts. Every DPC therefore takes the secondary path and
+    // no CPU spins at DISPATCH_LEVEL waiting for shared metadata.
     NTSTATUS st = hv_vmcall_ex(
         VMCALL_EPT_HOOK,
         (UINT64)ctx->target,
         (UINT64)ctx->proxy,
         (UINT64)ctx->origin,
         ctx->caller_cr3,
-        (UINT64)ctx->hook_type | (packed_flags << 32),
+        (UINT64)ctx->hook_type | (ctx->flags << 32),
         ctx->target_cr3,
         (UINT64)ctx->user_trampoline,
         ctx->user_trampoline_pa,
         ctx->expected_tid);
-
-    if (is_primary) {
-        ctx->primary_done = 1;
-    }
 
     if (NT_SUCCESS(st)) {
         _InterlockedIncrement(&ctx->success_count);
@@ -698,6 +754,18 @@ TdEptHookR3(
     // level allocation/attach path below may block safely while holding it.
     R3HookGateGuard hook_guard;
 
+    // A target function may only have one active hook per process.  Keep the
+    // check under g_r3_hooks_gate so concurrent IOCTL callers cannot both pass
+    // it and install duplicate EPT state for the same (pid, VA).
+    R3_HOOK_ENTRY * existing = R3HookFind(target_pid, target_va);
+    if (existing)
+    {
+        HYPERPLATFORM_LOG_WARN(
+            "[td-r3] duplicate R3 hook rejected: pid=%llu va=%p trampoline=%p",
+            target_pid, target_va, existing->trampoline_va);
+        return STATUS_OBJECT_NAME_COLLISION;
+    }
+
     R3_HOOK_ENTRY * entry = R3HookFindFree();
     if (!entry)
     {
@@ -719,8 +787,18 @@ TdEptHookR3(
     //
     // 1. lock target page in physical memory via MDL
     //
-    PVOID page_va = (PVOID)((UINT64)target_va & ~0xFFFULL);
-    PMDL mdl = IoAllocateMdl(page_va, PAGE_SIZE, FALSE, FALSE, NULL);
+    UINT64 page_start = (UINT64)target_va & ~0xFFFULL;
+    UINT64 page_offset = (UINT64)target_va & 0xFFFULL;
+    SIZE_T lock_length = PAGE_SIZE;
+
+    // The decoder may read up to 32 bytes while collecting whole instructions
+    // for the patch. Pin the next page as well when that window crosses it.
+    if (page_offset + 32 > PAGE_SIZE)
+        lock_length += PAGE_SIZE;
+
+    PVOID page_va = (PVOID)page_start;
+    PMDL mdl = IoAllocateMdl(
+        page_va, (ULONG)lock_length, FALSE, FALSE, NULL);
     if (!mdl)
     {
         KeUnstackDetachProcess(&apc);
@@ -920,21 +998,65 @@ TdEptHookR3(
     ctx.target_cr3          = target_cr3;
     ctx.user_trampoline     = tramp_va;
     ctx.user_trampoline_pa  = tramp_pa;
-    ctx.primary_processor   = KeGetCurrentProcessorNumber();
-    ctx.primary_done        = 0;
     ctx.success_count       = 0;
     ctx.failure_count       = 0;
     ctx.first_failure       = (LONG)STATUS_SUCCESS;
 
-    KeGenericCallDpc(DpcEptHookR3, &ctx);
+    // Phase 1: create and publish the shared hook metadata on this CPU while
+    // attached to the target address space.
+    NTSTATUS primary_status = hv_vmcall_ex(
+        VMCALL_EPT_HOOK,
+        (UINT64)ctx.target,
+        (UINT64)ctx.proxy,
+        (UINT64)ctx.origin,
+        ctx.caller_cr3,
+        (UINT64)ctx.hook_type | ((ctx.flags | 4ULL) << 32),
+        ctx.target_cr3,
+        (UINT64)ctx.user_trampoline,
+        ctx.user_trampoline_pa,
+        ctx.expected_tid);
+    BOOLEAN primary_installed = NT_SUCCESS(primary_status);
 
-    ctx.result = (ctx.failure_count != 0)
-        ? (NTSTATUS)ctx.first_failure
-        : ((ctx.success_count != 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL);
+    // Phase 2 starts only after the primary metadata is visible. The current
+    // CPU participates again via the idempotent secondary path.
+    if (primary_installed)
+    {
+        KeMemoryBarrier();
+        KeGenericCallDpc(DpcEptHookR3, &ctx);
+        ctx.result = TdDpcAggregateStatus(
+            ctx.success_count, ctx.failure_count, ctx.first_failure);
+    }
+    else
+    {
+        ctx.result = primary_status;
+    }
+
+    // If propagation failed, retire the published hook before releasing the
+    // trampoline and MDL. Keep ownership when rollback itself is incomplete.
+    BOOLEAN retain_resources = FALSE;
+    if (!NT_SUCCESS(ctx.result) && primary_installed)
+    {
+        EPT_UNHOOK_DPC_CTX rollback = {};
+        rollback.target = target_va;
+        rollback.caller_cr3 = caller_cr3;
+        KeGenericCallDpc(DpcEptUnhook, &rollback);
+        NTSTATUS rollback_status = TdDpcAggregateStatus(
+            rollback.success_count,
+            rollback.failure_count,
+            rollback.first_failure);
+        if (!NT_SUCCESS(rollback_status))
+        {
+            retain_resources = TRUE;
+            ctx.result = rollback_status;
+            HYPERPLATFORM_LOG_ERROR(
+                "[td-r3] hook rollback failed; resources retained: 0x%08X",
+                rollback_status);
+        }
+    }
 
     KeUnstackDetachProcess(&apc);
 
-    if (NT_SUCCESS(ctx.result))
+    if (NT_SUCCESS(ctx.result) || retain_resources)
     {
         entry->active           = TRUE;
         entry->target_pid       = target_pid;
@@ -944,10 +1066,12 @@ TdEptHookR3(
         entry->target_mdl       = mdl;
         entry->target_cr3       = target_cr3;
 
-        if (out_trampoline)
+        if (NT_SUCCESS(ctx.result) && out_trampoline)
             *out_trampoline = origin_ptr;
 
-        HYPERPLATFORM_LOG_INFO("[td-r3] R3 EPT hook installed! trampoline=%p", origin_ptr);
+        if (NT_SUCCESS(ctx.result))
+            HYPERPLATFORM_LOG_INFO(
+                "[td-r3] R3 EPT hook installed! trampoline=%p", origin_ptr);
     }
     else
     {
@@ -955,6 +1079,7 @@ TdEptHookR3(
         // failed 閳?clean up: free trampoline, unlock MDL
         //
         KeStackAttachProcess(proc, &apc);
+        TdStealthFreePage((PVOID)((UINT64)tramp_va & ~0xFFFULL));
         ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
         KeUnstackDetachProcess(&apc);
 
@@ -995,15 +1120,25 @@ TdEptUnhookR3(UINT64 target_pid, PVOID target_va)
     KAPC_STATE apc;
     KeStackAttachProcess(proc, &apc);
 
-    struct {
-        PVOID    target;
-        UINT64   caller_cr3;
-        NTSTATUS result;
-    } unhook_ctx = {};
+    EPT_UNHOOK_DPC_CTX unhook_ctx = {};
     unhook_ctx.target     = target_va;
     unhook_ctx.caller_cr3 = __readcr3();
 
     KeGenericCallDpc(DpcEptUnhook, &unhook_ctx);
+    NTSTATUS unhook_status = TdDpcAggregateStatus(
+        unhook_ctx.success_count,
+        unhook_ctx.failure_count,
+        unhook_ctx.first_failure);
+
+    if (!NT_SUCCESS(unhook_status))
+    {
+        KeUnstackDetachProcess(&apc);
+        ObDereferenceObject(proc);
+        HYPERPLATFORM_LOG_ERROR(
+            "[td-r3] R3 unhook failed; resources retained: 0x%08X",
+            unhook_status);
+        return unhook_status;
+    }
 
     //
     // 2. free trampoline stealth page, then trampoline memory in target process
@@ -1036,7 +1171,7 @@ TdEptUnhookR3(UINT64 target_pid, PVOID target_va)
 
     RtlZeroMemory(entry, sizeof(*entry));
     ObDereferenceObject(proc);
-    return unhook_ctx.result;
+    return unhook_status;
 }
 
 //
@@ -1070,13 +1205,25 @@ TdEptUnhookAllR3(VOID)
                 KAPC_STATE apc;
                 KeStackAttachProcess(proc, &apc);
 
-                struct { PVOID target; UINT64 caller_cr3; NTSTATUS result; } ctx = {};
+                EPT_UNHOOK_DPC_CTX ctx = {};
                 ctx.target     = g_r3_hooks[i].target_va;
                 ctx.caller_cr3 = __readcr3();
                 KeGenericCallDpc(DpcEptUnhook, &ctx);
+                NTSTATUS unhook_status = TdDpcAggregateStatus(
+                    ctx.success_count,
+                    ctx.failure_count,
+                    ctx.first_failure);
 
                 KeUnstackDetachProcess(&apc);
                 ObDereferenceObject(proc);
+
+                if (!NT_SUCCESS(unhook_status))
+                {
+                    HYPERPLATFORM_LOG_ERROR(
+                        "[td-r3] unload unhook failed; entry retained: 0x%08X",
+                        unhook_status);
+                    continue;
+                }
             }
             // else: process dead 閳?EPT pages are orphaned but harmless.
             // the PFN won't be reused for anything meaningful until

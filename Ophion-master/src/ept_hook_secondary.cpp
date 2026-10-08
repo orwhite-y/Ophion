@@ -37,6 +37,8 @@ ept_hook_install_secondary_cpu(
     UINT64 target_pfn,
     UINT64 phys_addr)
 {
+    UNREFERENCED_PARAMETER(req);
+
     //
     // 1. Find existing HOOKED_PAGE_INFO (primary CPU already created it)
     //
@@ -44,9 +46,12 @@ ept_hook_install_secondary_cpu(
 
     if (!hp)
     {
-        // Primary CPU failed or hasn't completed yet
-        g_ept_hook_diag = HOOK_DIAG_SECONDARY_NO_PAGE;
-        g_ept_hook_diag2 = target_pfn;
+        // The owner-first caller publishes metadata before broadcasting any
+        // secondary install. A miss is therefore a real consistency failure.
+        if (g_ept_hook_diag == 0) {   // preserve the primary's real failure code
+            g_ept_hook_diag = HOOK_DIAG_SECONDARY_NO_PAGE;
+            g_ept_hook_diag2 = target_pfn;
+        }
         return FALSE;
     }
 
@@ -58,8 +63,10 @@ ept_hook_install_secondary_cpu(
     {
         if (!ept_split_large_page_pool(vcpu->ept_page_table, (SIZE_T)phys_addr))
         {
-            g_ept_hook_diag = HOOK_DIAG_SECONDARY_SPLIT;
-            g_ept_hook_diag2 = phys_addr;
+            if (g_ept_hook_diag == 0) {
+                g_ept_hook_diag = HOOK_DIAG_SECONDARY_SPLIT;
+                g_ept_hook_diag2 = phys_addr;
+            }
             return FALSE;
         }
     }
@@ -70,8 +77,10 @@ ept_hook_install_secondary_cpu(
     PEPT_PML1_ENTRY target_pte = ept_get_pml1(vcpu->ept_page_table, (SIZE_T)phys_addr);
     if (!target_pte)
     {
-        g_ept_hook_diag = HOOK_DIAG_SECONDARY_NO_PML1;
-        g_ept_hook_diag2 = phys_addr;
+        if (g_ept_hook_diag == 0) {
+            g_ept_hook_diag = HOOK_DIAG_SECONDARY_NO_PML1;
+            g_ept_hook_diag2 = phys_addr;
+        }
         return FALSE;
     }
 

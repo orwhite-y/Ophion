@@ -169,6 +169,27 @@ TdTraceFindLocked(UINT64 session_id)
     return NULL;
 }
 
+static UINT64
+TdTraceAllocateSessionIdLocked(VOID)
+{
+    // At most four IDs can be live, so five attempts are sufficient even when
+    // the signed counter wraps back into the low positive range.
+    for (UINT32 attempt = 0; attempt <= TD_TRACE_MAX_SESSIONS; ++attempt)
+    {
+        LONG next_id = InterlockedIncrement(&g_trace_next_id);
+        if (next_id <= 0)
+        {
+            InterlockedExchange(&g_trace_next_id, 1);
+            next_id = 1;
+        }
+
+        const UINT64 candidate = (UINT32)next_id;
+        if (!TdTraceFindLocked(candidate))
+            return candidate;
+    }
+    return 0;
+}
+
 static VOID
 TdTraceUnlockPages(PTD_TRACE_ENTRY entry)
 {
@@ -258,6 +279,8 @@ TdTraceClearBreakpoint(UINT64 breakpoint_id)
     context.breakpoint_id = breakpoint_id;
     context.record_operation = 1;
     NTSTATUS status = TdTraceIssueVmcall(&context);
+    if (status == STATUS_NOT_FOUND)
+        return STATUS_SUCCESS;
     if (!NT_SUCCESS(status))
         return status;
 
@@ -279,24 +302,45 @@ TdTraceStopLocked(
     NTSTATUS first_status = STATUS_SUCCESS;
     if (issue_vmcalls)
     {
-        TD_TRACE_DPC_CONTEXT context = {};
-        context.operation = TdTraceDpcStop;
-        context.session_id = entry->session_id;
-        context.stop_reason = reason;
-        first_status = TdTraceBroadcast(&context);
+        if (entry->running)
+        {
+            TD_TRACE_DPC_CONTEXT context = {};
+            context.operation = TdTraceDpcStop;
+            context.session_id = entry->session_id;
+            context.stop_reason = reason;
+            first_status = TdTraceBroadcast(&context);
+            if (first_status == STATUS_NOT_FOUND &&
+                entry->breakpoint_count == 0)
+                first_status = STATUS_SUCCESS;
+            if (NT_SUCCESS(first_status))
+                entry->running = FALSE;
+        }
 
+        UINT32 retained = 0;
         for (UINT32 i = 0; i < entry->breakpoint_count; ++i)
         {
             NTSTATUS status = TdTraceClearBreakpoint(entry->breakpoint_ids[i]);
             if (NT_SUCCESS(first_status) && !NT_SUCCESS(status))
                 first_status = status;
+            if (!NT_SUCCESS(status))
+                entry->breakpoint_ids[retained++] = entry->breakpoint_ids[i];
         }
+        for (UINT32 i = retained; i < entry->breakpoint_count; ++i)
+            entry->breakpoint_ids[i] = 0;
+        entry->breakpoint_count = retained;
+    }
+    else
+    {
+        entry->running = FALSE;
+        entry->breakpoint_count = 0;
+        RtlZeroMemory(entry->breakpoint_ids, sizeof(entry->breakpoint_ids));
     }
 
-    TdTraceUnlockPages(entry);
-    entry->breakpoint_count = 0;
-    RtlZeroMemory(entry->breakpoint_ids, sizeof(entry->breakpoint_ids));
-    entry->running = FALSE;
+    // Keep the pages pinned whenever a stop or EPT permission restore failed.
+    // Releasing the MDL here could let an armed physical-page breakpoint trap
+    // an unrelated allocation after the PFN is reused.
+    if (!entry->running && entry->breakpoint_count == 0)
+        TdTraceUnlockPages(entry);
     return first_status;
 }
 
@@ -304,9 +348,12 @@ static NTSTATUS
 TdTraceCloseLocked(PTD_TRACE_ENTRY entry, BOOLEAN issue_vmcalls)
 {
     NTSTATUS status = STATUS_SUCCESS;
-    if (entry->running)
+    if (entry->running || entry->breakpoint_count || entry->mdl)
         status = TdTraceStopLocked(
             entry, OPHION_TRACE_STOP_REQUESTED, issue_vmcalls);
+
+    if (!NT_SUCCESS(status))
+        return status;
 
     if (issue_vmcalls)
     {
@@ -314,8 +361,8 @@ TdTraceCloseLocked(PTD_TRACE_ENTRY entry, BOOLEAN issue_vmcalls)
         context.operation = TdTraceDpcClose;
         context.session_id = entry->session_id;
         NTSTATUS close_status = TdTraceBroadcast(&context);
-        if (NT_SUCCESS(status) && !NT_SUCCESS(close_status))
-            status = close_status;
+        if (!NT_SUCCESS(close_status))
+            return close_status;
     }
 
     RtlZeroMemory(entry, sizeof(*entry));
@@ -350,11 +397,13 @@ TdTraceStart(OPHION_TRACE_START_REQUEST * request)
         return STATUS_INVALID_ADDRESS;
 
     const UINT64 range_size = request->end_address - request->start_address;
+    if (range_size > (UINT64)TD_TRACE_MAX_PAGES * PAGE_SIZE)
+        return STATUS_INVALID_BUFFER_SIZE;
     const SIZE_T pages_spanned = ADDRESS_AND_SIZE_TO_SPAN_PAGES(
         (PVOID)(ULONG_PTR)request->start_address, (SIZE_T)range_size);
-    const UINT32 page_count = (UINT32)pages_spanned;
-    if (!page_count || page_count > TD_TRACE_MAX_PAGES)
+    if (!pages_spanned || pages_spanned > TD_TRACE_MAX_PAGES)
         return STATUS_INVALID_BUFFER_SIZE;
+    const UINT32 page_count = (UINT32)pages_spanned;
     if (!TdOphionAlive())
         return STATUS_DEVICE_NOT_READY;
 
@@ -381,15 +430,15 @@ TdTraceStart(OPHION_TRACE_START_REQUEST * request)
             : OPHION_TRACE_BACKEND_EPT;
 
     RtlZeroMemory(entry, sizeof(*entry));
-    LONG next_id = InterlockedIncrement(&g_trace_next_id);
-    if (next_id <= 0)
+    const UINT64 next_id = TdTraceAllocateSessionIdLocked();
+    if (!next_id)
     {
-        InterlockedExchange(&g_trace_next_id, 1);
-        next_id = 1;
+        ExReleaseFastMutex(&g_trace_mutex);
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
     entry->allocated = TRUE;
     entry->running = TRUE;
-    entry->session_id = (UINT32)next_id;
+    entry->session_id = next_id;
     entry->scope = request->scope;
     entry->backend = backend;
     entry->flags = request->flags;
@@ -472,12 +521,22 @@ TdTraceStart(OPHION_TRACE_START_REQUEST * request)
         stop_context.operation = TdTraceDpcStop;
         stop_context.session_id = entry->session_id;
         stop_context.stop_reason = OPHION_TRACE_STOP_REQUESTED;
-        TdTraceBroadcast(&stop_context);
-        stop_context.operation = TdTraceDpcClose;
-        TdTraceBroadcast(&stop_context);
+        NTSTATUS reset_status = TdTraceBroadcast(&stop_context);
+        if (NT_SUCCESS(reset_status))
+        {
+            stop_context.operation = TdTraceDpcClose;
+            reset_status = TdTraceBroadcast(&stop_context);
+        }
 
-        entry->backend = OPHION_TRACE_BACKEND_EPT;
-        status = TdTraceConfigureSession(entry, request->max_steps, TRUE);
+        if (NT_SUCCESS(reset_status))
+        {
+            entry->backend = OPHION_TRACE_BACKEND_EPT;
+            status = TdTraceConfigureSession(entry, request->max_steps, TRUE);
+        }
+        else
+        {
+            status = reset_status;
+        }
     }
     if (!NT_SUCCESS(status))
     {
@@ -521,14 +580,19 @@ TdTraceStart(OPHION_TRACE_START_REQUEST * request)
     return STATUS_SUCCESS;
 
 ExitFailureConfigured:
-    TdTraceStopLocked(entry, OPHION_TRACE_STOP_REQUESTED, TRUE);
     {
-        TD_TRACE_DPC_CONTEXT close_context = {};
-        close_context.operation = TdTraceDpcClose;
-        close_context.session_id = entry->session_id;
-        TdTraceBroadcast(&close_context);
+        const UINT64 failed_session_id = entry->session_id;
+        const UINT32 failed_backend = entry->backend;
+        NTSTATUS cleanup_status = TdTraceCloseLocked(entry, TRUE);
+        if (!NT_SUCCESS(cleanup_status))
+        {
+            // Preserve the local entry and pinned pages so CLOSE can be
+            // retried instead of orphaning live EPT metadata.
+            request->session_id = failed_session_id;
+            request->actual_backend = failed_backend;
+            status = cleanup_status;
+        }
     }
-    RtlZeroMemory(entry, sizeof(*entry));
     ExReleaseFastMutex(&g_trace_mutex);
     return status;
 
@@ -560,7 +624,10 @@ TdTraceStop(OPHION_TRACE_CONTROL_REQUEST * request, UINT32 reason)
         ? TdTraceStopLocked(entry, reason, TdOphionAlive())
         : STATUS_NOT_FOUND;
     request->status = status;
-    request->state = entry ? OPHION_TRACE_STATE_STOPPED : 0;
+    request->state = entry
+        ? (entry->running ? OPHION_TRACE_STATE_RUNNING
+                          : OPHION_TRACE_STATE_STOPPED)
+        : 0;
     ExReleaseFastMutex(&g_trace_mutex);
     return status;
 }
@@ -600,6 +667,15 @@ TdTraceRead(
         max_records = capacity;
 
     RtlZeroMemory(output, output_size);
+    ExAcquireFastMutex(&g_trace_mutex);
+    PTD_TRACE_ENTRY entry = TdTraceFindLocked(request->session_id);
+    if (!entry)
+    {
+        ExReleaseFastMutex(&g_trace_mutex);
+        output->status = (UINT32)STATUS_NOT_FOUND;
+        return STATUS_NOT_FOUND;
+    }
+
     NTSTATUS status = hv_vmcall_ex(
         HV_VMCALL_TRACE_READ,
         request->session_id,
@@ -608,6 +684,7 @@ TdTraceRead(
         (UINT64)(ULONG_PTR)output,
         output_size,
         0, 0, 0, 0);
+    ExReleaseFastMutex(&g_trace_mutex);
     output->status = status;
     return status;
 }

@@ -268,35 +268,35 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Win10 Debug|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-    <IncludePath>$(SolutionDir)Common;$(SolutionDir)Common\Ring0;$(SolutionDir)include;$(VC_IncludePath);$(IncludePath)</IncludePath>
-    <OutDir>$(SolutionDir)build\bin\$(Configuration)\</OutDir>
-    <IntDir>$(SolutionDir)build\obj\DbgkSysWin10_$(Configuration)\</IntDir>
+    <IncludePath>$(ProjectDir)..\Common;$(ProjectDir)..\Common\Ring0;$(ProjectDir)..\include;$(VC_IncludePath);$(IncludePath)</IncludePath>
+    <OutDir>$(ProjectDir)..\build\bin\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)..\build\obj\DbgkSysWin10_$(Configuration)\</IntDir>
     <TargetName>DbgkSysWin10</TargetName>
     <EnableInf2cat>false</EnableInf2cat>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-    <IncludePath>$(SolutionDir)Common;$(SolutionDir)Common\Ring0;$(SolutionDir)include;$(VC_IncludePath);$(IncludePath)</IncludePath>
-    <OutDir>$(SolutionDir)build\bin\$(Configuration)\</OutDir>
-    <IntDir>$(SolutionDir)build\obj\DbgkSysWin10_$(Configuration)\</IntDir>
+    <IncludePath>$(ProjectDir)..\Common;$(ProjectDir)..\Common\Ring0;$(ProjectDir)..\include;$(VC_IncludePath);$(IncludePath)</IncludePath>
+    <OutDir>$(ProjectDir)..\build\bin\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)..\build\obj\DbgkSysWin10_$(Configuration)\</IntDir>
     <TargetName>DbgkSysWin10</TargetName>
     <EnableInf2cat>false</EnableInf2cat>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Win7 Debug|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-    <IncludePath>$(SolutionDir)Common;$(SolutionDir)Common\Ring0;$(SolutionDir)include;$(VC_IncludePath);$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir)..\Common;$(ProjectDir)..\Common\Ring0;$(ProjectDir)..\include;$(VC_IncludePath);$(IncludePath)</IncludePath>
     <EnableInf2cat>false</EnableInf2cat>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Win10 Release|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-    <IncludePath>$(SolutionDir)Common;$(SolutionDir)Common\Ring0;$(SolutionDir)include;$(VC_IncludePath);$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir)..\Common;$(ProjectDir)..\Common\Ring0;$(ProjectDir)..\include;$(VC_IncludePath);$(IncludePath)</IncludePath>
     <EnableInf2cat>false</EnableInf2cat>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-    <IncludePath>$(SolutionDir)Common;$(SolutionDir)Common\Ring0;$(SolutionDir)include;$(VC_IncludePath);$(IncludePath)</IncludePath>
-    <OutDir>$(SolutionDir)build\bin\$(Configuration)\</OutDir>
-    <IntDir>$(SolutionDir)build\obj\DbgkSysWin10_$(Configuration)\</IntDir>
+    <IncludePath>$(ProjectDir)..\Common;$(ProjectDir)..\Common\Ring0;$(ProjectDir)..\include;$(VC_IncludePath);$(IncludePath)</IncludePath>
+    <OutDir>$(ProjectDir)..\build\bin\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)..\build\obj\DbgkSysWin10_$(Configuration)\</IntDir>
     <TargetName>DbgkSysWin10</TargetName>
     <EnableInf2cat>false</EnableInf2cat>
   </PropertyGroup>
@@ -338,7 +338,7 @@
       <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;_WIN10_;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$(SolutionDir)Common\Ring0\SymbolicAccessKM.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(ProjectDir)..\Common\Ring0\SymbolicAccessKM.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -349,7 +349,7 @@
       <PreprocessorDefinitions>DEBUG;_CRT_SECURE_NO_WARNINGS;_WIN10_;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$(SolutionDir)Common\Ring0\SymbolicAccessKM.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(ProjectDir)..\Common\Ring0\SymbolicAccessKM.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win7 Debug|x64'">
@@ -360,7 +360,7 @@
       <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;_WIN7_;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$(SolutionDir)Common\Ring0\SymbolicAccessKM.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(ProjectDir)..\Common\Ring0\SymbolicAccessKM.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win10 Release|x64'">
@@ -371,7 +371,7 @@
       <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$(SolutionDir)Common\Ring0\SymbolicAccessKM.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(ProjectDir)..\Common\Ring0\SymbolicAccessKM.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -382,7 +382,7 @@
       <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$(SolutionDir)Common\Ring0\SymbolicAccessKM.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(ProjectDir)..\Common\Ring0\SymbolicAccessKM.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup>

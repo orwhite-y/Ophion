@@ -122,17 +122,17 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
     <EnableInf2cat>false</EnableInf2cat>
-    <IncludePath>$(SolutionDir)Common;$(SolutionDir)Common\Ring0;$(SolutionDir)include;$(VC_IncludePath);$(IncludePath)</IncludePath>
-    <OutDir>$(SolutionDir)build\bin\$(Configuration)\</OutDir>
-    <IntDir>$(SolutionDir)build\obj\DbgkSysWin11_$(Configuration)\</IntDir>
+    <IncludePath>$(ProjectDir)..\Common;$(ProjectDir)..\Common\Ring0;$(ProjectDir)..\include;$(VC_IncludePath);$(IncludePath)</IncludePath>
+    <OutDir>$(ProjectDir)..\build\bin\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)..\build\obj\DbgkSysWin11_$(Configuration)\</IntDir>
     <TargetName>DbgkSysWin11</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
     <EnableInf2cat>false</EnableInf2cat>
-    <IncludePath>$(SolutionDir)Common;$(SolutionDir)Common\Ring0;$(SolutionDir)include;$(VC_IncludePath);$(IncludePath)</IncludePath>
-    <OutDir>$(SolutionDir)build\bin\$(Configuration)\</OutDir>
-    <IntDir>$(SolutionDir)build\obj\DbgkSysWin11_$(Configuration)\</IntDir>
+    <IncludePath>$(ProjectDir)..\Common;$(ProjectDir)..\Common\Ring0;$(ProjectDir)..\include;$(VC_IncludePath);$(IncludePath)</IncludePath>
+    <OutDir>$(ProjectDir)..\build\bin\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)..\build\obj\DbgkSysWin11_$(Configuration)\</IntDir>
     <TargetName>DbgkSysWin11</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM'">
@@ -155,12 +155,12 @@
       <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$(SolutionDir)Common\Ring0\SymbolicAccessKM.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(ProjectDir)..\Common\Ring0\SymbolicAccessKM.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <Link>
-      <AdditionalDependencies>$(SolutionDir)Common\Ring0\SymbolicAccessKM.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(ProjectDir)..\Common\Ring0\SymbolicAccessKM.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>

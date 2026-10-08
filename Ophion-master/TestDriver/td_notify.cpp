@@ -102,6 +102,7 @@ TdProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO Crea
     HYPERPLATFORM_LOG_INFO("[td-rw] process exit: pid=%llu exit_status=0x%08X",
         (UINT64)ProcessId, (UINT32)exit_st);
     TdCleanupStealthForProcess(Process, (UINT64)ProcessId);
+    TdMemoryBreakpointCleanupProcess((UINT64)ProcessId);
     TdCleanupSelfPeInfo((UINT64)ProcessId);
 
     // re-arm CreateFile("test") injection: if this is the Box.exe we injected,
@@ -131,6 +132,7 @@ TdProcessNotifyLegacy(HANDLE ParentId, HANDLE ProcessId, BOOLEAN Create)
         (UINT64)ProcessId, (UINT32)exit_st);
 
     TdCleanupStealthForProcess(proc, (UINT64)ProcessId);
+    TdMemoryBreakpointCleanupProcess((UINT64)ProcessId);
     TdCleanupSelfPeInfo((UINT64)ProcessId);
 
     // re-arm CreateFile("test") injection for the next Box.exe (see TdProcessNotify).

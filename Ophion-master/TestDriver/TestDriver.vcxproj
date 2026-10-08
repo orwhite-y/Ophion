@@ -93,6 +93,7 @@
     <ClCompile Include="td_shadow.cpp" />
     <ClCompile Include="td_inject.cpp" />
     <ClCompile Include="td_ept_hook.cpp" />
+    <ClCompile Include="td_breakpoint.cpp" />
     <ClCompile Include="td_pe_mapper.cpp" />
     <ClCompile Include="td_ioctl.cpp" />
     <ClCompile Include="td_stealth_track.cpp" />

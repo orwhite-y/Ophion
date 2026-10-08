@@ -369,6 +369,60 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
     // (file buffer + format string), causing 60x slowdown in scan workloads.
     switch (io->Parameters.DeviceIoControl.IoControlCode)
     {
+    case IOCTL_HV_BP_SET:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_MEMORY_BREAKPOINT_REQUEST) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_MEMORY_BREAKPOINT_REQUEST))
+        {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        PTD_MEMORY_BREAKPOINT_REQUEST request =
+            (PTD_MEMORY_BREAKPOINT_REQUEST)irp->AssociatedIrp.SystemBuffer;
+        st = TdMemoryBreakpointSet(request);
+        request->status = (UINT32)st;
+        irp->IoStatus.Information = sizeof(*request);
+        // The operation result is returned in request->status so DeviceIoControl
+        // still returns the populated response for diagnostic failures.
+        st = STATUS_SUCCESS;
+        break;
+    }
+
+    case IOCTL_HV_BP_CLEAR:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_MEMORY_BREAKPOINT_REQUEST) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_MEMORY_BREAKPOINT_REQUEST))
+        {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        PTD_MEMORY_BREAKPOINT_REQUEST request =
+            (PTD_MEMORY_BREAKPOINT_REQUEST)irp->AssociatedIrp.SystemBuffer;
+        NTSTATUS clear_status = TdMemoryBreakpointClear(
+            request->breakpoint_id, TdOphionAlive());
+        request->status = (UINT32)clear_status;
+        irp->IoStatus.Information = sizeof(*request);
+        st = STATUS_SUCCESS;
+        break;
+    }
+
+    case IOCTL_HV_BP_CLEAR_ALL:
+    {
+        TdMemoryBreakpointCleanupAll(TdOphionAlive());
+        if (io->Parameters.DeviceIoControl.OutputBufferLength >=
+            sizeof(TD_MEMORY_BREAKPOINT_REQUEST))
+        {
+            PTD_MEMORY_BREAKPOINT_REQUEST request =
+                (PTD_MEMORY_BREAKPOINT_REQUEST)irp->AssociatedIrp.SystemBuffer;
+            request->status = (UINT32)STATUS_SUCCESS;
+            irp->IoStatus.Information = sizeof(*request);
+        }
+        st = STATUS_SUCCESS;
+        break;
+    }
+
     case IOCTL_INJECT:
     {
         //

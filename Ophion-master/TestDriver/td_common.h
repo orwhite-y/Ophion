@@ -427,6 +427,9 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
 #define IOCTL_HV_WRITE_MEM  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 18, METHOD_IN_DIRECT, FILE_ANY_ACCESS)
 #define IOCTL_HV_QUERY_VA   CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 19, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_HV_DIAG_WALK  CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 22, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_HV_BP_SET            CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 28, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_HV_BP_CLEAR          CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 29, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_HV_BP_CLEAR_ALL      CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 30, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // VMCALL subcodes (must match Ophion include/hv_types.h)
 #define HV_VMCALL_READ_MEM   0x0000000B
@@ -436,6 +439,40 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
 #define HV_VMCALL_DIAG_WALK   0x00000010
 #define HV_VMCALL_READ_MEM_PTE  0x00000011
 #define HV_VMCALL_WRITE_MEM_PTE 0x00000012
+#define HV_VMCALL_MEMORY_BREAKPOINT_SET   0x00000018
+#define HV_VMCALL_MEMORY_BREAKPOINT_CLEAR 0x00000019
+
+#define TD_BP_ACCESS_READ          0x01
+#define TD_BP_ACCESS_WRITE         0x02
+#define TD_BP_ACCESS_EXECUTE       0x04
+#define TD_BP_FLAG_ONESHOT         0x01
+#define TD_MAX_MEMORY_BREAKPOINTS  64
+
+typedef struct _TD_MEMORY_BREAKPOINT_REQUEST {
+    UINT64 breakpoint_id;       // [out for SET] / [in for CLEAR]
+    UINT64 target_pid;          // [in]
+    UINT64 target_address;      // [in]
+    UINT32 size;                // [in], must remain inside one 4KB page
+    UINT32 access;              // [in], TD_BP_ACCESS_* bit mask
+    UINT32 flags;               // [in], TD_BP_FLAG_ONESHOT or 0 for permanent
+    UINT32 status;              // [out], NTSTATUS from the operation
+} TD_MEMORY_BREAKPOINT_REQUEST, *PTD_MEMORY_BREAKPOINT_REQUEST;
+
+typedef struct _TD_MEMORY_BREAKPOINT_ENTRY {
+    BOOLEAN active;
+    UINT64  breakpoint_id;
+    UINT64  target_pid;
+    UINT64  target_address;
+    UINT64  target_cr3;
+    UINT64  target_physical;
+    UINT32  size;
+    UINT32  access;
+    UINT32  flags;
+    PMDL    mdl;
+} TD_MEMORY_BREAKPOINT_ENTRY, *PTD_MEMORY_BREAKPOINT_ENTRY;
+
+extern FAST_MUTEX g_memory_breakpoint_mutex;
+extern TD_MEMORY_BREAKPOINT_ENTRY g_memory_breakpoints[TD_MAX_MEMORY_BREAKPOINTS];
 
 #define HV_MEM_MAX           16777216       // CE<->TestDriver IOCTL contract (16 MB per IOCTL)
 #define HV_VMCALL_MEM_MAX    262144         // vmcall batch size (16 pages, must match Ophion HV_R3_MEM_MAX)
@@ -737,6 +774,10 @@ VOID TdApplyProtectToPte(PUINT64 pte, ULONG protect);
 void TdCacheSelfPeInfo(UINT64 pid, UINT64 module_base, PIMAGE_NT_HEADERS64 nt);
 void TdCleanupSelfPeInfo(UINT64 pid);
 VOID TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid);
+VOID TdMemoryBreakpointCleanupAll(BOOLEAN issue_vmcalls);
+VOID TdMemoryBreakpointCleanupProcess(UINT64 pid);
+NTSTATUS TdMemoryBreakpointSet(PTD_MEMORY_BREAKPOINT_REQUEST request);
+NTSTATUS TdMemoryBreakpointClear(UINT64 breakpoint_id, BOOLEAN issue_vmcalls);
 VOID TdCloseCreatedThreadHandle(HANDLE thread_h, BOOLEAN thread_started);
 VOID TdEptUnhookAllR3(VOID);
 VOID TdFlushAddressRange(UINT64 base_va, SIZE_T size, UINT64 target_cr3, UINT64 shadow_cr3);

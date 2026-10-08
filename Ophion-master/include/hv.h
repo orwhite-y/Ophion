@@ -340,6 +340,22 @@ BOOLEAN ept_breakpoint_handle_violation(VIRTUAL_MACHINE_STATE * vcpu,
 VOID ept_breakpoint_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu);
 BOOLEAN ept_breakpoint_page_reserved(UINT64 target_pfn);
 
+// Unified instruction trace engine (trace.cpp)
+BOOLEAN hv_trace_configure(VIRTUAL_MACHINE_STATE * vcpu, UINT64 session_id,
+    UINT32 scope, UINT32 backend, UINT32 flags, UINT64 target_pid,
+    UINT64 target_cr3, UINT64 start_address, UINT64 end_address,
+    UINT64 max_steps, BOOLEAN create_record);
+BOOLEAN hv_trace_stop(VIRTUAL_MACHINE_STATE * vcpu, UINT64 session_id,
+    UINT32 stop_reason);
+BOOLEAN hv_trace_close(VIRTUAL_MACHINE_STATE * vcpu, UINT64 session_id);
+BOOLEAN hv_trace_read(UINT64 session_id, UINT64 next_sequence,
+    UINT32 max_records, OPHION_TRACE_READ_OUTPUT * output, UINT32 output_size);
+BOOLEAN hv_trace_record_ept(VIRTUAL_MACHINE_STATE * vcpu, UINT64 breakpoint_id);
+BOOLEAN hv_trace_handle_debug_exception(VIRTUAL_MACHINE_STATE * vcpu,
+    UINT64 debug_status);
+VOID hv_trace_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu);
+VOID hv_trace_prepare_guest_debug_state(VIRTUAL_MACHINE_STATE * vcpu);
+
 //
 // stealth memory allocation (ept_stealth.cpp)
 //   allocates PAGE_READWRITE memory with hidden execute capability via EPT split

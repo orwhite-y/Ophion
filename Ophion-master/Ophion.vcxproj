@@ -126,6 +126,7 @@
     <ClCompile Include="src\ept_diag.cpp" />
     <ClCompile Include="src\ept_hook.cpp" />
     <ClCompile Include="src\ept_breakpoint.cpp" />
+    <ClCompile Include="src\trace.cpp" />
     <ClCompile Include="src\ept_hook_secondary.cpp" />
     <ClCompile Include="src\pool_manager.cpp" />
     <ClCompile Include="src\ept_stealth.cpp" />
@@ -147,6 +148,7 @@
     <ClInclude Include="include\hv.h" />
     <ClInclude Include="include\ia32.h" />
     <ClInclude Include="include\hv_types.h" />
+    <ClInclude Include="include\trace_protocol.h" />
     <ClInclude Include="include\asm_prototypes.h" />
     <ClInclude Include="include\stealth.h" />
     <ClInclude Include="src\log.h" />

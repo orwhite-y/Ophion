@@ -229,8 +229,11 @@ ept_breakpoint_configure(
     UINT8 flags,
     BOOLEAN create_record)
 {
-    if (!vcpu || !id || !target_pid || !target_va || !target_phys || size == 0 ||
+    const BOOLEAN trace_breakpoint = (flags & HV_BP_FLAG_TRACE) ? TRUE : FALSE;
+    if (!vcpu || !id || (!target_pid && !trace_breakpoint) ||
+        !target_va || !target_phys || size == 0 ||
         size > PAGE_SIZE || (access & ~0x07) != 0 || access == 0 ||
+        (flags & ~(HV_BP_FLAG_ONESHOT | HV_BP_FLAG_TRACE)) != 0 ||
         ((target_va & 0xFFF) + size) > PAGE_SIZE ||
         ((target_phys & 0xFFF) != (target_va & 0xFFF)))
         return FALSE;
@@ -271,7 +274,7 @@ ept_breakpoint_configure(
         slot->page_offset = (UINT32)(target_va & 0xFFF);
         slot->size = size;
         slot->access = access;
-        slot->flags = flags & HV_BP_FLAG_ONESHOT;
+        slot->flags = flags & (HV_BP_FLAG_ONESHOT | HV_BP_FLAG_TRACE);
         _mm_mfence();
         InterlockedExchange(&slot->active, 1);
         InterlockedExchange(&slot->allocated, 1);
@@ -399,8 +402,13 @@ ept_breakpoint_handle_violation(
         return FALSE;
 
     for (UINT32 i = 0; i < hit_count; ++i)
-        ept_breakpoint_log_hit(
-            vcpu, &hits[i], guest_linear, guest_phys, guest_cr3);
+    {
+        if (hits[i].flags & HV_BP_FLAG_TRACE)
+            hv_trace_record_ept(vcpu, hits[i].id);
+        else
+            ept_breakpoint_log_hit(
+                vcpu, &hits[i], guest_linear, guest_phys, guest_cr3);
+    }
 
     if (ept_breakpoint_page_has_active(target_pfn))
         ept_breakpoint_allow_one_instruction(vcpu, target_pfn);

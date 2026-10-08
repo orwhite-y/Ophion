@@ -145,6 +145,14 @@ vmexit_advance_rip(VIRTUAL_MACHINE_STATE * vcpu)
             continue;
 
         UINT64 drn;
+        if (vcpu->trace_private_dr_active &&
+            vcpu->trace_private_dr_armed &&
+            i == vcpu->trace_private_dr_index)
+        {
+            drn = vcpu->trace_private_dr_address;
+        }
+        else
+        {
         switch (i)
         {
         case 0: drn = vcpu->guest_dr0; break;
@@ -152,6 +160,7 @@ vmexit_advance_rip(VIRTUAL_MACHINE_STATE * vcpu)
         case 2: drn = vcpu->guest_dr2; break;
         case 3: drn = vcpu->guest_dr3; break;
         default: continue;
+        }
         }
 
         if (drn == new_rip)
@@ -1173,6 +1182,42 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
 
         switch (vmcall_num)
         {
+        case VMCALL_TRACE_CONFIG:
+        {
+            // rdx=id, r8=packed(scope/backend/flags/create), r9=pid,
+            // r10=cr3, r11=start, r12=end, r13=max_steps.
+            const UINT64 control = regs->r8;
+            BOOLEAN ok = hv_trace_configure(
+                vcpu, regs->rdx,
+                (UINT32)(control & 0xFF),
+                (UINT32)((control >> 8) & 0xFF),
+                (UINT32)((control >> 16) & 0xFFFF),
+                regs->r9, regs->r10, regs->r11, regs->r12, regs->r13,
+                (control & (1ULL << 32)) ? TRUE : FALSE);
+            regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
+            break;
+        }
+
+        case VMCALL_TRACE_STOP:
+            regs->rax = hv_trace_stop(vcpu, regs->rdx, (UINT32)regs->r8)
+                ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_NOT_FOUND;
+            break;
+
+        case VMCALL_TRACE_READ:
+        {
+            BOOLEAN ok = hv_trace_read(
+                regs->rdx, regs->r8, (UINT32)regs->r9,
+                (OPHION_TRACE_READ_OUTPUT *)(ULONG_PTR)regs->r10,
+                (UINT32)regs->r11);
+            regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_NOT_FOUND;
+            break;
+        }
+
+        case VMCALL_TRACE_CLOSE:
+            regs->rax = hv_trace_close(vcpu, regs->rdx)
+                ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_UNSUCCESSFUL;
+            break;
+
         case VMCALL_MEMORY_BREAKPOINT_SET:
         {
             // rdx=id, r8=target_cr3, r9=target_va, r10=target_phys,
@@ -2098,7 +2143,10 @@ vmexit_handle_mov_dr(VIRTUAL_MACHINE_STATE * vcpu)
         case 3: vcpu->guest_dr3 = val; break;
         case 6: vcpu->guest_dr6 = val; break;
         case 7:
-            __vmx_vmwrite(VMCS_GUEST_DR7, val);
+            if (vcpu->trace_private_dr_active)
+                vcpu->guest_dr7_shadow = val;
+            else
+                __vmx_vmwrite(VMCS_GUEST_DR7, val);
             break;
         }
     }
@@ -2113,7 +2161,10 @@ vmexit_handle_mov_dr(VIRTUAL_MACHINE_STATE * vcpu)
         case 3: val = vcpu->guest_dr3; break;
         case 6: val = vcpu->guest_dr6; break;
         case 7:
-            __vmx_vmread(VMCS_GUEST_DR7, &val);
+            if (vcpu->trace_private_dr_active)
+                val = vcpu->guest_dr7_shadow;
+            else
+                __vmx_vmread(VMCS_GUEST_DR7, &val);
             break;
         default: break;
         }
@@ -2140,11 +2191,14 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     vcpu->in_root     = TRUE;
     vcpu->advance_rip = TRUE;
 
-    vcpu->guest_dr0 = __readdr(0);
-    vcpu->guest_dr1 = __readdr(1);
-    vcpu->guest_dr2 = __readdr(2);
-    vcpu->guest_dr3 = __readdr(3);
-    vcpu->guest_dr6 = __readdr(6);
+    if (!vcpu->trace_private_dr_active)
+    {
+        vcpu->guest_dr0 = __readdr(0);
+        vcpu->guest_dr1 = __readdr(1);
+        vcpu->guest_dr2 = __readdr(2);
+        vcpu->guest_dr3 = __readdr(3);
+        vcpu->guest_dr6 = __readdr(6);
+    }
     vcpu->guest_cr8 = (UINT8)__readcr8();
 
     // __vmx_vmread writes size_t
@@ -2425,6 +2479,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
     case VMX_EXIT_REASON_MONITOR_TRAP_FLAG:
         ept_handle_mtf(vcpu);
+        hv_trace_handle_mtf(vcpu);
         vcpu->advance_rip = FALSE;
         break;
 
@@ -2519,6 +2574,17 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
         if (int_info.Valid)
         {
+            if (int_info.Vector == EXCEPTION_VECTOR_DEBUG &&
+                int_info.InterruptionType == INTERRUPT_TYPE_HARDWARE_EXCEPTION)
+            {
+                const UINT64 debug_status = __readdr(6);
+                if (hv_trace_handle_debug_exception(vcpu, debug_status))
+                {
+                    vcpu->advance_rip = FALSE;
+                    break;
+                }
+            }
+
             UINT32 vector = int_info.Vector;
 
             size_t rflags_raw = 0;
@@ -2919,11 +2985,16 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
     if (!vcpu->vmxoff.executed)
     {
-        __writedr(0, vcpu->guest_dr0);
-        __writedr(1, vcpu->guest_dr1);
-        __writedr(2, vcpu->guest_dr2);
-        __writedr(3, vcpu->guest_dr3);
-        __writedr(6, vcpu->guest_dr6);
+        if (vcpu->trace_private_dr_active)
+            hv_trace_prepare_guest_debug_state(vcpu);
+        else
+        {
+            __writedr(0, vcpu->guest_dr0);
+            __writedr(1, vcpu->guest_dr1);
+            __writedr(2, vcpu->guest_dr2);
+            __writedr(3, vcpu->guest_dr3);
+            __writedr(6, vcpu->guest_dr6);
+        }
         __writecr8(vcpu->guest_cr8);
     }
 

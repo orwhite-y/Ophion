@@ -5,6 +5,7 @@
 #pragma once
 
 #include "ia32.h"
+#include "trace_protocol.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -165,6 +166,7 @@ typedef struct _STEALTH_REGION {
 #define HV_BP_ACCESS_WRITE        0x02
 #define HV_BP_ACCESS_EXECUTE      0x04
 #define HV_BP_FLAG_ONESHOT        0x01
+#define HV_BP_FLAG_TRACE          0x80
 
 typedef struct _EPT_MEMORY_BREAKPOINT {
     volatile LONG allocated;       // slot contains metadata (also kept as a stale-PTE tombstone)
@@ -182,6 +184,30 @@ typedef struct _EPT_MEMORY_BREAKPOINT {
     volatile LONG64 hit_count;
 } EPT_MEMORY_BREAKPOINT, *PEPT_MEMORY_BREAKPOINT;
 
+#define HV_MAX_TRACE_SESSIONS     4
+#define HV_TRACE_RING_CAPACITY    1024
+#define HV_TRACE_BP_SIGNATURE     0x5452ULL
+
+typedef struct _HV_TRACE_SESSION {
+    volatile LONG   allocated;
+    volatile LONG   active;
+    volatile LONG   state;
+    volatile LONG   stop_reason;
+    UINT64          id;
+    UINT64          target_pid;
+    UINT64          target_cr3;
+    UINT64          start_address;
+    UINT64          end_address;
+    UINT64          max_steps;
+    UINT32          scope;
+    UINT32          backend;
+    UINT32          flags;
+    UINT32          reserved;
+    volatile LONG64 produced;
+    volatile LONG64 overwritten;
+    OPHION_TRACE_RECORD records[HV_TRACE_RING_CAPACITY];
+} HV_TRACE_SESSION, *PHV_TRACE_SESSION;
+
 // forward declarations for pointer types used in VIRTUAL_MACHINE_STATE
 typedef struct _EPT_STEALTH_PAGE_INFO *PEPT_STEALTH_PAGE_INFO;
 // PSTEALTH_FAKE_PT already forward-declared above (before EPT_HOOKED_PAGE_INFO)
@@ -198,6 +224,7 @@ typedef struct _EPT_STATE {
     LIST_ENTRY            stealth_fake_pts;
     STEALTH_REGION        stealth_region;
     EPT_MEMORY_BREAKPOINT memory_breakpoints[HV_MAX_MEMORY_BREAKPOINTS];
+    HV_TRACE_SESSION      trace_sessions[HV_MAX_TRACE_SESSIONS];
 
     //
     // EPT/stealth lifecycle epoch.  A successful installation advances this
@@ -310,6 +337,19 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     UINT64               mtf_breakpoint_pfn_stack[4];
     volatile LONG        mtf_breakpoint_pfn_depth;
 
+    // Private debug-register overlay used only to trigger an R3 HWBP trace.
+    // Guest MOV-DR accesses see guest_dr* shadows while the physical slot stays
+    // armed, so guest code clearing DR0-DR7 cannot remove the trace trigger.
+    BOOLEAN              trace_private_dr_active;
+    UINT8                trace_private_dr_index;
+    BOOLEAN              trace_mtf_active;
+    BOOLEAN              trace_private_dr_armed;
+    BOOLEAN              trace_db_intercept_was_set;
+    UINT8                trace_reserved0[3];
+    UINT64               trace_private_dr_address;
+    UINT64               trace_session_id;
+    UINT64               guest_dr7_shadow;
+
     //
     // stealth page: restore stack after MTF single-step (nested trampolines)
     //
@@ -408,6 +448,10 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_EPT_LIFECYCLE_RESUME 0x00000017 // R0: resume this vCPU after a global EPT lifecycle barrier
 #define VMCALL_MEMORY_BREAKPOINT_SET    0x00000018
 #define VMCALL_MEMORY_BREAKPOINT_CLEAR  0x00000019
+#define VMCALL_TRACE_CONFIG             0x0000001A
+#define VMCALL_TRACE_STOP               0x0000001B
+#define VMCALL_TRACE_READ               0x0000001C
+#define VMCALL_TRACE_CLOSE              0x0000001D
 
 #define HV_R3_MEM_MAX           262144        // max bytes per R3 read/write call (16 pages, prefetch batch)
 

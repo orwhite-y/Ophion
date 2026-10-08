@@ -90,5 +90,13 @@ RIP 离开范围或达到 `max_steps` 时完成；EPT 模式只记录范围内�
 4. 增加 PID/TID、寄存器表达式、命中次数等条件，以及 immediate/buffered 两种 action。
 5. 给 EPT trace 增加跨页热区自适应，仅对当前控制流附近的页保持 NX，降低无关进程退出量。
 
+`r3-hwbp` 会跳过目标进程临时进入 ring 0 的中断/系统调用路径；若 MTF
+期间已经切换到其他进程，则会以 `OPHION_TRACE_STOP_CONTEXT_EXIT` 结束，避免
+把不连续的两段执行流拼成一条伪 trace。
+
+客户机在 trace 期间新启用被占用的 DR 槽时，私有断点会迁移到其他空闲槽；
+若四个槽都已占用，则以 `OPHION_TRACE_STOP_HWBP_CONFLICT` 结束并完整恢复客户机
+DR 状态。
+
 设计参考：HyperDbg 的事件/动作与 `!monitor`、`!dr` 接口，以及 VivienneVMM 的
 debug-register facade；本实现保留客户机 DR 语义，并补上可实际触发的私有硬断点槽。

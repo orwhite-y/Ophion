@@ -339,6 +339,7 @@ BOOLEAN ept_breakpoint_handle_violation(VIRTUAL_MACHINE_STATE * vcpu,
     UINT64 guest_phys, UINT64 exit_qual);
 VOID ept_breakpoint_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu);
 BOOLEAN ept_breakpoint_page_reserved(UINT64 target_pfn);
+VOID ept_breakpoint_deactivate_trace_session(UINT64 session_id);
 
 // Unified instruction trace engine (trace.cpp)
 BOOLEAN hv_trace_configure(VIRTUAL_MACHINE_STATE * vcpu, UINT64 session_id,

@@ -202,7 +202,7 @@ typedef struct _HV_TRACE_SESSION {
     UINT32          scope;
     UINT32          backend;
     UINT32          flags;
-    UINT32          reserved;
+    volatile LONG   writers;
     volatile LONG64 produced;
     volatile LONG64 overwritten;
     OPHION_TRACE_RECORD records[HV_TRACE_RING_CAPACITY];

@@ -46,6 +46,28 @@ ept_breakpoint_find_locked(UINT64 id)
     return NULL;
 }
 
+VOID
+ept_breakpoint_deactivate_trace_session(UINT64 session_id)
+{
+    if (!g_ept || !session_id)
+        return;
+
+    ept_lists_lock_acquire();
+    for (UINT32 i = 0; i < HV_MAX_MEMORY_BREAKPOINTS; ++i)
+    {
+        PEPT_MEMORY_BREAKPOINT bp = &g_ept->memory_breakpoints[i];
+        if (!bp->allocated || !(bp->flags & HV_BP_FLAG_TRACE))
+            continue;
+        if ((bp->id >> 48) != HV_TRACE_BP_SIGNATURE ||
+            ((bp->id >> 16) & 0xFFFFFFFFULL) !=
+                (session_id & 0xFFFFFFFFULL))
+            continue;
+
+        InterlockedExchange(&bp->active, 0);
+    }
+    ept_lists_lock_release();
+}
+
 BOOLEAN
 ept_breakpoint_page_reserved(UINT64 target_pfn)
 {

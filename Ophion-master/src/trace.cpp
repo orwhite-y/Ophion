@@ -15,6 +15,23 @@ hv_trace_find(UINT64 session_id)
     return NULL;
 }
 
+static VOID
+hv_trace_disable_private_dr(VIRTUAL_MACHINE_STATE * vcpu);
+
+static VOID
+hv_trace_complete(PHV_TRACE_SESSION session, UINT32 stop_reason)
+{
+    if (!session)
+        return;
+
+    InterlockedCompareExchange(&session->stop_reason,
+        stop_reason, OPHION_TRACE_STOP_NONE);
+    InterlockedExchange(&session->state, OPHION_TRACE_STATE_COMPLETE);
+    InterlockedExchange(&session->active, 0);
+    if (session->backend == OPHION_TRACE_BACKEND_EPT)
+        ept_breakpoint_deactivate_trace_session(session->id);
+}
+
 static BOOLEAN
 hv_trace_matches_context(
     PHV_TRACE_SESSION session,
@@ -75,6 +92,44 @@ hv_trace_prepare_guest_debug_state(VIRTUAL_MACHINE_STATE * vcpu)
     if (!vcpu->trace_private_dr_active)
         return;
 
+    PHV_TRACE_SESSION session = hv_trace_find(vcpu->trace_session_id);
+    if (!session || !session->active)
+    {
+        hv_trace_disable_private_dr(vcpu);
+        return;
+    }
+
+    UINT8 index = vcpu->trace_private_dr_index;
+    const UINT64 current_enable_mask =
+        (DR7_L0 | DR7_G0) << (index * 2);
+    if (vcpu->guest_dr7_shadow & current_enable_mask)
+    {
+        UINT8 replacement = 0xFF;
+        for (UINT8 candidate = 0; candidate < 4; ++candidate)
+        {
+            const UINT64 candidate_mask =
+                (DR7_L0 | DR7_G0) << (candidate * 2);
+            if (!(vcpu->guest_dr7_shadow & candidate_mask))
+            {
+                replacement = candidate;
+                break;
+            }
+        }
+
+        if (replacement == 0xFF)
+        {
+            hv_trace_complete(session, OPHION_TRACE_STOP_HWBP_CONFLICT);
+            hv_trace_disable_private_dr(vcpu);
+            return;
+        }
+
+        // Restore the guest value in the old physical slot before moving the
+        // private execution breakpoint. MOV-DR reads continue to use shadows.
+        hv_trace_write_dr(index, hv_trace_guest_dr_value(vcpu, index));
+        vcpu->trace_private_dr_index = replacement;
+        index = replacement;
+    }
+
     __writedr(0, vcpu->guest_dr0);
     __writedr(1, vcpu->guest_dr1);
     __writedr(2, vcpu->guest_dr2);
@@ -82,7 +137,6 @@ hv_trace_prepare_guest_debug_state(VIRTUAL_MACHINE_STATE * vcpu)
     __writedr(6, vcpu->guest_dr6);
 
     UINT64 effective_dr7 = vcpu->guest_dr7_shadow;
-    const UINT8 index = vcpu->trace_private_dr_index;
     const UINT64 enable_mask = (DR7_L0 | DR7_G0) << (index * 2);
     const UINT64 condition_mask = 0xFULL << DR7_RW_SHIFT(index);
 
@@ -190,10 +244,40 @@ hv_trace_capture(
     VIRTUAL_MACHINE_STATE * vcpu,
     UINT16 event_type)
 {
-    if (!session || !session->active)
+    if (!session)
         return FALSE;
 
-    const LONG64 sequence = InterlockedIncrement64(&session->produced);
+    InterlockedIncrement(&session->writers);
+    _mm_mfence();
+    if (!session->allocated || !session->active)
+    {
+        InterlockedDecrement(&session->writers);
+        return FALSE;
+    }
+
+    LONG64 observed = session->produced;
+    LONG64 sequence = 0;
+    for (;;)
+    {
+        if (session->max_steps &&
+            (UINT64)observed >= session->max_steps)
+        {
+            hv_trace_complete(session, OPHION_TRACE_STOP_LIMIT);
+            InterlockedDecrement(&session->writers);
+            return FALSE;
+        }
+
+        const LONG64 desired = observed + 1;
+        const LONG64 previous = InterlockedCompareExchange64(
+            &session->produced, desired, observed);
+        if (previous == observed)
+        {
+            sequence = desired;
+            break;
+        }
+        observed = previous;
+    }
+
     const UINT32 index = (UINT32)((sequence - 1) % HV_TRACE_RING_CAPACITY);
     OPHION_TRACE_RECORD * record = &session->records[index];
     InterlockedExchange64(&record->sequence, 0);
@@ -242,14 +326,14 @@ hv_trace_capture(
     _mm_mfence();
     InterlockedExchange64(&record->sequence, sequence);
 
-    if (session->max_steps && (UINT64)sequence >= session->max_steps)
+    BOOLEAN keep_running = TRUE;
+    if (session->max_steps && (UINT64)sequence == session->max_steps)
     {
-        InterlockedExchange(&session->stop_reason, OPHION_TRACE_STOP_LIMIT);
-        InterlockedExchange(&session->state, OPHION_TRACE_STATE_COMPLETE);
-        InterlockedExchange(&session->active, 0);
-        return FALSE;
+        hv_trace_complete(session, OPHION_TRACE_STOP_LIMIT);
+        keep_running = FALSE;
     }
-    return TRUE;
+    InterlockedDecrement(&session->writers);
+    return keep_running;
 }
 
 BOOLEAN
@@ -267,6 +351,7 @@ hv_trace_configure(
     BOOLEAN create_record)
 {
     if (!vcpu || !session_id || start_address >= end_address || !max_steps ||
+        max_steps > 0x7FFFFFFFFFFFFFFFULL ||
         (scope != OPHION_TRACE_SCOPE_USER && scope != OPHION_TRACE_SCOPE_KERNEL) ||
         (backend != OPHION_TRACE_BACKEND_EPT &&
          backend != OPHION_TRACE_BACKEND_HWBP) ||
@@ -346,6 +431,8 @@ hv_trace_stop(
     if (session)
     {
         InterlockedExchange(&session->active, 0);
+        if (session->backend == OPHION_TRACE_BACKEND_EPT)
+            ept_breakpoint_deactivate_trace_session(session->id);
         if (session->state == OPHION_TRACE_STATE_RUNNING)
             InterlockedExchange(&session->state, OPHION_TRACE_STATE_STOPPED);
         if (session->stop_reason == OPHION_TRACE_STOP_NONE)
@@ -369,6 +456,8 @@ hv_trace_close(VIRTUAL_MACHINE_STATE * vcpu, UINT64 session_id)
     if (!session)
         return TRUE;
     if (session->active)
+        return FALSE;
+    if (session->writers)
         return FALSE;
 
     ept_lists_lock_acquire();
@@ -469,16 +558,36 @@ hv_trace_handle_debug_exception(
     if (!(debug_status & private_bit))
         return FALSE;
 
-    PHV_TRACE_SESSION session = hv_trace_find(vcpu->trace_session_id);
-    if (!session || !session->active ||
-        session->backend != OPHION_TRACE_BACKEND_HWBP ||
-        !hv_trace_matches_context(session, vcpu) ||
-        vcpu->vmexit_rip != session->start_address)
-        return FALSE;
-
-    vcpu->trace_private_dr_armed = FALSE;
+    // Remove the private reason from the guest-visible DR6 shadow even when
+    // this address was reached by another process. The physical execution
+    // breakpoint is global to the logical CPU; leaking its B0-B3 bit would
+    // inject a spurious #DB into an unrelated guest context.
     vcpu->guest_dr6 &= ~private_bit;
     vcpu->guest_dr6 |= debug_status & ~private_bit;
+
+    const UINT64 guest_reasons = debug_status &
+        ((PENDING_DEBUG_B0 | PENDING_DEBUG_B1 | PENDING_DEBUG_B2 |
+          PENDING_DEBUG_B3 | PENDING_DEBUG_BS) & ~private_bit);
+
+    PHV_TRACE_SESSION session = hv_trace_find(vcpu->trace_session_id);
+    if (!session || !session->active ||
+        session->backend != OPHION_TRACE_BACKEND_HWBP)
+    {
+        hv_trace_disable_private_dr(vcpu);
+        return guest_reasons == 0;
+    }
+
+    if (!hv_trace_matches_context(session, vcpu) ||
+        vcpu->vmexit_rip != session->start_address)
+    {
+        // Keep the private slot armed for the target process, but consume this
+        // address-space alias hit. Genuine guest breakpoint reasons are still
+        // reinjected below by returning FALSE.
+        hv_trace_prepare_guest_debug_state(vcpu);
+        return guest_reasons == 0;
+    }
+
+    vcpu->trace_private_dr_armed = FALSE;
     hv_trace_prepare_guest_debug_state(vcpu);
 
     if (hv_trace_capture(session, vcpu, OPHION_TRACE_EVENT_HWBP_ENTRY))
@@ -492,9 +601,6 @@ hv_trace_handle_debug_exception(
     }
 
     // If a guest-visible debug reason fired at the same time, preserve it.
-    const UINT64 guest_reasons = debug_status &
-        ((PENDING_DEBUG_B0 | PENDING_DEBUG_B1 | PENDING_DEBUG_B2 |
-          PENDING_DEBUG_B3 | PENDING_DEBUG_BS) & ~private_bit);
     return guest_reasons == 0;
 }
 
@@ -505,21 +611,41 @@ hv_trace_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
         return;
 
     PHV_TRACE_SESSION session = hv_trace_find(vcpu->trace_session_id);
-    if (!session || !session->active ||
-        !hv_trace_matches_context(session, vcpu))
+    if (!session || !session->active)
     {
         hv_trace_disable_private_dr(vcpu);
         return;
+    }
+
+    if (!hv_trace_matches_context(session, vcpu))
+    {
+        // MTF is CPU-local. Once execution switches to another process the
+        // original instruction stream cannot be continued losslessly, so end
+        // the session explicitly instead of silently dropping this vCPU.
+        hv_trace_complete(session, OPHION_TRACE_STOP_CONTEXT_EXIT);
+        hv_trace_disable_private_dr(vcpu);
+        return;
+    }
+
+    if (session->scope == OPHION_TRACE_SCOPE_USER)
+    {
+        SIZE_T cs = 0;
+        __vmx_vmread(VMCS_GUEST_CS_SELECTOR, &cs);
+        if ((cs & 3) != 3)
+        {
+            // Interrupts and system calls may temporarily enter ring 0 while
+            // the target process remains current. Skip those instructions and
+            // keep MTF armed until execution returns to ring 3.
+            hv_trace_arm_mtf();
+            return;
+        }
     }
 
     if ((session->flags & OPHION_TRACE_FLAG_STOP_OUTSIDE_RANGE) &&
         (vcpu->vmexit_rip < session->start_address ||
          vcpu->vmexit_rip >= session->end_address))
     {
-        InterlockedExchange(&session->stop_reason,
-            OPHION_TRACE_STOP_RANGE_EXIT);
-        InterlockedExchange(&session->state, OPHION_TRACE_STATE_COMPLETE);
-        InterlockedExchange(&session->active, 0);
+        hv_trace_complete(session, OPHION_TRACE_STOP_RANGE_EXIT);
         hv_trace_disable_private_dr(vcpu);
         return;
     }

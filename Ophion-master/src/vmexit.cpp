@@ -2580,17 +2580,6 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
         if (int_info.Valid)
         {
-            if (int_info.Vector == EXCEPTION_VECTOR_DEBUG &&
-                int_info.InterruptionType == INTERRUPT_TYPE_HARDWARE_EXCEPTION)
-            {
-                const UINT64 debug_status = __readdr(6);
-                if (hv_trace_handle_debug_exception(vcpu, debug_status))
-                {
-                    vcpu->advance_rip = FALSE;
-                    break;
-                }
-            }
-
             UINT32 vector = int_info.Vector;
 
             size_t rflags_raw = 0;
@@ -2650,6 +2639,17 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
         if (int_info.Valid)
         {
+            if (int_info.Vector == EXCEPTION_VECTOR_DEBUG &&
+                int_info.InterruptionType == INTERRUPT_TYPE_HARDWARE_EXCEPTION)
+            {
+                const UINT64 debug_status = __readdr(6);
+                if (hv_trace_handle_debug_exception(vcpu, debug_status))
+                {
+                    vcpu->advance_rip = FALSE;
+                    break;
+                }
+            }
+
             //
             // stealth: intercept instruction-fetch #PF (NX violation)
             //

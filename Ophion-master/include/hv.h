@@ -354,6 +354,7 @@ BOOLEAN hv_trace_record_ept(VIRTUAL_MACHINE_STATE * vcpu, UINT64 breakpoint_id);
 BOOLEAN hv_trace_handle_debug_exception(VIRTUAL_MACHINE_STATE * vcpu,
     UINT64 debug_status);
 VOID hv_trace_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu);
+VOID hv_trace_rearm_pending_mtf(VIRTUAL_MACHINE_STATE * vcpu);
 VOID hv_trace_prepare_guest_debug_state(VIRTUAL_MACHINE_STATE * vcpu);
 
 //

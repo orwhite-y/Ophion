@@ -532,3 +532,10 @@ hv_trace_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
 
     hv_trace_arm_mtf();
 }
+
+VOID
+hv_trace_rearm_pending_mtf(VIRTUAL_MACHINE_STATE * vcpu)
+{
+    if (vcpu && vcpu->trace_mtf_active)
+        hv_trace_arm_mtf();
+}

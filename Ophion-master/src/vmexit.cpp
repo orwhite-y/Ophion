@@ -1205,10 +1205,12 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
 
         case VMCALL_TRACE_READ:
         {
+            UINT64 saved_cr3 = vmx_enter_guest_cr3();
             BOOLEAN ok = hv_trace_read(
                 regs->rdx, regs->r8, (UINT32)regs->r9,
                 (OPHION_TRACE_READ_OUTPUT *)(ULONG_PTR)regs->r10,
                 (UINT32)regs->r11);
+            vmx_leave_guest_cr3(saved_cr3);
             regs->rax = ok ? (UINT64)STATUS_SUCCESS : (UINT64)STATUS_NOT_FOUND;
             break;
         }
@@ -1342,6 +1344,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             // acknowledge the same epoch before global hook metadata is freed.
             stealth_clear_stale_window(vcpu);
             ept_handle_mtf(vcpu);
+            hv_trace_rearm_pending_mtf(vcpu);
 
             vcpu->ept_state_quiesced = TRUE;
             ept_state_mark_drained(vcpu);
@@ -1380,6 +1383,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             // never free a PEPT_HOOKED_PAGE_INFO still referenced by this vCPU.
             stealth_clear_stale_window(vcpu);
             ept_handle_mtf(vcpu);
+            hv_trace_rearm_pending_mtf(vcpu);
 
             // Pending state is drained.  Quiesce this vCPU and acknowledge the
             // current lifecycle epoch so bulk release can wait for every vCPU.
@@ -1402,6 +1406,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             // vCPU still owns a pending MTF or shadow-CR3 restore pointer.
             stealth_clear_stale_window(vcpu);
             ept_handle_mtf(vcpu);
+            hv_trace_rearm_pending_mtf(vcpu);
 
             vcpu->ept_state_quiesced = TRUE;
             ept_state_mark_drained(vcpu);
@@ -1472,6 +1477,7 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
             // any global stealth metadata can be removed.
             stealth_clear_stale_window(vcpu);
             ept_handle_mtf(vcpu);
+            hv_trace_rearm_pending_mtf(vcpu);
 
             vcpu->ept_state_quiesced = TRUE;
             ept_state_mark_drained(vcpu);

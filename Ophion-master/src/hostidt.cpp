@@ -46,7 +46,7 @@ hostidt_build(VOID)
     g_host_idt.original_idt_base = asm_get_idt_base();
 
     //
-    // default handler halts cpu â€?anything unexpected is a bug
+    // Default handler halts the CPU; any unexpected host exception is a bug.
     //
     for (UINT32 i = 0; i < IDT_NUM_ENTRIES; i++)
         hostidt_set_gate(&g_host_idt.idt[i], (UINT64)asm_host_default_handler, cs, IDT_TYPE_INTERRUPT_GATE, 0);

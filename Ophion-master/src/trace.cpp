@@ -633,10 +633,11 @@ hv_trace_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
         __vmx_vmread(VMCS_GUEST_CS_SELECTOR, &cs);
         if ((cs & 3) != 3)
         {
-            // Interrupts and system calls may temporarily enter ring 0 while
-            // the target process remains current. Skip those instructions and
-            // keep MTF armed until execution returns to ring 3.
-            hv_trace_arm_mtf();
+            // Continuing MTF through ring 0 single-steps arbitrary kernel and
+            // interrupt paths. End the user trace explicitly at the boundary
+            // instead of risking an unbounded VM-exit storm.
+            hv_trace_complete(session, OPHION_TRACE_STOP_CONTEXT_EXIT);
+            hv_trace_disable_private_dr(vcpu);
             return;
         }
     }

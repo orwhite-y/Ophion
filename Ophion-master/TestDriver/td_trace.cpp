@@ -386,6 +386,10 @@ TdTraceStart(OPHION_TRACE_START_REQUEST * request)
         (request->backend > OPHION_TRACE_BACKEND_HWBP) ||
         (request->scope == OPHION_TRACE_SCOPE_KERNEL &&
          request->backend == OPHION_TRACE_BACKEND_HWBP) ||
+        ((request->flags & OPHION_TRACE_FLAG_STOP_OUTSIDE_RANGE) &&
+         (request->backend == OPHION_TRACE_BACKEND_EPT ||
+          (request->backend == OPHION_TRACE_BACKEND_AUTO &&
+           request->scope == OPHION_TRACE_SCOPE_KERNEL))) ||
         (request->scope == OPHION_TRACE_SCOPE_USER && !request->target_pid) ||
         (request->flags & ~(OPHION_TRACE_FLAG_CAPTURE_STACK |
                             OPHION_TRACE_FLAG_STOP_OUTSIDE_RANGE)) != 0)
@@ -515,7 +519,8 @@ TdTraceStart(OPHION_TRACE_START_REQUEST * request)
     status = TdTraceConfigureSession(entry, request->max_steps, TRUE);
     if (!NT_SUCCESS(status) &&
         request->backend == OPHION_TRACE_BACKEND_AUTO &&
-        entry->scope == OPHION_TRACE_SCOPE_USER)
+        entry->scope == OPHION_TRACE_SCOPE_USER &&
+        !(entry->flags & OPHION_TRACE_FLAG_STOP_OUTSIDE_RANGE))
     {
         TD_TRACE_DPC_CONTEXT stop_context = {};
         stop_context.operation = TdTraceDpcStop;

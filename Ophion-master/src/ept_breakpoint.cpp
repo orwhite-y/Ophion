@@ -167,23 +167,11 @@ ept_breakpoint_allow_one_instruction(VIRTUAL_MACHINE_STATE * vcpu, UINT64 target
     _mm_mfence();
     ept_invept_single(vcpu->ept_pointer);
 
-    LONG depth = vcpu->mtf_breakpoint_pfn_depth;
-    BOOLEAN already_pending = FALSE;
-    for (LONG i = 0; i < depth && i < 4; ++i)
-        already_pending |= vcpu->mtf_breakpoint_pfn_stack[i] == target_pfn;
-
-    if (!already_pending)
-    {
-        if (depth < 4)
-        {
-            vcpu->mtf_breakpoint_pfn_stack[depth] = target_pfn;
-            vcpu->mtf_breakpoint_pfn_depth = depth + 1;
-        }
-        else
-        {
-            vcpu->mtf_breakpoint_pfn_stack[3] = target_pfn;
-        }
-    }
+    // A single instruction (notably REP string operations) may touch an
+    // unbounded number of pages before MTF exits. Do not keep a fixed-size PFN
+    // stack: it can overflow and leave an earlier page permanently RWX. The
+    // MTF handler restores every allocated breakpoint page instead.
+    InterlockedExchange(&vcpu->mtf_breakpoint_pending, 1);
 
     SIZE_T controls = 0;
     __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &controls);
@@ -384,7 +372,7 @@ ept_breakpoint_handle_violation(
 
     UINT64 guest_cr3 = vcpu->cached_guest_cr3 & CR3_ADDR_MASK;
     UINT64 guest_pid = (UINT64)(ULONG_PTR)PsGetCurrentProcessId();
-    HV_BP_HIT_LOCAL hits[8] = {};
+    HV_BP_HIT_LOCAL hits[HV_MAX_MEMORY_BREAKPOINTS] = {};
     UINT32 hit_count = 0;
     BOOLEAN known_page = FALSE;
 
@@ -443,13 +431,33 @@ ept_breakpoint_handle_violation(
 VOID
 ept_breakpoint_handle_mtf(VIRTUAL_MACHINE_STATE * vcpu)
 {
-    LONG depth = vcpu->mtf_breakpoint_pfn_depth;
-    while (depth > 0)
+    if (!vcpu || InterlockedExchange(&vcpu->mtf_breakpoint_pending, 0) == 0)
+        return;
+
+    UINT64 target_pfns[HV_MAX_MEMORY_BREAKPOINTS] = {};
+    UINT32 target_count = 0;
+
+    ept_lists_lock_acquire();
+    for (UINT32 i = 0; i < HV_MAX_MEMORY_BREAKPOINTS; ++i)
     {
-        UINT64 target_pfn = vcpu->mtf_breakpoint_pfn_stack[depth - 1];
-        vcpu->mtf_breakpoint_pfn_stack[depth - 1] = 0;
-        --depth;
-        vcpu->mtf_breakpoint_pfn_depth = depth;
-        ept_breakpoint_apply_page(vcpu, target_pfn);
+        PEPT_MEMORY_BREAKPOINT bp = &g_ept->memory_breakpoints[i];
+        if (!bp->allocated)
+            continue;
+
+        BOOLEAN duplicate = FALSE;
+        for (UINT32 j = 0; j < target_count; ++j)
+        {
+            if (target_pfns[j] == bp->target_pfn)
+            {
+                duplicate = TRUE;
+                break;
+            }
+        }
+        if (!duplicate)
+            target_pfns[target_count++] = bp->target_pfn;
     }
+    ept_lists_lock_release();
+
+    for (UINT32 i = 0; i < target_count; ++i)
+        ept_breakpoint_apply_page(vcpu, target_pfns[i]);
 }

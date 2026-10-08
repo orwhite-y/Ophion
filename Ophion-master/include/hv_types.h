@@ -333,9 +333,8 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     PEPT_HOOKED_PAGE_INFO mtf_restore_page_stack[4];
     volatile LONG        mtf_restore_page_depth;
 
-    // EPT memory-breakpoint pages temporarily opened for one instruction.
-    UINT64               mtf_breakpoint_pfn_stack[4];
-    volatile LONG        mtf_breakpoint_pfn_depth;
+    // One or more EPT memory-breakpoint pages are temporarily open until MTF.
+    volatile LONG        mtf_breakpoint_pending;
 
     // Private debug-register overlay used only to trigger an R3 HWBP trace.
     // Guest MOV-DR accesses see guest_dr* shadows while the physical slot stays

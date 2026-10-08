@@ -9,6 +9,7 @@
 #include <intrin.h>
 #include <ntimage.h>
 #include "log.h"
+#include "trace_protocol.h"
 
 
 // ---- extern "C" kernel APIs ----
@@ -430,6 +431,10 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
 #define IOCTL_HV_BP_SET            CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 28, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_HV_BP_CLEAR          CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 29, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_HV_BP_CLEAR_ALL      CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 30, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_HV_TRACE_START        CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 31, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_HV_TRACE_STOP         CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 32, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_HV_TRACE_READ         CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 33, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
+#define IOCTL_HV_TRACE_CLOSE        CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 34, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // VMCALL subcodes (must match Ophion include/hv_types.h)
 #define HV_VMCALL_READ_MEM   0x0000000B
@@ -441,6 +446,10 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
 #define HV_VMCALL_WRITE_MEM_PTE 0x00000012
 #define HV_VMCALL_MEMORY_BREAKPOINT_SET   0x00000018
 #define HV_VMCALL_MEMORY_BREAKPOINT_CLEAR 0x00000019
+#define HV_VMCALL_TRACE_CONFIG             0x0000001A
+#define HV_VMCALL_TRACE_STOP               0x0000001B
+#define HV_VMCALL_TRACE_READ               0x0000001C
+#define HV_VMCALL_TRACE_CLOSE              0x0000001D
 
 #define TD_BP_ACCESS_READ          0x01
 #define TD_BP_ACCESS_WRITE         0x02
@@ -778,6 +787,14 @@ VOID TdMemoryBreakpointCleanupAll(BOOLEAN issue_vmcalls);
 VOID TdMemoryBreakpointCleanupProcess(UINT64 pid);
 NTSTATUS TdMemoryBreakpointSet(PTD_MEMORY_BREAKPOINT_REQUEST request);
 NTSTATUS TdMemoryBreakpointClear(UINT64 breakpoint_id, BOOLEAN issue_vmcalls);
+VOID TdTraceInitialize(VOID);
+VOID TdTraceCleanupAll(BOOLEAN issue_vmcalls);
+VOID TdTraceCleanupProcess(UINT64 pid);
+NTSTATUS TdTraceStart(OPHION_TRACE_START_REQUEST * request);
+NTSTATUS TdTraceStop(OPHION_TRACE_CONTROL_REQUEST * request, UINT32 reason);
+NTSTATUS TdTraceClose(OPHION_TRACE_CONTROL_REQUEST * request);
+NTSTATUS TdTraceRead(const OPHION_TRACE_READ_REQUEST * request,
+    OPHION_TRACE_READ_OUTPUT * output, UINT32 output_size);
 VOID TdCloseCreatedThreadHandle(HANDLE thread_h, BOOLEAN thread_started);
 VOID TdEptUnhookAllR3(VOID);
 VOID TdFlushAddressRange(UINT64 base_va, SIZE_T size, UINT64 target_cr3, UINT64 shadow_cr3);

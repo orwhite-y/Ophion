@@ -369,6 +369,75 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
     // (file buffer + format string), causing 60x slowdown in scan workloads.
     switch (io->Parameters.DeviceIoControl.IoControlCode)
     {
+    case IOCTL_HV_TRACE_START:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(OPHION_TRACE_START_REQUEST) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(OPHION_TRACE_START_REQUEST))
+        {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        OPHION_TRACE_START_REQUEST * request =
+            (OPHION_TRACE_START_REQUEST *)irp->AssociatedIrp.SystemBuffer;
+        NTSTATUS trace_status = TdTraceStart(request);
+        request->status = trace_status;
+        irp->IoStatus.Information = sizeof(*request);
+        st = STATUS_SUCCESS;
+        break;
+    }
+
+    case IOCTL_HV_TRACE_STOP:
+    case IOCTL_HV_TRACE_CLOSE:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(OPHION_TRACE_CONTROL_REQUEST) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(OPHION_TRACE_CONTROL_REQUEST))
+        {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        OPHION_TRACE_CONTROL_REQUEST * request =
+            (OPHION_TRACE_CONTROL_REQUEST *)irp->AssociatedIrp.SystemBuffer;
+        NTSTATUS trace_status =
+            io->Parameters.DeviceIoControl.IoControlCode == IOCTL_HV_TRACE_STOP
+                ? TdTraceStop(request, OPHION_TRACE_STOP_REQUESTED)
+                : TdTraceClose(request);
+        request->status = trace_status;
+        irp->IoStatus.Information = sizeof(*request);
+        st = STATUS_SUCCESS;
+        break;
+    }
+
+    case IOCTL_HV_TRACE_READ:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(OPHION_TRACE_READ_REQUEST) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < OPHION_TRACE_READ_OUTPUT_HEADER_SIZE ||
+            !irp->MdlAddress)
+        {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        OPHION_TRACE_READ_REQUEST * request =
+            (OPHION_TRACE_READ_REQUEST *)irp->AssociatedIrp.SystemBuffer;
+        OPHION_TRACE_READ_OUTPUT * output =
+            (OPHION_TRACE_READ_OUTPUT *)MmGetSystemAddressForMdlSafe(
+                irp->MdlAddress, NormalPagePriority);
+        if (!output)
+        {
+            st = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+
+        NTSTATUS trace_status = TdTraceRead(
+            request, output,
+            io->Parameters.DeviceIoControl.OutputBufferLength);
+        output->status = trace_status;
+        irp->IoStatus.Information = OPHION_TRACE_READ_OUTPUT_HEADER_SIZE +
+            ((ULONG_PTR)output->record_count * sizeof(OPHION_TRACE_RECORD));
+        st = STATUS_SUCCESS;
+        break;
+    }
+
     case IOCTL_HV_BP_SET:
     {
         if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_MEMORY_BREAKPOINT_REQUEST) ||

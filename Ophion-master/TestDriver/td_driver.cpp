@@ -91,6 +91,7 @@ VOID TdUnload(PDRIVER_OBJECT drv)
     // removed. manage_driver.bat stops TestDriver before Ophion.
     if (TdOphionAlive())
     {
+        TdTraceCleanupAll(TRUE);
         TdMemoryBreakpointCleanupAll(TRUE);
 
         if (g_hooked_target)
@@ -103,6 +104,7 @@ VOID TdUnload(PDRIVER_OBJECT drv)
     }
     else
     {
+        TdTraceCleanupAll(FALSE);
         TdMemoryBreakpointCleanupAll(FALSE);
         HYPERPLATFORM_LOG_ERROR(
             "[td] Ophion not alive during unload; skipped all VMCALL teardown.");
@@ -155,6 +157,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     KeInitializeSpinLock(&g_shadow_alloc_lock);
     KeInitializeSpinLock(&g_stealth_track_lock);
     ExInitializeFastMutex(&g_memory_breakpoint_mutex);
+    TdTraceInitialize();
     TdR3HooksSyncInit();
     KeInitializeSpinLock(&g_inject_target_lock);
     g_inject_target_lock_init = TRUE;

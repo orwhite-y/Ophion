@@ -441,6 +441,48 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
 #define IOCTL_HV_TRACE_READ         CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 33, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
 #define IOCTL_HV_TRACE_CLOSE        CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 34, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+// =============================================================================
+//  REMOTE_CALL (R3 -> kernel -> VBox VMM EPT-hook plane)
+//
+//  Ring-3 asks the driver to call one function inside a target process:
+//    1. allocate one PAGE_READWRITE page as the parameter block
+//    2. create a thread SUSPENDED at ntdll!NtTestAlert, lpParameter = block
+//    3. VMCALL INSTALL_JUMP to the VirtualBox defeat/v1 VMM (EptHook/Runtime):
+//       first fetch at the trigger page redirects RIP to function_va with
+//       RCX = parameter block (oneshot, invisible to the guest)
+//    4. resume the thread; the function returns into RtlUserThreadStart, so
+//       its RAX becomes the thread exit code
+//    5. wait (optional), VMCALL REMOVE_JUMP, free the parameter block
+//
+//  Requires the VM extradata "VBoxInternal/EptHook/Runtime" = 1.  The driver
+//  probes the plane once per boot with SEH: an unhandled VMCALL would #UD,
+//  the probe turns that into STATUS_NOT_SUPPORTED instead of a bugcheck.
+//
+//  Calling contract: the target function receives RCX = parameter block:
+//      block+0x00: magic 'RCLL'   block+0x08: arg_count
+//      block+0x10: arg[0..N-1] (UINT64 each)
+// =============================================================================
+#define IOCTL_REMOTE_CALL CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 35, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define TD_REMOTE_CALL_MAX_ARGS 24
+#define TD_REMOTE_CALL_BLOCK_MAGIC 0x4C4C4352ULL /* 'RCLL' */
+
+typedef struct _TD_REMOTE_CALL_PARAMS {
+    UINT64 target_pid;          // [in]  target process PID, 0 = caller process
+    UINT64 function_va;         // [in]  R3 VA to call in target; called as fn(param_block)
+    UINT64 wait_ms;             // [in]  >0: wait thread, unhook, free block, return exit code
+                                //       0: fire-and-forget (hook stays armed, block stays)
+    UINT32 arg_count;           // [in]  0..TD_REMOTE_CALL_MAX_ARGS
+    UINT32 flags;               // [in]  reserved, must be 0
+    UINT64 param_block_va;      // [out] parameter block VA in target (= RCX)
+    UINT64 trigger_va;          // [out] ntdll trigger VA the suspended thread starts at
+    UINT64 thread_exit_code;    // [out] target function return value (waited only)
+    UINT64 vbox_status;         // [out] raw VMM status of INSTALL (0 = ok; ~0U = VERR_INVALID_PARAMETER)
+    UINT64 status;              // [out] NTSTATUS
+    UINT64 arg[TD_REMOTE_CALL_MAX_ARGS]; // [in] copied into the parameter block
+} TD_REMOTE_CALL_PARAMS, *PTD_REMOTE_CALL_PARAMS;
+
+
 // VMCALL subcodes (must match Ophion include/hv_types.h)
 #define HV_VMCALL_READ_MEM   0x0000000B
 #define HV_VMCALL_WRITE_MEM  0x0000000C
@@ -746,6 +788,9 @@ NTSTATUS TdMakeKernelThreadHandle(HANDLE thread_h, HANDLE * kernel_thread_h, UIN
 NTSTATUS TdManualMapInProcess( PEPROCESS proc, PUINT8 raw_dll, SIZE_T dll_size, PVOID * out_base, PVOID * out_entry);
 NTSTATUS TdNtResumeThreadBySSDT(HANDLE thread_h, PULONG previous_count);
 NTSTATUS TdReadFileKernel(PCUNICODE_STRING nt_path, PUINT8 * out_buf, SIZE_T * out_size);
+NTSTATUS TdRemoteCall(PTD_REMOTE_CALL_PARAMS request);
+BOOLEAN TdRemoteCallPlaneAvailable(VOID);
+VOID TdRemoteCallProbe(VOID);
 NTSTATUS TdResumeThreadHandle(HANDLE thread_h, PULONG previous_count);
 NTSTATUS TdRunPerCpuVmcall(TD_PERCPU_VMCALL_CTX * ctx, ULONG timeout_ms);
 NTSTATUS TdRunStealthAllocOnCpus(TD_STEALTH_PARAM * req, PVOID pt_buf, PVOID tgt_buf);

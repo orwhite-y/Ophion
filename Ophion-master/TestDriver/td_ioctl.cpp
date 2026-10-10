@@ -435,6 +435,26 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         break;
     }
 
+    case IOCTL_REMOTE_CALL:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_REMOTE_CALL_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_REMOTE_CALL_PARAMS))
+        {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        PTD_REMOTE_CALL_PARAMS request =
+            (PTD_REMOTE_CALL_PARAMS)irp->AssociatedIrp.SystemBuffer;
+        NTSTATUS rc_status = TdRemoteCall(request);
+        request->status = (UINT32)rc_status;
+        irp->IoStatus.Information = sizeof(*request);
+        // Result (incl. raw VMM status in request->vbox_status) is returned
+        // even for diagnostic failures so the caller sees the populated reply.
+        st = STATUS_SUCCESS;
+        break;
+    }
+
     case IOCTL_HV_TRACE_READ:
     {
         if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(OPHION_TRACE_READ_REQUEST) ||

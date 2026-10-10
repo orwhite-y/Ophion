@@ -74,4 +74,47 @@ hv_vmcall_simple PROC
     ret
 hv_vmcall_simple ENDP
 
+;
+; VBox defeat/v1 EPT-hook runtime plane ("remote call").
+; ABI must match VBox include/VBox/vmm/EptHook.h:
+;   rax = 'EPTH' (045505448h) | (op << 32)
+;   rdx = arg0 (page-aligned target GPA)
+;   rbx = arg1 (INSTALL: GvaTrigger)   rsi = arg2 (INSTALL: RCX cookie)
+;   rdi = arg3 (INSTALL: GvaRedirect)
+; VBox returns rax = VMM status (0 = ok, else VERR_* as UINT32),
+; rdx = op result (slot index / query word), and skips the vmcall.
+;
+; UINT64 TdVmcallEptAsm(
+;     UINT64 op,            ; rcx
+;     UINT64 arg0,          ; rdx
+;     UINT64 arg1,          ; r8   -> rbx
+;     UINT64 arg2,          ; r9   -> rsi
+;     UINT64 arg3,          ; [rsp+28h] -> rdi
+;     UINT64 *out_result    ; [rsp+30h] receives VMM rdx
+; );
+; returns raw VMM rax.  Callers MUST wrap this in __try/__except: a VMM
+; without the plane delivers #UD.
+;
+TdVmcallEptAsm PROC
+    push    rbx
+    push    rsi
+    push    rdi
+    ; entry stack: [rsp+28h]=arg3, [rsp+30h]=out_result
+    ; after 3 pushes (18h): arg3=[rsp+40h], out_result=[rsp+48h]
+    mov     r10, rcx
+    shl     r10, 32
+    mov     rax, 045505448h
+    or      rax, r10
+    mov     rbx, r8
+    mov     rsi, r9
+    mov     rdi, [rsp + 40h]
+    mov     r11, [rsp + 48h]
+    vmcall
+    mov     [r11], rdx
+    pop     rdi
+    pop     rsi
+    pop     rbx
+    ret
+TdVmcallEptAsm ENDP
+
 END

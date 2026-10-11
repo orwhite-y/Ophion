@@ -821,6 +821,13 @@ NTSTATUS TdVbxCmdSubmit(UINT32 uOperation, VOID const * payload, UINT32 cbPayloa
                         VOID * resp, UINT32 cbRespMax, UINT32 * pcbResp, UINT32 * puVmmRc);
 NTSTATUS TdVbxCapsQuery(VOID * pCaps);
 NTSTATUS TdVbxDiagWalk(UINT64 GCPhys, VOID * pDiag);
+NTSTATUS TdVbxJumpInstall(UINT64 trig_gpa, UINT64 gva_trigger, UINT64 cookie, UINT64 gva_redirect);
+NTSTATUS TdVbxJumpRemove(UINT64 trig_gpa);
+VOID TdVbxHookRegister(UINT64 pid, UINT64 trig_gpa);
+VOID TdVbxHookUnregister(UINT64 pid, UINT64 trig_gpa);
+VOID TdVbxHookRemoveByPid(UINT64 pid);
+VOID TdVbxHookRemoveAll(VOID);
+extern BOOLEAN g_fUseOphionPlane;   /* A/B: FALSE (default) = VBox plane. */
 EXTERN_C UINT64 TdVmcallEptAsm(UINT64 op, UINT64 arg0, UINT64 arg1,
                                UINT64 arg2, UINT64 arg3, UINT64 * out_result);
 NTSTATUS TdResumeThreadHandle(HANDLE thread_h, PULONG previous_count);

@@ -1200,6 +1200,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
     SIZE_T total_pages = 0;
     UINT64 target_pid = (UINT64)PsGetProcessId(proc);
     PVOID trigger_fn = NULL;
+    UINT64 trigger_gpa = 0;
     HANDLE cleanup_thr_h = NULL;
     UINT64 expected_tid = 0;
     BOOLEAN trigger_hooked = FALSE;
@@ -1415,8 +1416,14 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
                         {
                             trigger_fn = TdFindExportByName(ldr_e->DllBase, "NtTestAlert");
                             if (trigger_fn)
+                            {
                                 HYPERPLATFORM_LOG_INFO("[%s] NtTestAlert=%p (ntdll=%p)",
                                     log_prefix, trigger_fn, ldr_e->DllBase);
+                                /* T3: GPA is stable while attached; the VBox
+                                   plane is GPA-based and needs no attach. */
+                                trigger_gpa = (UINT64)MmGetPhysicalAddress(trigger_fn).QuadPart
+                                            & ~0xFFFull;
+                            }
                             break;
                         }
                         ldr_cur = ldr_cur->Flink;
@@ -1450,7 +1457,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
                 HANDLE thr_h = NULL;
                 NTSTATUS thr_st = g_pZwCreateThreadEx(
                     &thr_h, THREAD_ALL_ACCESS, NULL, thr_proc_h,
-                    trigger_fn, NULL,
+                    trigger_fn, mapped_base /* T3: RCX cookie for the VBox JUMP */,
                     THREAD_CREATE_FLAGS_CREATE_SUSPENDED,
                     0, 0, 0, NULL);
 
@@ -1498,7 +1505,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
             CLIENT_ID cid = {};
             NTSTATUS thr_st = RtlCreateUserThread(
                 ZwCurrentProcess(), NULL, TRUE, 0, 0, 0,
-                trigger_fn, NULL, &thr_h, &cid);
+                trigger_fn, mapped_base /* T3: RCX cookie */, &thr_h, &cid);
 
             if (NT_SUCCESS(thr_st) && thr_h)
             {
@@ -1539,6 +1546,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
     struct _RW_CLEANUP_CTX {
         HANDLE          thread_handle;
         PVOID           trigger_fn;
+        UINT64          trigger_gpa;
         PVOID           shellcode_va;
         UINT64          target_cr3;
         UINT64          target_pid;
@@ -1563,6 +1571,7 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
     {
         cleanup_ctx->thread_handle = cleanup_thr_h;
         cleanup_ctx->trigger_fn    = trigger_fn;
+        cleanup_ctx->trigger_gpa   = trigger_gpa;
         cleanup_ctx->shellcode_va  = mapped_base;
         cleanup_ctx->target_cr3    = caller_cr3;
         cleanup_ctx->target_pid    = target_pid;
@@ -1584,19 +1593,43 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
     // 10. EPT hook trigger -> mapped_entry (DllMain stub at base+stub_off) (TID-filtered, oneshot)
     if (NT_SUCCESS(st) && expected_tid)
     {
-        PVOID dummy_origin = NULL;
-        volatile LONG * fired_ptr = cleanup_ctx ? &cleanup_ctx->fired_signal : NULL;
-        NTSTATUS hook_st = TdInstallTriggerHookAllCpus(
-            trigger_fn, mapped_entry, caller_cr3, 2, expected_tid, &dummy_origin, fired_ptr);
+        if (g_fUseOphionPlane)
+        {
+            /* A/B fallback (default OFF): legacy Ophion-HV trigger. */
+            PVOID dummy_origin = NULL;
+            volatile LONG * fired_ptr = cleanup_ctx ? &cleanup_ctx->fired_signal : NULL;
+            NTSTATUS hook_st = TdInstallTriggerHookAllCpus(
+                trigger_fn, mapped_entry, caller_cr3, 2, expected_tid, &dummy_origin, fired_ptr);
 
-        HYPERPLATFORM_LOG_WARN("[%s] trigger hook %s trigger=%p sc=%p tid=%llu st=0x%08X",
-                   log_prefix, NT_SUCCESS(hook_st) ? "OK" : "FAILED",
-                   trigger_fn, mapped_entry, expected_tid, hook_st);
+            HYPERPLATFORM_LOG_WARN("[%s] trigger hook %s trigger=%p sc=%p tid=%llu st=0x%08X",
+                       log_prefix, NT_SUCCESS(hook_st) ? "OK" : "FAILED",
+                       trigger_fn, mapped_entry, expected_tid, hook_st);
 
-        if (!NT_SUCCESS(hook_st))
-            st = hook_st;
+            if (!NT_SUCCESS(hook_st))
+                st = hook_st;
+            else
+                trigger_hooked = TRUE;
+        }
         else
-            trigger_hooked = TRUE;
+        {
+            /* T3: oneshot JUMP through the VBox defeat/v1 runtime plane.
+               Cookie = mapped_base (the thread start parameter lands in RCX;
+               the DllMain stub overwrites RCX itself). */
+            NTSTATUS hook_st = TdVbxJumpInstall(trigger_gpa, (UINT64)(ULONG_PTR)trigger_fn,
+                                                (UINT64)(ULONG_PTR)mapped_base,
+                                                (UINT64)(ULONG_PTR)mapped_entry);
+            HYPERPLATFORM_LOG_WARN("[%s] trigger hook %s (VBox) trigger=%p gpa=%llx sc=%p st=0x%08X",
+                       log_prefix, NT_SUCCESS(hook_st) ? "OK" : "FAILED",
+                       trigger_fn, trigger_gpa, mapped_entry, hook_st);
+
+            if (!NT_SUCCESS(hook_st))
+                st = hook_st;
+            else
+            {
+                trigger_hooked = TRUE;
+                TdVbxHookRegister(target_pid, trigger_gpa);
+            }
+        }
     }
 
     HYPERPLATFORM_LOG_WARN("[%s] detached, trigger_hooked=%d, about to resume", log_prefix, (int)trigger_hooked);
@@ -1690,19 +1723,28 @@ TdInjectRenderdocShadow(PEPROCESS proc, PCUNICODE_STRING renderdoc_path, const c
             // value, does NOT load the dead CR3 -> no use-after-free on freed PT).
             // The pre-injection cleanup (VMCALL_STEALTH_FREE_ALL -> ept_unhook_all)
             // is the ultimate safety net: it removes ALL hooks before next injection.
-            PEPROCESS proc2 = NULL;
-            if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)c->target_pid, &proc2)))
+            if (g_fUseOphionPlane)
             {
-                KAPC_STATE apc2;
-                KeStackAttachProcess(proc2, &apc2);
-                TdUnhookTriggerAllCpus(c->trigger_fn, c->target_cr3);
-                KeUnstackDetachProcess(&apc2);
-                ObDereferenceObject(proc2);
+                PEPROCESS proc2 = NULL;
+                if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)c->target_pid, &proc2)))
+                {
+                    KAPC_STATE apc2;
+                    KeStackAttachProcess(proc2, &apc2);
+                    TdUnhookTriggerAllCpus(c->trigger_fn, c->target_cr3);
+                    KeUnstackDetachProcess(&apc2);
+                    ObDereferenceObject(proc2);
+                }
+                else
+                {
+                    // Process dead: unhook by CR3 match (safe, no CR3 load).
+                    hv_vmcall_simple(VMCALL_EPT_UNHOOK_BY_CR3, c->target_cr3, 0, 0);
+                }
             }
             else
             {
-                // Process dead: unhook by CR3 match (safe, no CR3 load).
-                hv_vmcall_simple(VMCALL_EPT_UNHOOK_BY_CR3, c->target_cr3, 0, 0);
+                // T3: explicit REMOVE on the VBox plane (registration swept).
+                TdVbxJumpRemove(c->trigger_gpa);
+                TdVbxHookUnregister(c->target_pid, c->trigger_gpa);
             }
             HYPERPLATFORM_LOG_WARN("[td-inj-shadow] cleanup: trigger unhook=%p, inject RESIDENT=%p",
                 c->trigger_fn, c->shellcode_va);

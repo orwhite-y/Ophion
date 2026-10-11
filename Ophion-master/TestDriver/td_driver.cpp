@@ -57,6 +57,7 @@ BOOLEAN TdOphionAlive(VOID)
 
 VOID TdUnload(PDRIVER_OBJECT drv)
 {
+    TdVbxHookRemoveAll();
     TdVbxCmdFini();
     // Stop new exit callbacks first. Successful removal waits for callbacks
     // already in flight, so hook teardown below cannot race TdProcessNotify.

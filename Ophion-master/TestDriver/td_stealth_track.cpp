@@ -257,6 +257,10 @@ TdStealthFreePageSafe(PVOID target_va, UINT64 target_phys)
 VOID
 TdCleanupStealthForProcess(PEPROCESS Process, UINT64 pid)
 {
+    /* T3: sweep any VBox-plane JUMP hooks registered by this process
+       (fire-and-forget remote calls, renderdoc triggers).  Explicit REMOVE
+       only - CR3 changes never touch hooks (taskbook 3.4 / R-09). */
+    TdVbxHookRemoveByPid(pid);
     // Serialize against hook install/explicit unhook. The process callback is
     // PASSIVE_LEVEL, so waiting on the synchronization-event gate is valid.
     TdR3HooksLock();

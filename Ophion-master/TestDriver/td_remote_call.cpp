@@ -291,6 +291,12 @@ NTSTATUS TdRemoteCall(PTD_REMOTE_CALL_PARAMS request)
             UINT64 rm_raw = 0;
             TdRcVmcall(EPTH_OP_REMOVE_JUMP, trig_gpa, 0, 0, 0, NULL, &rm_raw);
             armed = FALSE;
+            {
+                UINT64 pid = request->target_pid
+                           ? request->target_pid
+                           : (UINT64)(ULONG_PTR)PsGetCurrentProcessId();
+                TdVbxHookUnregister(pid, trig_gpa);
+            }
             ZwFreeVirtualMemory(ZwCurrentProcess(), &block, &block_size, MEM_RELEASE);
             block = NULL;
             st = STATUS_SUCCESS;

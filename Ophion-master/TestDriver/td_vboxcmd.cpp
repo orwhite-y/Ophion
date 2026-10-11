@@ -236,3 +236,143 @@ NTSTATUS TdVbxDiagWalk(UINT64 GCPhys, VOID * pDiagRaw)
         return STATUS_INVALID_PARAMETER;
     return st;
 }
+
+// =============================================================================
+//  JUMP install/remove wrappers + per-process hook registration (T3)
+//
+//  Every successful INSTALL is registered with the owning PID so process
+//  exit and driver unload can sweep leftovers.  Registration is bookkeeping
+//  only - the VMM disarms oneshot hooks by itself when they fire.
+// =============================================================================
+
+#define VBX_HOOK_REG_MAX 32
+
+typedef struct _VBX_HOOK_REG_ENTRY {
+    UINT64 pid;
+    UINT64 trig_gpa;
+    BOOLEAN active;
+} VBX_HOOK_REG_ENTRY;
+
+static VBX_HOOK_REG_ENTRY g_vbxHooks[VBX_HOOK_REG_MAX];
+static KSPIN_LOCK g_vbxHookLock;
+static BOOLEAN g_vbxHookLockInit;
+BOOLEAN g_fUseOphionPlane = FALSE;   /* A/B: default OFF = VBox plane. */
+
+//
+// INSTALL_JUMP through the register ABI (op 2 args: rdx=GPA page,
+// rbx=GvaTrigger, rsi=cookie, rdi=GvaRedirect).  SEH-guarded.
+//
+NTSTATUS TdVbxJumpInstall(UINT64 trig_gpa, UINT64 gva_trigger, UINT64 cookie,
+                          UINT64 gva_redirect)
+{
+    UINT64 raw = 0;
+    UINT64 res = 0;
+    __try {
+        raw = TdVmcallEptAsm(1 /* INSTALL_JUMP */, trig_gpa, gva_trigger,
+                             cookie, gva_redirect, &res);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    return raw == 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
+//
+// REMOVE_JUMP through the register ABI (op 2).
+//
+NTSTATUS TdVbxJumpRemove(UINT64 trig_gpa)
+{
+    UINT64 raw = 0;
+    UINT64 res = 0;
+    __try {
+        raw = TdVmcallEptAsm(2 /* REMOVE_JUMP */, trig_gpa, 0, 0, 0, &res);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    return raw == 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
+static VOID TdVbxHookLock(VOID)
+{
+    if (!g_vbxHookLockInit)
+    {
+        KeInitializeSpinLock(&g_vbxHookLock);
+        g_vbxHookLockInit = TRUE;
+    }
+}
+
+VOID TdVbxHookRegister(UINT64 pid, UINT64 trig_gpa)
+{
+    KIRQL irql;
+    TdVbxHookLock();
+    KeAcquireSpinLock(&g_vbxHookLock, &irql);
+    for (UINT32 i = 0; i < VBX_HOOK_REG_MAX; i++)
+    {
+        if (!g_vbxHooks[i].active)
+        {
+            g_vbxHooks[i].pid = pid;
+            g_vbxHooks[i].trig_gpa = trig_gpa;
+            g_vbxHooks[i].active = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_vbxHookLock, irql);
+}
+
+VOID TdVbxHookUnregister(UINT64 pid, UINT64 trig_gpa)
+{
+    KIRQL irql;
+    TdVbxHookLock();
+    KeAcquireSpinLock(&g_vbxHookLock, &irql);
+    for (UINT32 i = 0; i < VBX_HOOK_REG_MAX; i++)
+    {
+        if (g_vbxHooks[i].active && g_vbxHooks[i].pid == pid &&
+            g_vbxHooks[i].trig_gpa == trig_gpa)
+        {
+            g_vbxHooks[i].active = FALSE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_vbxHookLock, irql);
+}
+
+//
+// Sweeps every registered hook of one process (process-exit notification).
+// CR3 never participates: this is an explicit REMOVE, not an auto-retire.
+//
+VOID TdVbxHookRemoveByPid(UINT64 pid)
+{
+    KIRQL irql;
+    TdVbxHookLock();
+    KeAcquireSpinLock(&g_vbxHookLock, &irql);
+    for (UINT32 i = 0; i < VBX_HOOK_REG_MAX; i++)
+    {
+        if (g_vbxHooks[i].active && g_vbxHooks[i].pid == pid)
+        {
+            UINT64 gpa = g_vbxHooks[i].trig_gpa;
+            g_vbxHooks[i].active = FALSE;
+            KeReleaseSpinLock(&g_vbxHookLock, irql);
+            TdVbxJumpRemove(gpa);
+            KeAcquireSpinLock(&g_vbxHookLock, &irql);
+        }
+    }
+    KeReleaseSpinLock(&g_vbxHookLock, irql);
+}
+
+VOID TdVbxHookRemoveAll(VOID)
+{
+    KIRQL irql;
+    TdVbxHookLock();
+    KeAcquireSpinLock(&g_vbxHookLock, &irql);
+    for (UINT32 i = 0; i < VBX_HOOK_REG_MAX; i++)
+    {
+        if (g_vbxHooks[i].active)
+        {
+            UINT64 gpa = g_vbxHooks[i].trig_gpa;
+            g_vbxHooks[i].active = FALSE;
+            KeReleaseSpinLock(&g_vbxHookLock, irql);
+            TdVbxJumpRemove(gpa);
+            KeAcquireSpinLock(&g_vbxHookLock, &irql);
+        }
+    }
+    KeReleaseSpinLock(&g_vbxHookLock, irql);
+}

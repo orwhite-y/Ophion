@@ -376,3 +376,154 @@ VOID TdVbxHookRemoveAll(VOID)
     }
     KeReleaseSpinLock(&g_vbxHookLock, irql);
 }
+
+// =============================================================================
+//  T4/T5: breakpoints, trace and event rings over the command page.
+// =============================================================================
+
+#pragma pack(push, 8)
+typedef struct _VBX_BP_REQ {
+    VBX_CMD_HDR Hdr;
+    UINT64 GCPhys;
+    UINT64 uCr3User;
+    UINT64 uCr3Kernel;
+    UINT32 offHook;
+    UINT32 cbHook;
+    UINT8  fAccess;
+    UINT8  fFlags;
+    UINT16 u16Reserved;
+    UINT32 u32Reserved;
+} VBX_BP_REQ;
+
+typedef struct _VBX_BP_RESP {
+    INT32  idHook;
+    UINT32 uGeneration;
+} VBX_BP_RESP;
+
+typedef struct _VBX_BP_REMOVE_REQ {
+    VBX_CMD_HDR Hdr;
+    INT32  idHook;
+    UINT32 uGeneration;
+} VBX_BP_REMOVE_REQ;
+
+typedef struct _VBX_EVENT_READ_REQ {
+    VBX_CMD_HDR Hdr;
+    UINT32 cMaxEvents;
+    UINT32 u32Reserved;
+} VBX_EVENT_READ_REQ;
+
+typedef struct _VBX_EVENT_READ_HDR {
+    UINT32 cEvents;
+    UINT32 cDropped;
+    UINT32 cRemaining;
+    UINT32 u32Reserved;
+} VBX_EVENT_READ_HDR;
+#pragma pack(pop)
+
+#define VBX_BP_ACCESS_READ      0x1
+#define VBX_BP_ACCESS_WRITE     0x2
+#define VBX_BP_ACCESS_EXECUTE   0x4
+#define VBX_BP_F_ONESHOT        0x1
+#define VBX_CMD_BP_INSTALL      3
+#define VBX_CMD_BP_REMOVE       4
+#define VBX_CMD_EVENT_READ      5
+#define VBX_CMD_TRACE_START     6
+#define VBX_CMD_TRACE_STOP      7
+
+NTSTATUS TdVbxBpInstall(UINT64 GCPhysPage, UINT32 off, UINT32 cb, UINT32 access,
+                        UINT32 fOneshot, UINT64 target_cr3, INT32 *pidHook, UINT32 *puGen)
+{
+    VBX_BP_REQ req;
+    RtlZeroMemory(&req, sizeof(req));
+    req.GCPhys = GCPhysPage;
+    req.uCr3User = target_cr3;      /* KPTI: same value filters both views */
+    req.uCr3Kernel = target_cr3;
+    req.offHook = off;
+    req.cbHook = cb;
+    req.fAccess = (UINT8)access;
+    req.fFlags = (UINT8)(fOneshot ? VBX_BP_F_ONESHOT : 0);
+
+    VBX_BP_RESP resp = {};
+    UINT32 cbResp = 0;
+    UINT32 vmmRc = 0;
+    // Persistent execute-only installs announce as TRACE_START so the VMM
+    // marks the EPTHOOKEVENT stream as trace policy (T5).
+    UINT32 const uOp = (access == VBX_BP_ACCESS_EXECUTE && !fOneshot)
+                     ? VBX_CMD_TRACE_START : VBX_CMD_BP_INSTALL;
+    NTSTATUS st = TdVbxCmdSubmit(uOp,
+                                 (UINT8 *)&req + sizeof(VBX_CMD_HDR),
+                                 sizeof(req) - sizeof(VBX_CMD_HDR),
+                                 &resp, sizeof(resp), &cbResp, &vmmRc);
+    if (NT_SUCCESS(st))
+    {
+        if (pidHook) *pidHook = resp.idHook;
+        if (puGen) *puGen = resp.uGeneration;
+    }
+    return st;
+}
+
+NTSTATUS TdVbxBpRemove(INT32 idHook, UINT32 uGeneration)
+{
+    VBX_BP_REMOVE_REQ req;
+    RtlZeroMemory(&req, sizeof(req));
+    req.idHook = idHook;
+    req.uGeneration = uGeneration;
+    UINT32 vmmRc = 0;
+    return TdVbxCmdSubmit(VBX_CMD_BP_REMOVE,
+                          (UINT8 *)&req + sizeof(VBX_CMD_HDR),
+                          sizeof(req) - sizeof(VBX_CMD_HDR),
+                          NULL, 0, NULL, &vmmRc);
+}
+
+//
+// Drains the event ring of every processor: pins the current thread to each
+// CPU in turn and issues one EVENT_READ per CPU (the ring drains on the
+// submitting EMT).  events[] receives packed 64-byte EPTHOOKEVENT records.
+//
+NTSTATUS TdVbxEventReadAll(UINT64 *pEvents, UINT32 cMaxEvents, UINT32 *pcEvents,
+                           UINT32 *pcDropped, UINT32 *pcRemaining)
+{
+    if (!cMaxEvents) return STATUS_INVALID_PARAMETER;
+    NTSTATUS stFinal = STATUS_SUCCESS;
+    UINT32 cCopied = 0, cDropped = 0, cRemaining = 0;
+
+    ULONG cCpus = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    for (ULONG idx = 0; idx < cCpus; ++idx)
+    {
+        GROUP_AFFINITY oldAff = {}, newAff = {}, *pOld = &oldAff;
+        newAff.Group = (USHORT)(idx >= 64 ? 1 : 0);
+        newAff.Mask = (KAFFINITY)1 << (idx & 63);
+        KeSetSystemGroupAffinityThread(&newAff, pOld);
+
+        VBX_EVENT_READ_REQ req;
+        RtlZeroMemory(&req, sizeof(req));
+        req.cMaxEvents = cMaxEvents - cCopied;
+
+        UINT8 resp[PAGE_SIZE] = {};
+        UINT32 cb = 0;
+        UINT32 vmmRc = 0;
+        NTSTATUS st = TdVbxCmdSubmit(VBX_CMD_EVENT_READ,
+                                     (UINT8 *)&req + sizeof(VBX_CMD_HDR),
+                                     sizeof(req) - sizeof(VBX_CMD_HDR),
+                                     resp, sizeof(resp), &cb, &vmmRc);
+        if (NT_SUCCESS(st) && cb >= sizeof(VBX_EVENT_READ_HDR))
+        {
+            VBX_EVENT_READ_HDR const * pHdr = (VBX_EVENT_READ_HDR const *)resp;
+            cDropped += pHdr->cDropped;
+            cRemaining += pHdr->cRemaining;
+            UINT32 const cGot = pHdr->cEvents;
+            for (UINT32 i = 0; i < cGot && cCopied < cMaxEvents; ++i)
+                pEvents[cCopied++] = *(UINT64 const *)((UINT8 const *)(pHdr + 1) + (SIZE_T)i * 64);
+        }
+        else if (!NT_SUCCESS(st) && NT_SUCCESS(stFinal))
+            stFinal = st;
+
+        KeRevertToUserGroupAffinityThread(pOld);
+        if (cCopied >= cMaxEvents)
+            break;
+    }
+    if (pcEvents) *pcEvents = cCopied;
+    if (pcDropped) *pcDropped = cDropped;
+    if (pcRemaining) *pcRemaining = cRemaining;
+    return stFinal;
+}

@@ -496,6 +496,32 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         break;
     }
 
+    case IOCTL_HV_EVENT_READ:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_HV_EVENT_READ_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_HV_EVENT_READ_PARAMS))
+        {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        PTD_HV_EVENT_READ_PARAMS request =
+            (PTD_HV_EVENT_READ_PARAMS)irp->AssociatedIrp.SystemBuffer;
+        if (request->cMaxEvents > TD_EVENT_READ_MAX)
+            request->cMaxEvents = TD_EVENT_READ_MAX;
+        UINT32 cEvents = 0, cDropped = 0, cRemaining = 0;
+        NTSTATUS ev_st = TdVbxEventReadAll(request->events, request->cMaxEvents,
+                                           &cEvents, &cDropped, &cRemaining);
+        request->cEvents = cEvents;
+        request->cDropped = cDropped;
+        request->cRemaining = cRemaining;
+        request->cCpus = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+        request->status = (UINT32)ev_st;
+        irp->IoStatus.Information = sizeof(*request);
+        st = STATUS_SUCCESS;
+        break;
+    }
+
     case IOCTL_HV_TRACE_READ:
     {
         if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(OPHION_TRACE_READ_REQUEST) ||

@@ -136,6 +136,15 @@ TdMemoryBreakpointClearLocked(
         return STATUS_SUCCESS;
     }
 
+    if (TdVbxCmdReady() && !g_fUseOphionPlane)
+    {
+        // T4: transactional BP_REMOVE by {slot, generation}.
+        NTSTATUS vbox_status = TdVbxBpRemove(entry->vbox_id_hook, entry->vbox_generation);
+        if (NT_SUCCESS(vbox_status))
+            TdMemoryBreakpointReleaseEntry(entry);
+        return vbox_status;
+    }
+
     NTSTATUS status = TdMemoryBreakpointVmcall(
         FALSE, entry->breakpoint_id, 0, 0, 0, 0, 0, 0, 0, 1);
     if (!NT_SUCCESS(status))
@@ -166,7 +175,7 @@ TdMemoryBreakpointSet(PTD_MEMORY_BREAKPOINT_REQUEST request)
         (request->flags & ~TD_BP_FLAG_ONESHOT) != 0)
         return STATUS_INVALID_PARAMETER;
 
-    if (!TdOphionAlive())
+    if (!TdOphionAlive() && !(TdVbxCmdReady() && !g_fUseOphionPlane))
         return STATUS_DEVICE_NOT_READY;
 
     ExAcquireFastMutex(&g_memory_breakpoint_mutex);
@@ -256,16 +265,29 @@ TdMemoryBreakpointSet(PTD_MEMORY_BREAKPOINT_REQUEST request)
     slot->mdl = mdl;
     request->breakpoint_id = breakpoint_id;
 
-    status = TdMemoryBreakpointVmcall(
-        TRUE, breakpoint_id, request->target_pid, target_cr3, request->target_address,
-        target_physical, request->size, request->access, request->flags, 1);
-    BOOLEAN record_created = NT_SUCCESS(status);
-    if (NT_SUCCESS(status))
+    if (TdVbxCmdReady() && !g_fUseOphionPlane)
     {
-        status = TdMemoryBreakpointBroadcast(
-            TRUE, breakpoint_id, request->target_pid, target_cr3, request->target_address,
-            target_physical, request->size, request->access, request->flags);
+        // T4: one transactional BP_INSTALL on the VBox plane; the VMM handles
+        // every vCPU (no DPC broadcast needed).
+        status = TdVbxBpInstall(target_physical & ~0xFFFull,
+                                (UINT32)(target_physical & 0xFFF), request->size,
+                                request->access,
+                                (request->flags & TD_BP_FLAG_ONESHOT) ? 1u : 0u,
+                                target_cr3, &slot->vbox_id_hook, &slot->vbox_generation);
     }
+    else
+    {
+        status = TdMemoryBreakpointVmcall(
+            TRUE, breakpoint_id, request->target_pid, target_cr3, request->target_address,
+            target_physical, request->size, request->access, request->flags, 1);
+        if (NT_SUCCESS(status))
+        {
+            status = TdMemoryBreakpointBroadcast(
+                TRUE, breakpoint_id, request->target_pid, target_cr3, request->target_address,
+                target_physical, request->size, request->access, request->flags);
+        }
+    }
+    BOOLEAN record_created = NT_SUCCESS(status);
 
     if (!NT_SUCCESS(status))
     {

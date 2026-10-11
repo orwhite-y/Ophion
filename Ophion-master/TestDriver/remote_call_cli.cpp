@@ -19,6 +19,13 @@
 
 #define TD_IOCTL_BASE 0x900
 #define IOCTL_REMOTE_CALL CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 35, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_HV_EVENT_READ CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 37, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define TD_EVENT_READ_MAX 64
+typedef struct _TD_HV_EVENT_READ_PARAMS {
+    uint32_t cMaxEvents; uint32_t cEvents; uint32_t cDropped; uint32_t cRemaining;
+    uint32_t cCpus; uint32_t status;
+    uint64_t events[TD_EVENT_READ_MAX][8];
+} TD_HV_EVENT_READ_PARAMS;
 
 #define TD_REMOTE_CALL_MAX_ARGS 24
 
@@ -48,6 +55,41 @@ static void PrintUsage()
 
 int wmain(int argc, wchar_t** argv)
 {
+    if (argc == 2 && _wcsicmp(argv[1], L"evread") == 0)
+    {
+        HANDLE device = CreateFileW(L"\\\\.\\RMCoreTst", GENERIC_READ | GENERIC_WRITE,
+                                    0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (device == INVALID_HANDLE_VALUE)
+        {
+            wprintf(L"open RMCoreTst failed: Win32=%lu\n", GetLastError());
+            return 1;
+        }
+        TD_HV_EVENT_READ_PARAMS ev = {};
+        ev.cMaxEvents = TD_EVENT_READ_MAX;
+        DWORD returned = 0;
+        BOOL ok = DeviceIoControl(device, IOCTL_HV_EVENT_READ, &ev, sizeof(ev), &ev, sizeof(ev), &returned, nullptr);
+        CloseHandle(device);
+        if (!ok)
+        {
+            wprintf(L"DeviceIoControl failed: Win32=%lu\n", GetLastError());
+            return 1;
+        }
+        wprintf(L"status=0x%08X events=%u dropped=%u remaining=%u cpus=%u\n",
+                ev.status, ev.cEvents, ev.cDropped, ev.cRemaining, ev.cCpus);
+        for (uint32_t i = 0; i < ev.cEvents; ++i)
+        {
+            const uint64_t* e = ev.events[i];
+            // EPTHOOKEVENT layout: seq, tsc, rip, cr3, gpa, {hook,gen}, {cpu,acc,flags,rsv}
+            wprintf(L"[%2u] seq=%llu cpu=%llu acc=%llu hook=%llu gen=%llu rip=0x%llX gpa=0x%llX cr3=0x%llX\n",
+                    i, (unsigned long long)e[0], (unsigned long long)(e[6] & 0xFFFF),
+                    (unsigned long long)(e[6] >> 16) & 0xFF,
+                    (unsigned long long)(e[5] & 0xFFFFFFFF),
+                    (unsigned long long)(e[5] >> 32), (unsigned long long)e[2],
+                    (unsigned long long)e[4], (unsigned long long)e[3]);
+        }
+        return ev.status == 0 ? 0 : 1;
+    }
+
     if (argc < 3)
     {
         PrintUsage();

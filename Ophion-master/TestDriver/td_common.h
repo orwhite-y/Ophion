@@ -472,6 +472,21 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
 // =============================================================================
 #define IOCTL_HOOK_DIAG CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 36, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+// EVENT_READ (T4/T5): drains the per-vCPU event rings of every processor
+// (the driver pins itself to each CPU in turn).  events[] are the raw 64-byte
+// EPTHOOKEVENT records (VBox EptHook.h ABI).
+#define IOCTL_HV_EVENT_READ CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 37, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define TD_EVENT_READ_MAX   64
+typedef struct _TD_HV_EVENT_READ_PARAMS {
+    UINT32 cMaxEvents;          // [in]  capacity of events[] (<= TD_EVENT_READ_MAX)
+    UINT32 cEvents;             // [out] events copied
+    UINT32 cDropped;            // [out] summed drop counters
+    UINT32 cRemaining;          // [out] events still queued after the sweep
+    UINT32 cCpus;               // [out] processors swept
+    UINT32 status;              // [out] NTSTATUS
+    UINT64 events[TD_EVENT_READ_MAX];
+} TD_HV_EVENT_READ_PARAMS, *PTD_HV_EVENT_READ_PARAMS;
+
 typedef struct _TD_HOOK_DIAG_PARAMS {
     UINT64 GCPhys;              // [in]  page-aligned guest physical address to walk
     UINT64 status;              // [out] NTSTATUS
@@ -548,6 +563,8 @@ typedef struct _TD_MEMORY_BREAKPOINT_ENTRY {
     UINT32  access;
     UINT32  flags;
     PMDL    mdl;
+    INT32   vbox_id_hook;   // T4: VBox slot (plane mode only)
+    UINT32  vbox_generation;
 } TD_MEMORY_BREAKPOINT_ENTRY, *PTD_MEMORY_BREAKPOINT_ENTRY;
 
 extern FAST_MUTEX g_memory_breakpoint_mutex;
@@ -821,6 +838,11 @@ NTSTATUS TdVbxCmdSubmit(UINT32 uOperation, VOID const * payload, UINT32 cbPayloa
                         VOID * resp, UINT32 cbRespMax, UINT32 * pcbResp, UINT32 * puVmmRc);
 NTSTATUS TdVbxCapsQuery(VOID * pCaps);
 NTSTATUS TdVbxDiagWalk(UINT64 GCPhys, VOID * pDiag);
+NTSTATUS TdVbxBpInstall(UINT64 GCPhysPage, UINT32 off, UINT32 cb, UINT32 access,
+                        UINT32 fOneshot, UINT64 target_cr3, INT32 *pidHook, UINT32 *puGen);
+NTSTATUS TdVbxBpRemove(INT32 idHook, UINT32 uGeneration);
+NTSTATUS TdVbxEventReadAll(UINT64 *pEvents, UINT32 cMaxEvents, UINT32 *pcEvents,
+                           UINT32 *pcDropped, UINT32 *pcRemaining);
 NTSTATUS TdVbxJumpInstall(UINT64 trig_gpa, UINT64 gva_trigger, UINT64 cookie, UINT64 gva_redirect);
 NTSTATUS TdVbxJumpRemove(UINT64 trig_gpa);
 VOID TdVbxHookRegister(UINT64 pid, UINT64 trig_gpa);

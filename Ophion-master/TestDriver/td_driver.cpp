@@ -57,8 +57,9 @@ BOOLEAN TdOphionAlive(VOID)
 
 VOID TdUnload(PDRIVER_OBJECT drv)
 {
-    TdVbxHookRemoveAll();
-    TdVbxCmdFini();
+    /* F12: the command page must outlive the process-notify callbacks and
+       the breakpoint/hook sweeps that may still submit REMOVEs; it is freed
+       last (search "F12 teardown" below). */
     // Stop new exit callbacks first. Successful removal waits for callbacks
     // already in flight, so hook teardown below cannot race TdProcessNotify.
     if (g_process_notify_registered)
@@ -81,6 +82,11 @@ VOID TdUnload(PDRIVER_OBJECT drv)
                 "[td] Process notify callback removal FAILED: 0x%08X", notify_st);
         }
     }
+
+    /* F12 teardown: sweep VBox hooks and free the command page only after
+       the notify callbacks are gone. */
+    TdVbxHookRemoveAll();
+    TdVbxCmdFini();
 
     // [瀹歌尙顩﹂悽鈺?娑撳秴鍟€闁俺绻?LoadImage 閸ョ偠鐨熷▔銊ュ弳 renderdoc閿涘本鏁兼稉?NtCreateFile hook 鐟欙箑褰?
     //if (g_loadimage_registered)

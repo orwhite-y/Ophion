@@ -130,15 +130,13 @@ TdMemoryBreakpointClearLocked(
     if (!entry || !entry->active)
         return STATUS_NOT_FOUND;
 
-    if (!issue_vmcalls)
+    /* F12: the VBox branch runs before the issue_vmcalls gate - the hook's
+       owner is the backend that installed it, and releasing the MDL without
+       BP_REMOVE would leave the VMM hooking an unstable page. */
+    if (entry->f_vbox_backend)
     {
-        TdMemoryBreakpointReleaseEntry(entry);
-        return STATUS_SUCCESS;
-    }
-
-    if (TdVbxCmdReady() && !g_fUseOphionPlane)
-    {
-        // T4: transactional BP_REMOVE by {slot, generation}.
+        // F12: cleanup follows the backend that owns the hook, never the
+        // Ophion liveness event.
         NTSTATUS vbox_status = TdVbxBpRemove(entry->vbox_id_hook, entry->vbox_generation);
         if (NT_SUCCESS(vbox_status))
             TdMemoryBreakpointReleaseEntry(entry);
@@ -263,6 +261,7 @@ TdMemoryBreakpointSet(PTD_MEMORY_BREAKPOINT_REQUEST request)
     slot->access = request->access;
     slot->flags = request->flags;
     slot->mdl = mdl;
+    slot->f_vbox_backend = TdVbxCmdReady() && !g_fUseOphionPlane;
     request->breakpoint_id = breakpoint_id;
 
     if (TdVbxCmdReady() && !g_fUseOphionPlane)

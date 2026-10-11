@@ -230,7 +230,11 @@ NTSTATUS TdVbxDiagWalk(UINT64 GCPhys, VOID * pDiagRaw)
     req.GCPhys = GCPhys;
     UINT32 cb = 0;
     UINT32 vmmRc = 0;
-    NTSTATUS st = TdVbxCmdSubmit(VBX_CMD_DIAG_WALK, &req, sizeof(req) - sizeof(VBX_CMD_HDR),
+    /* F02: the payload starts AFTER the header on the wire - pass the GCPhys
+       field itself, not the struct base (which would copy header bytes). */
+    NTSTATUS st = TdVbxCmdSubmit(VBX_CMD_DIAG_WALK,
+                                 (UINT8 *)&req + sizeof(VBX_CMD_HDR),
+                                 sizeof(req) - sizeof(VBX_CMD_HDR),
                                  pDiag, sizeof(*pDiag), &cb, &vmmRc);
     if (NT_SUCCESS(st) && cb < sizeof(*pDiag))
         return STATUS_INVALID_PARAMETER;
@@ -514,8 +518,15 @@ NTSTATUS TdVbxEventReadAll(UINT64 *pEvents, UINT32 cMaxEvents, UINT32 *pcEvents,
             cDropped += pHdr->cDropped;
             cRemaining += pHdr->cRemaining;
             UINT32 const cGot = pHdr->cEvents;
+            /* F13: copy the full 64-byte EPTHOOKEVENT records - the old code
+               kept only the sequence qword and dropped every other field. */
             for (UINT32 i = 0; i < cGot && cCopied < cMaxEvents; ++i)
-                pEvents[cCopied++] = *(UINT64 const *)((UINT8 const *)(pHdr + 1) + (SIZE_T)i * 64);
+            {
+                RtlCopyMemory((UINT8 *)pEvents + (SIZE_T)cCopied * 64,
+                              (UINT8 const *)(pHdr + 1) + (SIZE_T)i * 64,
+                              64);
+                ++cCopied;
+            }
         }
         else if (!NT_SUCCESS(st) && NT_SUCCESS(stFinal))
             stFinal = st;

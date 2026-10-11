@@ -565,6 +565,7 @@ typedef struct _TD_MEMORY_BREAKPOINT_ENTRY {
     PMDL    mdl;
     INT32   vbox_id_hook;   // T4: VBox slot (plane mode only)
     UINT32  vbox_generation;
+    BOOLEAN f_vbox_backend; // F12: cleanup must use the backend that owns the hook
 } TD_MEMORY_BREAKPOINT_ENTRY, *PTD_MEMORY_BREAKPOINT_ENTRY;
 
 extern FAST_MUTEX g_memory_breakpoint_mutex;

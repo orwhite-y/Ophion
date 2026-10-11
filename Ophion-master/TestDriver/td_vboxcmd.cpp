@@ -429,6 +429,8 @@ typedef struct _VBX_EVENT_READ_HDR {
 #define VBX_CMD_EVENT_READ      5
 #define VBX_CMD_TRACE_START     6
 #define VBX_CMD_TRACE_STOP      7
+#define VBX_CMD_SPLIT_INSTALL   8
+#define VBX_CMD_SPLIT_REMOVE    9
 
 NTSTATUS TdVbxBpInstall(UINT64 GCPhysPage, UINT32 off, UINT32 cb, UINT32 access,
                         UINT32 fOneshot, UINT64 target_cr3, INT32 *pidHook, UINT32 *puGen)
@@ -526,4 +528,64 @@ NTSTATUS TdVbxEventReadAll(UINT64 *pEvents, UINT32 cMaxEvents, UINT32 *pcEvents,
     if (pcDropped) *pcDropped = cDropped;
     if (pcRemaining) *pcRemaining = cRemaining;
     return stFinal;
+}
+
+// =============================================================================
+//  T6: runtime split-view (immutable code pages) over the command page.
+// =============================================================================
+
+#pragma pack(push, 8)
+typedef struct _VBX_SPLIT_REQ {
+    VBX_CMD_HDR Hdr;
+    UINT64 GCPhys;
+    UINT32 offHook;
+    UINT32 cbHook;
+    UINT8  abHook[64];
+    UINT8  u8Reserved[8];
+} VBX_SPLIT_REQ;
+#pragma pack(pop)
+
+//
+// Installs an immutable split-view byte patch.  Any later guest write to the
+// page invalidates the hook on every vCPU (VMM-side contract, R-03).
+//
+NTSTATUS TdVbxSplitInstall(UINT64 GCPhysPage, UINT32 off,
+                           UINT8 const * pbBytes, UINT32 cbBytes,
+                           INT32 *pidHook, UINT32 *puGeneration)
+{
+    if (!cbBytes || cbBytes > 64 || off + cbBytes > PAGE_SIZE)
+        return STATUS_INVALID_PARAMETER;
+    VBX_SPLIT_REQ req;
+    RtlZeroMemory(&req, sizeof(req));
+    req.GCPhys = GCPhysPage;
+    req.offHook = off;
+    req.cbHook = cbBytes;
+    RtlCopyMemory(req.abHook, pbBytes, cbBytes);
+
+    VBX_BP_RESP resp = {};
+    UINT32 cbResp = 0;
+    UINT32 vmmRc = 0;
+    NTSTATUS st = TdVbxCmdSubmit(VBX_CMD_SPLIT_INSTALL,
+                                 (UINT8 *)&req + sizeof(VBX_CMD_HDR),
+                                 sizeof(req) - sizeof(VBX_CMD_HDR),
+                                 &resp, sizeof(resp), &cbResp, &vmmRc);
+    if (NT_SUCCESS(st))
+    {
+        if (pidHook) *pidHook = resp.idHook;
+        if (puGeneration) *puGeneration = resp.uGeneration;
+    }
+    return st;
+}
+
+NTSTATUS TdVbxSplitRemove(INT32 idHook, UINT32 uGeneration)
+{
+    VBX_BP_REMOVE_REQ req;
+    RtlZeroMemory(&req, sizeof(req));
+    req.idHook = idHook;
+    req.uGeneration = uGeneration;
+    UINT32 vmmRc = 0;
+    return TdVbxCmdSubmit(VBX_CMD_SPLIT_REMOVE,
+                          (UINT8 *)&req + sizeof(VBX_CMD_HDR),
+                          sizeof(req) - sizeof(VBX_CMD_HDR),
+                          NULL, 0, NULL, &vmmRc);
 }

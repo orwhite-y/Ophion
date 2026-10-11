@@ -841,6 +841,9 @@ NTSTATUS TdVbxDiagWalk(UINT64 GCPhys, VOID * pDiag);
 NTSTATUS TdVbxBpInstall(UINT64 GCPhysPage, UINT32 off, UINT32 cb, UINT32 access,
                         UINT32 fOneshot, UINT64 target_cr3, INT32 *pidHook, UINT32 *puGen);
 NTSTATUS TdVbxBpRemove(INT32 idHook, UINT32 uGeneration);
+NTSTATUS TdVbxSplitInstall(UINT64 GCPhysPage, UINT32 off, UINT8 const * pbBytes,
+                           UINT32 cbBytes, INT32 *pidHook, UINT32 *puGeneration);
+NTSTATUS TdVbxSplitRemove(INT32 idHook, UINT32 uGeneration);
 NTSTATUS TdVbxEventReadAll(UINT64 *pEvents, UINT32 cMaxEvents, UINT32 *pcEvents,
                            UINT32 *pcDropped, UINT32 *pcRemaining);
 NTSTATUS TdVbxJumpInstall(UINT64 trig_gpa, UINT64 gva_trigger, UINT64 cookie, UINT64 gva_redirect);

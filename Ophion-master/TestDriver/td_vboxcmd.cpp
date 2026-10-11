@@ -589,3 +589,77 @@ NTSTATUS TdVbxSplitRemove(INT32 idHook, UINT32 uGeneration)
                           sizeof(req) - sizeof(VBX_CMD_HDR),
                           NULL, 0, NULL, &vmmRc);
 }
+
+// =============================================================================
+//  T8: NX shadow (guest PTE NX + transient VMM flip on execution).
+// =============================================================================
+
+#pragma pack(push, 8)
+typedef struct _VBX_NX_PAGE {
+    UINT64 Gva;
+    UINT64 GpaPte;
+} VBX_NX_PAGE;
+
+typedef struct _VBX_NX_REQ {
+    VBX_CMD_HDR Hdr;
+    UINT64 uCr3User;
+    UINT64 uCr3Kernel;
+    UINT32 cPages;
+    UINT32 u32Reserved;
+    VBX_NX_PAGE aPages[32];
+} VBX_NX_REQ;
+
+typedef struct _VBX_NX_RESP {
+    UINT32 cPages;
+    UINT32 fArmed;
+    UINT64 cFlips;
+} VBX_NX_RESP;
+#pragma pack(pop)
+
+#define VBX_CMD_NX_ADD     10
+#define VBX_CMD_NX_REMOVE  11
+#define VBX_CMD_NX_QUERY   12
+#define VBX_NX_MAX_PAGES   32
+
+//
+// Arm NX hiding for up to 32 pages of one process.  The driver must supply
+// the leaf-PTE guest-physical address of every page (walk the target CR3
+// twice: page PTE and its own PTE) and re-arm whenever the process exits or
+// the mappings change.
+//
+NTSTATUS TdVbxNxAdd(UINT64 target_cr3,
+                    VBX_NX_PAGE const * pPages, UINT32 cPages,
+                    UINT32 * pcArmed)
+{
+    if (!cPages || cPages > VBX_NX_MAX_PAGES || !pPages)
+        return STATUS_INVALID_PARAMETER;
+    VBX_NX_REQ req;
+    RtlZeroMemory(&req, sizeof(req));
+    req.uCr3User = target_cr3;
+    req.uCr3Kernel = target_cr3;
+    req.cPages = cPages;
+    RtlCopyMemory(req.aPages, pPages, sizeof(VBX_NX_PAGE) * cPages);
+
+    VBX_NX_RESP resp = {};
+    UINT32 cbResp = 0;
+    UINT32 vmmRc = 0;
+    NTSTATUS st = TdVbxCmdSubmit(VBX_CMD_NX_ADD,
+                                 (UINT8 *)&req + sizeof(VBX_CMD_HDR),
+                                 sizeof(req) - sizeof(VBX_CMD_HDR),
+                                 &resp, sizeof(resp), &cbResp, &vmmRc);
+    if (NT_SUCCESS(st) && pcArmed)
+        *pcArmed = resp.cPages;
+    return st;
+}
+
+NTSTATUS TdVbxNxRemove(UINT32 * pcArmed)
+{
+    VBX_NX_RESP resp = {};
+    UINT32 cbResp = 0;
+    UINT32 vmmRc = 0;
+    NTSTATUS st = TdVbxCmdSubmit(VBX_CMD_NX_REMOVE, NULL, 0,
+                                 &resp, sizeof(resp), &cbResp, &vmmRc);
+    if (NT_SUCCESS(st) && pcArmed)
+        *pcArmed = resp.cPages;
+    return st;
+}

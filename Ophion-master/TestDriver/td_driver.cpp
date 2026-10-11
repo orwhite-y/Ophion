@@ -57,6 +57,7 @@ BOOLEAN TdOphionAlive(VOID)
 
 VOID TdUnload(PDRIVER_OBJECT drv)
 {
+    TdVbxCmdFini();
     // Stop new exit callbacks first. Successful removal waits for callbacks
     // already in flight, so hook teardown below cannot race TdProcessNotify.
     if (g_process_notify_registered)
@@ -201,6 +202,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
     g_inject_target_lock_init = TRUE;
     KeInitializeSpinLock(&g_SelfPeInfoLock);
     g_SelfPeInfoLockInit = TRUE;
+    TdVbxCmdInit();
 
     //
     // init log system 闁?file output, truncate on load

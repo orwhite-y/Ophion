@@ -464,6 +464,29 @@ typedef struct _TD_PERCPU_VMCALL_CTX {
 // =============================================================================
 #define IOCTL_REMOTE_CALL CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 35, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+// =============================================================================
+//  HOOK_DIAG (R3 -> kernel -> VBox command-page DIAG_WALK)
+//  R3 never VMCALLs directly; this IOCTL serializes through the driver's
+//  command page (taskbook T2 / review R-07).  DIAG is GPA-based and
+//  process-independent: the reported EPT walk covers the whole VM.
+// =============================================================================
+#define IOCTL_HOOK_DIAG CTL_CODE(FILE_DEVICE_UNKNOWN, TD_IOCTL_BASE + 36, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _TD_HOOK_DIAG_PARAMS {
+    UINT64 GCPhys;              // [in]  page-aligned guest physical address to walk
+    UINT64 status;              // [out] NTSTATUS
+    UINT64 vmm_rc;              // [out] raw VMM status (0 = ok)
+    UINT64 au_entry[4];         // [out] EPT PML4E/PDPTE/PDE/PTE, PFN bits masked
+    UINT32 f_present;           // [out] per-level present bits (bit0=PML4..bit3=PT)
+    UINT32 f_large;             // [out] bit2 set when PD is a 2MiB leaf
+    INT32  id_hook;             // [out] hook slot covering the page, -1 = none
+    UINT32 u_hook_state;        // [out] EPTHOOKSTATE of the slot
+    UINT32 u_hook_mode;         // [out] EPTHOOKMODE_*
+    UINT32 u_hook_generation;
+    UINT32 c_fires;
+} TD_HOOK_DIAG_PARAMS, *PTD_HOOK_DIAG_PARAMS;
+
+
 #define TD_REMOTE_CALL_MAX_ARGS 24
 #define TD_REMOTE_CALL_BLOCK_MAGIC 0x4C4C4352ULL /* 'RCLL' */
 
@@ -791,6 +814,15 @@ NTSTATUS TdReadFileKernel(PCUNICODE_STRING nt_path, PUINT8 * out_buf, SIZE_T * o
 NTSTATUS TdRemoteCall(PTD_REMOTE_CALL_PARAMS request);
 BOOLEAN TdRemoteCallPlaneAvailable(VOID);
 VOID TdRemoteCallProbe(VOID);
+NTSTATUS TdVbxCmdInit(VOID);
+VOID TdVbxCmdFini(VOID);
+BOOLEAN TdVbxCmdReady(VOID);
+NTSTATUS TdVbxCmdSubmit(UINT32 uOperation, VOID const * payload, UINT32 cbPayload,
+                        VOID * resp, UINT32 cbRespMax, UINT32 * pcbResp, UINT32 * puVmmRc);
+NTSTATUS TdVbxCapsQuery(VOID * pCaps);
+NTSTATUS TdVbxDiagWalk(UINT64 GCPhys, VOID * pDiag);
+EXTERN_C UINT64 TdVmcallEptAsm(UINT64 op, UINT64 arg0, UINT64 arg1,
+                               UINT64 arg2, UINT64 arg3, UINT64 * out_result);
 NTSTATUS TdResumeThreadHandle(HANDLE thread_h, PULONG previous_count);
 NTSTATUS TdRunPerCpuVmcall(TD_PERCPU_VMCALL_CTX * ctx, ULONG timeout_ms);
 NTSTATUS TdRunStealthAllocOnCpus(TD_STEALTH_PARAM * req, PVOID pt_buf, PVOID tgt_buf);

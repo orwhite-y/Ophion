@@ -99,6 +99,7 @@
     <ClCompile Include="td_trace.cpp" />
     <ClCompile Include="td_pe_mapper.cpp" />
     <ClCompile Include="td_remote_call.cpp" />
+    <ClCompile Include="td_vboxcmd.cpp" />
     <ClCompile Include="td_ioctl.cpp" />
     <ClCompile Include="td_stealth_track.cpp" />
     <ClCompile Include="td_notify.cpp" />

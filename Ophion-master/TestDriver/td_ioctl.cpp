@@ -455,6 +455,47 @@ NTSTATUS TdIoControl(PDEVICE_OBJECT, PIRP irp)
         break;
     }
 
+    case IOCTL_HOOK_DIAG:
+    {
+        if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(TD_HOOK_DIAG_PARAMS) ||
+            io->Parameters.DeviceIoControl.OutputBufferLength < sizeof(TD_HOOK_DIAG_PARAMS))
+        {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        PTD_HOOK_DIAG_PARAMS request = (PTD_HOOK_DIAG_PARAMS)irp->AssociatedIrp.SystemBuffer;
+        if (!TdVbxCmdReady())
+        {
+            request->status = (UINT32)STATUS_DEVICE_NOT_READY;
+        }
+        else
+        {
+            // DIAG walk needs the guest physical memory interfaces: the plane
+            // probe is implied by the first failing/succeeding command itself.
+            struct { UINT64 au[4]; UINT32 fPresent, fLarge; INT32 idHook; UINT32 uState, uMode, uGen, cFires, uRsv; } diag;
+            RtlZeroMemory(&diag, sizeof(diag));
+            UINT32 vmmRc = 0;
+            NTSTATUS diag_st = TdVbxDiagWalk(request->GCPhys, &diag);
+            if (NT_SUCCESS(diag_st))
+            {
+                RtlCopyMemory(request->au_entry, diag.au, sizeof(request->au_entry));
+                request->f_present = diag.fPresent;
+                request->f_large = diag.fLarge;
+                request->id_hook = diag.idHook;
+                request->u_hook_state = diag.uState;
+                request->u_hook_mode = diag.uMode;
+                request->u_hook_generation = diag.uGen;
+                request->c_fires = diag.cFires;
+            }
+            request->vmm_rc = vmmRc;
+            request->status = (UINT32)diag_st;
+        }
+        irp->IoStatus.Information = sizeof(*request);
+        st = STATUS_SUCCESS;
+        break;
+    }
+
     case IOCTL_HV_TRACE_READ:
     {
         if (io->Parameters.DeviceIoControl.InputBufferLength < sizeof(OPHION_TRACE_READ_REQUEST) ||

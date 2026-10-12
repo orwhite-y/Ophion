@@ -1,42 +1,12 @@
-# Independent git repos
-/Box/
-/MemoryModulePP-master/
-/renderdoc-1.36/
-/Injector/
-/Output/
-/ophion_diff.txt
-/renderdoc_diff.txt
-
-# runtime / local files
-.crashdata/
-.crash*data/
-/query
-/settings.ini
-
-# ---- local debug-session artifacts (never commit) ----
-/cdb_*.txt
-/gowr_*
-/qrenderdoc_*
-/ophion_*.txt
-/_diff_*.txt
-/_audit_*.txt
-/_dump_*.txt
-/capture_*.json
-/capture_*.py
-/cdb_*.json
+# 大产物禁止入库 (2026-10-12 历史清洗: 2.33GiB -> 9.89MiB)
 *.dmp
 *.7z
-Ophion-master/build/
-Ophion-master/query
-Ophion-master/TestDriver/*.exe
-Ophion-master/TestDriver/*.obj
-Ophion-master/TestDriver/*.ilk
-Ophion-master/TestDriver/*.pdb
-Ophion-master/TestDriver/*.dll
-Ophion-master/TestDriver/*.log
-Ophion-master/TestDriver/*.bak_*
-Ophion-master/TestDriver/*.nul_backup
-Ophion-master/TestDriver/*.disasm.txt
-Ophion-master/include/*.bak_*
-Ophion-master/src/*.bak_*
-Ophion-master/*.bak_*
+*.i64
+*.id0
+*.id1
+*.id2
+*.$$$
+*.i64.zip
+gowr_full_disasm.txt
+nvapi-stub/.vs/
+ida_*_db/

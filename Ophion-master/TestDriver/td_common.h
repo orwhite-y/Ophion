@@ -11,10 +11,38 @@
 #include "log.h"
 #include "trace_protocol.h"
 
-// ---- Compatibility: build 18362 (Win10 1903) lacks ExAllocatePool2 ----
-// ExAllocatePool2 was introduced in Win10 2004 (build 19041).  All current
-// callers use POOL_FLAG_NON_PAGED; map to the legacy NonPagedPoolNx API.
-#define ExAllocatePool2(Flags, Size, Tag) ExAllocatePoolWithTag(NonPagedPoolNx, Size, Tag)
+// ---- Compatibility: ExAllocatePool2 macro control ----
+//
+// ExAllocatePool2 was introduced in Win10 2004 (build 19041).  Guests on
+// older builds (e.g. 1903 / build 18362) lack this ntoskrnl export.
+//
+// Set VBOX_TD_USE_EXALLOCATEPOOL2 to 1 to use the native ExAllocatePool2
+// (requires Win10 2004+ guest).  Default 0 = use the legacy
+// ExAllocatePoolWithTag compatibility wrapper.
+//
+// The wrapper maps ExAllocatePool2 flag-style arguments to POOL_TYPE:
+//   POOL_FLAG_NON_PAGED         -> NonPagedPoolNx
+//   POOL_FLAG_NON_PAGED_EXECUTE -> NonPagedPool
+//
+// The original ExAllocatePool2 call sites are preserved verbatim; only this
+// macro block decides which API is used underneath.
+#ifndef VBOX_TD_USE_EXALLOCATEPOOL2
+# define VBOX_TD_USE_EXALLOCATEPOOL2 0
+#endif
+
+#if VBOX_TD_USE_EXALLOCATEPOOL2
+/* Native ExAllocatePool2: no wrapper needed, the WDK headers declare it. */
+#else
+/* Legacy compatibility: map flag-style args to POOL_TYPE-style args. */
+
+/* Map POOL_FLAG_* values to POOL_TYPE equivalents. */
+# define POOL_FLAG_NON_PAGED          NonPagedPoolNx
+# define POOL_FLAG_NON_PAGED_EXECUTE  NonPagedPool
+
+# define ExAllocatePool2(PoolType, Size, Tag) \
+        ExAllocatePoolWithTag((PoolType), (Size), (Tag))
+
+#endif /* !VBOX_TD_USE_EXALLOCATEPOOL2 */
 
 
 

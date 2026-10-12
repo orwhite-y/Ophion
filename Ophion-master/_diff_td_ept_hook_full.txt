@@ -1,0 +1,280 @@
+﻿diff --git a/Ophion-master/TestDriver/td_ept_hook.cpp b/Ophion-master/TestDriver/td_ept_hook.cpp
+index d4d5e6e..2ecfb37 100644
+--- a/Ophion-master/TestDriver/td_ept_hook.cpp
++++ b/Ophion-master/TestDriver/td_ept_hook.cpp
+@@ -353,61 +353,85 @@ R3HookFind(UINT64 pid, PVOID target_va)
+         if (g_r3_hooks[i].active && g_r3_hooks[i].target_pid == pid &&
+             g_r3_hooks[i].target_va == target_va)
+             return &g_r3_hooks[i];
+     return NULL;
+ }
+ 
+ //
+ // DPC callback for R3 EPT hook install
+ //
+ typedef struct _R3_HOOK_DPC_CTX {
+     PVOID    target;
+     PVOID    proxy;
+     PVOID *  origin;
+     UINT64   caller_cr3;
+     UINT32   hook_type;
+     UINT64   target_cr3;
+     PVOID    user_trampoline;
+     UINT64   user_trampoline_pa;
+     UINT64   flags;             // bit 0 = force_read_access (shellcode self-read)
+     UINT64   expected_tid;      // 0 = any thread
++    volatile LONG secondary_phase;
++    volatile LONG success_count;
++    volatile LONG failure_count;
++    volatile LONG first_failure;
+     NTSTATUS result;
+ } R3_HOOK_DPC_CTX;
+ 
+ VOID
+ DpcEptHookR3(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
+ {
+     UNREFERENCED_PARAMETER(Dpc);
+     R3_HOOK_DPC_CTX * ctx = (R3_HOOK_DPC_CTX *)Ctx;
+ 
+-    ctx->result = hv_vmcall_ex(
++    // This DPC is used only after the caller completed the primary installation.
++    // Secondary CPUs therefore never spin at DISPATCH_LEVEL waiting for primary.
++    if (!ctx->secondary_phase) {
++        _InterlockedIncrement(&ctx->failure_count);
++        _InterlockedCompareExchange(&ctx->first_failure,
++            (LONG)STATUS_INVALID_DEVICE_STATE, (LONG)STATUS_SUCCESS);
++        KeSignalCallDpcSynchronize(A2);
++        KeSignalCallDpcDone(A1);
++        return;
++    }
++
++    UINT64 packed_flags = ctx->flags;
++
++    NTSTATUS st = hv_vmcall_ex(
+         VMCALL_EPT_HOOK,
+         (UINT64)ctx->target,
+         (UINT64)ctx->proxy,
+         (UINT64)ctx->origin,
+         ctx->caller_cr3,
+-        (UINT64)ctx->hook_type | (ctx->flags << 32),
++        (UINT64)ctx->hook_type | (packed_flags << 32),
+         ctx->target_cr3,
+         (UINT64)ctx->user_trampoline,
+         ctx->user_trampoline_pa,
+         ctx->expected_tid);
+ 
++    if (NT_SUCCESS(st)) {
++        _InterlockedIncrement(&ctx->success_count);
++    } else {
++        _InterlockedIncrement(&ctx->failure_count);
++        _InterlockedCompareExchange(&ctx->first_failure, (LONG)st, (LONG)STATUS_SUCCESS);
++    }
++
+     KeSignalCallDpcSynchronize(A2);
+     KeSignalCallDpcDone(A1);
+ }
+ 
+ #ifndef TD_MAX_DPC_CPUS
+ #define TD_MAX_DPC_CPUS 64
+ #endif
+ #define TD_PERCPU_VMCALL_TAG 'cVdT'
+ 
+ 
+ 
+ VOID
+ TdPerCpuVmcallDpc(PKDPC Dpc, PVOID Ctx, PVOID, PVOID)
+ {
+     UNREFERENCED_PARAMETER(Dpc);
+     TD_PERCPU_VMCALL_CTX * ctx = (TD_PERCPU_VMCALL_CTX *)Ctx;
+     NTSTATUS st = STATUS_INVALID_DEVICE_REQUEST;
+ 
+     if (ctx->op == TdPerCpuVmcallHookTrigger)
+     {
+@@ -628,42 +652,51 @@ TdEptHookR3(
+     if (!entry)
+     {
+         HYPERPLATFORM_LOG_ERROR("[td-r3] no free R3 hook slots");
+         return STATUS_INSUFFICIENT_RESOURCES;
+     }
+ 
+     // look up target process
+     PEPROCESS proc = NULL;
+     NTSTATUS st = PsLookupProcessByProcessId((HANDLE)target_pid, &proc);
+     if (!NT_SUCCESS(st)) return st;
+ 
+     KAPC_STATE apc;
+     KeStackAttachProcess(proc, &apc);
+ 
+     UINT64 target_cr3 = __readcr3();
+     UINT64 caller_cr3 = target_cr3;
+ 
+     //
+     // 1. lock target page in physical memory via MDL
+     //
+-    PVOID page_va = (PVOID)((UINT64)target_va & ~0xFFFULL);
+-    PMDL mdl = IoAllocateMdl(page_va, PAGE_SIZE, FALSE, FALSE, NULL);
++    UINT64 page_start = (UINT64)target_va & ~0xFFFULL;
++    UINT64 page_offset = (UINT64)target_va & 0xFFFULL;
++    SIZE_T lock_length = PAGE_SIZE;
++
++    // A cross-page hook can read LDE bytes and write payload bytes into the
++    // next page. 32 bytes covers the maximum LDE accumulation window.
++    if (page_offset + 32 > PAGE_SIZE)
++        lock_length += PAGE_SIZE;
++
++    PVOID page_va = (PVOID)page_start;
++    PMDL mdl = IoAllocateMdl(page_va, (ULONG)lock_length, FALSE, FALSE, NULL);
+     if (!mdl)
+     {
+         KeUnstackDetachProcess(&apc);
+         ObDereferenceObject(proc);
+         return STATUS_INSUFFICIENT_RESOURCES;
+     }
+ 
+     __try {
+         MmProbeAndLockPages(mdl, UserMode, IoReadAccess);
+     } __except (EXCEPTION_EXECUTE_HANDLER) {
+         IoFreeMdl(mdl);
+         KeUnstackDetachProcess(&apc);
+         ObDereferenceObject(proc);
+         HYPERPLATFORM_LOG_ERROR("[td-r3] MmProbeAndLockPages failed for %p", target_va);
+         return STATUS_ACCESS_VIOLATION;
+     }
+ 
+     //
+     // 2. allocate R3 trampoline in target process as PAGE_READWRITE (NX=1).
+     // Stealth: no executable memory in the real PTE. The trampoline is made
+@@ -829,66 +862,131 @@ TdEptHookR3(
+             HYPERPLATFORM_LOG_INFO(
+                 "[td-r3] trampoline stealth page registered: tramp=%p shadow=0x%llX",
+                 tramp_va, tramp_shadow);
+         }
+     }
+ 
+     //
+     // 3. DPC broadcast VMCALL to install hook on all CPUs
+     //
+     PVOID origin_ptr = NULL;
+ 
+     R3_HOOK_DPC_CTX ctx = {};
+     ctx.target              = target_va;
+     ctx.proxy               = proxy_va;
+     ctx.origin              = &origin_ptr;
+     ctx.caller_cr3          = caller_cr3;
+     ctx.hook_type           = hook_type;
+     ctx.target_cr3          = target_cr3;
+     ctx.user_trampoline     = tramp_va;
+     ctx.user_trampoline_pa  = tramp_pa;
++    ctx.secondary_phase     = 0;
++    ctx.success_count       = 0;
++    ctx.failure_count       = 0;
++    ctx.first_failure       = (LONG)STATUS_SUCCESS;
+ 
+-    KeGenericCallDpc(DpcEptHookR3, &ctx);
++    //
++    // Phase 1: full installation on the current CPU only.  This is done while
++    // still attached to the target process, so caller_cr3 and all target VAs
++    // remain valid for the VMX-root installer.
++    //
++    BOOLEAN primary_installed = FALSE;
++    {
++        UINT64 packed_flags = ctx.flags | (1ULL << 2);
++        NTSTATUS primary_st = hv_vmcall_ex(
++            VMCALL_EPT_HOOK,
++            (UINT64)ctx.target,
++            (UINT64)ctx.proxy,
++            (UINT64)ctx.origin,
++            ctx.caller_cr3,
++            (UINT64)ctx.hook_type | (packed_flags << 32),
++            ctx.target_cr3,
++            (UINT64)ctx.user_trampoline,
++            ctx.user_trampoline_pa,
++            ctx.expected_tid);
++
++        if (NT_SUCCESS(primary_st)) {
++            primary_installed = TRUE;
++            _InterlockedIncrement(&ctx.success_count);
++        } else {
++            _InterlockedIncrement(&ctx.failure_count);
++            _InterlockedCompareExchange(&ctx.first_failure,
++                (LONG)primary_st, (LONG)STATUS_SUCCESS);
++        }
++    }
++
++    //
++    // Phase 2: only after primary success, propagate the already-installed hook
++    // to every CPU.  DpcEptHookR3 now performs secondary installs only and never
++    // waits for primary inside a DPC.
++    //
++    if (ctx.failure_count == 0)
++    {
++        KeMemoryBarrier();
++        _InterlockedExchange(&ctx.secondary_phase, 1);
++        KeGenericCallDpc(DpcEptHookR3, &ctx);
++    }
++
++    ctx.result = (ctx.failure_count != 0)
++        ? (NTSTATUS)ctx.first_failure
++        : ((ctx.success_count != 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL);
+ 
+     KeUnstackDetachProcess(&apc);
+ 
+     if (NT_SUCCESS(ctx.result))
+     {
+         entry->active           = TRUE;
+         entry->target_pid       = target_pid;
+         entry->target_va        = target_va;
+         entry->trampoline_va    = tramp_va;
+         entry->trampoline_size  = tramp_size;
+         entry->target_mdl       = mdl;
+         entry->target_cr3       = target_cr3;
+ 
+         if (out_trampoline)
+             *out_trampoline = origin_ptr;
+ 
+         HYPERPLATFORM_LOG_INFO("[td-r3] R3 EPT hook installed! trampoline=%p", origin_ptr);
+     }
+     else
+     {
+         //
+-        // failed 閳?clean up: free trampoline, unlock MDL
++        // Failed. If phase 1 installed the global hook, remove it before freeing
++        // the user trampoline. Always unregister the trampoline stealth page,
++        // otherwise the hypervisor keeps a reference to freed user memory.
+         //
+         KeStackAttachProcess(proc, &apc);
++
++        if (primary_installed)
++        {
++            struct
++            {
++                PVOID    target;
++                UINT64   caller_cr3;
++                NTSTATUS result;
++            } unhook_ctx = {};
++            unhook_ctx.target     = target_va;
++            unhook_ctx.caller_cr3 = __readcr3();
++            KeGenericCallDpc(DpcEptUnhook, &unhook_ctx);
++        }
++
++        TdStealthFreePage((PVOID)((UINT64)tramp_va & ~0xFFFULL));
+         ZwFreeVirtualMemory(ZwCurrentProcess(), &tramp_va, &tramp_size, MEM_RELEASE);
+         KeUnstackDetachProcess(&apc);
+ 
+         MmUnlockPages(mdl);
+         IoFreeMdl(mdl);
+ 
+         NTSTATUS diag = hv_vmcall_simple(VMCALL_GET_HOOK_DIAG, 0, 0, 0);
+         UINT64 diag2 = (UINT64)hv_vmcall_simple(VMCALL_GET_HOOK_DIAG2, 0, 0, 0);
+         HYPERPLATFORM_LOG_ERROR("[td-r3] R3 EPT hook FAILED: 0x%08X diag=%llu diag2=0x%llX", ctx.result, (UINT64)diag, diag2);
+     }
+ 
+     ObDereferenceObject(proc);
+     return ctx.result;
+ }
+ 
+ //
+ // remove R3 EPT hook and clean up resources
+ //
+ NTSTATUS
+ TdEptUnhookR3(UINT64 target_pid, PVOID target_va)

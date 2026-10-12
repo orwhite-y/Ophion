@@ -1,0 +1,8 @@
+input=D:\game\冒险岛online\mxdclassic\GameAssembly_clean.dll
+idb=F:\winDriver\te\Ophion-master\ida_blob_headless_db\GameAssembly_clean_headless.i64
+target=0x181d59fe0 sub_181D59FE0
+xrefs=183
+unique_callers=117
+errors=0
+elapsed=16.869s
+report=F:\winDriver\te\Ophion-master\ida_blob_headless_out\blob_headless_report.json

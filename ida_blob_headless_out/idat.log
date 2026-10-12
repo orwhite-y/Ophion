@@ -1,0 +1,74 @@
+BinDiff 8 (@internal, Oct  7 2024), (c)2004-2011 zynamics GmbH, (c)2011-2024 Google LLC.
+BinExport 12 (@1045a99, Oct  7 2024), (c)2004-2011 zynamics GmbH, (c)2011-2024 Google LLC.
+IDAMCPPlugin instance created
+WPeChatGPT is using GPTAPI-US
+IDA has found an unpacked version of database: D:\game\冒险岛online\mxdclassic\GameAssembly_clean.dll.i64
+on the disk.
+
+Should we proceed with the unpacked files?
+ -> Pro~c~eed with unpacked base
+
+  bytes   pages size description
+--------- ----- ---- --------------------------------------------
+134217728 16384 8192 allocating memory for b-tree...
+D:\game\冒险岛online\mxdclassic\GameAssembly_clean.dll.id0: bTree error: bad B-tree header -> OKBinDiff 8 (@internal, Oct  7 2024), (c)2004-2011 zynamics GmbH, (c)2011-2024 Google LLC.
+BinExport 12 (@1045a99, Oct  7 2024), (c)2004-2011 zynamics GmbH, (c)2011-2024 Google LLC.
+IDAMCPPlugin instance created
+WPeChatGPT is using GPTAPI-US
+
+  bytes   pages size description
+--------- ----- ---- --------------------------------------------
+134217728 16384 8192 allocating memory for b-tree...
+268435456 32768 8192 allocating memory for virtual array...
+   262144    32 8192 allocating memory for name pointers...
+-----------------------------------------------------------------
+402915328            total memory allocated
+
+Loading processor module F:\tool\IDA Professional 9.1\procs\pc.dll for metapc...Initializing processor module metapc...OK
+Loading type libraries...
+Autoanalysis subsystem has been initialized.
+Database for file 'GameAssembly_clean.dll' has been loaded.
+Hex-Rays Decompiler plugin has been loaded (v9.1.0.250226)
+  The hotkeys are F5: decompile, Ctrl-F5: decompile all.
+
+  Please check the Edit/Plugins menu for more information.
+[AutoEnum] Plugin loaded!
+================================================================================
+Start Data Export Plus plugin
+================================================================================
+Findcrypt v0.2 by David BERARD, 2017
+Findcrypt search shortcut key is Ctrl-Alt-F
+Global rules in F:\tool\IDA Professional 9.1\plugins\findcrypt3.rules
+User-defined rules in C:\Users\Administrator\AppData\Roaming\Hex-Rays\IDA Pro\plugins\findcrypt-yara/*.rules
+================================================================================
+Hex-rays version 9.1.0.250226 has been detected, gooMBA plugin ready to use
+[hrt] Error loading 'F:\tool\IDA Professional 9.1\plugins\literal.txt', enum autoresolve is turned off
+[hrt] hrtng (bes's tools collection) v2.5.41 for IDA910  ready to use
+[MCP] Plugin loaded (idalib mode, server managed externally)
+IDAMCPPlugin instance created
+IDA MCP Server v1.0 by IDA MCP
+Initializing plugin...
+Failed to attach start server action to menu
+Failed to attach stop server action to menu
+Menu items created successfully
+Menu items added
+Plugin initialized successfully
+================================================================================
+Keypatch v2.2 (c) Nguyen Anh Quynh & Thanh Nguyen, 2018
+Keypatch is using Keystone v0.9.2
+Keypatch Patcher's shortcut key is Ctrl-Alt-K
+Use the same hotkey Ctrl-Alt-K to open 'Fill Range' window on a selected range of code
+To revert (undo) the last patching, choose menu Edit | Keypatch | Undo last patching
+Keypatch Search is available from menu Edit | Keypatch | Search
+Find more information about Keypatch at http://keystone-engine.org/keypatch
+================================================================================
+LazyIDA (v1.0.0.3) plugin has been loaded.
+[LLVM Deobfuscator] ready (core: proved C++ bridge)
+FAILED TO DETACH MENU ITEM Edit/Plugins//Rollback last proved view patches
+FAILED TO DETACH MENU ITEM Edit/Plugins//Apply proved single-edge view patches
+FAILED TO DETACH MENU ITEM Edit/Plugins//Preview proved CFG recovery
+WPeChatGPT is using GPTAPI-US
+Auto-WPeGPT v0.2 is ready.
+WPeChat-GPTAPI-US v2.6 works fine! :)@WPeace
+
+export_snapshot: wrote D:\game\冒险岛online\mxdclassic\llvm_deobf_store\snapshot_181D59FE0.json (1 functions, 352262 function_starts)

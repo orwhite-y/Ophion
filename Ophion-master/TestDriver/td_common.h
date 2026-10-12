@@ -11,6 +11,12 @@
 #include "log.h"
 #include "trace_protocol.h"
 
+// ---- Compatibility: build 18362 (Win10 1903) lacks ExAllocatePool2 ----
+// ExAllocatePool2 was introduced in Win10 2004 (build 19041).  All current
+// callers use POOL_FLAG_NON_PAGED; map to the legacy NonPagedPoolNx API.
+#define ExAllocatePool2(Flags, Size, Tag) ExAllocatePoolWithTag(NonPagedPoolNx, Size, Tag)
+
+
 
 // ---- extern "C" kernel APIs ----
 extern "C" {
